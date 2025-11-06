@@ -1,0 +1,36 @@
+name: grainlegumes-pino
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch=2.4
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - tqdm
+  - torchmetrics
+  - ipykernel
+  - jupyter
+  - jupyterlab
+  - ipympl
+  - black
+  - isort
+  - ruff
+  - mypy
+  - nbqa
+  - pre-commit
+  - radon
+  - pip
+  - pip:
+      - neuraloperator==2.0.*
+      - wandb
+      - pyfftw
+      - numba
+      - complexipy

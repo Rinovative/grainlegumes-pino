@@ -1,0 +1,70 @@
+{
+  "name": "grainlegumes-pino",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "runArgs": [
+    "--gpus",
+    "all",
+    "--shm-size=16G" // default: 16 GB shared memory; Cluster set XX GB
+  ],
+  "remoteUser": "mambauser",
+  "workspaceFolder": "/home/mambauser/workspace",
+  "mounts": [
+    // 🔐 SSH Mount
+    "source=${env:USERPROFILE}\\.ssh,target=/home/mambauser/.ssh,type=bind,consistency=cached",
+    // 🔄 Workspace Mounts
+    "source=${localWorkspaceFolder},target=/home/mambauser/workspace,type=bind",
+    "source=${localWorkspaceFolder}/data,target=/home/mambauser/workspace/data,type=bind",
+    "source=${localWorkspaceFolder}/data_generation/data,target=/home/mambauser/workspace/data_generation/data,type=bind",
+    "source=${localWorkspaceFolder}/model_training/data,target=/home/mambauser/workspace/model_training/data,type=bind"
+  ],
+  "remoteEnv": {
+    "GIT_SSH_COMMAND": "ssh -i /home/mambauser/.ssh/id_ed25519 -o StrictHostKeyChecking=no"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-toolsai.jupyter-renderers",
+        "ms-azuretools.vscode-docker",
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker"
+      ],
+      "settings": {
+        // --- Python-Interpreter im Container ---
+        "python.defaultInterpreterPath": "/opt/micromamba/envs/grainlegumes-pino/bin/python",
+
+        // --- Format & Linting ---
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.codeActionsOnSave": {
+          "source.fixAll": true,
+          "source.organizeImports": true
+        },
+
+        // --- Ruff auch für Notebooks ---
+        "notebook.formatOnSave.enabled": true,
+        "notebook.codeActionsOnSave": {
+          "source.fixAll": true
+        },
+        "notebook.defaultFormatter": "charliermarsh.ruff",
+
+        // --- Python Linting Config ---
+        "python.formatting.provider": "black",
+        "python.linting.enabled": true,
+        "python.linting.ruffEnabled": true,
+        "python.linting.mypyEnabled": true,
+        "python.analysis.typeCheckingMode": "basic",
+
+        // --- Ruff performance ---
+        "ruff.organizeImports": true,
+        "ruff.fixAll": true
+      }
+    }
+  }
+  // Optional:
+  // "postCreateCommand": "pre-commit install || true"
+}

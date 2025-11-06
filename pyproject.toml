@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grainlegumes-pino"
+version = "0.1.0"
+description = "Synthetic permeability generation and PINO training pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Rino M. Albertin" }]
+
+[tool.setuptools]
+package-dir = { "" = "model_training" }
+
+[tool.setuptools.packages.find]
+where = ["model_training/src"]
+include = ["src*"]
+
+# --- Code Style & Linting ---
+[tool.black]
+line-length = 150
+extend-exclude = "/(venv|.venv|data|outputs|results|build|dist)/"
+
+[tool.isort]
+profile = "black"
+line_length = 150
+skip_gitignore = true
+skip = ["**/data", "venv", ".venv", "outputs", "results"]
+
+[tool.ruff]
+line-length = 150
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E203"]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = true
+
+[tool.nbqa.config]
+black = ["--line-length=150"]
+isort = ["--profile=black"]
+ruff = ["--fix"]

@@ -1,0 +1,58 @@
+# -------------------------------
+# 🧠 GENERAL
+# -------------------------------
+.git
+.gitignore
+.dockerignore
+.devcontainer/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.o
+*.a
+
+# -------------------------------
+# 🧮 NOTEBOOKS & CACHE
+# -------------------------------
+.ipynb_checkpoints
+*.ipynb_checkpoints
+.DS_Store
+Thumbs.db
+
+# -------------------------------
+# 📦 PYTHON ENV / PACKAGES
+# -------------------------------
+env/
+venv/
+.venv/
+*.egg-info/
+build/
+dist/
+
+# -------------------------------
+# ☁️ SYSTEM / ONEDRIVE
+# -------------------------------
+*.tmp
+*.bak
+*.swp
+*.swx
+*~$
+OneDrive*/
+*.lnk
+
+# -------------------------------
+# 📊 PROJECT DATA
+# -------------------------------
+data/
+data_generation/data/
+model_training/data/
+
+# Temporary files
+*.pt
+*.csv
+*.zip
+*.log
+__pycache__/
+.ipynb_checkpoints/
