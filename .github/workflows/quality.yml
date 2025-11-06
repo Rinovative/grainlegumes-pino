@@ -8,13 +8,18 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Micromamba
-        uses: mamba-org/provision-with-micromamba@v16
+        uses: mamba-org/setup-micromamba@v1
         with:
           environment-file: environment.yml
+          cache-environment: true
           cache-downloads: true
+          init-shell: bash
+
       - name: Linting & Type Checks
         shell: bash -l {0}
         run: |
@@ -22,12 +27,14 @@ jobs:
           isort --check-only .
           ruff check .
           mypy .
+
       - name: Notebook QA
         shell: bash -l {0}
         run: |
           nbqa black --check notebooks/
           nbqa isort --check notebooks/
           nbqa ruff notebooks/
+
       - name: Complexity Analysis
         shell: bash -l {0}
         run: |
