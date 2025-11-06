@@ -12,8 +12,8 @@
 
 This specialization project investigates the performance and applicability of **Physics-Informed Neural Operators (PINOs)** for simulating air flow in **porous granular media** such as agricultural grain beds.  
 
-Permeability fields κ(x) are **generated in MATLAB**, solved via **COMSOL Multiphysics**, and exported as structured **PyTorch datasets (.pt)**.  
-The goal is to train a 2-D PINO model that learns the mapping from permeability to pressure and velocity fields — effectively replacing expensive CFD solvers for design and optimization tasks.
+Permeability fields κ are **generated in MATLAB** and solved via **COMSOL Multiphysics**.
+The goal is to train a 2-D PINO model in python that learns the mapping from permeability to pressure and velocity fields — effectively replacing expensive CFD solvers for design and optimization tasks.
 
 The repository provides a complete, modular workflow covering:
 - 🧩 **Data generation** (MATLAB → COMSOL → PyTorch conversion)  
@@ -28,11 +28,11 @@ The repository provides a complete, modular workflow covering:
 
 ```mermaid
 graph LR
-A[MATLAB – Permeability field generator] --> B[COMSOL – Brinkman flow solver]
-B --> C[PyTorch dataset (.pt)]
-C --> D[EDA – Spectral analysis]
-D --> E[PINO training – Physics-informed neural operator]
-E --> F[Evaluation – Residuals & spectral error maps]
+A[MATLAB - Permeability field generator] --> B[COMSOL - Brinkman flow solver]
+B --> C[PyTorch dataset]
+C --> D[EDA - Spectral analysis]
+D --> E[PINO training - Physics-informed neural operator]
+E --> F[Evaluation - Residuals & spectral error maps]
 F --> G[Model checkpoints & reproducible results]
 ```
 
@@ -207,13 +207,6 @@ This project is released under the []().
 
 ## 📚 Reference
 
-```bibtex
-@article{kossaifi2025librarylearningneuraloperators,
-   author    = {Jean Kossaifi and Nikola Kovachki and Zongyi Li and David Pitt and 
-                 Miguel Liu-Schiaffini and Valentin Duruisseaux and Robert Joseph George and 
-                 Boris Bonev and Kamyar Azizzadenesheli and Julius Berner and Anima Anandkumar},
-   title     = {A Library for Learning Neural Operators},
-   journal   = {arXiv preprint arXiv:2412.10354},
-   year      = {2025}
-}
-```
+Kossaifi, J., Kovachki, N., Li, Z., Pitt, D., Liu-Schiaffini, M., Duruisseaux, V., George, R. J., Bonev, B., Azizzadenesheli, K., Berner, J., & Anandkumar, A. (2025).  
+*A Library for Learning Neural Operators.*  
+*arXiv preprint* [arXiv:2412.10354](https://arxiv.org/abs/2412.10354)
