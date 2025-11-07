@@ -36,6 +36,9 @@ fixable = ["ALL"]
 
 [tool.mypy]
 python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_configs = true
+strict_optional = true
 
 [tool.nbqa.config]
 ruff = ["--fix", "--exit-zero"]
