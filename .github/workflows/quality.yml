@@ -34,8 +34,8 @@ jobs:
       - name: Notebook QA
         shell: bash -l {0}
         run: |
-          nbqa ruff notebooks/
-          nbqa mypy notebooks/
+          nbqa ruff model_training/notebooks/
+          nbqa mypy model_training/notebooks/
 
       - name: Complexity Analysis
         shell: bash -l {0}
