@@ -284,9 +284,6 @@ def plot_vertical_spectral_lines(df: pd.DataFrame, dataset_name: str) -> widgets
         # Ensure at least 2D arrays for FFT
         seg_low: np.ndarray = np.atleast_2d(field[mask_low].mean(axis=0))
         seg_high: np.ndarray = np.atleast_2d(field[mask_high].mean(axis=0))
-        # Ensure seg_high is 2D with shape (1, N) for FFT
-        if seg_high.ndim == 1:
-            seg_high = seg_high[np.newaxis, :]
 
         y_low_mean: float = float(np.mean(y[mask_low]))
         y_high_mean: float = float(np.mean(y[mask_high]))
