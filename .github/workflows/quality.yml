@@ -12,12 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Micromamba
+      - name: Set up Micromamba (dev env)
         uses: mamba-org/setup-micromamba@v1
         with:
-          environment-file: environment.yml
+          environment-file: environment-dev.yml
           cache-environment: true
           cache-downloads: true
+          cache-key: dev-env
           init-shell: bash
 
       - name: Linting & Type Checks

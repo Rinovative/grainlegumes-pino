@@ -1,3 +1,3 @@
-from . import util_data, util_nb
+from . import util_data, util_nb  # noqa: D104
 
-__all__ = ["util_nb", "util_data"]
+__all__ = ["util_data", "util_nb"]

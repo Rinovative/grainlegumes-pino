@@ -1,5 +1,3 @@
-# src/__init__.py
+from . import eda, model, util  # noqa: D104
 
-from . import eda, model, util
-
-__all__ = ["util", "eda", "model"]
+__all__ = ["eda", "model", "util"]

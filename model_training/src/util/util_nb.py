@@ -1,12 +1,23 @@
+"""Jupyter notebook utility functions for interactive plotting and widgets.
+
+This module provides:
+- Functions for creating interactive plot dropdowns
+- Functions for creating collapsible widget panels with tabs
+- Helper functions for displaying and managing plots
+"""
+
+from collections.abc import Callable, Sequence
+from typing import Any
+
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
+import pandas as pd
 from IPython.display import clear_output, display
 from matplotlib.figure import Figure
 
 
 def _sanitize_name(name: str) -> str:
-    """
-    Normalizes a plot name into a filename-safe format.
+    """Normalize a plot name into a filename-safe format.
 
     Converts to lowercase, replaces spaces and various dashes,
     and removes invalid path characters.
@@ -16,13 +27,13 @@ def _sanitize_name(name: str) -> str:
 
     Returns:
         str: Sanitized name suitable for filenames.
+
     """
-    return name.lower().replace(" ", "_").replace("–", "-").replace("—", "-").replace("/", "_")
+    return name.lower().replace(" ", "_").replace("–", "-").replace("—", "-").replace("/", "_")  # noqa: RUF001
 
 
-def _show_anything(result):
-    """
-    Displays an arbitrary result object in a Jupyter notebook.
+def _show_anything(result: Any) -> None:
+    """Display an arbitrary result object in a Jupyter notebook.
 
     Supports:
     - Matplotlib figures
@@ -35,6 +46,7 @@ def _show_anything(result):
 
     Returns:
         None
+
     """
     if isinstance(result, Figure):
         display(result)
@@ -42,15 +54,13 @@ def _show_anything(result):
     elif hasattr(result, "show") and callable(result.show):
         result.show()
     elif isinstance(result, str):
-        print(result)
+        print(result)  # noqa: T201
     elif result is not None:
         display(result)
-        display(result)
 
 
-def make_dropdown_section(plots, description="Plot:"):
-    """
-    Creates an interactive dropdown section for selecting and displaying plots.
+def make_dropdown_section(plots: list, description: str = "Plot:") -> Any:
+    """Create an interactive dropdown section for selecting and displaying plots.
 
     Each entry in 'plots' must be a tuple (title, function, plot_name).
 
@@ -60,6 +70,7 @@ def make_dropdown_section(plots, description="Plot:"):
 
     Returns:
         widgets.VBox: Interactive section with dropdown and output area.
+
     """
     dropdown = widgets.Dropdown(
         options=[(title, i) for i, (title, _, _) in enumerate(plots)],
@@ -69,7 +80,7 @@ def make_dropdown_section(plots, description="Plot:"):
     output = widgets.Output()
     last_idx = {"idx": None}
 
-    def on_plot_change(change):
+    def on_plot_change(change: dict) -> None:
         idx = change["new"]
         if last_idx["idx"] == idx:
             return
@@ -91,7 +102,6 @@ def make_dropdown_section(plots, description="Plot:"):
                 _show_anything(result)
 
         last_idx["idx"] = idx
-        last_idx["idx"] = idx
 
     dropdown.observe(on_plot_change, names="value")
     on_plot_change({"type": "change", "name": "value", "new": 0})
@@ -99,9 +109,8 @@ def make_dropdown_section(plots, description="Plot:"):
     return widgets.VBox([dropdown, output])
 
 
-def make_toggle_shortcut(df, dataset_name=None):
-    """
-    Returns a helper function for constructing dropdown plot entries.
+def make_toggle_shortcut(df: pd.DataFrame, dataset_name: str = "") -> Callable:
+    """Return a helper function for constructing dropdown plot entries.
 
     The returned function 'toggle' standardizes plot tuple creation with automatic
     naming and argument injection.
@@ -112,10 +121,11 @@ def make_toggle_shortcut(df, dataset_name=None):
 
     Returns:
         function: Callable toggle(title, func, plot_name=None, **kwargs)
+
     """
     counter = {"i": 0}
 
-    def toggle(title, func, plot_name=None, **kwargs):
+    def toggle(title: str, func: Callable[..., Any], plot_name: str | None = None, **kwargs: Any) -> tuple[str, Callable[[], Any], str]:
         if plot_name is None:
             plot_name = f"plot_{counter['i']:03d}"
             counter["i"] += 1
@@ -135,9 +145,13 @@ def make_toggle_shortcut(df, dataset_name=None):
     return toggle
 
 
-def make_lazy_panel_with_tabs(sections, tab_titles=None, open_btn_text="Open section", close_btn_text="Close"):
-    """
-    Creates a collapsible widget panel containing multiple tabs.
+def make_lazy_panel_with_tabs(
+    sections: Sequence[widgets.Widget],
+    tab_titles: Sequence[str] | None = None,
+    open_btn_text: str = "Open section",
+    close_btn_text: str = "Close",
+) -> widgets.Output:
+    """Create a collapsible widget panel containing multiple tabs.
 
     The panel can be opened and closed using buttons, and each tab may contain
     arbitrary widgets (e.g., dropdown sections, plots, layouts).
@@ -150,6 +164,7 @@ def make_lazy_panel_with_tabs(sections, tab_titles=None, open_btn_text="Open sec
 
     Returns:
         widgets.Output: A widget container suitable for direct notebook display.
+
     """
     main_out = widgets.Output()
     open_btn = widgets.Button(description=open_btn_text, button_style="primary")
@@ -165,12 +180,12 @@ def make_lazy_panel_with_tabs(sections, tab_titles=None, open_btn_text="Open sec
 
     panel = widgets.VBox([close_btn, tabs])
 
-    def show_panel(_=None):
+    def show_panel() -> None:
         with main_out:
             clear_output()
             display(panel)
 
-    def show_open(_=None):
+    def show_open() -> None:
         with main_out:
             clear_output()
             display(open_btn)

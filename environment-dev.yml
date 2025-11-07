@@ -1,0 +1,14 @@
+name: dev
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - black
+  - isort
+  - ruff
+  - mypy
+  - nbqa
+  - radon
+  - pip
+  - pip:
+      - complexipy
