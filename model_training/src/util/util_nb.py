@@ -54,7 +54,7 @@ def _show_anything(result: Any) -> None:
     elif hasattr(result, "show") and callable(result.show):
         result.show()
     elif isinstance(result, str):
-        print(result)  # noqa: T201
+        print(result)
     elif result is not None:
         display(result)
 
