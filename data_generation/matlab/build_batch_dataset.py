@@ -33,6 +33,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np  # --- added
 import pandas as pd
 import torch
 from tqdm import tqdm
@@ -121,30 +122,55 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
     df, meta = load_case(csv_path, meta_path)
     nx, ny = meta["geometry"]["nx"], meta["geometry"]["ny"]
 
+    dropped_input_fields, dropped_output_fields = [], []
+
+    for c in [c for c in df.columns if c.startswith("br.kappa")]:
+        arr = df[c].to_numpy().reshape(ny, nx)
+        if not np.any(arr):
+            dropped_input_fields.append(c.replace("br.", ""))
+
+    for key in ["u", "v", "p", "br.U"]:
+        if key in df.columns:
+            arr = df[key].to_numpy().reshape(ny, nx)
+            if not np.any(arr):
+                dropped_output_fields.append(key.replace("br.", ""))
+
+    if verbose and (dropped_input_fields or dropped_output_fields):
+        print("\n[INFO] Constant-zero fields detected and excluded:")
+        if dropped_input_fields:
+            print(f"  Inputs:  {', '.join(dropped_input_fields)}")
+        if dropped_output_fields:
+            print(f"  Outputs: {', '.join(dropped_output_fields)}")
+        print("--------------------------------------------------")
+
     input_fields = {}
     if "x" in df.columns and "y" in df.columns:
         input_fields["x"] = df["x"].to_numpy().reshape(ny, nx)
         input_fields["y"] = df["y"].to_numpy().reshape(ny, nx)
     for c in [c for c in df.columns if c.startswith("br.kappa")]:
-        input_fields[c.replace("br.", "")] = df[c].to_numpy().reshape(ny, nx)
+        clean = c.replace("br.", "")
+        if clean in dropped_input_fields:  # --- added
+            continue  # --- added
+        input_fields[clean] = df[c].to_numpy().reshape(ny, nx)
 
     output_fields = {}
     for key in ["u", "v", "p", "br.U"]:
-        if key in df.columns:
+        clean = key.replace("br.", "")
+        if key in df.columns and clean not in dropped_output_fields:  # --- added
             arr = df[key].to_numpy().reshape(ny, nx)
-            output_fields[key.replace("br.", "")] = arr
+            output_fields[clean] = arr
 
     if verbose:
-        print("\nExample structure for first case:")  # noqa: T201
-        print("--------------------------------------------------")  # noqa: T201
-        print("input_fields:")  # noqa: T201
+        print("\nExample structure for first case:")
+        print("--------------------------------------------------")
+        print("input_fields:")
         for k, v in input_fields.items():
-            print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")  # noqa: T201
-        print("output_fields:")  # noqa: T201
+            print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")
+        print("output_fields:")
         for k, v in output_fields.items():
-            print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")  # noqa: T201
-        print("meta keys:", list(meta.keys()))  # noqa: T201
-        print("--------------------------------------------------\n")  # noqa: T201
+            print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")
+        print("meta keys:", list(meta.keys()))
+        print("--------------------------------------------------\n")
 
     # -------------------------- main loop --------------------------
     pbar = tqdm(total=len(common), desc=f"Building {batch_name}", unit="file", disable=not verbose)
@@ -160,13 +186,18 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
             input_fields["x"] = df["x"].to_numpy().reshape(ny, nx)
             input_fields["y"] = df["y"].to_numpy().reshape(ny, nx)
         for c in [c for c in df.columns if c.startswith("br.kappa")]:
-            input_fields[c.replace("br.", "")] = df[c].to_numpy().reshape(ny, nx)
+            clean = c.replace("br.", "")
+            if clean in dropped_input_fields:  # --- added
+                continue  # --- added
+            input_fields[clean] = df[c].to_numpy().reshape(ny, nx)
 
         output_fields = {}
         for key in ["u", "v", "p", "br.U"]:
-            if key in df.columns:
-                arr = df[key].to_numpy().reshape(ny, nx)
-                output_fields[key.replace("br.", "")] = arr
+            clean = key.replace("br.", "")
+            if key not in df.columns or clean in dropped_output_fields:  # --- added
+                continue  # --- added
+            arr = df[key].to_numpy().reshape(ny, nx)
+            output_fields[clean] = arr
 
         data_case = {
             "input_fields": input_fields,
@@ -205,6 +236,6 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
 
 
 if __name__ == "__main__":
-    result = build_batch_dataset("samples_uniform_var10_N1000", verbose=True)
+    result = build_batch_dataset("samples_uniform_var20_N1000", verbose=True)
     for line in result["log"]:
-        print(line)  # noqa: T201
+        print(line)

@@ -180,12 +180,12 @@ def make_lazy_panel_with_tabs(
 
     panel = widgets.VBox([close_btn, tabs])
 
-    def show_panel() -> None:
+    def show_panel(_: None = None) -> None:
         with main_out:
             clear_output()
             display(panel)
 
-    def show_open() -> None:
+    def show_open(_: None = None) -> None:
         with main_out:
             clear_output()
             display(open_btn)

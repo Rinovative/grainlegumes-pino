@@ -4,23 +4,34 @@
     "dockerfile": "../Dockerfile",
     "context": ".."
   },
-  "runArgs": ["--gpus", "all", "--shm-size=16G"],
+
+  // GPU + RAM settings
+  "runArgs": ["--name", "grainlegumes-pino", "--gpus", "all", "--shm-size=16G"],
+
+  // Use non-root user
   "remoteUser": "mambauser",
+  "updateRemoteUserUID": false,
   "workspaceFolder": "/home/mambauser/workspace",
 
+  // ----------------------------------------------------------------------
+  // 🔗 Mounts
+  // ----------------------------------------------------------------------
   "mounts": [
     // 🔐 SSH Key
     "source=${env:USERPROFILE}\\.ssh,target=/home/mambauser/.ssh,type=bind,consistency=cached",
 
-    // 🧠 Code
+    // 🧠 Code from host
     "source=${localWorkspaceFolder},target=/home/mambauser/workspace,type=bind,consistency=cached",
 
-    // 💾 Daten-Volumes
+    // 💾 Persistent Docker volumes
     "source=grainlegumes_data,target=/home/mambauser/workspace/data,type=volume",
     "source=grainlegumes_generation,target=/home/mambauser/workspace/data_generation/data,type=volume",
     "source=grainlegumes_training,target=/home/mambauser/workspace/model_training/data,type=volume"
   ],
 
+  // ----------------------------------------------------------------------
+  // 🌿 Environment variables
+  // ----------------------------------------------------------------------
   "remoteEnv": {
     "GIT_SSH_COMMAND": "ssh -i /home/mambauser/.ssh/id_ed25519 -o StrictHostKeyChecking=no",
     "DATA_ROOT": "/home/mambauser/workspace/data",
@@ -28,6 +39,9 @@
     "TRAIN_ROOT": "/home/mambauser/workspace/model_training/data"
   },
 
+  // ----------------------------------------------------------------------
+  // 🧩 VS Code settings
+  // ----------------------------------------------------------------------
   "customizations": {
     "vscode": {
       "extensions": [
@@ -47,9 +61,7 @@
           "source.organizeImports": true
         },
         "notebook.formatOnSave.enabled": true,
-        "notebook.codeActionsOnSave": {
-          "source.fixAll": true
-        },
+        "notebook.codeActionsOnSave": { "source.fixAll": true },
         "notebook.defaultFormatter": "charliermarsh.ruff",
         "python.formatting.provider": "black",
         "python.linting.enabled": true,
