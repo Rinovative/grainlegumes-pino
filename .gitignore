@@ -57,3 +57,9 @@ model_training/data/
 *.err
 .DS_Store
 Thumbs.db
+
+# ================================
+# Weights & Biases logs & cache
+# ================================
+wandb/
+**/wandb/

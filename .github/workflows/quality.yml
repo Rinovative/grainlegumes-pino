@@ -35,4 +35,4 @@ jobs:
         shell: bash -l {0}
         run: |
           radon cc -s -a .
-          complexipy --paths . || true
+          complexipy . || true

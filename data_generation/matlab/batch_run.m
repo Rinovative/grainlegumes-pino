@@ -37,7 +37,7 @@ addpath(genpath(fullfile(project_root, 'matlab', 'functions')));
 
 % === SAMPLING PARAMETERS ===
 method     = 'uniform';     % 'uniform', 'lhs', or 'sobol'
-variation  = 0.10;          % ± % variation
+variation  = 0.20;          % ± % variation
 N          = 1000;          % number of fields
 seed       = 1;             % reproducibility
 p_log      = 1.0;           % fraction of lognormal fields

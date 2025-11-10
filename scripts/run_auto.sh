@@ -4,7 +4,7 @@
 # ============================================================
 
 SCRIPT_PATH=$1
-CONTAINER_NAME="vsc-grainlegumes-pino"
+CONTAINER_NAME="grainlegumes-pino"
 
 if hostname | grep -qiE "hpc|cluster|hpc115"; then
     echo "🧠 HPC mode - job queued via gpucommand"

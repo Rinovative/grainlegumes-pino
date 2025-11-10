@@ -26,7 +26,16 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
 # ----------------------------------------------------------------------
 # 👤 Non-root user
 # ----------------------------------------------------------------------
-RUN useradd -m -s /bin/bash mambauser
+RUN useradd -m -u 1000 -s /bin/bash mambauser
+
+# --- 🔧 Ensure workspace and subfolders exist + correct ownership ---
+RUN mkdir -p \
+    /home/mambauser/workspace/data \
+    /home/mambauser/workspace/data_generation/data \
+    /home/mambauser/workspace/model_training/data && \
+    chown -R 1000:1000 /home/mambauser/workspace && \
+    chmod -R u+rwX /home/mambauser/workspace
+
 USER mambauser
 WORKDIR /home/mambauser/workspace
 
@@ -56,11 +65,10 @@ USER mambauser
 # ----------------------------------------------------------------------
 # 🔹 Auto-activate env in login shell
 # ----------------------------------------------------------------------
-RUN echo 'eval "$(micromamba shell hook -s bash)" && micromamba activate grainlegumes-pino' \
-    >> ~/.bashrc
+RUN echo 'eval "$(micromamba shell hook -s bash)" && micromamba activate grainlegumes-pino' >> ~/.bashrc
 
 # ----------------------------------------------------------------------
-# ⚙️ Runtime — tini = PID 1 init for clean signals
+# ⚙️ Runtime — tini + init_permissions
 # ----------------------------------------------------------------------
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash", "-l"]

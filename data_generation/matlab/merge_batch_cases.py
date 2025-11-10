@@ -5,35 +5,6 @@
 Author:  Rino M. Albertin
 Date:    2025-10-28
 Project: GrainLegumes_PINO_project
-
-DESCRIPTION
------------
-Merges all individual case_XXXX.pt files of a simulation batch
-into one consolidated dataset for PINO training and copies the
-corresponding meta.pt file to the model_training directory.
-
-DIRECTORY STRUCTURE
--------------------
-Input:
-    data/raw/<batch_name>/cases/case_XXXX.pt
-    data/raw/<batch_name>/meta.pt
-
-Output:
-    model_training/data/raw/<batch_name>/
-        ├── <batch_name>.pt
-        └── meta.pt
-
-USAGE
------
-As module:
-    from merge_batch_cases import merge_batch_cases
-    result = merge_batch_cases("samples_uniform_var10_N1000", verbose=True)
-
-As script:
-    python merge_batch_cases.py
-
-verbose=True  → shows tqdm progress bar and structure preview
-verbose=False → silent execution, logs returned only
 ============================================================
 """  # noqa: INP001
 
@@ -51,37 +22,23 @@ def merge_batch_cases(  # noqa: C901, PLR0915
     keep_output_fields: list[str] | None = None,
     verbose: bool = False,
 ) -> dict:
-    """Merge all case_XXXX.pt files of a batch into one dataset for PINO training and copies meta.pt.
-
-    Parameters
-    ----------
-    batch_name : str
-        Name of the simulation batch.
-    keep_input_fields : list[str], optional
-        List of input field names to include.
-    keep_output_fields : list[str], optional
-        List of output field names to include.
-    verbose : bool, optional
-        If True, shows structure preview and tqdm progress bar.
-
-    Returns
-    -------
-    dict
-        {
-            "batch_name": str,
-            "n_cases": int,
-            "inputs_shape": tuple,
-            "outputs_shape": tuple,
-            "dst_dir": Path,
-            "meta_copied": bool,
-            "log": list[str]
-        }
-
-    """
+    """Merge all case_XXXX.pt files of a batch into one dataset for PINO training and copies meta.pt."""
     if keep_input_fields is None:
-        keep_input_fields = ["kappaxx"]
+        keep_input_fields = [
+            "x",
+            "y",
+            "kappaxx",
+            "kappayx",
+            "kappazx",
+            "kappaxy",
+            "kappayy",
+            "kappazy",
+            "kappaxz",
+            "kappayz",
+            "kappazz",
+        ]
     if keep_output_fields is None:
-        keep_output_fields = ["p"]
+        keep_output_fields = ["u", "v", "U", "p"]
 
     log = []
 
@@ -114,17 +71,17 @@ def merge_batch_cases(  # noqa: C901, PLR0915
     output_fields_first = {k: v for k, v in first_case["output_fields"].items() if k in keep_output_fields}
 
     if verbose:
-        print("\nExample structure for first case:")  # noqa: T201
-        print("--------------------------------------------------")  # noqa: T201
-        print("input_fields:")  # noqa: T201
+        print("\nExample structure for first case:")
+        print("--------------------------------------------------")
+        print("input_fields:")
         for k, v in input_fields_first.items():
             arr = np.array(v)
-            print(f"  {k:10s}  shape={arr.shape}, dtype={arr.dtype}")  # noqa: T201
-        print("output_fields:")  # noqa: T201
+            print(f"  {k:10s}  shape={arr.shape}, dtype={arr.dtype}")
+        print("output_fields:")
         for k, v in output_fields_first.items():
             arr = np.array(v)
-            print(f"  {k:10s}  shape={arr.shape}, dtype={arr.dtype}")  # noqa: T201
-        print("--------------------------------------------------\n")  # noqa: T201
+            print(f"  {k:10s}  shape={arr.shape}, dtype={arr.dtype}")
+        print("--------------------------------------------------\n")
 
     # -------------------- main merging loop --------------------
     inputs_list = []
@@ -134,27 +91,34 @@ def merge_batch_cases(  # noqa: C901, PLR0915
 
     for case_path in case_files:
         data_case = torch.load(case_path, map_location="cpu", weights_only=False)
+
         input_fields = {k: v for k, v in data_case["input_fields"].items() if k in keep_input_fields}
         output_fields = {k: v for k, v in data_case["output_fields"].items() if k in keep_output_fields}
 
-        if not all(k in input_fields for k in keep_input_fields) or not all(k in output_fields for k in keep_output_fields):
-            log.append(f"Skipped {case_path.name}: missing fields")
-            pbar.update(1)
-            continue
-
-        input_stack = np.stack([input_fields[k] for k in keep_input_fields], axis=0)
-        output_stack = np.stack([output_fields[k] for k in keep_output_fields], axis=0)
-
-        inputs_list.append(torch.tensor(input_stack, dtype=torch.float32))
-        outputs_list.append(torch.tensor(output_stack, dtype=torch.float32))
+        if input_fields:
+            input_stack = np.stack([input_fields[k] for k in input_fields], axis=0)
+            inputs_list.append(torch.tensor(input_stack, dtype=torch.float32))
+        if output_fields:
+            output_stack = np.stack([output_fields[k] for k in output_fields], axis=0)
+            outputs_list.append(torch.tensor(output_stack, dtype=torch.float32))
 
         pbar.update(1)
 
     pbar.close()
 
-    if not inputs_list:
-        msg = f"No valid cases merged in {cases_dir}"
-        raise RuntimeError(msg)
+    # Wenn gar keine Daten mehr übrig sind
+    if not inputs_list or not outputs_list:
+        log.append(f"[WARNING] No valid tensors created from {cases_dir}")
+        print(log[-1])
+        return {
+            "batch_name": batch_name,
+            "n_cases": 0,
+            "inputs_shape": (),
+            "outputs_shape": (),
+            "dst_dir": dst_batch_dir,
+            "meta_copied": False,
+            "log": log,
+        }
 
     inputs_tensor = torch.stack(inputs_list, dim=0)
     outputs_tensor = torch.stack(outputs_list, dim=0)
@@ -164,12 +128,15 @@ def merge_batch_cases(  # noqa: C901, PLR0915
     log.append(f"Cases merged: {len(inputs_list)}")
 
     # Save merged dataset
+    final_input_fields = [f for f in keep_input_fields if f in input_fields_first]
+    final_output_fields = [f for f in keep_output_fields if f in output_fields_first]
+
     batch_dataset = {
         "inputs": inputs_tensor,
         "outputs": outputs_tensor,
         "fields": {
-            "inputs": keep_input_fields,
-            "outputs": keep_output_fields,
+            "inputs": final_input_fields,
+            "outputs": final_output_fields,
         },
     }
     torch.save(batch_dataset, dst_data_path)
@@ -196,11 +163,6 @@ def merge_batch_cases(  # noqa: C901, PLR0915
 
 
 if __name__ == "__main__":
-    result = merge_batch_cases(
-        "samples_uniform_var10_N1000",
-        keep_input_fields=["x", "y", "kappaxx"],
-        keep_output_fields=["u", "v", "p"],
-        verbose=True,
-    )
+    result = merge_batch_cases("samples_uniform_var20_N1000", verbose=True)
     for line in result["log"]:
-        print(line)  # noqa: T201
+        print(line)

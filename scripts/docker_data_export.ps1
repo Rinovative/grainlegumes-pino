@@ -6,10 +6,10 @@
 $ErrorActionPreference = "Stop"
 
 # Container-ID finden
-$container = docker ps --filter "name=vsc-grainlegumes-pino" -q
+$container = docker ps --filter "name=grainlegumes-pino" -q
 
 if (-not $container) {
-    Write-Host "❌ No running container found (vsc-grainlegumes-pino). Start Devcontainer first." -ForegroundColor Red
+    Write-Host "❌ No running container found (grainlegumes-pino). Start Devcontainer first." -ForegroundColor Red
     exit 1
 }
 

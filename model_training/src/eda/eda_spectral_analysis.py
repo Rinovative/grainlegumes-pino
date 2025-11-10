@@ -249,7 +249,7 @@ def plot_field_spectra_overview(df: pd.DataFrame, dataset_name: str) -> widgets.
 
     return make_case_navigator(
         len(df),
-        lambda i: _plot_base(df, dataset_name, i, field_plotter, " (2D overview)", figsize=(12, 8)),
+        lambda i: _plot_base(df, dataset_name, i, field_plotter, " (2D overview)", figsize=(12, 4)),
     )
 
 
