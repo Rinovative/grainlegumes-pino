@@ -24,24 +24,15 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
     | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba
 
 # ----------------------------------------------------------------------
-# 👤 Flexible non-root user (UID/GID passed at build time)
+# 👤 Non-root user, permission fix
 # ----------------------------------------------------------------------
-# Allows you to build with:  docker build --build-arg USER_ID=$(id -u) -t grainlegumes-pino .
-ARG USER_ID=1000
-ARG GROUP_ID=1000
-RUN groupadd -g ${GROUP_ID} mambauser && \
-    useradd -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash mambauser
-
-# --- 🔧 Ensure workspace and subfolders exist + correct ownership ---
-RUN mkdir -p \
-    /home/mambauser/workspace/data \
-    /home/mambauser/workspace/data_generation/data \
-    /home/mambauser/workspace/model_training/data && \
-    chown -R ${USER_ID}:${GROUP_ID} /home/mambauser/workspace && \
-    chmod -R u+rwX /home/mambauser/workspace
-
-USER mambauser
-WORKDIR /home/mambauser/workspace
+RUN useradd -m -u 1000 -s /bin/bash mambauser && \
+    mkdir -p \
+      /home/mambauser/workspace/data \
+      /home/mambauser/workspace/data_generation/data \
+      /home/mambauser/workspace/model_training/data && \
+    chown -R mambauser:mambauser /home/mambauser/workspace && \
+    chmod -R a+rwX /home/mambauser/workspace
 
 # ----------------------------------------------------------------------
 # 📦 Environment creation
