@@ -1,5 +1,5 @@
 # ==========================================
-# 🧠 GrainLegumes_PINO_project – SOTA Dockerfile
+# 🧠 GrainLegumes_PINO
 # Base: CUDA 12.1 + cuDNN8 on Ubuntu 22.04
 # ==========================================
 
@@ -24,16 +24,20 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
     | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba
 
 # ----------------------------------------------------------------------
-# 👤 Non-root user
+# 👤 Flexible non-root user (UID/GID passed at build time)
 # ----------------------------------------------------------------------
-RUN useradd -m -u 1000 -s /bin/bash mambauser
+# Allows you to build with:  docker build --build-arg USER_ID=$(id -u) -t grainlegumes-pino .
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+RUN groupadd -g ${GROUP_ID} mambauser && \
+    useradd -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash mambauser
 
 # --- 🔧 Ensure workspace and subfolders exist + correct ownership ---
 RUN mkdir -p \
     /home/mambauser/workspace/data \
     /home/mambauser/workspace/data_generation/data \
     /home/mambauser/workspace/model_training/data && \
-    chown -R 1000:1000 /home/mambauser/workspace && \
+    chown -R ${USER_ID}:${GROUP_ID} /home/mambauser/workspace && \
     chmod -R u+rwX /home/mambauser/workspace
 
 USER mambauser
