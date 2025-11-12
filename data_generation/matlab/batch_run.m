@@ -42,7 +42,7 @@ N          = 1000;          % number of fields
 seed       = 1;             % reproducibility
 p_log      = 1.0;           % fraction of lognormal fields
 
-batch_name = sprintf('samples_%s_var%.0f_N%d', method, variation*100, N);
+batch_name = sprintf('%s_var%.0f_plog%.0f_seed%.0f', method, variation*100, p_log*100, seed);
 
 % === PATHS ===
 meta_dir      = fullfile(project_root, 'data', 'meta');

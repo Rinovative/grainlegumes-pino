@@ -123,6 +123,17 @@ def merge_batch_cases(  # noqa: C901, PLR0915
     inputs_tensor = torch.stack(inputs_list, dim=0)
     outputs_tensor = torch.stack(outputs_list, dim=0)
 
+    # --- Log-transform permeability channels ---
+    eps = 1e-12
+    actual_input_fields = [f for f in keep_input_fields if f in input_fields_first]
+    kappa_channels = [i for i, name in enumerate(actual_input_fields) if name.startswith("kappa")]
+
+    if kappa_channels:
+        inputs_tensor[:, kappa_channels, :, :] = torch.log10(inputs_tensor[:, kappa_channels, :, :] + eps)
+        log.append(f"Applied log10 transform to channels: {[actual_input_fields[i] for i in kappa_channels]}")
+    else:
+        log.append("No permeability channels found for log10 transform.")
+
     log.append(f"Inputs shape: {tuple(inputs_tensor.shape)}")
     log.append(f"Outputs shape: {tuple(outputs_tensor.shape)}")
     log.append(f"Cases merged: {len(inputs_list)}")

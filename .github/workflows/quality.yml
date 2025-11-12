@@ -24,7 +24,7 @@ jobs:
         shell: bash -l {0}
         run: |
           ruff check . || true
-          ruff format --check . || true
+          ruff format --check . --exclude "*.ipynb" || true
 
       - name: Run Type Checking (mypy)
         shell: bash -l {0}

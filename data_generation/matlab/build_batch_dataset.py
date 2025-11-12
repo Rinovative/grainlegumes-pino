@@ -187,15 +187,15 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
             input_fields["y"] = df["y"].to_numpy().reshape(ny, nx)
         for c in [c for c in df.columns if c.startswith("br.kappa")]:
             clean = c.replace("br.", "")
-            if clean in dropped_input_fields:  # --- added
-                continue  # --- added
+            if clean in dropped_input_fields:
+                continue
             input_fields[clean] = df[c].to_numpy().reshape(ny, nx)
 
         output_fields = {}
         for key in ["u", "v", "p", "br.U"]:
             clean = key.replace("br.", "")
-            if key not in df.columns or clean in dropped_output_fields:  # --- added
-                continue  # --- added
+            if key not in df.columns or clean in dropped_output_fields:
+                continue
             arr = df[key].to_numpy().reshape(ny, nx)
             output_fields[clean] = arr
 
@@ -236,6 +236,6 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
 
 
 if __name__ == "__main__":
-    result = build_batch_dataset("samples_uniform_var20_N1000", verbose=True)
+    result = build_batch_dataset("uniform_var20", verbose=True)
     for line in result["log"]:
         print(line)
