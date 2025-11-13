@@ -24,7 +24,7 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
     | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba
 
 # ----------------------------------------------------------------------
-# 👤 Non-root user
+# 👤 Non-root user, permission fix
 # ----------------------------------------------------------------------
 RUN useradd -m -u 1000 -s /bin/bash mambauser && \
     mkdir -p \
@@ -58,12 +58,12 @@ RUN micromamba run -n grainlegumes-pino pip install -e .
 USER mambauser
 
 # ----------------------------------------------------------------------
-# 🧩 Auto-activate env
+# 🔹 Auto-activate env in login shell
 # ----------------------------------------------------------------------
 RUN echo 'eval "$(micromamba shell hook -s bash)" && micromamba activate grainlegumes-pino' >> ~/.bashrc
 
 # ----------------------------------------------------------------------
-# ⚙️ Runtime
+# ⚙️ Runtime — tini + init_permissions
 # ----------------------------------------------------------------------
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash", "-l"]
