@@ -28,19 +28,13 @@ CONFIG = {
     "persistent_workers": True,
 
     # --- Training ---
-    "n_epochs": 500,
+    "n_epochs": 20,
     "eval_interval": 5,        # evaluate every N epochs
     "mixed_precision": False,  # enables AMP on modern GPUs
 
     # --- Checkpointing & Resume ---
     # "resume_from_dir": "FNO_samples_uniform_var10_N1000_20251112_153012",
-    # "resume_from_dir": "latest",
-
-    # --- Adaptive Early Stopping ---
-    "early_stopping": True,    # enable adaptive early stopping
-    "base_patience": 25,       # initial patience
-    "growth_factor": 1.5,      # patience grows over time
-    "min_delta": 1e-4,         # required min improvement
+    "resume_from_dir": "latest",
 
     # --- Logging ---
     "save_best": "eval_l2",    # metric key to monitor for best checkpoint

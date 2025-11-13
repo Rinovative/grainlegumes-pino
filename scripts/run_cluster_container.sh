@@ -11,12 +11,6 @@ IMAGE_NAME="grainlegumes-pino"
 # ============================================================
 # 🧩 Mode selection
 # ============================================================
-# Default: detached (runs in background)
-# Usage examples:
-#   ./scripts/run_cluster_container.sh        → detached
-#   ./scripts/run_cluster_container.sh -i     → interactive
-# ============================================================
-
 MODE="detached"
 if [[ "$1" == "-i" || "$1" == "--interactive" ]]; then
   MODE="interactive"
@@ -36,11 +30,14 @@ fi
 # ============================================================
 echo "🧠 Starting container '$CONTAINER_NAME' in $MODE mode..."
 
+SSH_PATH="/home/rino.albertin/.ssh"
+
 if [ "$MODE" == "interactive" ]; then
     docker run -it --rm \
       --name $CONTAINER_NAME \
       --gpus all \
       --shm-size=16G \
+      -v $SSH_PATH:/root/.ssh:ro \
       -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
       -v ~/workspace/data:/home/mambauser/workspace/data:rw \
       -v ~/workspace/data_generation:/home/mambauser/workspace/data_generation/data:rw \
@@ -51,6 +48,7 @@ else
       --name $CONTAINER_NAME \
       --gpus all \
       --shm-size=16G \
+      -v $SSH_PATH:/root/.ssh:ro \
       -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
       -v ~/workspace/data:/home/mambauser/workspace/data:rw \
       -v ~/workspace/data_generation:/home/mambauser/workspace/data_generation/data:rw \
