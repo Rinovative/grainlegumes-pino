@@ -1,9 +1,8 @@
-import torch  # noqa: D100
+import torch  # noqa: D100, INP001
 from neuralop import H1Loss, LpLoss
 from neuralop.models import FNO
 from neuralop.training import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
 from training.train_base import train_base
 
 # ================================================================
