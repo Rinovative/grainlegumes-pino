@@ -1,8 +1,9 @@
-import torch  # noqa: D100, INP001
+import torch  # noqa: D100
 from neuralop import H1Loss, LpLoss
 from neuralop.models import FNO
 from neuralop.training import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 from training.train_base import train_base
 
 # ================================================================
@@ -24,7 +25,7 @@ CONFIG = {
     "pin_memory": True,
     "persistent_workers": True,
     # --- Training ---
-    "n_epochs": 10,
+    "n_epochs": 1000,
     "eval_interval": 5,  # evaluate every N epochs
     "mixed_precision": False,  # enables AMP on modern GPUs
     # --- Checkpointing & Resume ---
