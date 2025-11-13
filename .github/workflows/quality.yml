@@ -29,8 +29,7 @@ jobs:
       - name: Run Type Checking (mypy)
         shell: bash -l {0}
         run: |
-          mypy model_training || true
-          mypy data_generation || true
+          mypy . || true
 
       - name: Complexity Analysis
         shell: bash -l {0}

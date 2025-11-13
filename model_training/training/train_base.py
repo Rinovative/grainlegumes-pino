@@ -1,4 +1,4 @@
-import inspect  # noqa: D100
+import inspect  # noqa: D100, INP001
 import json
 import os
 import random
