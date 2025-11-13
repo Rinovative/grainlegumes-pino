@@ -67,7 +67,9 @@ ignore_missing_imports = true
 warn_unused_configs = true
 strict_optional = true
 
-disable_error_code = ["misc"]
+exclude = [
+    "model_training/training/"
+]
 
 # ============================================================
 # 📓 Jupyter / nbQA
