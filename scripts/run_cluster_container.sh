@@ -38,10 +38,10 @@ if [ "$MODE" == "interactive" ]; then
       --gpus all \
       --shm-size=16G \
       -v $SSH_PATH:/home/mambauser/.ssh:ro \
-      -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
-      -v ~/workspace/data:/home/mambauser/workspace/data:rw \
-      -v ~/workspace/data_generation:/home/mambauser/workspace/data_generation/data:rw \
-      -v ~/workspace/data_training:/home/mambauser/workspace/model_training/data:rw \
+      -v ~/workspace/grainlegumes-pino:/workspace:rw \
+      -v ~/workspace/data:/workspace/data:rw \
+      -v ~/workspace/data_generation:/workspace/data_generation/data:rw \
+      -v ~/workspace/data_training:/workspace/model_training/data:rw \
       $IMAGE_NAME bash
 else
     docker run -d --rm \
@@ -49,10 +49,10 @@ else
       --gpus all \
       --shm-size=16G \
       -v $SSH_PATH:/home/mambauser/.ssh:ro \
-      -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
-      -v ~/workspace/data:/home/mambauser/workspace/data:rw \
-      -v ~/workspace/data_generation:/home/mambauser/workspace/data_generation/data:rw \
-      -v ~/workspace/data_training:/home/mambauser/workspace/model_training/data:rw \
+      -v ~/workspace/grainlegumes-pino:/workspace:rw \
+      -v ~/workspace/data:/workspace/data:rw \
+      -v ~/workspace/data_generation:/workspace/data_generation/data:rw \
+      -v ~/workspace/data_training:/workspace/model_training/data:rw \
       $IMAGE_NAME tail -f /dev/null
 
     echo ""
