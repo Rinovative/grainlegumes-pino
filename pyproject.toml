@@ -46,13 +46,14 @@ ignore = [
   "D203",  # No blank line before class (conflicts with D211)
   "D212",  # Summary line position (conflicts with D213)
 
-  # 👇 Your previous intentional ignores
+  # intentional ignores
   "ANN401",  # Typing Any
   "FBT001", "FBT002", "FBT003",  # Boolean positional arguments
   "PLR0913",  # Too many function arguments
   "N806", "N803",  # Variable naming conventions
   "EXE002",  # Missing executable permissions
   "T201",    # Print statements
+  "ERA001",  # commented-out code disallowed
 ]
 fixable = ["ALL"]
 
