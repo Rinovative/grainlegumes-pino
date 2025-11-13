@@ -31,8 +31,8 @@ RUN useradd -m -u 1000 -s /bin/bash mambauser && \
       /home/mambauser/workspace/data \
       /home/mambauser/workspace/data_generation/data \
       /home/mambauser/workspace/model_training/data && \
-    chown -R mambauser:mambauser /home/mambauser && \
-    chmod -R a+rwX /home/mambauser
+    chown -R mambauser:mambauser /home/mambauser/workspace && \
+    chmod -R a+rwX /home/mambauser/workspace
 
 # ----------------------------------------------------------------------
 # 📦 Environment creation
