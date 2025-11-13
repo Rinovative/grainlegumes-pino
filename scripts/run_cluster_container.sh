@@ -2,7 +2,7 @@
 set -e
 
 # ============================================================
-# 🚀 Run GrainLegumes_PINO Docker Container (Cluster Version)
+# 🚀 Run GrainLegumes_PINO Docker Container
 # ============================================================
 
 CONTAINER_NAME="grainlegumes-pino"
@@ -37,7 +37,7 @@ if [ "$MODE" == "interactive" ]; then
       --name $CONTAINER_NAME \
       --gpus all \
       --shm-size=16G \
-      -v $SSH_PATH:/root/.ssh:ro \
+      -v $SSH_PATH:/home/mambauser/.ssh:ro \
       -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
       -v ~/workspace/data:/home/mambauser/workspace/data:rw \
       -v ~/workspace/data_generation:/home/mambauser/workspace/data_generation/data:rw \
@@ -48,7 +48,7 @@ else
       --name $CONTAINER_NAME \
       --gpus all \
       --shm-size=16G \
-      -v $SSH_PATH:/root/.ssh:ro \
+      -v $SSH_PATH:/home/mambauser/.ssh:ro \
       -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
       -v ~/workspace/data:/home/mambauser/workspace/data:rw \
       -v ~/workspace/data_generation:/home/mambauser/workspace/data_generation/data:rw \
