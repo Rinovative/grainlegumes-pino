@@ -14,7 +14,8 @@ class FlowModule:
         include_inputs: list[str] | None = None,
         include_outputs: list[str] | None = None,
     ) -> None:
-        """Initialize FlowModule for merged datasets.
+        """
+        Initialize FlowModule for merged datasets.
 
         Args:
             data:

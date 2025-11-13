@@ -1,4 +1,5 @@
-"""============================================================
+"""
+============================================================
 
  merge_batch_cases.py.
 ============================================================
@@ -16,7 +17,7 @@ import torch
 from tqdm import tqdm
 
 
-def merge_batch_cases(  # noqa: C901, PLR0915
+def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
     batch_name: str,
     keep_input_fields: list[str] | None = None,
     keep_output_fields: list[str] | None = None,
@@ -174,6 +175,6 @@ def merge_batch_cases(  # noqa: C901, PLR0915
 
 
 if __name__ == "__main__":
-    result = merge_batch_cases("samples_uniform_var20_N1000", verbose=True)
+    result = merge_batch_cases("uniform_var10_plog100_seed1", verbose=True)
     for line in result["log"]:
         print(line)

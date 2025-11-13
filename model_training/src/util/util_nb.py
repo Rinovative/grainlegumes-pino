@@ -1,4 +1,5 @@
-"""Jupyter notebook utility functions for interactive plotting and widgets.
+"""
+Jupyter notebook utility functions for interactive plotting and widgets.
 
 This module provides:
 - Functions for creating interactive plot dropdowns
@@ -17,7 +18,8 @@ from matplotlib.figure import Figure
 
 
 def _sanitize_name(name: str) -> str:
-    """Normalize a plot name into a filename-safe format.
+    """
+    Normalize a plot name into a filename-safe format.
 
     Converts to lowercase, replaces spaces and various dashes,
     and removes invalid path characters.
@@ -33,7 +35,8 @@ def _sanitize_name(name: str) -> str:
 
 
 def _show_anything(result: Any) -> None:
-    """Display an arbitrary result object in a Jupyter notebook.
+    """
+    Display an arbitrary result object in a Jupyter notebook.
 
     Supports:
     - Matplotlib figures
@@ -60,7 +63,8 @@ def _show_anything(result: Any) -> None:
 
 
 def make_dropdown_section(plots: list, description: str = "Plot:") -> Any:
-    """Create an interactive dropdown section for selecting and displaying plots.
+    """
+    Create an interactive dropdown section for selecting and displaying plots.
 
     Each entry in 'plots' must be a tuple (title, function, plot_name).
 
@@ -110,7 +114,8 @@ def make_dropdown_section(plots: list, description: str = "Plot:") -> Any:
 
 
 def make_toggle_shortcut(df: pd.DataFrame, dataset_name: str = "") -> Callable:
-    """Return a helper function for constructing dropdown plot entries.
+    """
+    Return a helper function for constructing dropdown plot entries.
 
     The returned function 'toggle' standardizes plot tuple creation with automatic
     naming and argument injection.
@@ -151,7 +156,8 @@ def make_lazy_panel_with_tabs(
     open_btn_text: str = "Open section",
     close_btn_text: str = "Close",
 ) -> widgets.Output:
-    """Create a collapsible widget panel containing multiple tabs.
+    """
+    Create a collapsible widget panel containing multiple tabs.
 
     The panel can be opened and closed using buttons, and each tab may contain
     arbitrary widgets (e.g., dropdown sections, plots, layouts).

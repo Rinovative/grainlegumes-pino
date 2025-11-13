@@ -1,4 +1,5 @@
-"""============================================================
+"""
+============================================================
 
  build_batch_dataset.py.
 ============================================================
@@ -40,7 +41,8 @@ from tqdm import tqdm
 
 
 def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa: C901, PLR0912, PLR0915
-    """Build structured .pt case files and a batch-level meta.pt file.
+    """
+    Build structured .pt case files and a batch-level meta.pt file.
 
     Parameters
     ----------
@@ -236,6 +238,6 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
 
 
 if __name__ == "__main__":
-    result = build_batch_dataset("uniform_var20", verbose=True)
+    result = build_batch_dataset("uniform_var20_plog100_seed1", verbose=True)
     for line in result["log"]:
         print(line)

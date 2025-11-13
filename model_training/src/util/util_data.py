@@ -1,4 +1,5 @@
-"""Utility functions for data loading and processing.
+"""
+Utility functions for data loading and processing.
 
 This module provides functions to:
 - Load and convert PyTorch tensors to NumPy arrays
@@ -23,7 +24,8 @@ if TYPE_CHECKING:
 
 
 def _to_numpy(value: Any) -> NDArray[np.float64] | None:
-    """Convert arbitrary values (PyTorch tensors, lists, tuples) into NumPy arrays.
+    """
+    Convert arbitrary values (PyTorch tensors, lists, tuples) into NumPy arrays.
 
     Args:
         value: Object to convert (tensor, list, tuple, array, etc.).
@@ -52,7 +54,8 @@ def _to_numpy(value: Any) -> NDArray[np.float64] | None:
 
 
 def _iter_cases_sorted(cases_dir: Path) -> list[tuple[int, Path]]:
-    """Collect all `case_XXXX.pt` files in numeric order.
+    """
+    Collect all `case_XXXX.pt` files in numeric order.
 
     Args:
         cases_dir (Path): Path to the directory containing case files.
@@ -72,7 +75,8 @@ def _iter_cases_sorted(cases_dir: Path) -> list[tuple[int, Path]]:
 
 
 def _extract_fields(sample: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Extract relevant data fields from a loaded `.pt` dictionary.
+    """
+    Extract relevant data fields from a loaded `.pt` dictionary.
 
     Converts tensors to NumPy arrays and flattens the nested structure
     into a single row dictionary for DataFrame assembly.
@@ -126,7 +130,8 @@ def generate_dataframe(  # noqa: C901, PLR0912, PLR0915
     show_progress: bool = False,
     max_cases: int | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Load all `.pt` cases of a COMSOL batch and assemble them into a DataFrame.
+    """
+    Load all `.pt` cases of a COMSOL batch and assemble them into a DataFrame.
 
     Args:
         dataset_name (str): Name of the COMSOL batch folder (e.g. "batch_var0.5").

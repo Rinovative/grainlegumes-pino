@@ -1,8 +1,12 @@
-import os
+import inspect  # noqa: D100, INP001
 import json
-import datetime
-import inspect
+import os
 import random
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import torch
 import wandb
@@ -14,34 +18,97 @@ from src import dataset
 # 🧭 Utilities
 # ================================================================
 def set_seed(seed: int = 1) -> None:
+    """
+    Set all random seeds for reproducibility.
+
+    Args:
+        seed (int): Seed value used for numpy, random and torch initialisation.
+
+    """
     random.seed(seed)
-    np.random.seed(seed)
+    _rng = np.random.Generator(np.random.PCG64(seed))
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-def extract_init_params(obj):
+def extract_init_params(obj: Any) -> dict[str, Any]:
+    """
+    Extract initialisation parameters of an object for logging.
+
+    Args:
+        obj (Any): Model, optimizer or scheduler instance.
+
+    Returns:
+        Dict[str, Any]: Mapping of parameter names to their current values.
+
+    """
     try:
         sig = inspect.signature(obj.__class__.__init__)
-        args = {k: getattr(obj, k, None) for k in sig.parameters if k != "self"}
-        return {k: v for k, v in args.items() if not callable(v)}
-    except Exception:
+    except (TypeError, ValueError):
         return {}
 
+    params: dict[str, Any] = {}
+    for name in sig.parameters:
+        if name == "self":
+            continue
+        try:
+            value = getattr(obj, name)
+        except AttributeError:
+            continue
+        if not callable(value):
+            params[name] = value
 
-def make_json_safe(obj):
+    return params
+
+
+def make_json_safe(obj: Any) -> Any:
+    """
+    Convert arbitrary Python objects into JSON serialisable structures.
+
+    Args:
+        obj (Any): Input object of any type.
+
+    Returns:
+        Any: JSON compatible version of the object.
+
+    """
     if isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
+
     if isinstance(obj, dict):
         return {k: make_json_safe(v) for k, v in obj.items()}
+
     if isinstance(obj, (list, tuple, set)):
         return [make_json_safe(v) for v in obj]
+
     return str(obj)
 
 
-def build_wandb_config(CONFIG, model, optimizer, scheduler, train_loss, eval_losses):
+def build_wandb_config(
+    CONFIG: Mapping[str, Any],
+    model: Any,
+    optimizer: Any,
+    scheduler: Any | None,
+    train_loss: Any | None,
+    eval_losses: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    Build a wandb configuration dictionary for logging.
+
+    Args:
+        CONFIG (Mapping[str, Any]): Global configuration.
+        model (Any): Model instance.
+        optimizer (Any): Optimizer instance.
+        scheduler (Optional[Any]): Scheduler instance or None.
+        train_loss (Optional[Any]): Training loss function.
+        eval_losses (Mapping[str, Any]): Mapping of evaluation loss names to functions.
+
+    Returns:
+        Dict[str, Any]: Structured configuration tree for wandb.
+
+    """
     return {
         "general": {
             "run_name": CONFIG["model_name"],
@@ -79,48 +146,80 @@ def build_wandb_config(CONFIG, model, optimizer, scheduler, train_loss, eval_los
 # ================================================================
 # 🚀 Main Training Pipeline
 # ================================================================
-def train_base(CONFIG, model, optimizer, scheduler=None, train_loss=None, eval_losses=None):
+def train_base(
+    CONFIG: dict[str, Any],
+    model: Any,
+    optimizer: Any,
+    scheduler: Any | None = None,
+    train_loss: Any | None = None,
+    eval_losses: dict[str, Any] | None = None,
+) -> None:
+    """
+    Execute the complete model training pipeline.
 
+    This includes:
+    - Seeding
+    - Resume logic
+    - Dataset and dataloader creation
+    - Trainer setup and execution
+    - Checkpoint handling
+    - wandb logging
+
+    Args:
+        CONFIG (dict): Global configuration dictionary.
+        model: Neural operator model instance.
+        optimizer: Initialised optimizer.
+        scheduler: Scheduler instance or None.
+        train_loss: Training loss function.
+        eval_losses (dict): Evaluation losses.
+
+    Returns:
+        None
+
+    """
     set_seed(CONFIG["seed"])
     device = CONFIG["device"]
 
-    DATA_ROOT = "model_training/data/raw"
-    train_dataset = os.path.join(DATA_ROOT, CONFIG["train_dataset_name"], f"{CONFIG['train_dataset_name']}.pt")
-    ood_dataset = os.path.join(DATA_ROOT, CONFIG["ood_dataset_name"], f"{CONFIG['ood_dataset_name']}.pt")
+    # ------------------------------------------------------------
+    # Paths
+    # ------------------------------------------------------------
+    data_root = Path("model_training/data/raw")
+    train_dataset = data_root / CONFIG["train_dataset_name"] / f"{CONFIG['train_dataset_name']}.pt"
+    ood_dataset = data_root / CONFIG["ood_dataset_name"] / f"{CONFIG['ood_dataset_name']}.pt"
 
     # ------------------------------------------------------------
-    # 🔁 Resume logic FIRST (important!)
+    # Resume logic
     # ------------------------------------------------------------
-    resume_from = CONFIG.get("resume_from_dir", None)
-    base = "model_training/data/processed/model"
+    resume_from = CONFIG.get("resume_from_dir")
+    base = Path("model_training/data/processed/model")
 
     if resume_from:
         if resume_from == "latest":
-            runs = sorted([r for r in os.listdir(base) if os.path.isdir(os.path.join(base, r))])
+            runs = sorted([p for p in base.iterdir() if p.is_dir()])
             if not runs:
-                raise FileNotFoundError("❌ No previous runs for ‘latest’.")
-            resume_from = os.path.join(base, runs[-1])
+                msg = "No previous runs for latest."
+                raise FileNotFoundError(msg)
+            resume_from = runs[-1]
         else:
-            resume_from = os.path.join(base, resume_from)
+            resume_from = base / resume_from
 
-        if not os.path.isdir(resume_from):
-            raise FileNotFoundError(f"❌ resume_from_dir not found: {resume_from}")
+        if not resume_from.is_dir():
+            msg = f"resume_from_dir not found: {resume_from}"
+            raise FileNotFoundError(msg)
 
-        print(f"♻️  Resuming from checkpoint: {resume_from}")
+        print(f"Resuming from checkpoint: {resume_from}")
 
-        # reuse existing run folder
-        RUN_NAME = os.path.basename(resume_from)
-        SAVE_DIR = resume_from
+        run_name = resume_from.name
+        save_dir = resume_from
 
     else:
-        # create new run
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        RUN_NAME = f"{CONFIG['model_name']}_{CONFIG['train_dataset_name']}_{timestamp}"
-        SAVE_DIR = os.path.join(base, RUN_NAME)
-        os.makedirs(SAVE_DIR, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        run_name = f"{CONFIG['model_name']}_{CONFIG['train_dataset_name']}_{timestamp}"
+        save_dir = base / run_name
+        save_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------
-    # 🟦 W&B Setup
+    # W&B Setup
     # ------------------------------------------------------------
     os.environ["WANDB_API_KEY"] = "REMOVED_WANDB_KEY"
     os.environ["WANDB_PROJECT"] = "grainlegumes_pino"
@@ -130,20 +229,19 @@ def train_base(CONFIG, model, optimizer, scheduler=None, train_loss=None, eval_l
     wandb.init(
         project=os.environ["WANDB_PROJECT"],
         entity=os.environ["WANDB_ENTITY"],
-        name=RUN_NAME,
+        name=run_name,
         dir=os.environ["WANDB_DIR"],
-        config=build_wandb_config(CONFIG, model, optimizer, scheduler, train_loss, eval_losses),
+        config=build_wandb_config(CONFIG, model, optimizer, scheduler, train_loss, eval_losses or {}),
         reinit=True,
     )
 
-    # Save config
-    config_path = os.path.join(SAVE_DIR, "config.json")
-    with open(config_path, "w", encoding="utf-8") as f:
+    config_path = save_dir / "config.json"
+    with config_path.open("w", encoding="utf-8") as f:
         json.dump(make_json_safe(CONFIG), f, indent=2)
-    wandb.save(config_path)
+    wandb.save(str(config_path))
 
     # ------------------------------------------------------------
-    # 📦 Dataset
+    # Dataset
     # ------------------------------------------------------------
     dataloader_cfg = {
         "batch_size": CONFIG["batch_size"],
@@ -154,8 +252,8 @@ def train_base(CONFIG, model, optimizer, scheduler=None, train_loss=None, eval_l
 
     train_loader, test_loaders, data_processor = dataset.dataset_base.create_dataloaders(
         dataset_cls=dataset.dataset_simulation.PermeabilityFlowDataset,
-        path_train=train_dataset,
-        path_test_ood=ood_dataset,
+        path_train=str(train_dataset),
+        path_test_ood=str(ood_dataset),
         train_ratio=CONFIG["train_ratio"],
         ood_fraction=CONFIG["ood_fraction"],
         **dataloader_cfg,
@@ -177,8 +275,11 @@ def train_base(CONFIG, model, optimizer, scheduler=None, train_loss=None, eval_l
     )
 
     # ------------------------------------------------------------
-    # 🚀 Start Training
+    # Training (mypy requires explicit non-optional parameters)
     # ------------------------------------------------------------
+    save_best = CONFIG["save_best"] if CONFIG.get("save_best") is not None else None
+    resume_arg: str = str(resume_from) if resume_from is not None else ""
+
     trainer.train(
         train_loader=train_loader,
         test_loaders=test_loaders,
@@ -186,10 +287,10 @@ def train_base(CONFIG, model, optimizer, scheduler=None, train_loss=None, eval_l
         scheduler=scheduler,
         training_loss=train_loss,
         eval_losses=eval_losses,
-        save_dir=SAVE_DIR,
-        save_best=CONFIG.get("save_best"),
-        resume_from_dir=resume_from,
+        save_dir=str(save_dir),
+        save_best=save_best,  # pyright: ignore[reportArgumentType]
+        resume_from_dir=resume_arg,
     )
 
     wandb.finish()
-    print("🏁 Training complete.")
+    print("Training complete.")

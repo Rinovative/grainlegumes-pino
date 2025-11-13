@@ -58,12 +58,10 @@ RUN micromamba run -n grainlegumes-pino pip install -e .
 USER mambauser
 
 # ----------------------------------------------------------------------
-# 🔹 Auto-activate env in login shell
-# ----------------------------------------------------------------------
-RUN echo 'eval "$(micromamba shell hook -s bash)" && micromamba activate grainlegumes-pino' >> ~/.bashrc
-
-# ----------------------------------------------------------------------
 # ⚙️ Runtime — tini + init_permissions
 # ----------------------------------------------------------------------
+RUN echo 'eval "$(micromamba shell hook --shell bash)"' >> /home/mambauser/.bashrc && \
+    echo 'micromamba activate grainlegumes-pino' >> /home/mambauser/.bashrc
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash", "-l"]

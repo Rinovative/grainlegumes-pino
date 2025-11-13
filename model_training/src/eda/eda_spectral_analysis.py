@@ -1,4 +1,5 @@
-"""Exploratory Data Analysis (EDA) module for spectral analysis of simulation data.
+"""
+Exploratory Data Analysis (EDA) module for spectral analysis of simulation data.
 
 This module provides utilities and visualization tools for:
 - Computing 2D FFT and Power Spectral Density (PSD)
@@ -28,7 +29,8 @@ if TYPE_CHECKING:
 
 
 def _hann2d(ny: int, nx: int) -> np.ndarray:
-    """Create a 2D Hann window for spectral smoothing.
+    """
+    Create a 2D Hann window for spectral smoothing.
 
     Args:
         ny (int): Number of rows (y-dimension).
@@ -44,7 +46,8 @@ def _hann2d(ny: int, nx: int) -> np.ndarray:
 
 
 def _fft2_psd(field: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute the 2D FFT and corresponding Power Spectral Density (PSD).
+    """
+    Compute the 2D FFT and corresponding Power Spectral Density (PSD).
 
     Args:
         field (np.ndarray): 2D field data.
@@ -70,7 +73,8 @@ def _fft2_psd(field: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.n
 
 
 def _radial_spectrum(PSD: np.ndarray, kx: np.ndarray, ky: np.ndarray, n_bins: int = 200) -> tuple[np.ndarray, np.ndarray]:
-    """Compute the isotropic radial spectrum E(k) from a 2D PSD.
+    """
+    Compute the isotropic radial spectrum E(k) from a 2D PSD.
 
     Args:
         PSD (np.ndarray): Power spectral density.
@@ -104,7 +108,8 @@ def _radial_spectrum(PSD: np.ndarray, kx: np.ndarray, ky: np.ndarray, n_bins: in
 
 
 def _prepare_fields(df: pd.DataFrame, case_idx: int) -> tuple[dict[str, np.ndarray], float, float, str]:
-    """Extract κxx, p, U fields and grid spacing for a given case.
+    """
+    Extract κxx, p, U fields and grid spacing for a given case.
 
     Args:
         df (pd.DataFrame): DataFrame containing simulation cases.
@@ -131,7 +136,8 @@ def _prepare_fields(df: pd.DataFrame, case_idx: int) -> tuple[dict[str, np.ndarr
 
 
 def make_case_navigator(n_cases: int, plot_func: Callable[[int], Figure]) -> widgets.VBox:
-    """Create a simple navigation widget (← / →) to cycle through simulation cases.
+    """
+    Create a simple navigation widget (← / →) to cycle through simulation cases.
 
     Args:
         n_cases (int): Number of available cases.
@@ -172,7 +178,8 @@ def _plot_base(
     title_suffix: str,
     figsize: tuple[int, int] = (12, 6),
 ) -> Figure:
-    """Generic plotting template for spectral visualizations.
+    """
+    Generic plotting template for spectral visualizations.
 
     Handles:
       - field extraction and FFT preparation
@@ -212,7 +219,8 @@ def _plot_base(
 
 
 def plot_field_spectra_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
-    """Interactive global spectral overview for fields κxx, p, and U.
+    """
+    Interactive global spectral overview for fields κxx, p, and U.
 
     Shows:
       - 2D power spectra for each field (individual color scales)
@@ -259,7 +267,8 @@ def plot_field_spectra_overview(df: pd.DataFrame, dataset_name: str) -> widgets.
 
 
 def plot_vertical_spectral_lines(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
-    """Interactive vertical spectral evolution view (E(k, y)) for κxx, p, and U.
+    """
+    Interactive vertical spectral evolution view (E(k, y)) for κxx, p, and U.
 
     For each field, plots two radial spectra:
       - Lower region (around y ≈ 0.05 m)

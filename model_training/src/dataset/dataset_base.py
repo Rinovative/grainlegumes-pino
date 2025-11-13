@@ -1,4 +1,5 @@
-"""Base dataset utilities for modular simulation datasets.
+"""
+Base dataset utilities for modular simulation datasets.
 
 This module defines a generic dataset base class and a helper function
 to create train, validation, and out-of-distribution (OOD) dataloaders
@@ -14,14 +15,16 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 
 class BaseDataset(Dataset):
-    """Generic dataset base class for all simulation datasets.
+    """
+    Generic dataset base class for all simulation datasets.
 
     This class handles loading a `.pt` file and provides the standard
     dataset interface. It should be subclassed to implement `__getitem__`.
     """
 
     def __init__(self, data_path: str) -> None:
-        """Load the dataset from a serialized PyTorch file.
+        """
+        Load the dataset from a serialized PyTorch file.
 
         Args:
             data_path: Path to a `.pt` file containing simulation data.
@@ -39,7 +42,8 @@ class BaseDataset(Dataset):
         raise KeyError(msg)
 
     def __getitem__(self, idx: int) -> dict:
-        """Return a single sample by index.
+        """
+        Return a single sample by index.
 
         Must be implemented in subclasses.
         """
@@ -59,7 +63,8 @@ def create_dataloaders(
     persistent_workers: bool = True,
     **kwargs: Any,
 ) -> tuple[DataLoader, dict[str, DataLoader], DefaultDataProcessor]:
-    """Create train, evaluation, and OOD dataloaders with normalization.
+    """
+    Create train, evaluation, and OOD dataloaders with normalization.
 
     Args:
         dataset_cls: Dataset class to instantiate.

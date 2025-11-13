@@ -1,4 +1,5 @@
-"""Dataset definition for simulation-based PINO training.
+"""
+Dataset definition for simulation-based PINO training.
 
 This module implements the PermeabilityFlowDataset, which combines
 the BaseDataset with a physics-specific FlowModule. It provides
@@ -17,7 +18,8 @@ if TYPE_CHECKING:
 
 
 class PermeabilityFlowDataset(BaseDataset):
-    """Dataset for steady-state flow simulations with permeability fields.
+    """
+    Dataset for steady-state flow simulations with permeability fields.
 
     This dataset wraps the flattened dataset structure from `merge_batch_cases.py`
     and provides ready-to-use input/output tensors for PINO/FNO training.
@@ -39,7 +41,8 @@ class PermeabilityFlowDataset(BaseDataset):
         include_inputs: list[str] | None = None,
         include_outputs: list[str] | None = None,
     ) -> None:
-        """Initialize the dataset and attach the FlowModule.
+        """
+        Initialize the dataset and attach the FlowModule.
 
         Args:
             data_path:
@@ -60,7 +63,8 @@ class PermeabilityFlowDataset(BaseDataset):
         )
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return one preprocessed sample for index `idx`.
+        """
+        Return one preprocessed sample for index `idx`.
 
         Returns:
             dict[str, torch.Tensor]:
