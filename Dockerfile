@@ -26,13 +26,13 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
 # ----------------------------------------------------------------------
 # 👤 Non-root user
 # ----------------------------------------------------------------------
-RUN useradd -m -u 1000 -s /bin/bash mambauser
-
-# ----------------------------------------------------------------------
-# 📂 Global workspace (root-owned → keine Permissions-Probleme)
-# ----------------------------------------------------------------------
-RUN mkdir -p /workspace && chmod -R 777 /workspace
-WORKDIR /workspace
+RUN useradd -m -u 1000 -s /bin/bash mambauser && \
+    mkdir -p \
+      /home/mambauser/workspace/data \
+      /home/mambauser/workspace/data_generation/data \
+      /home/mambauser/workspace/model_training/data && \
+    chown -R mambauser:mambauser /home/mambauser/workspace && \
+    chmod -R a+rwX /home/mambauser/workspace
 
 # ----------------------------------------------------------------------
 # 📦 Environment creation
@@ -52,18 +52,18 @@ SHELL ["micromamba", "run", "-n", "grainlegumes-pino", "/bin/bash", "-c"]
 # ----------------------------------------------------------------------
 # 📂 Copy source and install package
 # ----------------------------------------------------------------------
-COPY --chown=mambauser:mambauser . /workspace
+COPY --chown=mambauser:mambauser . .
 USER root
 RUN micromamba run -n grainlegumes-pino pip install -e .
 USER mambauser
 
 # ----------------------------------------------------------------------
-# 🔹 Auto-activate env in login shell
+# 🧩 Auto-activate env
 # ----------------------------------------------------------------------
 RUN echo 'eval "$(micromamba shell hook -s bash)" && micromamba activate grainlegumes-pino' >> ~/.bashrc
 
 # ----------------------------------------------------------------------
-# ⚙️ Runtime — tini + init_permissions
+# ⚙️ Runtime
 # ----------------------------------------------------------------------
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash", "-l"]
