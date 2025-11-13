@@ -24,15 +24,15 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
     | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba
 
 # ----------------------------------------------------------------------
-# 👤 Non-root user + workspace + permissions
+# 👤 Non-root user
 # ----------------------------------------------------------------------
-RUN useradd -m -u 1000 -s /bin/bash mambauser && \
-    mkdir -p \
-      /home/mambauser/workspace/data \
-      /home/mambauser/workspace/data_generation/data \
-      /home/mambauser/workspace/model_training/data && \
-    chown -R mambauser:mambauser /home/mambauser/workspace && \
-    chmod -R a+rwX /home/mambauser/workspace
+RUN useradd -m -u 1000 -s /bin/bash mambauser
+
+# ----------------------------------------------------------------------
+# 📂 Global workspace (root-owned → keine Permissions-Probleme)
+# ----------------------------------------------------------------------
+RUN mkdir -p /workspace && chmod -R 777 /workspace
+WORKDIR /workspace
 
 # ----------------------------------------------------------------------
 # 📦 Environment creation
@@ -41,12 +41,6 @@ COPY --chown=mambauser:mambauser environment.yml /tmp/environment.yml
 USER root
 RUN micromamba env create -f /tmp/environment.yml -y && \
     micromamba clean --all --yes
-
-# -------------------------------
-# 🔧 Make env default for VS Code
-# -------------------------------
-ENV PATH="/opt/micromamba/envs/grainlegumes-pino/bin:${PATH}"
-
 USER mambauser
 
 # ----------------------------------------------------------------------
@@ -56,21 +50,20 @@ ENV MAMBA_DOCKERFILE_ACTIVATE=1
 SHELL ["micromamba", "run", "-n", "grainlegumes-pino", "/bin/bash", "-c"]
 
 # ----------------------------------------------------------------------
-# 📂 Copy project source and install package
+# 📂 Copy source and install package
 # ----------------------------------------------------------------------
-COPY --chown=mambauser:mambauser . .
+COPY --chown=mambauser:mambauser . /workspace
 USER root
 RUN micromamba run -n grainlegumes-pino pip install -e .
 USER mambauser
 
 # ----------------------------------------------------------------------
-# 🔹 Auto-activate env in login shell (correct user!)
+# 🔹 Auto-activate env in login shell
 # ----------------------------------------------------------------------
-RUN echo 'eval "$(micromamba shell hook -s bash)" && micromamba activate grainlegumes-pino' \
-    >> /home/mambauser/.bashrc
+RUN echo 'eval "$(micromamba shell hook -s bash)" && micromamba activate grainlegumes-pino' >> ~/.bashrc
 
 # ----------------------------------------------------------------------
-# ⚙️ Runtime — tini
+# ⚙️ Runtime — tini + init_permissions
 # ----------------------------------------------------------------------
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash", "-l"]
