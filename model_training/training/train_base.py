@@ -1,4 +1,4 @@
-import inspect  # noqa: D100, INP001
+import inspect  # noqa: D100
 import json
 import os
 import random
@@ -275,7 +275,7 @@ def train_base(
     )
 
     # ------------------------------------------------------------
-    # Training (mypy requires explicit non-optional parameters)
+    # Training
     # ------------------------------------------------------------
     save_best = CONFIG["save_best"] if CONFIG.get("save_best") is not None else None
     resume_arg: str = str(resume_from) if resume_from is not None else ""
