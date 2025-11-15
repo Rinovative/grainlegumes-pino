@@ -17,7 +17,7 @@ from src import dataset
 # ================================================================
 # 🧭 Utilities
 # ================================================================
-def set_seed(seed: int = 1) -> None:
+def set_seed(seed: int = 9) -> None:
     """
     Set all random seeds for reproducibility.
 

@@ -11,7 +11,7 @@ from training.train_base import train_base
 CONFIG = {
     # --- General ---
     "model_name": "FNO",
-    "seed": 1,
+    "seed": 9,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     # --- Dataset ---
     "train_dataset_name": "uniform_var10_plog100_seed1",
