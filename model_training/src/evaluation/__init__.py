@@ -1,13 +1,11 @@
 from . import (  # noqa: D104
     evaluation_dataframe,
     evaluation_inference,
-    evaluation_metrics,
-    evaluation_plots,
+    evaluation_plot,
 )
 
 __all__ = [
     "evaluation_dataframe",
     "evaluation_inference",
-    "evaluation_metrics",
-    "evaluation_plots",
+    "evaluation_plot",
 ]
