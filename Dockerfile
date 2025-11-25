@@ -52,9 +52,11 @@ SHELL ["micromamba", "run", "-n", "grainlegumes-pino", "/bin/bash", "-c"]
 # ----------------------------------------------------------------------
 # 📂 Copy source and install package
 # ----------------------------------------------------------------------
-COPY --chown=mambauser:mambauser . .
+WORKDIR /home/mambauser/workspace
+COPY --chown=mambauser:mambauser . /home/mambauser/workspace
+
 USER root
-RUN micromamba run -n grainlegumes-pino pip install -e .
+RUN micromamba run -n grainlegumes-pino pip install -e /home/mambauser/workspace
 USER mambauser
 
 # ----------------------------------------------------------------------

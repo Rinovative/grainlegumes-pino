@@ -57,7 +57,7 @@ else
       -v ~/workspace/data:/home/mambauser/workspace/data:rw \
       -v ~/workspace/data_generation:/home/mambauser/workspace/data_generation/data:rw \
       -v ~/workspace/data_training:/home/mambauser/workspace/model_training/data:rw \
-      $IMAGE_NAME tail -f /dev/null
+      $IMAGE_NAME bash -lc "sleep infinity"
 
     echo ""
     echo "✅ Container '$CONTAINER_NAME' is now running in detached mode."
