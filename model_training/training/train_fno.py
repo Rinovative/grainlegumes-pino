@@ -2,6 +2,7 @@ import torch  # noqa: D100, INP001
 from neuralop import H1Loss, LpLoss
 from neuralop.models import FNO
 from neuralop.training import AdamW
+from src.util.util_metrics import RelRMSEChannel, RMSEOverall
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from training.train_base import train_base
 
@@ -14,8 +15,8 @@ CONFIG = {
     "seed": 9,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     # --- Dataset ---
-    "train_dataset_name": "uniform_var10_plog100_seed1",
-    "ood_dataset_name": "uniform_var20_plog100_seed1",
+    "train_dataset_name": "lhs_var10_plog100_seed9",
+    "ood_dataset_name": "lhs_var20_plog100_seed9",
     "train_ratio": 0.8,  # fraction of dataset used for training
     "ood_fraction": 0.2,  # fraction of OOD data for evaluation
     # --- Dataloader ---
@@ -24,14 +25,14 @@ CONFIG = {
     "pin_memory": True,
     "persistent_workers": True,
     # --- Training ---
-    "n_epochs": 2000,
+    "n_epochs": 2500,
     "eval_interval": 5,  # evaluate every N epochs
     "mixed_precision": False,  # enables AMP on modern GPUs
     # --- Checkpointing & Resume ---
     # "resume_from_dir": "FNO_samples_uniform_var10_N1000_20251112_153012",
     # "resume_from_dir": "latest",
     # --- Logging ---
-    "save_best": "eval_l2",  # metric key to monitor for best checkpoint
+    "save_best": "eval_overall_rmse",  # metric key to monitor for best checkpoint
     "save_every": None,  # optional periodic checkpoint saving
 }
 
@@ -68,6 +69,8 @@ train_loss = H1Loss(d=2)
 eval_losses = {
     "h1": H1Loss(d=2),
     "l2": LpLoss(d=2, p=2),
+    "overall_rmse": RMSEOverall(),
+    "rel_rmse_U": RelRMSEChannel(3),
 }
 
 

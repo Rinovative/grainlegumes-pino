@@ -238,7 +238,7 @@ def generate_dataframe(  # noqa: C901, PLR0912, PLR0915
     logs.append(f"[INFO] Final DataFrame contains {len(df)} cases.")
     logs.append(f"[INFO] kappa columns: {', '.join(kappa_cols) if kappa_cols else '-'}")
 
-    # --- shape preview (now includes kappa fields) ---
+    # --- shape preview ---
     shape_keys = ["x", "y", *kappa_cols, "p", "u", "v", "U"]
     shapes_preview = {key: (None if df[key].isna().all() else getattr(df[key].dropna().iloc[0], "shape", None)) for key in shape_keys}
     logs.append(f"[INFO] Example shapes: {shapes_preview}")

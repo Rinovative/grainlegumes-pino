@@ -1,3 +1,3 @@
-from . import eda, evaluation, sensitivity, util  # noqa: D104
+from . import analysis, eda, util  # noqa: D104
 
-__all__ = ["eda", "evaluation", "sensitivity", "util"]
+__all__ = ["analysis", "eda", "util"]

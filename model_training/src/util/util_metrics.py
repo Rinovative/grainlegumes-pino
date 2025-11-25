@@ -9,7 +9,7 @@ This module provides functions to:
 - Compute Pearson correlations between numeric arrays
 - Aggregate per-sample error statistics for downstream analysis
 
-All functions operate on NumPy arrays
+All functions operate on NumPy arrays.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 from numpy.typing import NDArray
+from torch import nn
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -26,13 +27,17 @@ if TYPE_CHECKING:
 NumberArray = NDArray[np.float64]
 
 
+# ============================================================================
+# Conversion utilities
+# ============================================================================
+
+
 def _to_numpy(array: Any, *, copy: bool = False) -> NumberArray:
     """
     Convert arbitrary numeric input into a float64 NumPy array.
 
-    Supports NumPy arrays, PyTorch tensors and generic sequences. The
-    output is always a float64 array, which ensures consistent behavior
-    across all metrics.
+    Supports NumPy arrays, PyTorch tensors and generic sequences. The output
+    is always a float64 array for consistent behaviour across all metrics.
 
     Args:
         array: Input data (NumPy array, PyTorch tensor, list, tuple, etc.).
@@ -69,18 +74,16 @@ def mse(
     Args:
         y_true: Ground truth values.
         y_pred: Predicted values.
-        axis: Axis or axes along which to average. If None, average over
-            all elements.
+        axis: Axis or axes along which to average. If None, average over all elements.
 
     Returns:
-        np.ndarray: Mean squared error. A scalar is returned as a 0D array.
+        np.ndarray: Mean squared error as a float64 NumPy array.
 
     """
     yt = _to_numpy(y_true)
     yp = _to_numpy(y_pred)
     diff = yp - yt
-    out = np.mean(diff * diff, axis=axis)
-    return np.asarray(out, dtype=np.float64)
+    return np.asarray(np.mean(diff * diff, axis=axis), dtype=np.float64)
 
 
 def rmse(
@@ -94,11 +97,10 @@ def rmse(
     Args:
         y_true: Ground truth values.
         y_pred: Predicted values.
-        axis: Axis or axes along which to average. If None, average over
-            all elements.
+        axis: Axis or axes along which to average. If None, average over all elements.
 
     Returns:
-        np.ndarray: Root mean squared error. A scalar is returned as a 0D array.
+        np.ndarray: Root mean squared error as a float64 NumPy array.
 
     """
     return np.sqrt(mse(y_true=y_true, y_pred=y_pred, axis=axis))
@@ -115,21 +117,19 @@ def mae(
     Args:
         y_true: Ground truth values.
         y_pred: Predicted values.
-        axis: Axis or axes along which to average. If None, average over
-            all elements.
+        axis: Axis or axes along which to average. If None, average over all elements.
 
     Returns:
-        np.ndarray: Mean absolute error. A scalar is returned as a 0D array.
+        np.ndarray: Mean absolute error as a float64 NumPy array.
 
     """
     yt = _to_numpy(y_true)
     yp = _to_numpy(y_pred)
-    diff = np.abs(yp - yt)
-    return np.mean(diff, axis=axis)
+    return np.mean(np.abs(yp - yt), axis=axis)
 
 
 # ============================================================================
-# Relative and normalized errors
+# Relative error metrics
 # ============================================================================
 
 
@@ -140,31 +140,25 @@ def mean_relative_error(
     eps: float = 1e-12,
 ) -> NumberArray:
     """
-    Compute the mean absolute relative error between prediction and ground truth.
+    Compute the mean absolute relative error.
 
-    The relative error is defined elementwise as:
+    Defined elementwise as:
         |y_pred - y_true| / (|y_true| + eps)
 
     Args:
         y_true: Ground truth values.
         y_pred: Predicted values.
-        axis: Axis or axes along which to average. If None, average over
-            all elements.
-        eps: Small constant added to the denominator to avoid division by zero.
+        axis: Axes along which to average. If None, use all elements.
+        eps: Small constant added to avoid division by zero.
 
     Returns:
-        np.ndarray: Mean absolute relative error. A scalar is returned as
-            a 0D array.
+        np.ndarray: Mean absolute relative error as float64.
 
     """
     yt = _to_numpy(y_true)
     yp = _to_numpy(y_pred)
-    diff = np.abs(yp - yt)
-    denom = np.abs(yt) + eps
-    rel = diff / denom
-
-    out = np.mean(rel, axis=axis)
-    return np.asarray(out, dtype=np.float64)
+    rel = np.abs(yp - yt) / (np.abs(yt) + eps)
+    return np.asarray(np.mean(rel, axis=axis), dtype=np.float64)
 
 
 def l1_relative_error(
@@ -174,26 +168,24 @@ def l1_relative_error(
     eps: float = 1e-12,
 ) -> NumberArray:
     """
-    Compute the L1 relative error between prediction and ground truth.
+    Compute the L1 relative error.
 
-    The L1 relative error is defined as:
+    Defined as:
         ||y_pred - y_true||_1 / (||y_true||_1 + eps)
 
     Args:
         y_true: Ground truth values.
         y_pred: Predicted values.
-        axis: Axis or axes along which to sum. If None, use all elements.
-        eps: Small constant added to the denominator to avoid division by zero.
+        axis: Axes along which to sum. If None, sum over all elements.
+        eps: Small constant to avoid division by zero.
 
     Returns:
-        np.ndarray: L1 relative error. A scalar is returned as a 0D array.
+        np.ndarray: L1 relative error as float64.
 
     """
     yt = _to_numpy(y_true)
     yp = _to_numpy(y_pred)
-    diff = np.abs(yp - yt)
-
-    num = np.sum(diff, axis=axis)
+    num = np.sum(np.abs(yp - yt), axis=axis)
     denom = np.sum(np.abs(yt), axis=axis) + eps
     return num / denom
 
@@ -205,33 +197,31 @@ def l2_relative_error(
     eps: float = 1e-12,
 ) -> NumberArray:
     """
-    Compute the L2 relative error between prediction and ground truth.
+    Compute the L2 relative error.
 
-    The L2 relative error is defined as:
+    Defined as:
         ||y_pred - y_true||_2 / (||y_true||_2 + eps)
 
     Args:
         y_true: Ground truth values.
         y_pred: Predicted values.
-        axis: Axis or axes along which to sum squares. If None, use all
-            elements.
-        eps: Small constant added to the denominator to avoid division by zero.
+        axis: Axes along which to sum squares. If None, use all elements.
+        eps: Small constant to avoid division by zero.
 
     Returns:
-        np.ndarray: L2 relative error. A scalar is returned as a 0D array.
+        np.ndarray: L2 relative error as float64.
 
     """
     yt = _to_numpy(y_true)
     yp = _to_numpy(y_pred)
     diff = yp - yt
-
     num = np.sqrt(np.sum(diff * diff, axis=axis))
     denom = np.sqrt(np.sum(yt * yt, axis=axis)) + eps
     return num / denom
 
 
 # ============================================================================
-# Error maps across samples
+# Error maps
 # ============================================================================
 
 
@@ -241,25 +231,20 @@ def mean_absolute_error_map(
     sample_axis: int = 0,
 ) -> NumberArray:
     """
-    Compute a mean absolute error map across a sample axis.
-
-    This function is intended for spatial error maps where multiple samples
-    share the same spatial grid. It computes the mean absolute error per
-    grid location across the specified sample axis.
+    Compute a mean absolute error map across samples.
 
     Args:
-        y_true: Ground truth values with a dedicated sample axis.
-        y_pred: Predicted values with the same shape as y_true.
-        sample_axis: Axis that indexes samples (usually 0).
+        y_true: Ground truth values with a sample axis.
+        y_pred: Predicted values.
+        sample_axis: Axis indexing samples.
 
     Returns:
-        np.ndarray: Mean absolute error map with the sample axis removed.
+        np.ndarray: Mean absolute error per spatial location.
 
     """
     yt = _to_numpy(y_true)
     yp = _to_numpy(y_pred)
-    diff = np.abs(yp - yt)
-    return np.mean(diff, axis=sample_axis)
+    return np.mean(np.abs(yp - yt), axis=sample_axis)
 
 
 def std_error_map(
@@ -269,19 +254,16 @@ def std_error_map(
     ddof: int = 0,
 ) -> NumberArray:
     """
-    Compute a standard deviation error map across a sample axis.
-
-    The map is based on the signed error (y_pred - y_true) at each grid
-    location and computes the standard deviation across samples.
+    Compute a standard deviation error map across samples.
 
     Args:
-        y_true: Ground truth values with a dedicated sample axis.
-        y_pred: Predicted values with the same shape as y_true.
-        sample_axis: Axis that indexes samples (usually 0).
-        ddof: Delta degrees of freedom passed to np.std.
+        y_true: Ground truth values with a sample axis.
+        y_pred: Predicted values.
+        sample_axis: Axis indexing samples.
+        ddof: Delta degrees of freedom.
 
     Returns:
-        np.ndarray: Standard deviation error map with the sample axis removed.
+        np.ndarray: Standard deviation of signed error per location.
 
     """
     yt = _to_numpy(y_true)
@@ -291,7 +273,7 @@ def std_error_map(
 
 
 # ============================================================================
-# Correlation utilities
+# Correlation
 # ============================================================================
 
 
@@ -303,41 +285,30 @@ def pearson_correlation(
     """
     Compute the Pearson correlation coefficient between two arrays.
 
-    Both inputs are flattened before computing the correlation. This
-    function is intended as a generic building block, for example for
-    correlations between error and ground truth or between error and
-    derived quantities like velocity magnitude.
+    Both arrays are flattened before computing the correlation.
 
     Args:
-        x: First array.
-        y: Second array with the same number of elements as x.
-        eps: Small constant added to the denominator to avoid division by zero.
+        x: First input array.
+        y: Second input array.
+        eps: Small constant to avoid division by zero.
 
     Returns:
-        float: Pearson correlation coefficient in the range [-1, 1].
-
-    Raises:
-        ValueError: If x and y do not have the same number of elements.
+        float: Pearson correlation in the range [-1, 1].
 
     """
     x_arr = _to_numpy(x).ravel()
     y_arr = _to_numpy(y).ravel()
 
     if x_arr.size != y_arr.size:
-        msg = "pearson_correlation requires x and y to have the same number of elements."
+        msg = "Input arrays must have the same number of elements."
         raise ValueError(msg)
 
-    x_mean = float(np.mean(x_arr))
-    y_mean = float(np.mean(y_arr))
-
-    x_centered = x_arr - x_mean
-    y_centered = y_arr - y_mean
+    x_centered = x_arr - np.mean(x_arr)
+    y_centered = y_arr - np.mean(y_arr)
 
     num = float(np.mean(x_centered * y_centered))
-    x_std = float(np.sqrt(np.mean(x_centered * x_centered)))
-    y_std = float(np.sqrt(np.mean(y_centered * y_centered)))
+    denom = float(np.sqrt(np.mean(x_centered**2)) * np.sqrt(np.mean(y_centered**2)) + eps)
 
-    denom = x_std * y_std + eps
     return num / denom
 
 
@@ -353,28 +324,18 @@ def per_sample_error_statistics(
     eps: float = 1e-12,
 ) -> Mapping[str, NumberArray]:
     """
-    Compute a consistent set of error statistics per sample.
+    Compute a set of error statistics per sample.
 
-    The function treats the specified axis as the sample axis and aggregates
-    over all remaining dimensions. It returns one-dimensional arrays of
-    metrics indexed by sample. The following metrics are provided:
-
-    - "mse": Mean squared error per sample
-    - "rmse": Root mean squared error per sample
-    - "mae": Mean absolute error per sample
-    - "mean_relative_error": Mean absolute relative error per sample
-    - "l1_relative_error": L1 relative error per sample
-    - "l2_relative_error": L2 relative error per sample
+    Aggregates all metrics along all non-sample axes.
 
     Args:
-        y_true: Ground truth values with a dedicated sample axis.
-        y_pred: Predicted values with the same shape as y_true.
-        sample_axis: Axis that indexes samples (default 0).
-        eps: Small constant used in relative error computations.
+        y_true: Ground truth values with sample axis.
+        y_pred: Predicted values.
+        sample_axis: Axis indexing samples.
+        eps: Small constant to avoid division by zero.
 
     Returns:
-        Mapping[str, np.ndarray]: Dictionary mapping metric names to
-            one-dimensional arrays of shape (n_samples,).
+        Mapping[str, np.ndarray]: Metrics (shape n_samples,).
 
     """
     yt = _to_numpy(y_true)
@@ -385,21 +346,17 @@ def per_sample_error_statistics(
         yp = np.moveaxis(yp, sample_axis, 0)
 
     n_samples = yt.shape[0]
-
     yt_flat = yt.reshape(n_samples, -1)
     yp_flat = yp.reshape(n_samples, -1)
     diff_flat = yp_flat - yt_flat
 
-    # Core metrics
     mse_vals = np.mean(diff_flat * diff_flat, axis=1)
     rmse_vals = np.sqrt(mse_vals)
     mae_vals = np.mean(np.abs(diff_flat), axis=1)
 
-    # Mean absolute relative error (MAPE style)
     denom_abs = np.abs(yt_flat) + eps
     mean_rel_vals = np.mean(np.abs(diff_flat) / denom_abs, axis=1)
 
-    # L1 and L2 relative errors
     num_l1 = np.sum(np.abs(diff_flat), axis=1)
     denom_l1 = np.sum(np.abs(yt_flat), axis=1) + eps
     l1_rel_vals = num_l1 / denom_l1
@@ -416,3 +373,106 @@ def per_sample_error_statistics(
         "l1_relative_error": l1_rel_vals,
         "l2_relative_error": l2_rel_vals,
     }
+
+
+# ============================================================================
+# Overall RMSE (absolute)
+# ============================================================================
+
+
+class RMSEOverall(nn.Module):
+    """
+    Compute the Root Mean Squared Error (RMSE) across all channels and spatial dimensions.
+
+    This metric accepts arbitrary keyword arguments to remain compatible
+    with `neuralop.Trainer`, which forwards additional keys such as
+    ``x=`` or ``meta=`` during evaluation.
+
+    The RMSE is computed as:
+
+        RMSE = sqrt( mean( (pred - y)^2 ) )
+
+    Both ``pred`` and ``y`` must have identical shapes.
+
+    Returns a scalar tensor.
+    """
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        y: torch.Tensor,
+        **kwargs: torch.Tensor,  # noqa: ARG002
+    ) -> torch.Tensor:
+        """
+        Compute the overall RMSE.
+
+        Args:
+            pred: Predicted tensor of shape (batch, C, H, W).
+            y: Ground truth tensor with identical shape.
+            **kwargs: Ignored extra inputs for compatibility with Trainer.
+
+        Returns:
+            torch.Tensor: Scalar RMSE value.
+
+        """
+        diff = pred - y
+        return torch.sqrt(torch.mean(diff * diff))
+
+
+# ============================================================================
+# Channel-wise relative RMSE (percent)
+# ============================================================================
+
+
+class RelRMSEChannel(nn.Module):
+    """
+    Compute the relative RMSE (in percent) for a specific output channel.
+
+    This metric is physically interpretable and allows direct comparison
+    across channels with different numerical scales (for example pressure
+    vs velocity). It is defined as:
+
+        rel_RMSE = 100 * RMSE / mean(|y|)
+
+    Extra keyword arguments are ignored to maintain compatibility with
+    `neuralop.Trainer`.
+    """
+
+    def __init__(self, channel: int) -> None:
+        """
+        Initialize the channel-wise relative RMSE metric.
+
+        Args:
+            channel: Index of the output channel to evaluate.
+
+        """
+        super().__init__()
+        self.channel = channel
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        y: torch.Tensor,
+        **kwargs: torch.Tensor,  # noqa: ARG002
+    ) -> torch.Tensor:
+        """
+        Compute the relative RMSE for the selected channel.
+
+        Args:
+            pred: Predicted tensor of shape (batch, C, H, W).
+            y: Ground truth tensor with identical shape.
+            **kwargs: Ignored additional arguments forwarded by Trainer.
+
+        Returns:
+            torch.Tensor: Scalar relative RMSE value (percent) for the channel.
+
+        """
+        yt = y[:, self.channel]
+        pt = pred[:, self.channel]
+
+        diff = pt - yt
+        rmse = torch.sqrt(torch.mean(diff * diff))
+
+        denom = torch.mean(torch.abs(yt)) + 1e-8  # avoid division by zero
+
+        return 100.0 * rmse / denom

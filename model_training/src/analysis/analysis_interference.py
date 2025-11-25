@@ -73,35 +73,42 @@ def _load_config(config_path: Path) -> dict[str, Any]:
 # -----------------------------------------------------------------------------#
 def _build_model_from_config(model_cfg: dict[str, Any]) -> nn.Module:
     """
-    Rebuild the model architecture from the stored config.
+    Rebuild the model architecture exactly as it was during training.
 
     The config contains:
         - "architecture": e.g. "FNO"
-        - "model_params": dict with model hyperparameters
+        - "model_params": dict with ALL model hyperparameters
+          (as saved by the training pipeline)
+
+    This function also fixes JSON serialization issues:
+        neuralop stores skip-connection types internally as tuples,
+        which become lists in config.json. We convert them back to strings.
 
     Args:
         model_cfg: The `"model"` section of config.json.
 
     Returns:
-        The instantiated model.
+        The instantiated model, fully matching the training configuration.
 
     Raises:
         NotImplementedError: On unknown model architectures.
 
     """
     arch = model_cfg["architecture"]
-    params = model_cfg["model_params"]
+    params = dict(model_cfg["model_params"])  # safe copy
 
-    if arch == "FNO":
-        return FNO(
-            n_modes=tuple(params["n_modes"]),
-            hidden_channels=params["hidden_channels"],
-            in_channels=params["in_channels"],
-            out_channels=params["out_channels"],
-        )
+    if arch != "FNO":
+        msg = f"Unknown architecture: {arch}"
+        raise NotImplementedError(msg)
 
-    msg = f"Unknown architecture: {arch}"
-    raise NotImplementedError(msg)
+    # --- Fix JSON → tuple → list serialization for skip types ----------------
+    for key in ["channel_mlp_skip", "fno_skip"]:
+        val = params.get(key)
+        if isinstance(val, list) and len(val) == 1:
+            params[key] = val[0]  # convert ["soft-gating"] → "soft-gating"
+
+    # --- Instantiate model with full parameter set ---------------------------
+    return FNO(**params)
 
 
 # -----------------------------------------------------------------------------#

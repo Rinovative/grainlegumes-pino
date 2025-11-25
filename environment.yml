@@ -27,6 +27,7 @@ dependencies:
   - nbqa
   - pre-commit
   - radon
+  - pyarrow
   - pip
   - pip:
       - neuraloperator==2.0.*

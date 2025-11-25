@@ -190,8 +190,8 @@ def train_base(
     # ------------------------------------------------------------
     # Resume logic
     # ------------------------------------------------------------
-    resume_from = CONFIG.get("resume_from_dir")
-    base = Path("model_training/data/processed/model")
+    resume_from = CONFIG.get("resume_from_dir", None)  # noqa: SIM910
+    base = Path("model_training/data/processed")
 
     if resume_from:
         if resume_from == "latest":
@@ -226,18 +226,20 @@ def train_base(
     os.environ["WANDB_ENTITY"] = "Rinovative-Hub"
     os.environ["WANDB_DIR"] = "model_training/training/wandb"
 
+    wandb_cfg = build_wandb_config(CONFIG, model, optimizer, scheduler, train_loss, eval_losses or {})
+
     wandb.init(
         project=os.environ["WANDB_PROJECT"],
         entity=os.environ["WANDB_ENTITY"],
         name=run_name,
         dir=os.environ["WANDB_DIR"],
-        config=build_wandb_config(CONFIG, model, optimizer, scheduler, train_loss, eval_losses or {}),
+        config=wandb_cfg,
         reinit=True,
     )
 
     config_path = save_dir / "config.json"
     with config_path.open("w", encoding="utf-8") as f:
-        json.dump(make_json_safe(CONFIG), f, indent=2)
+        json.dump(make_json_safe(wandb_cfg), f, indent=2)
     wandb.save(str(config_path))
 
     # ------------------------------------------------------------
@@ -278,19 +280,32 @@ def train_base(
     # Training
     # ------------------------------------------------------------
     save_best = CONFIG["save_best"] if CONFIG.get("save_best") is not None else None
-    resume_arg: str = str(resume_from) if resume_from is not None else ""
 
-    trainer.train(
-        train_loader=train_loader,
-        test_loaders=test_loaders,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        training_loss=train_loss,
-        eval_losses=eval_losses,
-        save_dir=str(save_dir),
-        save_best=save_best,  # pyright: ignore[reportArgumentType]
-        resume_from_dir=resume_arg,
-    )
+    if resume_from is None:
+        # → NO RESUME
+        trainer.train(
+            train_loader=train_loader,
+            test_loaders=test_loaders,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            training_loss=train_loss,
+            eval_losses=eval_losses,
+            save_dir=str(save_dir),
+            save_best=save_best,  # pyright: ignore[reportArgumentType]
+        )
+    else:
+        # → RESUME
+        trainer.train(
+            train_loader=train_loader,
+            test_loaders=test_loaders,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            training_loss=train_loss,
+            eval_losses=eval_losses,
+            save_dir=str(save_dir),
+            save_best=save_best,  # pyright: ignore[reportArgumentType]
+            resume_from_dir=str(resume_from),
+        )
 
     wandb.finish()
     print("Training complete.")
