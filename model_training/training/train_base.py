@@ -272,6 +272,7 @@ def train_base(
         wandb_log=True,
         device=device,
         mixed_precision=CONFIG["mixed_precision"],
+        data_processor=data_processor,
         eval_interval=CONFIG["eval_interval"],
         verbose=True,
     )

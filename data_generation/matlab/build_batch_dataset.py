@@ -131,7 +131,7 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
         if not np.any(arr):
             dropped_input_fields.append(c.replace("br.", ""))
 
-    for key in ["u", "v", "p", "br.U"]:
+    for key in ["p", "u", "v", "br.U"]:
         if key in df.columns:
             arr = df[key].to_numpy().reshape(ny, nx)
             if not np.any(arr):
@@ -156,7 +156,7 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
         input_fields[clean] = df[c].to_numpy().reshape(ny, nx)
 
     output_fields = {}
-    for key in ["u", "v", "p", "br.U"]:
+    for key in ["p", "u", "v", "br.U"]:
         clean = key.replace("br.", "")
         if key in df.columns and clean not in dropped_output_fields:
             arr = df[key].to_numpy().reshape(ny, nx)
@@ -194,7 +194,7 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
             input_fields[clean] = df[c].to_numpy().reshape(ny, nx)
 
         output_fields = {}
-        for key in ["u", "v", "p", "br.U"]:
+        for key in ["p", "u", "v", "br.U"]:
             clean = key.replace("br.", "")
             if key not in df.columns or clean in dropped_output_fields:
                 continue
@@ -238,6 +238,6 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
 
 
 if __name__ == "__main__":
-    result = build_batch_dataset("uniform_var20_plog100_seed1", verbose=True)
+    result = build_batch_dataset("lhs_var20_plog100_seed9", verbose=True)
     for line in result["log"]:
         print(line)
