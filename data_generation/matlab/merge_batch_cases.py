@@ -39,7 +39,7 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
             "kappazz",
         ]
     if keep_output_fields is None:
-        keep_output_fields = ["u", "v", "U", "p"]
+        keep_output_fields = ["p", "u", "v", "U"]
 
     log = []
 
@@ -175,6 +175,6 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
 
 
 if __name__ == "__main__":
-    result = merge_batch_cases("uniform_var10_plog100_seed1", verbose=True)
+    result = merge_batch_cases("lhs_var20_plog100_seed9", verbose=True)
     for line in result["log"]:
         print(line)

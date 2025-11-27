@@ -1,11 +1,24 @@
 """
-Dataset definition for simulation-based PINO training.
+Dataset definition for simulation-based PINO/FNO training and evaluation.
 
 This module implements the PermeabilityFlowDataset, which combines
 the BaseDataset with a physics-specific FlowModule. It provides
 input/output tensors (x, y) formatted for neural operator training
-and supports both merged training datasets and directories of
-individual case files for evaluation.
+and supports both
+
+    - merged training datasets (single `<batch_name>.pt` file)
+    - directories of individual `case_XXXX.pt` files for evaluation.
+
+In both modes, __getitem__ returns a dictionary with at least
+
+    - "x": Tensor [C_in, H, W]
+    - "y": Tensor [C_out, H, W]
+
+In case-mode, an additional entry
+
+    - "meta": dict
+
+is provided with case-specific metadata.
 """
 
 from __future__ import annotations
@@ -26,11 +39,44 @@ class PermeabilityFlowDataset(BaseDataset):
     """
     Dataset for steady-state flow simulations with permeability fields.
 
-    Supports:
-        - merged training dataset (single `.pt` file)
-        - evaluation from individual `case_XXXX.pt` files
+    Supports two data layouts:
 
-    The FlowModule constructs model-ready tensors for PINO/FNO models.
+    1) Merged training dataset (single `.pt` file)
+       -------------------------------------------------
+       Produced by `merge_batch_cases.py`, with structure:
+
+           {
+               "inputs":  Tensor [N, C_in, H, W],
+               "outputs": Tensor [N, C_out, H, W],
+               "fields": {
+                   "inputs":  list[str],  # channel names in order
+                   "outputs": list[str],
+               },
+           }
+
+       In this mode, the dataset behaves like a standard
+       operator-learning dataset over N samples.
+
+    2) Evaluation dataset from individual case files
+       -------------------------------------------------
+       A directory containing `case_XXXX.pt` files produced by
+       `build_batch_dataset.py`, each with structure:
+
+           {
+               "input_fields":  dict[str, 2D-array],
+               "output_fields": dict[str, 2D-array],
+               "meta":          dict,
+           }
+
+       These cases are converted on-the-fly into tensors with a
+       synthetic batch dimension of size 1, then reduced back to
+       [C_in, H, W] / [C_out, H, W] via the FlowModule.
+
+    In both modes, the FlowModule constructs model-ready tensors for
+    PINO/FNO models, and __getitem__ returns:
+
+        {"x": Tensor, "y": Tensor}          # merged mode
+        {"x": Tensor, "y": Tensor, "meta": dict}  # cases mode
     """
 
     def __init__(
@@ -44,11 +90,14 @@ class PermeabilityFlowDataset(BaseDataset):
 
         Args:
             data_path:
-                Path to merged dataset or directory containing `case_XXXX.pt`.
+                Path to a merged dataset file (`<batch_name>.pt`) or to a
+                directory containing `case_XXXX.pt` files.
             include_inputs:
-                Field names to include in x. None = all.
+                Optional list of input channel names to include in x.
+                If None, all available input channels are used.
             include_outputs:
-                Field names to include in y. None = all.
+                Optional list of output channel names to include in y.
+                If None, all available output channels are used.
 
         """
         path = Path(data_path)
@@ -71,6 +120,7 @@ class PermeabilityFlowDataset(BaseDataset):
                 raise RuntimeError(msg)
 
             self.case_files = list(files)
+            # BaseDataset expects `self.data`, but we do not use it in cases mode.
             self.data = None  # type: ignore[assignment]
             return
 
@@ -78,8 +128,11 @@ class PermeabilityFlowDataset(BaseDataset):
         # Training mode: merged dataset
         # -----------------------------------------------------------
         self.mode = "merged"
-        super().__init__(data_path)  # loads into self.data: dict[str, Tensor]
 
+        # BaseDataset.__init__ loads the serialized dict into self.data
+        super().__init__(data_path)  # self.data: dict[str, Tensor]
+
+        # FlowModule handles channel ordering and selection for merged data
         self.flow_module = FlowModule(
             self.data,  # type: ignore[arg-type]
             include_inputs=include_inputs,
@@ -90,10 +143,12 @@ class PermeabilityFlowDataset(BaseDataset):
 
     def __len__(self) -> int:
         """
-        Get Number of samples in dataset.
+        Return the number of samples in the dataset.
 
         Returns:
-            int: sample count
+            Number of samples:
+                - For merged mode: N (first dimension of "inputs")
+                - For cases mode:  number of `case_XXXX.pt` files
 
         """
         if self.mode == "merged":
@@ -105,10 +160,24 @@ class PermeabilityFlowDataset(BaseDataset):
 
     def _load_case(self, idx: int) -> dict[str, Any]:
         """
-        Load and process one `case_XXXX.pt` file in evaluation mode.
+        Load and process a single `case_XXXX.pt` file in evaluation mode.
+
+        The raw case format is converted via FlowModule to
+
+            x: Tensor [C_in, H, W]
+            y: Tensor [C_out, H, W]
+
+        A shallow copy of the metadata is returned under "meta".
+
+        Args:
+            idx:
+                Case index in the sorted list of `case_XXXX.pt` files.
 
         Returns:
-            dict containing "x", "y", and optional "meta"
+            dict with keys:
+                - "x":    Tensor [C_in, H, W]
+                - "y":    Tensor [C_out, H, W]
+                - "meta": dict with case metadata
 
         """
         case_path = self.case_files[idx]
@@ -121,6 +190,7 @@ class PermeabilityFlowDataset(BaseDataset):
         )
 
         sample: dict[str, Any] = {}
+        # Single-case format has an artificial batch dimension of size 1
         module.apply(0, sample)
 
         x_tensor: Tensor = sample["x"]["input"]
@@ -131,15 +201,32 @@ class PermeabilityFlowDataset(BaseDataset):
 
     # ---------------------------------------------------------------
 
-    def __getitem__(self, idx: int) -> dict[str, Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         """
         Retrieve one dataset item.
 
-        Training mode:
-            returns {"x": Tensor, "y": Tensor}
+        Training (merged) mode:
+            Returns a dictionary
+                {
+                    "x": Tensor [C_in, H, W],
+                    "y": Tensor [C_out, H, W],
+                }
 
-        Evaluation mode:
-            returns {"x": Tensor, "y": Tensor, "meta": dict}
+        Evaluation (cases) mode:
+            Returns a dictionary
+                {
+                    "x":    Tensor [C_in, H, W],
+                    "y":    Tensor [C_out, H, W],
+                    "meta": dict,
+                }
+
+        Args:
+            idx:
+                Sample index (0-based).
+
+        Returns:
+            Sample dictionary with model-ready tensors and optional metadata.
+
         """
         if self.mode == "merged":
             fm = self.flow_module
