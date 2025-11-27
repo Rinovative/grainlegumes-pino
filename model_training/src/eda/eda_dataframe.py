@@ -124,7 +124,7 @@ def _extract_fields(sample: Mapping[str, Any]) -> tuple[dict[str, Any], list[str
     return row, missing
 
 
-def generate_dataframe(  # noqa: C901, PLR0912, PLR0915
+def generate_eda_dataframe(  # noqa: C901, PLR0912, PLR0915
     dataset_name: str,
     base_dir: str = "../../data/raw",
     show_progress: bool = False,
