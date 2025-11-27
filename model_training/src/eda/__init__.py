@@ -1,3 +1,3 @@
-from . import eda_spectral_analysis  # noqa: D104
+from . import eda_dataframe, eda_plot  # noqa: D104
 
-__all__ = ["eda_spectral_analysis"]
+__all__ = ["eda_dataframe", "eda_plot"]
