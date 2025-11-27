@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 from src import util
@@ -17,7 +18,7 @@ from src import util
 if TYPE_CHECKING:
     import ipywidgets as widgets
     import pandas as pd
-    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 
 # ======================================================================
@@ -130,169 +131,163 @@ ALL_KEYS = INPUT_KEYS + OUTPUT_KEYS
 
 
 # ======================================================================
-# 1) Interactive 2D spectral overview
+# Interactive 2D spectral overview
 # ======================================================================
 
 
 def plot_spectral_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
     """
-    Create an interactive viewer for two-dimensional spectral maps.
+    Build an interactive viewer for 2D spectral maps (PSD).
 
-    For each case the fields kappaxx, p and U are transformed into
-    PSD maps that are displayed side by side. Navigation across all
-    simulation cases is handled by util.util_plots.
+    Each case is visualised by transforming the fields listed in
+    `ALL_KEYS` into log-scaled 2D PSD maps using FFT. A separate subplot
+    is shown for each field, including an individual colourbar.
 
-    Args:
-        df (pd.DataFrame): Simulation dataset.
-        dataset_name (str): Name used in figure titles.
+    Navigation across cases is handled by the generic util_plot navigator.
 
-    Returns:
-        widgets.VBox: Interactive spectral viewer.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Simulation dataset. Must contain:
+        - the fields defined in ALL_KEYS
+        - spatial coordinates "x" and "y" for computing dx, dy
+    dataset_name : str
+        Name used in the subplot title (typically the batch name).
+
+    Returns
+    -------
+    widgets.VBox
+        Fully interactive spectral viewer with next/previous navigation.
 
     """
     df = df.reset_index(drop=True)
 
-    def _plot_single_2d_spectrum(
-        ax: Axes,
-        label: str,
-        field: np.ndarray,
-        dx: float,
-        dy: float,
-        _: int,
-    ) -> None:
-        """
-        Plot a single two-dimensional PSD map.
+    def plot_case(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
+        """Plot a multi-field 2D PSD overview for a single simulation case."""
+        row = df.iloc[idx]
 
-        The PSD is displayed as a log-scaled colour plot with axes
-        corresponding to wavenumbers in x and y direction.
+        fields = {key: np.asarray(row[key], float) for key in ALL_KEYS}
 
-        Args:
-            ax (Axes): Axes object to draw into.
-            label (str): Name of the field.
-            field (np.ndarray): Scalar field values.
-            dx (float): Grid spacing in the x direction.
-            dy (float): Grid spacing in the y direction.
-            j (int): Subplot index.
+        x = np.asarray(row["x"])
+        y = np.asarray(row["y"])
+        dx = float(np.nanmedian(np.abs(np.diff(x, axis=1))))
+        dy = float(np.nanmedian(np.abs(np.diff(y, axis=0))))
 
-        Returns:
-            None
+        ncols = len(fields)
+        fig, axes = plt.subplots(1, ncols, figsize=(12, 4))
+        axes = axes.ravel()
 
-        """
-        PSD, kx, ky = _fft2_psd(field, dx, dy)
-        logPSD = np.log10(PSD + 1e-20)
+        for ax, (label, field) in zip(axes, fields.items(), strict=True):
+            PSD, kx, ky = _fft2_psd(field, dx, dy)
+            logPSD = np.log10(PSD + 1e-20)
 
-        vmin, vmax = np.nanpercentile(logPSD, [2, 98])
+            vmin, vmax = np.nanpercentile(logPSD, [2, 98])
 
-        im = ax.pcolormesh(
-            kx,
-            ky,
-            logPSD,
-            cmap="inferno",
-            shading="auto",
-            vmin=vmin,
-            vmax=vmax,
-        )
+            im = ax.pcolormesh(
+                kx,
+                ky,
+                logPSD,
+                cmap="inferno",
+                shading="auto",
+                vmin=vmin,
+                vmax=vmax,
+            )
+            ax.set_title(f"{label} spectrum")
+            ax.set_xlabel("kx")
+            ax.set_ylabel("ky")
+            ax.set_aspect("equal")
+            fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
 
-        ax.set_aspect("equal")
-        ax.set_title(f"{label} spectrum")
-        ax.set_xlabel("kx")
-        ax.set_ylabel("ky")
-
-        fig = ax.figure
-        cbar = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
-        cbar.set_label("log10 PSD")
+        fig.suptitle(f"{dataset_name} - Case {idx}", fontsize=12, y=0.98)
+        fig.tight_layout()
+        return fig
 
     return util.util_plot.make_interactive_plot(
+        n_cases=len(df),
+        plot_func=plot_case,
         df=df,
         dataset_name=dataset_name,
-        field_plotter=_plot_single_2d_spectrum,
-        fields_to_plot=ALL_KEYS,
-        title_suffix="2D spectral overview",
-        figsize=(12, 4),
     )
 
 
 # ======================================================================
-# 2) Interactive vertical spectral evolution
+# Interactive vertical spectral evolution
 # ======================================================================
 
 
 def plot_spectral_vertical(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
     """
-    Create an interactive viewer for vertical spectral evolution.
+    Build an interactive viewer for vertical spectral evolution.
 
-    For each field the spectral energy is shown as a radial spectrum
-    at two vertical slices in the domain (near the bottom and the mid
-    height). This visualises vertical changes in spatial structure.
+    For each field in `ALL_KEYS`, two radial spectra are computed:
+    one from a thin slice near the bottom of the domain and one
+    from a slice near mid-height. This highlights changes in spatial
+    structure across the domain height.
 
-    Args:
-        df (pd.DataFrame): Simulation dataset.
-        dataset_name (str): Batch name used in figure titles.
+    Navigation across cases is handled by the generic util_plot navigator.
 
-    Returns:
-        widgets.VBox: Interactive spectral line viewer.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Simulation dataset. Must contain:
+        - the fields defined in ALL_KEYS
+        - spatial coordinates "x" and "y" for computing dx, dy
+    dataset_name : str
+        Name used in the subplot title (typically the batch name).
+
+    Returns
+    -------
+    widgets.VBox
+        Fully interactive viewer with per-field vertical line spectra.
 
     """
     df = df.reset_index(drop=True)
 
-    def _plot_single_vertical_spectrum(
-        ax: Axes,
-        label: str,
-        field: np.ndarray,
-        dx: float,
-        dy: float,
-        _: int,
-    ) -> None:
-        """
-        Plot vertical line spectra for a single field.
+    def plot_case(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
+        """Plot vertical (bottom/mid) radial spectra for a single case."""
+        row = df.iloc[idx]
+        fields = {key: np.asarray(row[key], float) for key in ALL_KEYS}
 
-        Two radial spectra are computed from narrow vertical slices
-        at y≈0.05 and y≈0.70 to highlight changes in spectral
-        structure across the domain height.
+        x = np.asarray(row["x"])
+        y = np.asarray(row["y"])
+        dx = float(np.nanmedian(np.abs(np.diff(x, axis=1))))
+        dy = float(np.nanmedian(np.abs(np.diff(y, axis=0))))
 
-        Args:
-            ax (Axes): Axes to draw into.
-            label (str): Field name.
-            field (np.ndarray): Two-dimensional scalar field.
-            dx (float): Grid spacing in the x direction.
-            dy (float): Grid spacing in the y direction.
-            j (int): Subplot index.
+        ncols = len(fields)
+        fig, axes = plt.subplots(1, ncols, figsize=(12, 4))
+        axes = axes.ravel()
 
-        Returns:
-            None
-
-        """
-        ny = field.shape[0]
-        y = np.linspace(0, 1, ny)
-
+        y_coords = np.linspace(0, 1, fields[ALL_KEYS[0]].shape[0])
         y_low, y_high = 0.05, 0.70
         win = 0.01
 
-        mask_low = (y >= y_low - win) & (y <= y_low + win)
-        mask_high = (y >= y_high - win) & (y <= y_high + win)
+        mask_low = (y_coords >= y_low - win) & (y_coords <= y_low + win)
+        mask_high = (y_coords >= y_high - win) & (y_coords <= y_high + win)
 
-        seg_low = np.atleast_2d(field[mask_low].mean(axis=0))
-        seg_high = np.atleast_2d(field[mask_high].mean(axis=0))
+        for ax, (label, field) in zip(axes, fields.items(), strict=True):
+            seg_low = np.atleast_2d(field[mask_low].mean(axis=0))
+            seg_high = np.atleast_2d(field[mask_high].mean(axis=0))
 
-        PSD_low, kx_low, ky_low = _fft2_psd(seg_low, dx, dy)
-        PSD_high, kx_high, ky_high = _fft2_psd(seg_high, dx, dy)
+            PSD_low, kx_low, ky_low = _fft2_psd(seg_low, dx, dy)
+            PSD_high, kx_high, ky_high = _fft2_psd(seg_high, dx, dy)
 
-        k_low, E_low = _radial_spectrum(PSD_low, kx_low, ky_low)
-        k_high, E_high = _radial_spectrum(PSD_high, kx_high, ky_high)
+            k_low, E_low = _radial_spectrum(PSD_low, kx_low, ky_low)
+            k_high, E_high = _radial_spectrum(PSD_high, kx_high, ky_high)
 
-        ax.loglog(k_low, E_low, lw=1.4, label=f"y={y_low:.2f}")
-        ax.loglog(k_high, E_high, lw=1.4, label=f"y={y_high:.2f}")
+            ax.loglog(k_low, E_low, lw=1.4, label=f"y={y_low:.2f}")
+            ax.loglog(k_high, E_high, lw=1.4, label=f"y={y_high:.2f}")
+            ax.set_title(label)
+            ax.set_xlabel("k")
+            ax.grid(True, which="both", ls=":")
+            ax.legend(fontsize=8)
 
-        ax.set_title(label)
-        ax.set_xlabel("k")
-        ax.grid(True, which="both", ls=":")
-        ax.legend(fontsize=8)
+        fig.suptitle(f"{dataset_name} - Case {idx}", fontsize=12, y=0.98)
+        fig.tight_layout()
+        return fig
 
     return util.util_plot.make_interactive_plot(
+        n_cases=len(df),
+        plot_func=plot_case,
         df=df,
         dataset_name=dataset_name,
-        field_plotter=_plot_single_vertical_spectrum,
-        fields_to_plot=ALL_KEYS,
-        title_suffix="vertical spectral lines",
-        figsize=(12, 4),
     )
