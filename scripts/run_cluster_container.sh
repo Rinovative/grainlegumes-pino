@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
+# Load WANDB key from private file
+WANDB_API_KEY=$(cat ~/wandb_key.txt)
+
 # ============================================================
 # 🚀 Run GrainLegumes_PINO Docker Container (Cluster Version)
 # ============================================================
@@ -16,7 +19,6 @@ IMAGE_NAME="grainlegumes-pino"
 #   ./scripts/run_cluster_container.sh        → detached
 #   ./scripts/run_cluster_container.sh -i     → interactive
 # ============================================================
-
 MODE="detached"
 if [[ "$1" == "-i" || "$1" == "--interactive" ]]; then
   MODE="interactive"
@@ -41,6 +43,7 @@ if [ "$MODE" == "interactive" ]; then
       --name $CONTAINER_NAME \
       --gpus all \
       --shm-size=16G \
+      -e WANDB_API_KEY="$WANDB_API_KEY" \
       -v ~/.ssh:/home/mambauser/.ssh:rw \
       -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
       -v ~/workspace/data:/home/mambauser/workspace/data:rw \
@@ -52,6 +55,7 @@ else
       --name $CONTAINER_NAME \
       --gpus all \
       --shm-size=16G \
+      -e WANDB_API_KEY="$WANDB_API_KEY" \
       -v ~/.ssh:/home/mambauser/.ssh:rw \
       -v ~/workspace/grainlegumes-pino:/home/mambauser/workspace:rw \
       -v ~/workspace/data:/home/mambauser/workspace/data:rw \

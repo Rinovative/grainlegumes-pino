@@ -221,7 +221,6 @@ def train_base(
     # ------------------------------------------------------------
     # W&B Setup
     # ------------------------------------------------------------
-    os.environ["WANDB_API_KEY"] = "REMOVED_WANDB_KEY"
     os.environ["WANDB_PROJECT"] = "grainlegumes_pino"
     os.environ["WANDB_ENTITY"] = "Rinovative-Hub"
     os.environ["WANDB_DIR"] = "model_training/training/wandb"
