@@ -4,7 +4,7 @@ Inference utilities for PINO/FNO model evaluation.
 This module provides a clean, reproducible inference pipeline.
 It reconstructs the full evaluation context without relying on
 `neuralop.training.load_training_state`. Instead, everything needed
-for inference is rebuilt manually and deterministically.
+for the inference setup is rebuilt manually and deterministically.
 
 Pipeline steps:
 
@@ -12,8 +12,8 @@ Pipeline steps:
 2. Rebuild model architecture from the configuration
 3. Load the `state_dict` (e.g., best_model_state_dict.pt)
 4. Load the dataset (`PermeabilityFlowDataset`)
-5. Recompute input/output normalisation using **all samples**
-   (mirrors your training behaviour using full_train)
+5. Recompute input/output normalisation using all samples
+   (mirrors training behaviour using full_train)
 6. Optionally subsample the dataset for OOD evaluation
 7. Build a clean evaluation DataLoader
 
@@ -51,13 +51,15 @@ def _load_config(config_path: Path) -> dict[str, Any]:
     Load the training configuration stored in `config.json`.
 
     Args:
-        config_path: Full path to config.json.
+        config_path:
+            Full path to `config.json`.
 
     Returns:
         Parsed configuration as a dictionary.
 
     Raises:
-        FileNotFoundError: If the JSON file is missing.
+        FileNotFoundError:
+            If the JSON file is missing.
 
     """
     if not config_path.exists():
@@ -80,18 +82,21 @@ def _build_model_from_config(model_cfg: dict[str, Any]) -> nn.Module:
         - "model_params": dict with ALL model hyperparameters
           (as saved by the training pipeline)
 
-    This function also fixes JSON serialization issues:
-        neuralop stores skip-connection types internally as tuples,
-        which become lists in config.json. We convert them back to strings.
+    This function also fixes JSON serialisation issues:
+    neuralop stores skip-connection types internally as tuples,
+    which become lists in `config.json`. We convert them back to
+    simple strings.
 
     Args:
-        model_cfg: The `"model"` section of config.json.
+        model_cfg:
+            The `"model"` section of `config.json`.
 
     Returns:
         The instantiated model, fully matching the training configuration.
 
     Raises:
-        NotImplementedError: On unknown model architectures.
+        NotImplementedError:
+            On unknown model architectures.
 
     """
     arch = model_cfg["architecture"]
@@ -101,13 +106,12 @@ def _build_model_from_config(model_cfg: dict[str, Any]) -> nn.Module:
         msg = f"Unknown architecture: {arch}"
         raise NotImplementedError(msg)
 
-    # --- Fix JSON → tuple → list serialization for skip types ----------------
+    # Fix JSON → list serialisation for skip types
     for key in ["channel_mlp_skip", "fno_skip"]:
         val = params.get(key)
         if isinstance(val, list) and len(val) == 1:
-            params[key] = val[0]  # convert ["soft-gating"] → "soft-gating"
+            params[key] = val[0]
 
-    # --- Instantiate model with full parameter set ---------------------------
     return FNO(**params)
 
 
@@ -120,11 +124,21 @@ def _build_normalizer_from_dataset(
     """
     Recompute input/output normalisation using all dataset samples.
 
-    Mirrors the training behaviour where global mean/std are computed
-    over the full in-distribution dataset.
+    This mirrors the training behavior, where mean and standard deviation
+    are computed over the entire in-distribution dataset
+    (before train/test split).
+
+    Expected structure of samples (per __getitem__):
+        {
+            "x": Tensor [C_in, H, W],
+            "y": Tensor [C_out, H, W],
+            ... (optional more Keys, e.g. "meta")
+        }
 
     Args:
-        dataset: Instance of PermeabilityFlowDataset.
+        dataset:
+            Instance of `PermeabilityFlowDataset` (merged `.pt` or
+            `cases/` directory).
 
     Returns:
         DefaultDataProcessor with fitted input/output normalizers.
@@ -135,11 +149,15 @@ def _build_normalizer_from_dataset(
 
     for idx in range(len(dataset)):
         sample = dataset[idx]
-        xs.append(sample["x"])
-        ys.append(sample["y"])
+        x = sample["x"]
+        y = sample["y"]
 
-    x_tensor = torch.stack(xs, dim=0)
-    y_tensor = torch.stack(ys, dim=0)
+        # Erwartet 3D-Tensoren [C, H, W]; das Stapeln erzeugt [N, C, H, W].
+        xs.append(x)
+        ys.append(y)
+
+    x_tensor = torch.stack(xs, dim=0)  # [N, C_in, H, W]
+    y_tensor = torch.stack(ys, dim=0)  # [N, C_out, H, W]
 
     in_norm = UnitGaussianNormalizer(dim=[0, 2, 3])
     out_norm = UnitGaussianNormalizer(dim=[0, 2, 3])
@@ -163,13 +181,15 @@ def _build_eval_loader(
     """
     Build a pure evaluation DataLoader.
 
-    - No shuffling
-    - No multiprocessing
-    - Deterministic
-
+    Properties:
+        - No shuffling
+        - No multiprocessing workers
+        - Deterministic behavior
     Args:
-        dataset: The dataset instance.
-        batch_size: Batch size for inference.
+        dataset:
+            Dataset instance for evaluation.
+        batch_size:
+            Batch size for inference.
 
     Returns:
         Configured evaluation DataLoader.
@@ -207,45 +227,54 @@ def load_inference_context(
         )
 
     Args:
-        dataset_path: Path to the `.pt` dataset (ID or OOD dataset).
-        checkpoint_path: Path to the saved `state_dict` (e.g. best_model_state_dict.pt).
-                         A `config.json` must exist in the same directory.
-        batch_size: Evaluation batch size. Default = 1.
-        ood_fraction: Fraction of samples to keep (for OOD testing).
-                      Default = 1.0 → use all samples.
-        prefer_cuda: If True, move model & processor to GPU when available.
+        dataset_path:
+            Path to the dataset (merged `.pt` or `cases/` directory).
+        checkpoint_path:
+            Path to the saved `state_dict` (e.g. `best_model_state_dict.pt`).
+            A `config.json` must be located in the same directory.
+        batch_size:
+            Evaluation batch size. Default is 1.
+        ood_fraction:
+            Fraction of samples to use (e.g. for OOD subsampling).
+            Default = 1.0 → all samples.
+        prefer_cuda:
+            If True, model and processor are moved to GPU if available.
 
     Returns:
-        model: Loaded and device-ready FNO model
-        loader: Evaluation DataLoader
-        processor: Reconstructed normalisation
-        device: torch.device used
+        model:
+            Loaded, device-ready FNO model.
+        loader:
+            Evaluation DataLoader.
+        processor:
+            Reconstructed normalization processor.
+        device:
+            Used `torch.device`.
 
     """
     dataset_path = Path(dataset_path)
     checkpoint_path = Path(checkpoint_path)
 
-    # 1) Load config
+    # 1) Load training configuration
     cfg = _load_config(checkpoint_path.parent / "config.json")
     model_cfg = cfg["model"]
 
-    # 2) Load dataset
+    # 2) Load dataset (merged .pt or cases directory)
     full_dataset = PermeabilityFlowDataset(str(dataset_path))
 
-    # 3) Recompute normalisation
+    # 3) Recompute normalisation on all samples
     data_processor = _build_normalizer_from_dataset(full_dataset)
 
-    # 4) Rebuild model + load weights
+    # 4) Rebuild model and load weights
     model = _build_model_from_config(model_cfg)
     state_dict = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(state_dict)
 
-    # 5) Device
+    # 5) Select device
     device = torch.device("cuda") if prefer_cuda and torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
     data_processor = data_processor.to(device)
 
-    # 6) Optional OOD subsampling
+    # 6) Optional OOD-style subsampling (Index-basiert, damit Reihenfolge erhalten bleibt)
     if ood_fraction < 1.0:
         n_total = len(full_dataset)
         n_keep = max(1, int(ood_fraction * n_total))
@@ -256,7 +285,7 @@ def load_inference_context(
     else:
         dataset_eval = cast("Dataset[dict[str, Tensor]]", full_dataset)
 
-    # 7) Evaluation DataLoader
+    # 7) Build evaluation DataLoader
     loader = _build_eval_loader(dataset_eval, batch_size=batch_size)
 
     return model, loader, data_processor, device

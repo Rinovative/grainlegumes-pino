@@ -1,3 +1,3 @@
-from . import analysis_artifacts, analysis_interference  # noqa: D104
+from . import analysis_artifacts, analysis_interference, evaluation  # noqa: D104
 
-__all__ = ["analysis_artifacts", "analysis_interference"]
+__all__ = ["analysis_artifacts", "analysis_interference", "evaluation"]
