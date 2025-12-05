@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
-from IPython.display import clear_output, display
+from IPython.display import display
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -69,7 +69,7 @@ def make_case_navigator(
 
     def _render(case_idx: int) -> None:
         with out:
-            clear_output(wait=True)
+            out.clear_output(wait=True)
             fig = plot_func(case_idx, **plot_kwargs)
             display(fig)
             plt.close(fig)

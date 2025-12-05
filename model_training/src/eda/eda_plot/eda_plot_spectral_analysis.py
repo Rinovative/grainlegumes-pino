@@ -198,7 +198,7 @@ def plot_spectral_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
             ax.set_aspect("equal")
             fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
 
-        fig.suptitle(f"{dataset_name} - Case {idx}", fontsize=12, y=0.98)
+        fig.suptitle(f"2D spectral maps: {dataset_name} - Case {idx}", fontsize=12, y=0.98)
         fig.tight_layout()
         return fig
 
@@ -281,7 +281,7 @@ def plot_spectral_vertical(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
             ax.grid(True, which="both", ls=":")
             ax.legend(fontsize=8)
 
-        fig.suptitle(f"{dataset_name} - Case {idx}", fontsize=12, y=0.98)
+        fig.suptitle(f"Vertical spectral profiles: {dataset_name} - Case {idx}", fontsize=12, y=0.98)
         fig.tight_layout()
         return fig
 

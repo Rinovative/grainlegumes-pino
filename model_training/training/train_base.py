@@ -146,7 +146,7 @@ def build_wandb_config(
 # ================================================================
 # 🚀 Main Training Pipeline
 # ================================================================
-def train_base(
+def train_base(  # noqa: PLR0915
     CONFIG: dict[str, Any],
     model: Any,
     optimizer: Any,
@@ -261,6 +261,11 @@ def train_base(
     )
 
     data_processor = data_processor.to(device)
+
+    # Save normalizer for inference
+    normalizer_path = save_dir / "normalizer.pt"
+    torch.save(data_processor.state_dict(), normalizer_path)
+    print(f"Saved normalizer to {normalizer_path}")
 
     # ------------------------------------------------------------
     # Trainer Setup
