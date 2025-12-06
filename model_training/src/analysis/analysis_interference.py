@@ -1,27 +1,30 @@
 """
 Inference utilities for PINO/FNO model evaluation.
 
-This module provides a clean, reproducible inference pipeline.
-It reconstructs the full evaluation context without relying on
-`neuralop.training.load_training_state`. Instead, everything needed
-for the inference setup is rebuilt manually and deterministically.
+This module reconstructs a full evaluation environment that mirrors the
+training setup exactly. It avoids relying on `neuralop.training.load_training_state`
+and instead rebuilds every required component deterministically.
 
-Pipeline steps:
+The evaluation pipeline performs the following steps:
 
-1. Load `config.json` from the run directory
-2. Rebuild model architecture from the configuration
-3. Load the `state_dict` (e.g., best_model_state_dict.pt)
-4. Load the dataset (`PermeabilityFlowDataset`)
-5. Recompute input/output normalisation using all samples
-   (mirrors training behaviour using full_train)
-6. Optionally subsample the dataset for OOD evaluation
-7. Build a clean evaluation DataLoader
+1. Load `config.json` from the run directory.
+2. Rebuild the model architecture using stored hyperparameters.
+3. Load model weights (`best_model_state_dict.pt`).
+4. Load the training normaliser (`normalizer.pt`), including automatic
+   support for both flat and nested state formats.
+5. Load the simulation dataset for evaluation.
+6. Build a deterministic DataLoader for inference.
 
-The function `load_inference_context()` returns:
+The main entry point is:
 
-    model, loader, processor, device
+    load_inference_context(...)
 
-Ready to run inference, evaluation, sensitivity analysis, etc.
+which returns:
+
+    (model, loader, processor, device)
+
+Ensuring the evaluation preprocessing and postprocessing match the training phase
+bit-for-bit guarantees reproducibility and consistent metrics.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from neuralop.data.transforms.data_processors import DefaultDataProcessor
 from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from neuralop.models import FNO
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 from src.dataset.dataset_simulation import PermeabilityFlowDataset
 
@@ -43,23 +46,27 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
-# -----------------------------------------------------------------------------#
-# Config loading                                                               #
-# -----------------------------------------------------------------------------#
+# =============================================================================
+# 1) CONFIG LOADING
+# =============================================================================
 def _load_config(config_path: Path) -> dict[str, Any]:
     """
-    Load the training configuration stored in `config.json`.
+    Load and parse a `config.json` file.
 
-    Args:
-        config_path:
-            Full path to `config.json`.
+    Parameters
+    ----------
+    config_path : Path
+        Path to the JSON configuration file produced during training.
 
-    Returns:
-        Parsed configuration as a dictionary.
+    Returns
+    -------
+    dict
+        Parsed configuration dictionary.
 
-    Raises:
-        FileNotFoundError:
-            If the JSON file is missing.
+    Raises
+    ------
+    FileNotFoundError
+        If the config file does not exist.
 
     """
     if not config_path.exists():
@@ -70,43 +77,40 @@ def _load_config(config_path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
-# -----------------------------------------------------------------------------#
-# Model reconstruction                                                         #
-# -----------------------------------------------------------------------------#
+# =============================================================================
+# 2) MODEL RECONSTRUCTION
+# =============================================================================
 def _build_model_from_config(model_cfg: dict[str, Any]) -> nn.Module:
     """
-    Rebuild the model architecture exactly as it was during training.
+    Reconstruct an FNO model from the stored hyperparameters.
 
-    The config contains:
-        - "architecture": e.g. "FNO"
-        - "model_params": dict with ALL model hyperparameters
-          (as saved by the training pipeline)
+    Parameters
+    ----------
+    model_cfg : dict
+        Dictionary under the key `"model"` from `config.json`.
+        Must contain:
+        - `"architecture"` (str)
+        - `"model_params"` (dict)
 
-    This function also fixes JSON serialisation issues:
-    neuralop stores skip-connection types internally as tuples,
-    which become lists in `config.json`. We convert them back to
-    simple strings.
+    Returns
+    -------
+    nn.Module
+        Instantiated FNO model configured identically to the training run.
 
-    Args:
-        model_cfg:
-            The `"model"` section of `config.json`.
-
-    Returns:
-        The instantiated model, fully matching the training configuration.
-
-    Raises:
-        NotImplementedError:
-            On unknown model architectures.
+    Raises
+    ------
+    NotImplementedError
+        If an unsupported architecture is requested.
 
     """
     arch = model_cfg["architecture"]
-    params = dict(model_cfg["model_params"])  # safe copy
+    params = dict(model_cfg["model_params"])
 
     if arch != "FNO":
         msg = f"Unknown architecture: {arch}"
         raise NotImplementedError(msg)
 
-    # Fix JSON → list serialisation for skip types
+    # Convert JSON-serialized single-element lists to scalars
     for key in ["channel_mlp_skip", "fno_skip"]:
         val = params.get(key)
         if isinstance(val, list) and len(val) == 1:
@@ -115,84 +119,99 @@ def _build_model_from_config(model_cfg: dict[str, Any]) -> nn.Module:
     return FNO(**params)
 
 
-# -----------------------------------------------------------------------------#
-# Normalisation reconstruction                                                 #
-# -----------------------------------------------------------------------------#
-def _build_normalizer_from_dataset(
-    dataset: PermeabilityFlowDataset,
-) -> DefaultDataProcessor:
+# =============================================================================
+# 3) NORMALIZER LOADING
+# =============================================================================
+def _load_normalizer(normalizer_path: Path, *, device: torch.device) -> DefaultDataProcessor:
     """
-    Recompute input/output normalisation using all dataset samples.
+    Load the training normaliser stored in `normalizer.pt` (flat NeuralOp format).
 
-    This mirrors the training behavior, where mean and standard deviation
-    are computed over the entire in-distribution dataset
-    (before train/test split).
+    The saved file contains exactly four tensors:
+        - in_normalizer.mean
+        - in_normalizer.std
+        - out_normalizer.mean
+        - out_normalizer.std
 
-    Expected structure of samples (per __getitem__):
-        {
-            "x": Tensor [C_in, H, W],
-            "y": Tensor [C_out, H, W],
-            ... (optional more Keys, e.g. "meta")
-        }
+    These tensors are manually assigned to a freshly constructed
+    `DefaultDataProcessor`, ensuring the shapes and downstream
+    NeuralOp expectations match the training setup.
 
-    Args:
-        dataset:
-            Instance of `PermeabilityFlowDataset` (merged `.pt` or
-            `cases/` directory).
+    All tensors are moved onto `device` so that preprocessing during
+    inference does not cause device-mismatch errors.
 
-    Returns:
-        DefaultDataProcessor with fitted input/output normalizers.
+    Parameters
+    ----------
+    normalizer_path : Path
+        Path to the `normalizer.pt` file.
+    device : torch.device
+        Device onto which the normaliser should be moved.
+
+    Returns
+    -------
+    DefaultDataProcessor
+        Fully reconstructed normalisation processor ready for inference.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    RuntimeError
+        If required keys are missing.
 
     """
-    xs: list[Tensor] = []
-    ys: list[Tensor] = []
+    if not normalizer_path.exists():
+        msg = f"Normalizer file not found: {normalizer_path}"
+        raise FileNotFoundError(msg)
 
-    for idx in range(len(dataset)):
-        sample = dataset[idx]
-        x = sample["x"]
-        y = sample["y"]
+    # Load raw saved tensors from training (all CPU tensors)
+    state = torch.load(normalizer_path, map_location="cpu")
 
-        # Erwartet 3D-Tensoren [C, H, W]; das Stapeln erzeugt [N, C, H, W].
-        xs.append(x)
-        ys.append(y)
+    expected_keys = {
+        "in_normalizer.mean",
+        "in_normalizer.std",
+        "out_normalizer.mean",
+        "out_normalizer.std",
+    }
+    if not expected_keys.issubset(state.keys()):
+        msg = f"Missing expected normalizer keys.\nExpected: {sorted(expected_keys)}\nFound: {sorted(state.keys())}"
+        raise RuntimeError(msg)
 
-    x_tensor = torch.stack(xs, dim=0)  # [N, C_in, H, W]
-    y_tensor = torch.stack(ys, dim=0)  # [N, C_out, H, W]
-
-    in_norm = UnitGaussianNormalizer(dim=[0, 2, 3])
-    out_norm = UnitGaussianNormalizer(dim=[0, 2, 3])
-
-    in_norm.fit(x_tensor)
-    out_norm.fit(y_tensor)
-
-    return DefaultDataProcessor(
-        in_normalizer=in_norm,
-        out_normalizer=out_norm,
+    # Create empty processor with correct structure
+    processor = DefaultDataProcessor(
+        in_normalizer=UnitGaussianNormalizer(dim=[0, 2, 3]),
+        out_normalizer=UnitGaussianNormalizer(dim=[0, 2, 3]),
     )
 
+    # Assign loaded tensors AND move them to device
+    processor.in_normalizer.mean = state["in_normalizer.mean"].to(device)  # pyright: ignore[reportOptionalMemberAccess]
+    processor.in_normalizer.std = state["in_normalizer.std"].to(device)  # pyright: ignore[reportOptionalMemberAccess]
+    processor.out_normalizer.mean = state["out_normalizer.mean"].to(device)  # pyright: ignore[reportOptionalMemberAccess]
+    processor.out_normalizer.std = state["out_normalizer.std"].to(device)  # pyright: ignore[reportOptionalMemberAccess]
 
-# -----------------------------------------------------------------------------#
-# Evaluation DataLoader                                                        #
-# -----------------------------------------------------------------------------#
-def _build_eval_loader(
-    dataset: Dataset[Any],
-    batch_size: int,
-) -> DataLoader:
+    # Make sure the processor itself tracks the device
+    processor.device = device
+
+    return processor
+
+
+# =============================================================================
+# 4) EVALUATION DATALOADER
+# =============================================================================
+def _build_eval_loader(dataset: Dataset[Any], batch_size: int) -> DataLoader:
     """
-    Build a pure evaluation DataLoader.
+    Create a deterministic DataLoader for evaluation.
 
-    Properties:
-        - No shuffling
-        - No multiprocessing workers
-        - Deterministic behavior
-    Args:
-        dataset:
-            Dataset instance for evaluation.
-        batch_size:
-            Batch size for inference.
+    Parameters
+    ----------
+    dataset : Dataset
+        Dataset containing simulation cases.
+    batch_size : int
+        Number of samples per batch during evaluation.
 
-    Returns:
-        Configured evaluation DataLoader.
+    Returns
+    -------
+    DataLoader
+        DataLoader with no shuffling and single-worker loading.
 
     """
     return DataLoader(
@@ -204,88 +223,76 @@ def _build_eval_loader(
     )
 
 
-# -----------------------------------------------------------------------------#
-# Public API                                                                   #
-# -----------------------------------------------------------------------------#
+# =============================================================================
+# 5) PUBLIC INFERENCE ENTRY POINT
+# =============================================================================
 def load_inference_context(
     *,
     dataset_path: str | Path,
     checkpoint_path: str | Path,
     batch_size: int = 1,
-    ood_fraction: float = 1.0,
     prefer_cuda: bool = True,
 ) -> tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]:
     """
-    Build the complete inference context for FNO/PINO evaluation.
+    Rebuild the complete inference context for a trained FNO/PINO model.
 
-    Typical usage:
-        model, loader, processor, device = load_inference_context(
-            dataset_path=dataset_pt_path,
-            checkpoint_path=checkpoint_path,
-            batch_size=1,
-            ood_fraction=1.0,
-        )
+    This includes model reconstruction, normalizer loading, dataset creation,
+    and DataLoader initialisation. All components are guaranteed to match the
+    training setup.
 
-    Args:
-        dataset_path:
-            Path to the dataset (merged `.pt` or `cases/` directory).
-        checkpoint_path:
-            Path to the saved `state_dict` (e.g. `best_model_state_dict.pt`).
-            A `config.json` must be located in the same directory.
-        batch_size:
-            Evaluation batch size. Default is 1.
-        ood_fraction:
-            Fraction of samples to use (e.g. for OOD subsampling).
-            Default = 1.0 → all samples.
-        prefer_cuda:
-            If True, model and processor are moved to GPU if available.
+    Parameters
+    ----------
+    dataset_path : str or Path
+        Path to the evaluation dataset directory (`cases/`).
+    checkpoint_path : str or Path
+        Path to the `best_model_state_dict.pt` file.
+        The directory must also contain:
+            - `config.json`
+            - `normalizer.pt`
+    batch_size : int, optional
+        Evaluation batch size (default 1).
+    prefer_cuda : bool, optional
+        Whether to prefer GPU if available (default True).
 
-    Returns:
-        model:
-            Loaded, device-ready FNO model.
-        loader:
-            Evaluation DataLoader.
-        processor:
-            Reconstructed normalization processor.
-        device:
-            Used `torch.device`.
+    Returns
+    -------
+    tuple
+        (model, loader, processor, device)
+        where:
+            model     : nn.Module, moved to correct device
+            loader    : evaluation DataLoader
+            processor : DefaultDataProcessor with loaded normalizer
+            device    : torch.device used for inference
+
+    Raises
+    ------
+    FileNotFoundError
+        If any required file is missing.
 
     """
     dataset_path = Path(dataset_path)
     checkpoint_path = Path(checkpoint_path)
+    run_dir = checkpoint_path.parent
 
-    # 1) Load training configuration
-    cfg = _load_config(checkpoint_path.parent / "config.json")
+    # Select evaluation device
+    device = torch.device("cuda") if prefer_cuda and torch.cuda.is_available() else torch.device("cpu")
+
+    # Load configuration
+    cfg = _load_config(run_dir / "config.json")
     model_cfg = cfg["model"]
 
-    # 2) Load dataset (merged .pt or cases directory)
+    # Load dataset and DataLoader
     full_dataset = PermeabilityFlowDataset(str(dataset_path))
-
-    # 3) Recompute normalisation on all samples
-    data_processor = _build_normalizer_from_dataset(full_dataset)
-
-    # 4) Rebuild model and load weights
-    model = _build_model_from_config(model_cfg)
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
-
-    # 5) Select device
-    device = torch.device("cuda") if prefer_cuda and torch.cuda.is_available() else torch.device("cpu")
-    model = model.to(device)
-    data_processor = data_processor.to(device)
-
-    # 6) Optional OOD-style subsampling (Index-basiert, damit Reihenfolge erhalten bleibt)
-    if ood_fraction < 1.0:
-        n_total = len(full_dataset)
-        n_keep = max(1, int(ood_fraction * n_total))
-        indices: list[int] = torch.randperm(n_total).tolist()[:n_keep]
-
-        base_ds = cast("Dataset[dict[str, Tensor]]", full_dataset)
-        dataset_eval: Dataset[dict[str, Tensor]] = Subset(base_ds, indices)
-    else:
-        dataset_eval = cast("Dataset[dict[str, Tensor]]", full_dataset)
-
-    # 7) Build evaluation DataLoader
+    dataset_eval = cast("Dataset[dict[str, Tensor]]", full_dataset)
     loader = _build_eval_loader(dataset_eval, batch_size=batch_size)
 
-    return model, loader, data_processor, device
+    # Load training normalizer
+    processor = _load_normalizer(run_dir / "normalizer.pt", device=device)
+
+    # Load model and weights
+    model = _build_model_from_config(model_cfg)
+    state = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(state)
+    model = model.to(device)
+
+    return model, loader, processor, device

@@ -1,177 +1,197 @@
 """
-Stable evaluation viewer WITH a colorbar at every subplot.
+Interactive 4x3 PINO/FNO evaluation viewer with fully independent scales.
 
-Designed for VS Code Notebook stability:
-- No constrained_layout
-- No plt.show()
-- AGG backend
-- One Output widget
-- Per-subplot colorbars (fast + safe)
+Each subplot (prediction, ground truth, absolute error) receives:
+    • its own colormap
+    • its own contour value levels
+    • quantile-based level spacing for smooth interpretation
+
+This avoids shared scaling between pred and true and makes qualitative
+differences deutlich erkennbar.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
-from IPython.display import clear_output, display
 
-# ==============================================================================
-# NPZ LOADING
-# ==============================================================================
+from src import util
+
+if TYPE_CHECKING:
+    import ipywidgets as widgets
+    import pandas as pd
+    from matplotlib.figure import Figure
 
 
-def _load_npz(row, debug: bool = False):
+# =============================================================================
+# NPZ CACHE
+# =============================================================================
+
+_npz_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+
+def _load_npz(row: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load pred/gt/err arrays from NPZ.
+    Load prediction, ground truth and error for a single case (cached).
 
     Parameters
     ----------
-    row : pandas.Series with 'npz_path'
-    debug : bool
+    row : pandas.Series
+        Single row with "npz_path" field.
 
     Returns
     -------
-    pred, gt, err : np.ndarray
+    tuple of np.ndarray
+        (pred, gt, err) each with shape (4, H, W)
 
     """
-    npz_path = Path(row["npz_path"])
-    if debug:
-        print(f"[DEBUG] Load NPZ: {npz_path}")
+    key = str(Path(row["npz_path"]))
 
-    if not npz_path.exists():
-        raise FileNotFoundError(npz_path)
+    if key in _npz_cache:
+        return _npz_cache[key]
 
-    data = np.load(npz_path, allow_pickle=True)
-    return data["pred"][0], data["gt"][0], data["err"][0]
+    data = np.load(key, allow_pickle=True)
+    pred = data["pred_plog"][0]
+    gt = data["gt_plog"][0]
+    err = data["err_plog"][0]
 
-
-# ==============================================================================
-# FIGURE DRAWING (WITH COLORBARS)
-# ==============================================================================
+    _npz_cache[key] = (pred, gt, err)
+    return pred, gt, err
 
 
-def _draw_case(df, idx: int, dataset_name: str, debug: bool = False):
+# =============================================================================
+# LEVEL COMPUTATION
+# =============================================================================
+
+
+_MIN_LEVEL_COUNT = 2
+
+
+def compute_levels(arr: np.ndarray, n: int = 12) -> np.ndarray:
     """
-    Draw a 4×3 grid: pred / gt / abs(err) for channels p,u,v,U.
-
-    Each subplot gets its own colorbar.
-
-    Returns
-    -------
-    fig : matplotlib.figure.Figure
-
-    """
-    if debug:
-        print(f"[DEBUG] Drawing case {idx}")
-
-    pred, gt, err = _load_npz(df.iloc[idx], debug=debug)
-
-    # No constrained_layout → stable
-    fig, axes = plt.subplots(
-        nrows=4,
-        ncols=3,
-        figsize=(13, 10),
-        constrained_layout=False,
-    )
-
-    fig.suptitle(f"{dataset_name} – Case {idx}", fontsize=12, y=0.98)
-
-    channels = ["p", "u", "v", "U"]
-    cmap_pred = "viridis"
-    cmap_gt = "viridis"
-    cmap_err = "coolwarm"
-
-    for i, label in enumerate(channels):
-        # Pred
-        ax = axes[i, 0]
-        im = ax.imshow(pred[i], cmap=cmap_pred)
-        ax.set_title(f"{label} pred", fontsize=8)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig.colorbar(im, ax=ax, fraction=0.032, pad=0.01)
-
-        # GT
-        ax = axes[i, 1]
-        im = ax.imshow(gt[i], cmap=cmap_gt)
-        ax.set_title(f"{label} true", fontsize=8)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig.colorbar(im, ax=ax, fraction=0.032, pad=0.01)
-
-        # Error
-        ax = axes[i, 2]
-        im = ax.imshow(np.abs(err[i]), cmap=cmap_err)
-        ax.set_title(f"{label} abs(err)", fontsize=8)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig.colorbar(im, ax=ax, fraction=0.032, pad=0.01)
-
-    return fig
-
-
-# ==============================================================================
-# PUBLIC WIDGET VIEWER
-# ==============================================================================
-
-
-def plot_sample_prediction_overview(
-    df,
-    dataset_name: str = "",
-    debug: bool = False,
-) -> widgets.VBox:
-    """
-    Robust evaluation viewer (Prev/Next) with colorbars at every subplot.
+    Compute contour levels based on quantiles of the input array.
 
     Parameters
     ----------
-    df : pandas.DataFrame with 'npz_path'
+    arr : np.ndarray
+        Input array from which to compute levels.
+    n : int, optional
+        Number of desired levels, by default 12.
+
+    Returns
+    -------
+    np.ndarray
+        Array of contour levels.
+
+    """
+    levels = np.round(np.quantile(arr, np.linspace(0, 1, n)), 2)
+    levels = np.unique(levels)
+
+    # Fallback falls kaum Variabilitaet vorhanden ist
+    if len(levels) < _MIN_LEVEL_COUNT:
+        vmin, vmax = float(arr.min()), float(arr.max())
+        if vmin == vmax:
+            vmin -= 1e-3
+            vmax += 1e-3
+        levels = np.linspace(vmin, vmax, n)
+
+    # Sicherheit: strictly increasing
+    if not np.all(np.diff(levels) > 0):
+        levels = np.linspace(levels[0], levels[-1], n)
+
+    return levels
+
+
+# =============================================================================
+# MAIN VIEWER
+# =============================================================================
+
+
+def plot_sample_prediction_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
+    """
+    Interactive multi-case viewer for PINO/FNO predictions (4x3 grid).
+
+    Rows  : p, u, v, U
+    Cols  : prediction | ground truth | absolute error
+
+    Every subplot receives:
+        • its own contour levels (quantile-based)
+        • its own color scale
+        • its own colorbar
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must contain column "npz_path" with artifact file paths.
+
     dataset_name : str
-    debug : bool
+        Name shown in viewer title.
 
     Returns
     -------
-    VBox : fully interactive viewer
+    widgets.VBox
+        Interactive next/previous widget and plot.
 
     """
-    n_cases = len(df)
+    df = df.reset_index(drop=True)
+    channels = ["p", "u", "v", "U"]
 
-    # Widgets
-    idx = widgets.BoundedIntText(
-        value=0,
-        min=0,
-        max=n_cases - 1,
-        description="Case:",
-        layout=widgets.Layout(width="140px"),
-    )
-    prev_btn = widgets.Button(description="← Prev", layout=widgets.Layout(width="70px"))
-    next_btn = widgets.Button(description="Next →", layout=widgets.Layout(width="70px"))
-    out = widgets.Output()
+    # Colormaps (pred & true consistent, error separate)
+    cmap_pred_true = "viridis"
+    cmap_error = "Blues"
 
-    # Rendering function
-    def _render(case_idx: int):
-        with out:
-            clear_output(wait=True)
-            fig = _draw_case(df, case_idx, dataset_name, debug=debug)
-            display(fig)
-            plt.close(fig)
+    n_levels = 12
 
-    # Buttons
-    def _step(delta: int):
-        idx.value = max(0, min(n_cases - 1, idx.value + delta))
+    def plot_case(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
+        """Render a 4x3 grid for a single selected case."""
+        row = df.iloc[idx]
+        pred, gt, err = _load_npz(row)
 
-    idx.observe(lambda e: _render(e["new"]), names="value")
-    prev_btn.on_click(lambda _: _step(-1))
-    next_btn.on_click(lambda _: _step(1))
+        fig, axes = plt.subplots(nrows=4, ncols=3, figsize=(15, 11))
 
-    # First figure
-    _render(0)
+        for i, label in enumerate(channels):
+            # ------------------------------
+            # Prediction
+            # ------------------------------
+            pred_levels = compute_levels(pred[i], n_levels)
 
-    return widgets.VBox(
-        [
-            widgets.HBox([idx, prev_btn, next_btn]),
-            out,
-        ]
+            ax = axes[i, 0]
+            im = ax.contourf(pred[i], levels=pred_levels, cmap=cmap_pred_true)
+            ax.set_title(f"{label} pred")
+            fig.colorbar(im, ax=ax, fraction=0.04)
+
+            # ------------------------------
+            # Ground truth
+            # ------------------------------
+            true_levels = compute_levels(gt[i], n_levels)
+
+            ax = axes[i, 1]
+            im = ax.contourf(gt[i], levels=true_levels, cmap=cmap_pred_true)
+            ax.set_title(f"{label} true")
+            fig.colorbar(im, ax=ax, fraction=0.04)
+
+            # ------------------------------
+            # Absolute error
+            # ------------------------------
+            err_abs = np.abs(err[i])
+            err_levels = compute_levels(err_abs, n_levels)
+
+            ax = axes[i, 2]
+            im = ax.contourf(err_abs, levels=err_levels, cmap=cmap_error)
+            ax.set_title(f"{label} abs(err)")
+            fig.colorbar(im, ax=ax, fraction=0.04)
+
+        fig.suptitle(f"{dataset_name} - Case {idx + 1}", fontsize=13)
+        fig.tight_layout()
+        return fig
+
+    # interactive viewer
+    return util.util_plot.make_interactive_plot(
+        n_cases=len(df),
+        plot_func=plot_case,
+        df=df,
+        dataset_name=dataset_name,
     )
