@@ -35,85 +35,81 @@ jobs:
         shell: bash -l {0}
         run: |
           python - << 'EOF'
-          import json, subprocess
-          from statistics import mean
-          from collections import defaultdict
+          import json
+          import subprocess
 
-          # format helper: ints → int, floats → rounded to 2 decimals
-          def fmt(v):
-              v = float(v)
-              if v.is_integer():
-                  return str(int(v))
-              return f"{v:.2f}"
+          def fmt(v: float) -> str:
+              """Format: integers without decimals, everything else 2 decimals."""
+              return str(int(v)) if float(v).is_integer() else f"{v:.2f}"
 
-          # global grade helper
-          def grade_for(c):
-              if c <= 5: return "A"
-              if c <= 10: return "B"
-              if c <= 20: return "C"
-              if c <= 30: return "D"
-              if c <= 40: return "E"
-              return "F"
+          # -----------------------------
+          # Run radon
+          # -----------------------------
+          proc = subprocess.run(
+              ["radon", "cc", "-j", "."],
+              capture_output=True,
+              text=True
+          )
+          data = json.loads(proc.stdout)
 
-          # run radon
-          result = subprocess.run(["radon", "cc", "-j", "."], capture_output=True, text=True)
-          data = json.loads(result.stdout)
+          # Mapping for sort order
+          rank_sort = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
 
-          all_blocks = [b for blocks in data.values() for b in blocks]
-          avg_c = mean(b["complexity"] for b in all_blocks) if all_blocks else 0.0
-          global_grade = grade_for(avg_c)
+          # Collect global stats
+          blocks_all = [b for file in data for b in data[file]]
+          total_files = sum(1 for f in data if data[f])
+          avg = sum(b["complexity"] for b in blocks_all) / len(blocks_all) if blocks_all else 0
 
-          # collect worst per file
-          rows = []
+          # -----------------------------
+          # Per-file complexity
+          # -----------------------------
+          file_rows = []
           for file, blocks in data.items():
               if not blocks:
                   continue
               worst = max(blocks, key=lambda b: b["complexity"])
-              rows.append((worst["rank"], worst["complexity"], file, blocks))
+              file_rows.append((file, worst["rank"], worst["complexity"], blocks))
 
-          rows.sort(key=lambda x: x[1], reverse=True)
+          file_rows.sort(key=lambda x: (rank_sort[x[1]], -x[2]))
 
-          grade_order = ["F","E","D","C","B","A"]
-          groups = defaultdict(list)
-          for r, c, file, blocks in rows:
-              groups[r].append((r, c, file, blocks))
-
-          # ====================== SUMMARY ============================
+          # ==========================================================
+          # TABLE 1: SUMMARY
+          # ==========================================================
           print("=================== COMPLEXITY SUMMARY ===================")
-          print(f"Total files analysed: {len(rows)}")
-          print(f"Global complexity:     {global_grade} ({avg_c:.2f})")
-          print("==========================================================")
-          print()
+          print(f"Total files analysed: {total_files}")
+          print(f"Global complexity:     {worst['rank']} ({fmt(avg)})")
+          print("==========================================================\n")
 
-          # ====================== PER FILE TABLE ====================
+          # ==========================================================
+          # TABLE 2: PER FILE
+          # ==========================================================
           print("=================== COMPLEXITY PER FILE ===================")
           print("Grade  CC          File")
           print("==============================================================")
 
-          first = True
-          for grade in grade_order:
-              if grade not in groups:
-                  continue
-              if not first:
+          last_rank = None
+          for file, rank, cc, _ in file_rows:
+              if last_rank is not None and rank != last_rank:
                   print("-------------------------------------------------------------------------------")
-              first = False
-              for r, c, file, blocks in groups[grade]:
-                  print(f"{r:6} {fmt(c):10} {file}")
+              print(f"{rank:<6} {fmt(cc):<10} {file}")
+              last_rank = rank
 
-          print("==============================================================")
-          print()
+          print("==============================================================\n")
 
-          # ====================== FUNCTION BREAKDOWN TABLE ==========
+          # ==========================================================
+          # TABLE 3: FUNCTION BREAKDOWN
+          # ==========================================================
           print("=================== FUNCTION BREAKDOWN ===================")
           print("Item                                         Grade(CC)")
           print("============================================================")
 
-          for r, c, file, blocks in rows:
+          for file, rank, cc, blocks in file_rows:
               print("------------------------------------------------------------")
               print(file)
-              sorted_blocks = sorted(blocks, key=lambda x: x["complexity"], reverse=True)
-              for b in sorted_blocks:
-                  print(f"  {b['name']:40} {b['rank']}({fmt(b['complexity'])})")
+              blocks_sorted = sorted(blocks, key=lambda b: b["complexity"], reverse=True)
+              for b in blocks_sorted:
+                  cc_fmt = fmt(b["complexity"])
+                  print(f"  {b['name']:<40} {b['rank']}({cc_fmt})")
 
           print("============================================================")
           EOF
