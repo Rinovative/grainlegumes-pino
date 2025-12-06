@@ -1,12 +1,33 @@
 """
-============================================================
+===============================================================================
 
- merge_batch_cases.py.
-============================================================
+ merge_batch_cases.
+===============================================================================
 Author:  Rino M. Albertin
 Date:    2025-10-28
 Project: GrainLegumes_PINO_project
-============================================================
+
+DESCRIPTION
+-----------
+Merges all individual case_XXXX.pt files of a simulation batch into a single
+training dataset file for PINO/FNO.
+
+Each case file contains:
+    - input_fields:  x, y, kappa* (already transformed in build_batch_dataset)
+    - output_fields: p, u, v, U
+    - meta:          simulation metadata
+
+This script:
+    1. Loads all case_XXXX.pt files.
+    2. Selects the desired input and output channels.
+    3. Stacks them into tensors of shape:
+           inputs:  (N, C_in,  ny, nx)
+           outputs: (N, C_out, ny, nx)
+    4. Saves a single <batch_name>.pt dataset for model_training.
+    5. Copies meta.pt into the dataset folder if available.
+
+No additional transformations (such as log10) are applied here.
+===============================================================================
 """  # noqa: INP001
 
 import shutil
@@ -17,13 +38,33 @@ import torch
 from tqdm import tqdm
 
 
-def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
+def merge_batch_cases(  # noqa: C901, PLR0915
     batch_name: str,
     keep_input_fields: list[str] | None = None,
     keep_output_fields: list[str] | None = None,
     verbose: bool = False,
 ) -> dict:
-    """Merge all case_XXXX.pt files of a batch into one dataset for PINO training and copies meta.pt."""
+    """
+    Merge all individual case_XXXX.pt files of a batch into one dataset for PINO/FNO training.
+
+    Parameters
+    ----------
+    batch_name : str
+        Name of the simulation batch.
+    keep_input_fields : list[str] or None
+        Input fields to keep. If None, defaults to all permeability components
+        plus x and y coordinates.
+    keep_output_fields : list[str] or None
+        Output fields to keep. If None, defaults to velocity and pressure fields.
+    verbose : bool
+        If True, prints structure information for the first case.
+
+    Returns
+    -------
+    dict
+        Summary information including dataset path and shapes.
+
+    """
     if keep_input_fields is None:
         keep_input_fields = [
             "x",
@@ -68,6 +109,7 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
     # -------------------- preview first case structure --------------------
     first_case_path = case_files[0]
     first_case = torch.load(first_case_path, map_location="cpu", weights_only=False)
+
     input_fields_first = {k: v for k, v in first_case["input_fields"].items() if k in keep_input_fields}
     output_fields_first = {k: v for k, v in first_case["output_fields"].items() if k in keep_output_fields}
 
@@ -88,7 +130,12 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
     inputs_list = []
     outputs_list = []
 
-    pbar = tqdm(total=len(case_files), desc=f"Merging {batch_name}", unit="file", disable=not verbose)
+    pbar = tqdm(
+        total=len(case_files),
+        desc=f"Merging {batch_name}",
+        unit="file",
+        disable=not verbose,
+    )
 
     for case_path in case_files:
         data_case = torch.load(case_path, map_location="cpu", weights_only=False)
@@ -99,6 +146,7 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
         if input_fields:
             input_stack = np.stack([input_fields[k] for k in input_fields], axis=0)
             inputs_list.append(torch.tensor(input_stack, dtype=torch.float32))
+
         if output_fields:
             output_stack = np.stack([output_fields[k] for k in output_fields], axis=0)
             outputs_list.append(torch.tensor(output_stack, dtype=torch.float32))
@@ -107,10 +155,8 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
 
     pbar.close()
 
-    # Wenn gar keine Daten mehr übrig sind
     if not inputs_list or not outputs_list:
         log.append(f"[WARNING] No valid tensors created from {cases_dir}")
-        print(log[-1])
         return {
             "batch_name": batch_name,
             "n_cases": 0,
@@ -123,17 +169,6 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
 
     inputs_tensor = torch.stack(inputs_list, dim=0)
     outputs_tensor = torch.stack(outputs_list, dim=0)
-
-    # --- Log-transform permeability channels ---
-    eps = 1e-12
-    actual_input_fields = [f for f in keep_input_fields if f in input_fields_first]
-    kappa_channels = [i for i, name in enumerate(actual_input_fields) if name.startswith("kappa")]
-
-    if kappa_channels:
-        inputs_tensor[:, kappa_channels, :, :] = torch.log10(inputs_tensor[:, kappa_channels, :, :] + eps)
-        log.append(f"Applied log10 transform to channels: {[actual_input_fields[i] for i in kappa_channels]}")
-    else:
-        log.append("No permeability channels found for log10 transform.")
 
     log.append(f"Inputs shape: {tuple(inputs_tensor.shape)}")
     log.append(f"Outputs shape: {tuple(outputs_tensor.shape)}")
@@ -151,10 +186,10 @@ def merge_batch_cases(  # noqa: C901, PLR0912, PLR0915
             "outputs": final_output_fields,
         },
     }
+
     torch.save(batch_dataset, dst_data_path)
     log.append(f"Saved dataset: {dst_data_path}")
 
-    # Copy meta file
     meta_copied = False
     if src_meta.exists():
         shutil.copy2(src_meta, dst_meta_path)

@@ -1,40 +1,35 @@
 """
-============================================================
+===============================================================================
 
- build_batch_dataset.py.
-============================================================
+ build_batch_dataset.
+===============================================================================
 Author:  Rino M. Albertin
 Date:    2025-10-28
 Project: GrainLegumes_PINO_project
 
 DESCRIPTION
 -----------
-Converts a full COMSOL simulation batch into structured PyTorch `.pt` files.
-Each case combines numerical results (`.csv`) with metadata (`.json`)
-and is saved as an individual `.pt` file containing:
-    - input_fields  (x, y, permeability tensors)
-    - output_fields (pressure and velocity)
-    - meta          (batch generation parameters)
-A batch-level `meta.pt` file is also generated.
+Reads raw COMSOL simulation outputs and converts them into structured PyTorch
+`.pt` case files for PINO/FNO training and evaluation.
 
-DIRECTORY STRUCTURE
--------------------
-Input:
-    data_generation/data/processed/<batch_name>/case_XXXX_sol.csv
-    data_generation/data/raw/<batch_name>/case_XXXX.json
-    data_generation/data/meta/<batch_name>.json / <batch_name>.csv
-Output:
+Each case file contains:
+    - input_fields:   x, y, kappa* tensors (kappa already log10-transformed)
+    - output_fields:  p, u, v, U
+    - meta:           simulation metadata
+
+Directory structure created:
+
     data/raw/<batch_name>/
-        ├── cases/        (individual .pt files)
-        └── meta.pt       (batch metadata)
-============================================================
+        ├── cases/       (case_XXXX.pt)
+        └── meta.pt      (optional batch metadata)
+===============================================================================
 """  # noqa: INP001
 
 import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np  # --- added
+import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
@@ -42,24 +37,23 @@ from tqdm import tqdm
 
 def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa: C901, PLR0912, PLR0915
     """
-    Build structured .pt case files and a batch-level meta.pt file.
+    Convert one COMSOL batch into structured `.pt` case files.
 
     Parameters
     ----------
     batch_name : str
         Name of the simulation batch.
-    verbose : bool, optional
-        If True, displays a structure preview and tqdm progress bar.
+    verbose : bool
+        If True, print additional information.
 
     Returns
     -------
     dict
-        Summary information including output paths and log messages.
+        Summary information for logging.
 
     """
     log = []
 
-    # ----------------------------- paths -----------------------------
     proj_root = Path(__file__).resolve().parents[2]
     gen_data_dir = proj_root / "data_generation" / "data"
 
@@ -74,7 +68,6 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
 
     log.append(f"Processing batch: {batch_name}")
 
-    # ----------------------- matching json/csv -----------------------
     json_files = sorted(raw_dir.glob("case_*.json"))
     csv_files = sorted(proc_dir.glob("case_*_sol.csv"))
 
@@ -83,30 +76,29 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
     common = sorted(json_names.intersection(csv_names))
 
     if not common:
-        msg = f"No matching case_XXXX.json / case_XXXX_sol.csv found in {batch_name}"
+        msg = f"No valid matching cases found for {batch_name}"
         raise RuntimeError(msg)
 
-    log.append(f"Found {len(common)} matching case pairs.")
+    log.append(f"Found {len(common)} matching cases.")
 
-    # -------------------------- helper --------------------------
-    def load_case(csv_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[Any, Any]]:
+    def load_case(csv_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         with meta_path.open() as f:
             meta_full = json.load(f)
+
         meta = {k: v for k, v in meta_full.items() if k != "parameters"}
         if "parameters" in meta_full:
             meta["parameters"] = {k: v for k, v in meta_full["parameters"].items() if k != "rng_state"}
 
-        # Read header
         with csv_path.open() as f:
             lines = f.readlines()
+
         header_line = [line for line in lines if line.strip().startswith("%")][-1]
         raw_header = [h.strip() for h in header_line[1:].split(",")]
 
         if raw_header.count("y") > 1:
-            second_y_index = [i for i, h in enumerate(raw_header) if h == "y"][1]
-            raw_header[second_y_index] = "y_on"
+            idx = [i for i, h in enumerate(raw_header) if h == "y"][1]
+            raw_header[idx] = "y_on"
 
-        # Let pandas handle duplicates automatically
         df = pd.read_csv(
             csv_path,
             comment="%",
@@ -117,101 +109,101 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
 
         return df, meta
 
-    # -------------------- load first case for preview --------------------
-    first_case = common[0]
-    csv_path = proc_dir / f"{first_case}_sol.csv"
-    meta_path = raw_dir / f"{first_case}.json"
-    df, meta = load_case(csv_path, meta_path)
-    nx, ny = meta["geometry"]["nx"], meta["geometry"]["ny"]
+    first = common[0]
+    df_first, meta_first = load_case(proc_dir / f"{first}_sol.csv", raw_dir / f"{first}.json")
+    nx, ny = meta_first["geometry"]["nx"], meta_first["geometry"]["ny"]
 
-    dropped_input_fields, dropped_output_fields = [], []
+    dropped_input = []
+    dropped_output = []
 
-    for c in [c for c in df.columns if c.startswith("br.kappa")]:
-        arr = df[c].to_numpy().reshape(ny, nx)
+    for c in [c for c in df_first.columns if c.startswith("br.kappa")]:
+        arr = df_first[c].to_numpy().reshape(ny, nx)
         if not np.any(arr):
-            dropped_input_fields.append(c.replace("br.", ""))
+            dropped_input.append(c.replace("br.", ""))
 
     for key in ["p", "u", "v", "br.U"]:
-        if key in df.columns:
-            arr = df[key].to_numpy().reshape(ny, nx)
+        if key in df_first.columns:
+            arr = df_first[key].to_numpy().reshape(ny, nx)
             if not np.any(arr):
-                dropped_output_fields.append(key.replace("br.", ""))
+                dropped_output.append(key.replace("br.", ""))
 
-    if verbose and (dropped_input_fields or dropped_output_fields):
-        print("\n[INFO] Constant-zero fields detected and excluded:")
-        if dropped_input_fields:
-            print(f"  Inputs:  {', '.join(dropped_input_fields)}")
-        if dropped_output_fields:
-            print(f"  Outputs: {', '.join(dropped_output_fields)}")
-        print("--------------------------------------------------")
+    input_fields_preview = {}
+    output_fields_preview = {}
 
-    input_fields = {}
-    if "x" in df.columns and "y" in df.columns:
-        input_fields["x"] = df["x"].to_numpy().reshape(ny, nx)
-        input_fields["y"] = df["y"].to_numpy().reshape(ny, nx)
-    for c in [c for c in df.columns if c.startswith("br.kappa")]:
-        clean = c.replace("br.", "")
-        if clean in dropped_input_fields:
+    if "x" in df_first.columns and "y" in df_first.columns:
+        input_fields_preview["x"] = df_first["x"].to_numpy().reshape(ny, nx)
+        input_fields_preview["y"] = df_first["y"].to_numpy().reshape(ny, nx)
+
+    eps = 1e-12
+    for col in [c for c in df_first.columns if c.startswith("br.kappa")]:
+        clean = col.replace("br.", "")
+        if clean in dropped_input:
             continue
-        input_fields[clean] = df[c].to_numpy().reshape(ny, nx)
+        raw = df_first[col].to_numpy().reshape(ny, nx)
+        input_fields_preview[clean] = np.log10(raw + eps)
 
-    output_fields = {}
     for key in ["p", "u", "v", "br.U"]:
         clean = key.replace("br.", "")
-        if key in df.columns and clean not in dropped_output_fields:
-            arr = df[key].to_numpy().reshape(ny, nx)
-            output_fields[clean] = arr
+        if key in df_first.columns and clean not in dropped_output:
+            output_fields_preview[clean] = df_first[key].to_numpy().reshape(ny, nx)
 
     if verbose:
         print("\nExample structure for first case:")
         print("--------------------------------------------------")
         print("input_fields:")
-        for k, v in input_fields.items():
+        for k, v in input_fields_preview.items():
             print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")
         print("output_fields:")
-        for k, v in output_fields.items():
+        for k, v in output_fields_preview.items():
             print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")
-        print("meta keys:", list(meta.keys()))
+        print("meta keys:", list(meta_first.keys()))
         print("--------------------------------------------------\n")
 
-    # -------------------------- main loop --------------------------
-    pbar = tqdm(total=len(common), desc=f"Building {batch_name}", unit="file", disable=not verbose)
+    pbar = tqdm(
+        total=len(common),
+        desc=f"Building {batch_name}",
+        unit="file",
+        disable=not verbose,
+    )
 
     for name in common:
         csv_path = proc_dir / f"{name}_sol.csv"
         meta_path = raw_dir / f"{name}.json"
+
         df, meta = load_case(csv_path, meta_path)
         nx, ny = meta["geometry"]["nx"], meta["geometry"]["ny"]
 
-        input_fields = {}
+        input_fields: dict[str, np.ndarray] = {}
+        output_fields: dict[str, np.ndarray] = {}
+
         if "x" in df.columns and "y" in df.columns:
             input_fields["x"] = df["x"].to_numpy().reshape(ny, nx)
             input_fields["y"] = df["y"].to_numpy().reshape(ny, nx)
-        for c in [c for c in df.columns if c.startswith("br.kappa")]:
-            clean = c.replace("br.", "")
-            if clean in dropped_input_fields:
-                continue
-            input_fields[clean] = df[c].to_numpy().reshape(ny, nx)
 
-        output_fields = {}
+        eps = 1e-12
+        for col in [c for c in df.columns if c.startswith("br.kappa")]:
+            clean = col.replace("br.", "")
+            if clean in dropped_input:
+                continue
+            raw = df[col].to_numpy().reshape(ny, nx)
+            input_fields[clean] = np.log10(raw + eps)
+
         for key in ["p", "u", "v", "br.U"]:
             clean = key.replace("br.", "")
-            if key not in df.columns or clean in dropped_output_fields:
-                continue
-            arr = df[key].to_numpy().reshape(ny, nx)
-            output_fields[clean] = arr
+            if key in df.columns and clean not in dropped_output:
+                output_fields[clean] = df[key].to_numpy().reshape(ny, nx)
 
         data_case = {
             "input_fields": input_fields,
             "output_fields": output_fields,
             "meta": meta,
         }
+
         torch.save(data_case, cases_dir / f"{name}.pt")
         pbar.update(1)
 
     pbar.close()
 
-    # ---------------------------- meta ----------------------------
     meta_json_path = meta_dir / f"{batch_name}.json"
     meta_csv_path = meta_dir / f"{batch_name}.csv"
     meta_saved = False
@@ -223,7 +215,7 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
         meta_struct = {"json": meta_json, "csv": meta_csv.to_dict(orient="list")}
         torch.save(meta_struct, out_batch / "meta.pt")
         meta_saved = True
-        log.append("Meta file saved.")
+        log.append("Saved meta.pt")
     else:
         log.append("No meta files found.")
 

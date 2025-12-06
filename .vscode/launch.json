@@ -5,7 +5,7 @@
             "name": "Run current file (auto local/cluster)",
             "type": "node-terminal",
             "request": "launch",
-            "command": "bash ${workspaceFolder}/scripts/run_auto.sh ${file}"
+            "command": "bash ${workspaceFolder}/scripts/container_run_auto.sh ${file}"
         }
     ]
 }
