@@ -35,12 +35,12 @@ jobs:
         shell: bash -l {0}
         run: |
           python - << 'EOF'
-          import json
-          import subprocess
+          import json, subprocess
           from statistics import mean
+          from collections import defaultdict
 
           # ----------------------------------------------------------
-          # Run radon in JSON mode
+          # Run radon
           # ----------------------------------------------------------
           result = subprocess.run(
               ["radon", "cc", "-j", "."],
@@ -50,50 +50,83 @@ jobs:
           data = json.loads(result.stdout)
 
           # ----------------------------------------------------------
-          # Collect global statistics
+          # Collect global blocks
           # ----------------------------------------------------------
           all_blocks = [b for blocks in data.values() for b in blocks]
-          avg_complexity = mean(b["complexity"] for b in all_blocks) if all_blocks else 0
-          total_files = len([f for f in data.keys() if data[f]])
 
-          # Rank mapping for sorting
-          rank_value = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
+          avg = mean(b["complexity"] for b in all_blocks) if all_blocks else 0.0
+
+          # radon-style grade mapping
+          def grade_from_complexity(c):
+              if c <= 5: return "A"
+              if c <= 10: return "B"
+              if c <= 20: return "C"
+              if c <= 30: return "D"
+              if c <= 40: return "E"
+              return "F"
+
+          global_grade = grade_from_complexity(avg)
 
           # ----------------------------------------------------------
-          # Per-file worst complexity
+          # Worst-per-file summary
           # ----------------------------------------------------------
-          file_rows = []
+          rows = []
           for file, blocks in data.items():
               if not blocks:
                   continue
               worst = max(blocks, key=lambda b: b["complexity"])
-              file_rows.append((file, worst["rank"], worst["complexity"], blocks))
+              rows.append((worst["rank"], worst["complexity"], file, blocks))
 
-          file_rows.sort(key=lambda x: x[2], reverse=True)
+          rows.sort(key=lambda x: x[1], reverse=True)
+
+          grade_order = ["F","E","D","C","B","A"]
+          grouped = defaultdict(list)
+          for rank, cc, file, blocks in rows:
+              grouped[rank].append((rank, cc, file, blocks))
 
           # ----------------------------------------------------------
           # GLOBAL SUMMARY
           # ----------------------------------------------------------
-          print("\n=== 📊 COMPLEXITY SUMMARY (GLOBAL) ===\n")
-          print(f"Total files analysed: {total_files}")
-          print(f"Average complexity: {avg_complexity:.2f}\n")
+          print("\n=================== COMPLEXITY SUMMARY ===================\n")
+          print(f"Total files analysed: {len(rows)}")
+          print(f"Global complexity:     {global_grade} ({avg})\n")
+          print("==========================================================\n")
 
           # ----------------------------------------------------------
-          # FILE SUMMARY
+          # COMPLEXITY PER FILE
           # ----------------------------------------------------------
-          print("=== 📁 Complexity Per File ===\n")
-          for file, rank, cc, blocks in file_rows:
-              print(f"{file:65} {rank} ({cc})")
+          print("=================== COMPLEXITY PER FILE ===================\n")
+          print(f"{'Grade':6} {'CC':10} File")
+          print("==============================================================\n")
+
+          first_group = True
+          for grade in grade_order:
+              if grade not in grouped:
+                  continue
+
+              if not first_group:
+                  print("-------------------------------------------------------------------------------")
+              first_group = False
+
+              for rank, cc, file, blocks in grouped[grade]:
+                  print(f"{rank:6} {cc:<10} {file}")
+              print("")
+
+          print("==============================================================\n")
 
           # ----------------------------------------------------------
           # FUNCTION BREAKDOWN
           # ----------------------------------------------------------
-          print("\n=== 🔍 Function Breakdown ===\n")
-          for file, rank, cc, blocks in file_rows:
-              print(f"\n--- {file} ---")
-              sorted_blocks = sorted(blocks, key=lambda b: b["complexity"], reverse=True)
-              for b in sorted_blocks:
-                  print(f"  {b['name']:40} {b['rank']} ({b['complexity']})")
+          print("=================== FUNCTION BREAKDOWN ===================\n")
 
-          print("\n=== Done ===")
+          for grade in grade_order:
+              if grade not in grouped:
+                  continue
+              for rank, cc, file, blocks in grouped[grade]:
+                  print(f"------------------- {file} -------------------")
+                  for b in sorted(blocks, key=lambda x: x["complexity"], reverse=True):
+                      print(f"  {b['name']:40} {b['rank']} ({b['complexity']})")
+                  print("")
+
+          print("============================================================\n")
           EOF
