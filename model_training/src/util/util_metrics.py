@@ -14,7 +14,7 @@ All functions operate on NumPy arrays.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import numpy as np
 import torch
@@ -24,7 +24,7 @@ from torch import nn
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-NumberArray = NDArray[np.float64]
+NumberArray: TypeAlias = NDArray[np.float64]
 
 
 # ============================================================================

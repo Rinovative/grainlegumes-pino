@@ -34,5 +34,66 @@ jobs:
       - name: Complexity Analysis
         shell: bash -l {0}
         run: |
-          radon cc -s -a . || true
-          complexipy . || true
+          python - << 'EOF'
+          import json
+          import subprocess
+          from statistics import mean
+
+          # ----------------------------------------------------------
+          # Run radon in JSON mode
+          # ----------------------------------------------------------
+          result = subprocess.run(
+              ["radon", "cc", "-j", "."],
+              capture_output=True,
+              text=True
+          )
+          data = json.loads(result.stdout)
+
+          # ----------------------------------------------------------
+          # Collect global statistics
+          # ----------------------------------------------------------
+          all_blocks = [b for blocks in data.values() for b in blocks]
+          avg_complexity = mean(b["complexity"] for b in all_blocks) if all_blocks else 0
+          total_files = len([f for f in data.keys() if data[f]])
+
+          # Rank mapping for sorting
+          rank_value = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
+
+          # ----------------------------------------------------------
+          # Per-file worst complexity
+          # ----------------------------------------------------------
+          file_rows = []
+          for file, blocks in data.items():
+              if not blocks:
+                  continue
+              worst = max(blocks, key=lambda b: b["complexity"])
+              file_rows.append((file, worst["rank"], worst["complexity"], blocks))
+
+          file_rows.sort(key=lambda x: x[2], reverse=True)
+
+          # ----------------------------------------------------------
+          # GLOBAL SUMMARY
+          # ----------------------------------------------------------
+          print("\n=== 📊 COMPLEXITY SUMMARY (GLOBAL) ===\n")
+          print(f"Total files analysed: {total_files}")
+          print(f"Average complexity: {avg_complexity:.2f}\n")
+
+          # ----------------------------------------------------------
+          # FILE SUMMARY
+          # ----------------------------------------------------------
+          print("=== 📁 Complexity Per File ===\n")
+          for file, rank, cc, blocks in file_rows:
+              print(f"{file:65} {rank} ({cc})")
+
+          # ----------------------------------------------------------
+          # FUNCTION BREAKDOWN
+          # ----------------------------------------------------------
+          print("\n=== 🔍 Function Breakdown ===\n")
+          for file, rank, cc, blocks in file_rows:
+              print(f"\n--- {file} ---")
+              sorted_blocks = sorted(blocks, key=lambda b: b["complexity"], reverse=True)
+              for b in sorted_blocks:
+                  print(f"  {b['name']:40} {b['rank']} ({b['complexity']})")
+
+          print("\n=== Done ===")
+          EOF
