@@ -39,25 +39,15 @@ jobs:
           from statistics import mean
           from collections import defaultdict
 
-          # ----------------------------------------------------------
-          # Run radon
-          # ----------------------------------------------------------
-          result = subprocess.run(
-              ["radon", "cc", "-j", "."],
-              capture_output=True,
-              text=True
-          )
-          data = json.loads(result.stdout)
+          # format helper: ints → int, floats → rounded to 2 decimals
+          def fmt(v):
+              v = float(v)
+              if v.is_integer():
+                  return str(int(v))
+              return f"{v:.2f}"
 
-          # ----------------------------------------------------------
-          # Collect global blocks
-          # ----------------------------------------------------------
-          all_blocks = [b for blocks in data.values() for b in blocks]
-
-          avg = mean(b["complexity"] for b in all_blocks) if all_blocks else 0.0
-
-          # radon-style grade mapping
-          def grade_from_complexity(c):
+          # global grade helper
+          def grade_for(c):
               if c <= 5: return "A"
               if c <= 10: return "B"
               if c <= 20: return "C"
@@ -65,11 +55,15 @@ jobs:
               if c <= 40: return "E"
               return "F"
 
-          global_grade = grade_from_complexity(avg)
+          # run radon
+          result = subprocess.run(["radon", "cc", "-j", "."], capture_output=True, text=True)
+          data = json.loads(result.stdout)
 
-          # ----------------------------------------------------------
-          # Worst-per-file summary
-          # ----------------------------------------------------------
+          all_blocks = [b for blocks in data.values() for b in blocks]
+          avg_c = mean(b["complexity"] for b in all_blocks) if all_blocks else 0.0
+          global_grade = grade_for(avg_c)
+
+          # collect worst per file
           rows = []
           for file, blocks in data.items():
               if not blocks:
@@ -80,53 +74,46 @@ jobs:
           rows.sort(key=lambda x: x[1], reverse=True)
 
           grade_order = ["F","E","D","C","B","A"]
-          grouped = defaultdict(list)
-          for rank, cc, file, blocks in rows:
-              grouped[rank].append((rank, cc, file, blocks))
+          groups = defaultdict(list)
+          for r, c, file, blocks in rows:
+              groups[r].append((r, c, file, blocks))
 
-          # ----------------------------------------------------------
-          # GLOBAL SUMMARY
-          # ----------------------------------------------------------
-          print("\n=================== COMPLEXITY SUMMARY ===================\n")
+          # ====================== SUMMARY ============================
+          print("=================== COMPLEXITY SUMMARY ===================")
           print(f"Total files analysed: {len(rows)}")
-          print(f"Global complexity:     {global_grade} ({avg})\n")
-          print("==========================================================\n")
+          print(f"Global complexity:     {global_grade} ({avg_c:.2f})")
+          print("==========================================================")
+          print()
 
-          # ----------------------------------------------------------
-          # COMPLEXITY PER FILE
-          # ----------------------------------------------------------
-          print("=================== COMPLEXITY PER FILE ===================\n")
-          print(f"{'Grade':6} {'CC':10} File")
-          print("==============================================================\n")
+          # ====================== PER FILE TABLE ====================
+          print("=================== COMPLEXITY PER FILE ===================")
+          print("Grade  CC          File")
+          print("==============================================================")
 
-          first_group = True
+          first = True
           for grade in grade_order:
-              if grade not in grouped:
+              if grade not in groups:
                   continue
-
-              if not first_group:
+              if not first:
                   print("-------------------------------------------------------------------------------")
-              first_group = False
+              first = False
+              for r, c, file, blocks in groups[grade]:
+                  print(f"{r:6} {fmt(c):10} {file}")
 
-              for rank, cc, file, blocks in grouped[grade]:
-                  print(f"{rank:6} {cc:<10} {file}")
-              print("")
+          print("==============================================================")
+          print()
 
-          print("==============================================================\n")
+          # ====================== FUNCTION BREAKDOWN TABLE ==========
+          print("=================== FUNCTION BREAKDOWN ===================")
+          print("Item                                         Grade(CC)")
+          print("============================================================")
 
-          # ----------------------------------------------------------
-          # FUNCTION BREAKDOWN
-          # ----------------------------------------------------------
-          print("=================== FUNCTION BREAKDOWN ===================\n")
+          for r, c, file, blocks in rows:
+              print("------------------------------------------------------------")
+              print(file)
+              sorted_blocks = sorted(blocks, key=lambda x: x["complexity"], reverse=True)
+              for b in sorted_blocks:
+                  print(f"  {b['name']:40} {b['rank']}({fmt(b['complexity'])})")
 
-          for grade in grade_order:
-              if grade not in grouped:
-                  continue
-              for rank, cc, file, blocks in grouped[grade]:
-                  print(f"------------------- {file} -------------------")
-                  for b in sorted(blocks, key=lambda x: x["complexity"], reverse=True):
-                      print(f"  {b['name']:40} {b['rank']} ({b['complexity']})")
-                  print("")
-
-          print("============================================================\n")
+          print("============================================================")
           EOF
