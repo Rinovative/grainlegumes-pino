@@ -57,9 +57,9 @@ def make_case_navigator(
 
     """
     idx = widgets.BoundedIntText(
-        value=start_idx,
-        min=0,
-        max=n_cases - 1,
+        value=start_idx + 1,
+        min=1,
+        max=n_cases,
         description="Case:",
         layout=widgets.Layout(width="140px"),
     )
@@ -75,9 +75,9 @@ def make_case_navigator(
             plt.close(fig)
 
     def _step(delta: int) -> None:
-        idx.value = max(0, min(n_cases - 1, idx.value + delta))
+        idx.value = max(1, min(n_cases, idx.value + delta))
 
-    idx.observe(lambda c: _render(c["new"]), names="value")
+    idx.observe(lambda c: _render(c["new"] - 1), names="value")
     prev_btn.on_click(lambda _: _step(-1))
     next_btn.on_click(lambda _: _step(1))
 
