@@ -1,13 +1,26 @@
 """
-Create persistent evaluation artifacts for PINO/FNO models.
+Create persistent evaluation artifacts for PINO and FNO models.
 
-Generated artifacts:
-    - One Parquet file per dataset (global statistics)
-    - One NPZ file per case (prediction, ground truth, error, meta)
+This module runs deterministic inference on a dataset and stores reusable
+artifacts for downstream analysis and visualisation. For each dataset,
+a Parquet summary file is created, and for each case an individual NPZ
+file is written containing prediction fields, ground truth, errors and
+metadata.
+
+Artifacts
+---------
+- Parquet summary file with global per-case metrics
+- One NPZ file per case containing:
+  * pred_plog : model prediction in physical space
+  * gt_plog   : ground truth in physical space
+  * err_plog  : prediction error in physical space
+  * meta      : JSON-safe metadata
+  * l2_plog, rel_l2_plog
 
 Notes
 -----
-NN outputs are fields [p, u, v, U].
+Neural network outputs are expected to contain the physical fields
+[p, u, v, U].
 
 """
 
@@ -44,22 +57,23 @@ NUMPY_FLOAT_TYPES = (
 )
 
 
-def meta_to_jsonable(obj: Any) -> Any:  # noqa: C901, PLR0911
-    """Recursively convert tensors, numpy values and arrays into JSON-safe Python objects."""
+def meta_to_jsonable(obj: Any) -> Any:  # noqa: PLR0911
+    """
+    Recursively convert numpy/tensor values into JSON-safe Python types.
+
+    Args:
+        obj (Any): Arbitrary metadata value.
+
+    Returns:
+        Any: Object converted to JSON-serializable form.
+
+    """
     if isinstance(obj, torch.Tensor):
         arr = obj.detach().cpu().numpy()
-        if arr.ndim == 0:
-            return float(arr)
-        if arr.ndim == 1 and arr.size == 1:
-            return float(arr[0])
-        return arr.tolist()
+        return float(arr) if arr.ndim == 0 else arr.tolist()
 
     if isinstance(obj, np.ndarray):
-        if obj.ndim == 0:
-            return float(obj)
-        if obj.ndim == 1 and obj.size == 1:
-            return float(obj[0])
-        return obj.tolist()
+        return float(obj) if obj.ndim == 0 else obj.tolist()
 
     if isinstance(obj, NUMPY_INT_TYPES):  # pyright: ignore[reportArgumentType]
         return int(obj)
@@ -91,51 +105,70 @@ def generate_artifacts(
     dataset_name: str,
 ) -> tuple[pd.DataFrame, Path]:
     """
-    Run inference on all cases and store reusable artifacts.
+    Run inference on all cases and generate persistent evaluation artifacts.
 
-    The physical prediction is obtained as:
-        y_hat = processor.out_normalizer.inverse_transform(y_hat_norm)
+    The following operations are performed for each case:
+        1. Load input fields and metadata.
+        2. Apply training-consistent normalisation.
+        3. Run forward inference.
+        4. Denormalise prediction into physical space.
+        5. Compute error fields and L2 metrics.
+        6. Store a NPZ file containing prediction, ground truth, error and metadata.
 
-    `postprocess` from DefaultDataProcessor is NOT used here because it
-    merges dicts and causes type confusion when metadata contains strings.
+    A Parquet summary file is generated containing per-case metrics and
+    NPZ file paths.
 
-    Stored per-case fields:
-        - pred_plog  : denormalised prediction (physical space)
-        - gt_plog    : ground truth
-        - err_plog   : absolute error (physical space)
-        - meta       : JSON-safe case metadata
-        - l2_plog / rel_l2_plog
+    Args:
+        model (Any): Trained PINO or FNO model in evaluation mode.
+        loader (DataLoader): Deterministic evaluation DataLoader.
+        processor (Any): NeuralOp normalisation processor.
+        device (torch.device): Device used for inference.
+        save_root (str | Path): Root directory for storing artifacts.
+        dataset_name (str): Name used for the Parquet summary file.
+
+    Returns:
+        tuple:
+            df (pd.DataFrame): Summary dataframe of all cases.
+            parquet_path (Path): Output path to the Parquet summary file.
+
     """
     model.eval()
+
     save_root = Path(save_root)
     npz_dir = save_root / "npz"
     npz_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = []
+    # Normaliser tensors already on correct device
+    in_mean = processor.in_normalizer.mean.to(device)
+    in_std = processor.in_normalizer.std.to(device)
+    out_mean = processor.out_normalizer.mean.to(device)
+    out_std = processor.out_normalizer.std.to(device)
+
+    rows: list[dict[str, Any]] = []
 
     for idx, batch in enumerate(loader):
         case_id = idx + 1
 
-        # --- get fields ---
+        # Input / ground truth
         x = batch["x"].to(device)
         y = batch["y"].to(device)
+
+        # Metadata
         meta_raw = batch.get("meta", {})
         meta_clean = meta_to_jsonable(meta_raw)
 
-        # --- forward ---
+        # Normalisation (Z-score)
         with torch.no_grad():
-            x_norm = processor.in_normalizer.transform(x)
+            x_norm = (x - in_mean) / (in_std + 1e-12)
             y_hat_norm = model(x_norm)
+            y_hat = y_hat_norm * (out_std + 1e-12) + out_mean
 
-            # denormalisation without touching meta
-            y_hat = processor.out_normalizer.inverse_transform(y_hat_norm)
-
-        # --- errors ---
+        # Error metrics
         err = y_hat - y
         l2 = torch.linalg.norm(err).item()
         rel_l2 = l2 / (torch.linalg.norm(y).item() + 1e-12)
 
-        # --- write NPZ ---
+        # Store NPZ
         npz_path = npz_dir / f"case_{case_id:04d}.npz"
         np.savez_compressed(
             npz_path,
@@ -155,6 +188,7 @@ def generate_artifacts(
             }
         )
 
+    # Parquet summary
     df = pd.DataFrame(rows)
     parquet_path = save_root / f"{dataset_name}.parquet"
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
