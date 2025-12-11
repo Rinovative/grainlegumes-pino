@@ -210,6 +210,6 @@ def merge_batch_cases(  # noqa: C901, PLR0915
 
 
 if __name__ == "__main__":
-    result = merge_batch_cases("lhs_var20_plog100_seed9", verbose=True)
+    result = merge_batch_cases("lhs_var80_plog100_seed3001", verbose=True)
     for line in result["log"]:
         print(line)

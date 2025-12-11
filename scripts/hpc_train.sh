@@ -3,7 +3,7 @@ set -e
 
 # ============================================================================
 # hpc_train.sh
-# Queue-based training launcher for HPC using gpucommand + docker.
+# Queue-based training launcher for HPC using runTSGPU.py + docker.
 # Only the filename is required, not the full path.
 # ============================================================================
 
@@ -41,9 +41,9 @@ echo "➡️  Starting training on GPU $GPU_ID (queued automatically)"
 echo ""
 
 # ------------------------------------------------------------
-# Launch container via gpucommand
+# Launch container via runTSGPU.py
 # ------------------------------------------------------------
-gpucommand -g$GPU_ID -- docker run --rm \
+runTSGPU.py -g$GPU_ID -- docker run --rm \
     --gpus "\"device=$GPU_ID\"" \
     --shm-size=16G \
     -e WANDB_API_KEY=$(cat ~/wandb_key.txt) \

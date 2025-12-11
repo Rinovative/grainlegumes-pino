@@ -230,6 +230,6 @@ def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa
 
 
 if __name__ == "__main__":
-    result = build_batch_dataset("lhs_var20_plog100_seed9", verbose=True)
+    result = build_batch_dataset("lhs_var80_plog100_seed3001", verbose=True)
     for line in result["log"]:
         print(line)

@@ -15,8 +15,8 @@ CONFIG = {
     "seed": 9,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     # --- Dataset ---
-    "train_dataset_name": "lhs_var10_plog100_seed9",
-    "ood_dataset_name": "lhs_var20_plog100_seed9",
+    "train_dataset_name": "lhs_var40_plog100_seed2001",
+    "ood_dataset_name": "lhs_var80_plog100_seed3001",
     "train_ratio": 0.8,  # fraction of dataset used for training
     "ood_fraction": 0.2,  # fraction of OOD data for evaluation
     # --- Dataloader ---
