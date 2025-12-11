@@ -64,7 +64,7 @@ def _fft2_psd(field: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.n
             np.ndarray: Centred wavenumber grid ky.
 
     """
-    a = np.asarray(field, float)
+    a = field.astype(float, copy=True)
     a -= np.mean(a)
     a *= _hann2d(*a.shape)
 
@@ -135,7 +135,7 @@ ALL_KEYS = INPUT_KEYS + OUTPUT_KEYS
 # ======================================================================
 
 
-def plot_spectral_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
+def plot_spectral_overview(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     """
     Build an interactive viewer for 2D spectral maps (PSD).
 
@@ -147,20 +147,20 @@ def plot_spectral_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
 
     Parameters
     ----------
-    df : pandas.DataFrame
-        Simulation dataset. Must contain:
+    datasets : dict[str, pandas.DataFrame]
+        Mapping: dataset_name -> DataFrame
+        Each DataFrame must contain:
         - the fields defined in ALL_KEYS
         - spatial coordinates "x" and "y" for computing dx, dy
-    dataset_name : str
-        Name used in the subplot title (typically the batch name).
 
     Returns
     -------
     widgets.VBox
         Fully interactive spectral viewer with next/previous navigation.
 
+
     """
-    df = df.reset_index(drop=True)
+    # Navigator übernimmt Auswahl → kein df oder dataset_name direkt nötig
 
     def plot_case(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
         """Plot a multi-field 2D PSD overview for a single simulation case."""
@@ -170,8 +170,8 @@ def plot_spectral_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
 
         x = np.asarray(row["x"])
         y = np.asarray(row["y"])
-        dx = float(np.nanmedian(np.abs(np.diff(x, axis=1))))
-        dy = float(np.nanmedian(np.abs(np.diff(y, axis=0))))
+        dx = float(np.nanmedian(np.diff(np.unique(x))))
+        dy = float(np.nanmedian(np.diff(np.unique(y))))
 
         ncols = len(fields)
         fig, axes = plt.subplots(1, ncols, figsize=(12, 4))
@@ -198,15 +198,13 @@ def plot_spectral_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
             ax.set_aspect("equal")
             fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
 
-        fig.suptitle(f"2D spectral maps: {dataset_name} - Case {idx}", fontsize=12, y=0.98)
+        fig.suptitle(f"2D spectral maps: {dataset_name} - Case {idx + 1}", fontsize=12, y=0.98)
         fig.tight_layout()
         return fig
 
-    return util.util_plot.make_interactive_plot(
-        n_cases=len(df),
+    return util.util_plot.make_interactive_plot_dropdown(
         plot_func=plot_case,
-        df=df,
-        dataset_name=dataset_name,
+        datasets=datasets,
     )
 
 
@@ -215,7 +213,7 @@ def plot_spectral_overview(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
 # ======================================================================
 
 
-def plot_spectral_vertical(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
+def plot_spectral_vertical(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     """
     Build an interactive viewer for vertical spectral evolution.
 
@@ -228,12 +226,11 @@ def plot_spectral_vertical(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
 
     Parameters
     ----------
-    df : pandas.DataFrame
-        Simulation dataset. Must contain:
+    datasets : dict[str, pandas.DataFrame]
+        Mapping: dataset_name -> DataFrame
+        Each DataFrame must contain:
         - the fields defined in ALL_KEYS
         - spatial coordinates "x" and "y" for computing dx, dy
-    dataset_name : str
-        Name used in the subplot title (typically the batch name).
 
     Returns
     -------
@@ -241,17 +238,16 @@ def plot_spectral_vertical(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
         Fully interactive viewer with per-field vertical line spectra.
 
     """
-    df = df.reset_index(drop=True)
 
     def plot_case(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
         """Plot vertical (bottom/mid) radial spectra for a single case."""
         row = df.iloc[idx]
         fields = {key: np.asarray(row[key], float) for key in ALL_KEYS}
 
-        x = np.asarray(row["x"])
-        y = np.asarray(row["y"])
-        dx = float(np.nanmedian(np.abs(np.diff(x, axis=1))))
-        dy = float(np.nanmedian(np.abs(np.diff(y, axis=0))))
+        x_arr = np.asarray(row["x"])
+        y_arr = np.asarray(row["y"])
+        dx = float(np.nanmedian(np.diff(np.unique(x_arr))))
+        dy = float(np.nanmedian(np.diff(np.unique(y_arr))))
 
         ncols = len(fields)
         fig, axes = plt.subplots(1, ncols, figsize=(12, 4))
@@ -281,13 +277,11 @@ def plot_spectral_vertical(df: pd.DataFrame, dataset_name: str) -> widgets.VBox:
             ax.grid(True, which="both", ls=":")
             ax.legend(fontsize=8)
 
-        fig.suptitle(f"Vertical spectral profiles: {dataset_name} - Case {idx}", fontsize=12, y=0.98)
+        fig.suptitle(f"Vertical spectral profiles: {dataset_name} - Case {idx + 1}", fontsize=12, y=0.98)
         fig.tight_layout()
         return fig
 
-    return util.util_plot.make_interactive_plot(
-        n_cases=len(df),
+    return util.util_plot.make_interactive_plot_dropdown(
         plot_func=plot_case,
-        df=df,
-        dataset_name=dataset_name,
+        datasets=datasets,
     )
