@@ -23,11 +23,6 @@ Supported kappa aggregation logic:
     • 4 components      → (kxx + kyy) / 2
     • 9 components      → (kxx + kyy + kzz) / 3
     • fallback          → mean across all components
-
-The module supports:
-    • multiple datasets via util.util_plot.make_interactive_plot_dropdown
-    • quantile-based contour-level computation with rounding
-    • consistent physical axes across all fields
 """
 
 from __future__ import annotations
@@ -96,7 +91,7 @@ def _load_npz(row: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
 # =============================================================================
 
 
-def aggregate_kappa(kappa: np.ndarray, names: list[str]) -> np.ndarray:
+def _aggregate_kappa(kappa: np.ndarray, names: list[str]) -> np.ndarray:
     """
     Construct a scalar permeability field from arbitrary tensor components.
 
@@ -147,7 +142,7 @@ def aggregate_kappa(kappa: np.ndarray, names: list[str]) -> np.ndarray:
 _MIN_LEVEL_COUNT = 2
 
 
-def compute_levels(arr: np.ndarray, n: int = 10) -> np.ndarray:
+def _compute_levels(arr: np.ndarray, n: int = 10) -> np.ndarray:
     """
     Compute contour levels based on quantiles with rounding to two significant figures.
 
@@ -212,17 +207,25 @@ def compute_levels(arr: np.ndarray, n: int = 10) -> np.ndarray:
 # =============================================================================
 
 
-def _apply_axis_labels(ax: Axes, row: int, col: int, Lx: float, Ly: float) -> None:
+def _apply_axis_labels(
+    ax: Axes,
+    _row: int,
+    col: int,
+    Lx: float,
+    Ly: float,
+    *,
+    is_last_row: bool,
+) -> None:
     """
     Apply consistent axis labels and enforce explicit y-ticks including 0.75.
 
     Behaviour:
         - Left column: show y-axis with ticks at [0, 0.25, 0.5, 0.75]
-        - Bottom row: show x-axis normally
-        - All other axes: hide ticklabels
+        - Bottom row (dynamic): show x-axis
+        - All other axes: hide tick labels
         - Axis limits always full domain
     """
-    # Set limits
+    # ---- Limits ----
     ax.set_xlim(0, Lx)
     ax.set_ylim(0, Ly)
 
@@ -238,14 +241,14 @@ def _apply_axis_labels(ax: Axes, row: int, col: int, Lx: float, Ly: float) -> No
         ax.tick_params(axis="y", labelleft=False)
 
     # ---- X-AXIS ----
-    if row == 3:  # noqa: PLR2004
+    if is_last_row:
         ax.set_xlabel("x [m]")
         ax.tick_params(axis="x", labelbottom=True)
     else:
         ax.tick_params(axis="x", labelbottom=False)
 
 
-def choose_colorbar_formatter(vmin: float, vmax: float) -> mticker.Formatter:
+def _choose_colorbar_formatter(vmin: float, vmax: float) -> mticker.Formatter:
     """
     Choose a colorbar formatter based on value range.
 
@@ -284,8 +287,51 @@ def choose_colorbar_formatter(vmin: float, vmax: float) -> mticker.Formatter:
     return mticker.FormatStrFormatter("%.0f")
 
 
+def _overlay_streamlines(
+    ax: Axes,
+    X: np.ndarray,
+    Y: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+) -> None:
+    """
+    Overlay streamlines on a given axis.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axis to plot on.
+    X : np.ndarray
+        Meshgrid X coordinates.
+    Y : np.ndarray
+        Meshgrid Y coordinates.
+    u : np.ndarray
+        Velocity field in x-direction.
+    v : np.ndarray
+        Velocity field in y-direction.
+
+    Returns
+    -------
+    None
+        Plots streamlines directly on the provided axis.
+
+    """
+    ax.streamplot(
+        X,
+        Y,
+        u,
+        v,
+        color=(0, 0, 0, 0.6),
+        density=1.0,
+        linewidth=0.6,
+        arrowsize=0.6,
+        minlength=0.1,
+        integration_direction="both",
+    )
+
+
 # =============================================================================
-# MAIN VIEWER
+# Viewer: 4x4 Prediction/GT/Error/Kappa
 # =============================================================================
 
 
@@ -319,17 +365,17 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
     # -------------------------------------------------------------
     # Error mode selector: MAE (default) vs. relative [%]
     # -------------------------------------------------------------
-    error_selector = util.util_plot_components.ui_error_mode_selector()
+    error_selector = util.util_plot_components.ui_radio_error_mode()
 
     def _plot(  # noqa: PLR0915
         idx: int,
         *,
         df: pd.DataFrame,
         dataset_name: str,
-        error_mode: widgets.RadioButtons,
+        error_mode: widgets.ValueWidget,
     ) -> Figure:
         """
-        Plot a single evaluation case.
+        Plot a single evaluation case with prediction, ground truth, error and kappa.
 
         Parameters
         ----------
@@ -339,13 +385,13 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
             Dataset-level table.
         dataset_name : str
             Name of dataset.
-        error_mode : widgets.RadioButtons
-            RadioButtons selecting 'MAE' or 'Relative [%]'.
+        error_mode : widgets.Widget
+            Error mode selector widget.
 
         Returns
         -------
         matplotlib.figure.Figure
-            Complete 4x4 subplot figure.
+            Complete figure with 4x4 subplots.
 
         """
         df = df.reset_index(drop=True)
@@ -361,106 +407,417 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
 
         fig, axes = plt.subplots(4, 4, figsize=(20, 9))
 
-        # Precompute aggregated kappa
-        kappa_field = aggregate_kappa(kappa, kappa_names)
-        kappa_levels = compute_levels(kappa_field, n_levels)
+        # ---- Kappa fields ----
+        kappa_field = _aggregate_kappa(kappa, kappa_names)
+        kappa_levels = _compute_levels(kappa_field, n_levels)
 
-        # Precompute log10(kappa)
         kappa_log_field = np.log10(np.maximum(kappa_field, 1e-30))
-        kappa_log_levels = compute_levels(kappa_log_field, n_levels)
+        kappa_log_levels = _compute_levels(kappa_log_field, n_levels)
+
+        nrows = 4  # fixed layout
 
         for r, label in enumerate(channels):
+            is_last_row = r == nrows - 1
+
+            # -------------------------------------------------
             # Prediction
-            levels_pred = compute_levels(pred[r], n_levels)
+            # -------------------------------------------------
             ax = axes[r, 0]
-            im = ax.contourf(X, Y, pred[r], levels=levels_pred, cmap=cmap_pred_true)
-            ax.set_ylim(0, Ly)
+            im = ax.contourf(
+                X,
+                Y,
+                pred[r],
+                levels=_compute_levels(pred[r], n_levels),
+                cmap=cmap_pred_true,
+            )
+            if label in {"u", "v", "U"}:
+                _overlay_streamlines(ax, X, Y, pred[1], pred[2])
+
             ax.set_title(f"{label} pred [{unit_map[label]}]")
             cb = fig.colorbar(im, ax=ax, fraction=0.04)
-            vmin, vmax = im.get_clim()
-            formatter = choose_colorbar_formatter(vmin, vmax)
-            cb.ax.yaxis.set_major_formatter(formatter)
-            _apply_axis_labels(ax, r, 0, Lx, Ly)
+            cb.ax.yaxis.set_major_formatter(_choose_colorbar_formatter(*im.get_clim()))
+            _apply_axis_labels(ax, r, 0, Lx, Ly, is_last_row=is_last_row)
 
+            # -------------------------------------------------
             # Ground truth
-            levels_true = compute_levels(gt[r], n_levels)
+            # -------------------------------------------------
             ax = axes[r, 1]
-            im = ax.contourf(X, Y, gt[r], levels=levels_true, cmap=cmap_pred_true)
-            ax.set_ylim(0, Ly)
+            im = ax.contourf(
+                X,
+                Y,
+                gt[r],
+                levels=_compute_levels(gt[r], n_levels),
+                cmap=cmap_pred_true,
+            )
+            if label in {"u", "v", "U"}:
+                _overlay_streamlines(ax, X, Y, gt[1], gt[2])
+
             ax.set_title(f"{label} true [{unit_map[label]}]")
             cb = fig.colorbar(im, ax=ax, fraction=0.04)
-            vmin, vmax = im.get_clim()
-            formatter = choose_colorbar_formatter(vmin, vmax)
-            cb.ax.yaxis.set_major_formatter(formatter)
-            _apply_axis_labels(ax, r, 1, Lx, Ly)
+            cb.ax.yaxis.set_major_formatter(_choose_colorbar_formatter(*im.get_clim()))
+            _apply_axis_labels(ax, r, 1, Lx, Ly, is_last_row=is_last_row)
 
-            # -----------------------------------------------------------------
-            # Error panel: MAE or Relative error depending on error_mode.value
-            # -----------------------------------------------------------------
-            mode = error_mode.value
-
-            if mode == "MAE":
+            # -------------------------------------------------
+            # Error
+            # -------------------------------------------------
+            ax = axes[r, 2]
+            if error_mode.value == "MAE":
                 err_field = np.abs(err[r])
-                err_field = np.nan_to_num(err_field, nan=0.0, posinf=0.0, neginf=0.0)
-                vmax_err = float(np.nanquantile(err_field, 0.99))
-                vmax_err = max(vmax_err, 1e-12)
-                levels_err = np.linspace(err_field.min(), err_field.max(), n_levels)
+                err_field = np.nan_to_num(err_field, nan=0.0)
+                levels_err = np.linspace(0.0, np.nanquantile(err_field, 0.99), n_levels)
                 err_title = f"{label} MAE [{unit_map[label]}]"
-            else:  # "Relative [%]"
+            else:
                 abs_err = np.abs(err[r])
                 true_abs = np.abs(gt[r])
-                rel = abs_err / (true_abs + 1e-12) * 100.0
-                rel[true_abs < mask_threshold] = np.nan
-                err_field = rel
-                vmax_err = float(np.nanquantile(err_field, 0.99))
-                vmax_err = max(vmax_err, 1e-6)
-                levels_err = np.linspace(0.0, vmax_err, n_levels)
+                err_field = abs_err / (true_abs + 1e-12) * 100.0
+                err_field[true_abs < mask_threshold] = np.nan
+                levels_err = np.linspace(0.0, np.nanquantile(err_field, 0.99), n_levels)
                 err_title = f"{label} rel err [%]"
 
-            ax = axes[r, 2]
             im = ax.contourf(X, Y, err_field, levels=levels_err, cmap=cmap_error)
-            ax.set_ylim(0, Ly)
             ax.set_title(err_title)
             cb = fig.colorbar(im, ax=ax, fraction=0.04)
-            vmin_cb, vmax_cb = im.get_clim()
-            formatter = choose_colorbar_formatter(vmin_cb, vmax_cb)
-            cb.ax.yaxis.set_major_formatter(formatter)
-            _apply_axis_labels(ax, r, 2, Lx, Ly)
+            cb.ax.yaxis.set_major_formatter(_choose_colorbar_formatter(*im.get_clim()))
+            _apply_axis_labels(ax, r, 2, Lx, Ly, is_last_row=is_last_row)
 
-            # Rightmost column: permeability panels
+            # -------------------------------------------------
+            # Kappa panels
+            # -------------------------------------------------
             ax = axes[r, 3]
-
             if r == 0:
-                # ---- Physical permeability ----
                 im = ax.contourf(X, Y, kappa_field, levels=kappa_levels, cmap=cmap_kappa)
                 ax.set_title("kappa [m²]")
                 fig.colorbar(im, ax=ax, fraction=0.04)
-                _apply_axis_labels(ax, r, 3, Lx, Ly)
+                _apply_axis_labels(ax, r, 3, Lx, Ly, is_last_row=is_last_row)
 
             elif r == 1:
-                # ---- Log10 permeability ----
-                im = ax.contourf(X, Y, kappa_log_field, levels=kappa_log_levels, cmap=cmap_kappa)
+                im = ax.contourf(
+                    X,
+                    Y,
+                    kappa_log_field,
+                    levels=kappa_log_levels,
+                    cmap=cmap_kappa,
+                )
                 ax.set_title("log10(kappa) [m²]")
                 fig.colorbar(im, ax=ax, fraction=0.04)
-                _apply_axis_labels(ax, r, 3, Lx, Ly)
+                _apply_axis_labels(ax, r, 3, Lx, Ly, is_last_row=is_last_row)
 
             else:
-                # Empty for rows 2 and 3
                 ax.axis("off")
 
         fig.suptitle(f"{dataset_name} — Case {idx + 1}", fontsize=14)
         fig.tight_layout()
         return fig
 
-    # -------------------------------------------------------------------------
-    # Use global navigator with dropdown; pass error_selector into plot_kwargs
-    # -------------------------------------------------------------------------
     return util.util_plot.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_idx=0,
         enable_dataset_dropdown=True,
-        enable_prev_next=True,
         extra_widgets=[error_selector],
+        error_mode=error_selector,
+    )
+
+
+# =============================================================================
+# Viewer: Kappa Tensor Components with Error Overlay
+# =============================================================================
+
+
+def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:  # noqa: C901, PLR0915
+    """
+    Build an interactive evaluation viewer for permeability tensor components with error contour overlays.
+
+    For each permeability tensor component, the physical field (kappa or log10(kappa))
+    is shown together with error contour lines of a selected output channel (p, u, v, U).
+
+    Error contours correspond to fixed global quantiles (50 %, 75 %, 90 %) of the
+    selected error metric (MAE or Relative [%]).
+
+    Parameters
+    ----------
+    datasets : dict[str, pandas.DataFrame]
+        Mapping dataset_name → DataFrame with columns:
+            - npz_path
+            - geom_Lx
+            - geom_Ly
+
+    Returns
+    -------
+    widgets.VBox
+        Interactive UI container with navigation and selectors.
+
+    """
+    channels = ["p", "u", "v", "U"]
+    unit_map = {"p": "Pa", "u": "m/s", "v": "m/s", "U": "m/s"}
+
+    cmap_kappa = "viridis"
+    cmap_error = "Reds"
+    n_kappa_levels = 10
+    mask_threshold = 1e-4
+
+    channel_selector = util.util_plot_components.ui_dropdown_channel()
+    error_selector = util.util_plot_components.ui_radio_error_mode()
+    kappa_scale_selector = util.util_plot_components.ui_radio_kappa_scale()
+
+    # ------------------------------------------------------------------
+    # Error computation
+    # ------------------------------------------------------------------
+    def _compute_error_field(
+        *,
+        err: np.ndarray,
+        gt: np.ndarray,
+        channel_idx: int,
+        mode: str,
+    ) -> np.ndarray:
+        """
+        Compute error field for a given channel and error mode.
+
+        Returns
+        -------
+        np.ndarray
+            Error field of shape (H, W).
+
+        """
+        if mode == "MAE":
+            return np.nan_to_num(np.abs(err[channel_idx]), nan=0.0)
+
+        abs_err = np.abs(err[channel_idx])
+        true_abs = np.abs(gt[channel_idx])
+        rel = abs_err / (true_abs + 1e-12) * 100.0
+        rel[true_abs < mask_threshold] = np.nan
+        return rel
+
+    # ------------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------------
+    def _plot(  # noqa: PLR0915
+        idx: int,
+        *,
+        df: pd.DataFrame,
+        dataset_name: str,
+        channel: widgets.ValueWidget,
+        error_mode: widgets.ValueWidget,
+        kappa_scale: widgets.ValueWidget,
+    ) -> Figure:
+        """
+        Plot a single evaluation case with kappa tensor components and error overlays.
+
+        Parameters
+        ----------
+        idx : int
+            Row index in DataFrame.
+        df : pandas.DataFrame
+            Dataset-level table.
+        dataset_name : str
+            Name of dataset.
+        channel : widgets.Widget
+            Channel selector widget.
+        error_mode : widgets.Widget
+            Error mode selector widget.
+        kappa_scale : widgets.Widget
+            Kappa scale selector widget.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            Complete figure with kappa components and error overlays.
+
+        """
+        df = df.reset_index(drop=True)
+        row = df.iloc[idx]
+        _, gt, err, kappa, kappa_names = _load_npz(row)
+
+        Lx, Ly = float(row["geom_Lx"]), float(row["geom_Ly"])
+        ny, nx = kappa.shape[1:]
+
+        x = np.linspace(0, Lx, nx)
+        y = np.linspace(0, Ly, ny)
+        X, Y = np.meshgrid(x, y)
+
+        channel_name = channel.value
+        channel_idx = channels.index(channel_name)
+
+        err_field = _compute_error_field(
+            err=err,
+            gt=gt,
+            channel_idx=channel_idx,
+            mode=error_mode.value,
+        )
+
+        # --------------------------------------------------
+        # Kappa components (only existing ones)
+        # --------------------------------------------------
+        name_to_idx = {n.lower(): i for i, n in enumerate(kappa_names)}
+        comps = [(name, kappa[i]) for name, i in name_to_idx.items()]
+
+        # Apply kappa scaling
+        if kappa_scale.value == "log10(kappa)":
+            comps = [(name, np.log10(np.maximum(field, 1e-30))) for name, field in comps]
+            kappa_unit = "log10(m²)"
+        else:
+            kappa_unit = "m²"
+
+        n_comp = len(comps)
+        ncols = int(np.ceil(np.sqrt(n_comp)))
+        nrows = int(np.ceil(n_comp / ncols))
+
+        fig, axes = plt.subplots(
+            nrows,
+            ncols + 1,
+            figsize=(4.8 * (ncols + 1), 3.6 * nrows),
+        )
+
+        if nrows == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        # --------------------------------------------------
+        # Levels
+        # --------------------------------------------------
+        kappa_levels = _compute_levels(
+            np.concatenate([c.ravel() for _, c in comps]),
+            n_kappa_levels,
+        )
+
+        valid_err = err_field[np.isfinite(err_field)]
+        if valid_err.size > 0:
+            err_levels = np.quantile(valid_err, [0.75, 0.95])
+            err_levels = np.unique(err_levels)
+        else:
+            err_levels = []
+
+        # --------------------------------------------------
+        # Kappa panels + error contours
+        # --------------------------------------------------
+        for i, (name, field) in enumerate(comps):
+            r, c = divmod(i, ncols)
+            ax = axes[r, c]
+
+            im = ax.contourf(
+                X,
+                Y,
+                field,
+                levels=kappa_levels,
+                cmap=cmap_kappa,
+            )
+
+            if len(err_levels) > 0:
+                ax.contour(
+                    X,
+                    Y,
+                    err_field,
+                    levels=err_levels,
+                    cmap=cmap_error,
+                    linewidths=1.0,
+                )
+
+            ax.set_title(f"{name} [{kappa_unit}]")
+
+            _apply_axis_labels(
+                ax,
+                r,
+                c,
+                Lx,
+                Ly,
+                is_last_row=(r == nrows - 1),
+            )
+
+            cb = fig.colorbar(im, ax=ax, fraction=0.045)
+            formatter = _choose_colorbar_formatter(*im.get_clim())
+            cb.ax.yaxis.set_major_formatter(formatter)
+
+        # --------------------------------------------------
+        # Right column: channel GT + error contours
+        # --------------------------------------------------
+        ax_gt = axes[0, -1]
+        gt_levels = _compute_levels(gt[channel_idx], n_kappa_levels)
+
+        im = ax_gt.contourf(
+            X,
+            Y,
+            gt[channel_idx],
+            levels=gt_levels,
+            cmap="turbo",
+        )
+
+        if len(err_levels) > 0:
+            ax_gt.contour(
+                X,
+                Y,
+                err_field,
+                levels=err_levels,
+                cmap=cmap_error,
+                linewidths=1.0,
+            )
+
+        ax_gt.set_title(f"{channel_name} true [{unit_map[channel_name]}]")
+
+        cb = fig.colorbar(im, ax=ax_gt, fraction=0.045)
+        formatter = _choose_colorbar_formatter(*im.get_clim())
+        cb.ax.yaxis.set_major_formatter(formatter)
+
+        _apply_axis_labels(
+            ax_gt,
+            0,
+            ncols,
+            Lx,
+            Ly,
+            is_last_row=(nrows == 1),
+        )
+
+        # --------------------------------------------------
+        # Right column: error reference
+        # --------------------------------------------------
+        if nrows > 1:
+            ax_err = axes[1, -1]
+
+            im = ax_err.contourf(
+                X,
+                Y,
+                err_field,
+                levels=err_levels if len(err_levels) > 0 else _compute_levels(err_field),
+                cmap=cmap_error,
+            )
+
+            unit = "MAE" if error_mode.value == "MAE" else "rel [%]"
+            ax_err.set_title(f"{channel_name} error [{unit}]")
+
+            cb = fig.colorbar(im, ax=ax_err, fraction=0.045)
+            formatter = _choose_colorbar_formatter(*im.get_clim())
+            cb.ax.yaxis.set_major_formatter(formatter)
+
+            _apply_axis_labels(
+                ax_err,
+                1,
+                ncols,
+                Lx,
+                Ly,
+                is_last_row=(nrows - 1 == 1),
+            )
+
+        # --------------------------------------------------
+        # Supertitle
+        # --------------------------------------------------
+        err_label = "MAE" if error_mode.value == "MAE" else "Relative error [%]"
+        fig.suptitle(
+            f"{dataset_name} — Case {idx + 1} — Error contours: 75 %, 95 % ({err_label}, channel {channel_name}, kappa scale: {kappa_scale.value})",
+            fontsize=14,
+        )
+
+        fig.tight_layout()
+        return fig
+
+    return util.util_plot.make_interactive_case_viewer(
+        plot_func=_plot,
+        datasets=datasets,
+        start_idx=0,
+        enable_dataset_dropdown=True,
+        extra_widgets=[
+            kappa_scale_selector,
+            channel_selector,
+            error_selector,
+        ],
+        kappa_scale=kappa_scale_selector,
+        channel=channel_selector,
         error_mode=error_selector,
     )

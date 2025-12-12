@@ -162,7 +162,7 @@ def plot_spectral_overview(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
     """
     # Navigator übernimmt Auswahl → kein df oder dataset_name direkt nötig
 
-    def plot_case(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
+    def _plot(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
         """Plot a multi-field 2D PSD overview for a single simulation case."""
         row = df.iloc[idx]
 
@@ -202,9 +202,12 @@ def plot_spectral_overview(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
         fig.tight_layout()
         return fig
 
-    return util.util_plot.make_interactive_plot_dropdown(
-        plot_func=plot_case,
+    return util.util_plot.make_interactive_case_viewer(
+        plot_func=_plot,
         datasets=datasets,
+        start_idx=0,
+        enable_dataset_dropdown=False,
+        enable_prev_next=True,
     )
 
 
@@ -239,7 +242,7 @@ def plot_spectral_vertical(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
 
     """
 
-    def plot_case(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
+    def _plot(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
         """Plot vertical (bottom/mid) radial spectra for a single case."""
         row = df.iloc[idx]
         fields = {key: np.asarray(row[key], float) for key in ALL_KEYS}
@@ -281,7 +284,10 @@ def plot_spectral_vertical(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
         fig.tight_layout()
         return fig
 
-    return util.util_plot.make_interactive_plot_dropdown(
-        plot_func=plot_case,
+    return util.util_plot.make_interactive_case_viewer(
+        plot_func=_plot,
         datasets=datasets,
+        start_idx=0,
+        enable_dataset_dropdown=False,
+        enable_prev_next=True,
     )

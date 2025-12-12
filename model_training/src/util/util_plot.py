@@ -1,22 +1,26 @@
 """
 Unified interactive plot navigators.
 
-This file provides exactly two viewer types:
+This module provides exactly two viewer types:
 
 1) make_interactive_case_viewer(...)
     - Shows ONE case at a time
-    - Optional dataset dropdown
-    - Optional prev/next navigation
-    - Optional extra widgets (e.g. error_mode)
+    - Dataset selection via dropdown
+    - Case navigation via step control (index + arrows)
+    - Arbitrary extra widgets supported
     - Used for all case-dependent visualisations
 
 2) make_casecount_viewer(...)
     - Aggregates statistics over N cases
-    - Controls N through a slider
+    - Case-count navigation via step control (slider + arrows)
+    - Arbitrary extra widgets supported
     - Used for global error metrics, GT-vs-Pred cached plots, etc.
 
-A third viewer remains for global (non-case) selection:
-    make_interactive_global_plot_dropdown(...)
+Design principles
+-----------------
+- Viewers contain logic and semantics
+- All UI elements are constructed via util_plot_components
+- No widget construction is duplicated here
 """
 
 from __future__ import annotations
@@ -28,10 +32,10 @@ import matplotlib.pyplot as plt
 from IPython.display import display
 
 from src.util.util_plot_components import (
-    ui_case_index,
-    ui_dataset_dropdown,
-    ui_output,
-    ui_prev_next,
+    ui_dropdown_dataset,
+    ui_output_plot,
+    ui_step_case_count,
+    ui_step_case_index,
 )
 
 if TYPE_CHECKING:
@@ -40,13 +44,79 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
-def make_interactive_case_viewer(  # noqa: C901, PLR0912, PLR0915
+# =============================================================================
+# INTERNAL HELPERS (viewer-agnostic, no semantics)
+# =============================================================================
+
+
+def _render_figure(
+    *,
+    out: widgets.Output,
+    plot_func: Callable[..., Any],
+    args: tuple[Any, ...] = (),
+    kwargs: dict[str, Any] | None = None,
+) -> None:
+    """
+    Render a matplotlib figure into a widgets.Output container.
+
+    Centralised rendering logic:
+        - clear output
+        - call plot function
+        - display figure
+        - close figure
+
+    Parameters
+    ----------
+    out : widgets.Output
+        Output widget to render into.
+    plot_func : callable
+        Plotting function returning a matplotlib Figure.
+    args : tuple, optional
+        Positional arguments forwarded to plot_func.
+    kwargs : dict, optional
+        Keyword arguments forwarded to plot_func.
+
+    """
+    kwargs = kwargs or {}
+
+    with out:
+        out.clear_output(wait=True)
+        fig = plot_func(*args, **kwargs)
+        display(fig)
+        plt.close(fig)
+
+
+def _attach_widget_rerender(
+    widgets_list: list[widgets.Widget],
+    render_func: Callable[[], None],
+) -> None:
+    """
+    Attach a re-render callback to multiple widgets.
+
+    Any change of a widget's value triggers the provided render function.
+
+    Parameters
+    ----------
+    widgets_list : list of widgets.Widget
+        Widgets whose value changes should trigger re-rendering.
+    render_func : callable
+        Zero-argument render function.
+
+    """
+    for w in widgets_list:
+        w.observe(lambda _: render_func(), names="value")
+
+
+# =============================================================================
+# 1) CASE VIEWER (single-case visualisations)
+# =============================================================================
+
+
+def make_interactive_case_viewer(
     plot_func: Callable[..., Any],
     *,
     datasets: dict[str, pd.DataFrame],
     start_idx: int = 0,
-    enable_case_index: bool = True,
-    enable_prev_next: bool = True,
     enable_dataset_dropdown: bool = True,
     extra_widgets: list[widgets.Widget] | None = None,
     **plot_kwargs: Any,
@@ -64,115 +134,117 @@ def make_interactive_case_viewer(  # noqa: C901, PLR0912, PLR0915
         Mapping: dataset_name -> dataset DataFrame.
     start_idx : int, optional
         Initial zero-based case index (default: 0).
-    enable_case_index : bool, optional
-        Whether to show case index selector (default: True).
-    enable_prev_next : bool, optional
-        Whether to show prev/next buttons (default: True).
     enable_dataset_dropdown : bool, optional
         Whether to show dataset dropdown (default: True).
     extra_widgets : list[widgets.Widget] | None, optional
-        Additional widgets to include in the header (default: None).
-        These widgets will trigger re-rendering when their value changes.
-    **plot_kwargs : any
+        Additional widgets to include in the header.
+        These widgets trigger re-rendering on value change.
+    **plot_kwargs : Any
         Forwarded into the plot function.
 
     Returns
     -------
     widgets.VBox
+        Complete interactive viewer.
 
     """
-    names = list(datasets.keys())
+    dataset_names = list(datasets.keys())
+    active_dataset = dataset_names[0]
 
-    if enable_dataset_dropdown and len(names) > 1:
-        dropdown = ui_dataset_dropdown(names)
-        active_name = dropdown.value or names[0]
-    else:
-        dropdown = None
-        active_name = names[0]
+    # ------------------------------------------------------------------
+    # Dataset selector
+    # ------------------------------------------------------------------
+    dataset_dropdown = ui_dropdown_dataset(dataset_names) if enable_dataset_dropdown and len(dataset_names) > 1 else None
 
-    if enable_case_index:
-        df_active = datasets[active_name]
-        idx = ui_case_index(len(df_active), start_idx)
-    else:
-        idx = None
+    # ------------------------------------------------------------------
+    # Case index step control
+    # ------------------------------------------------------------------
+    df_active = datasets[active_dataset]
+    case_index, prev_btn, next_btn = ui_step_case_index(
+        n_cases=len(df_active),
+        start_idx=start_idx,
+    )
 
-    if enable_prev_next and enable_case_index:
-        prev_btn, next_btn = ui_prev_next()
-    else:
-        prev_btn, next_btn = None, None
-
-    out = ui_output()
+    # ------------------------------------------------------------------
+    # Output container
+    # ------------------------------------------------------------------
+    out = ui_output_plot()
     extra_widgets = extra_widgets or []
 
+    # ------------------------------------------------------------------
+    # Render logic
+    # ------------------------------------------------------------------
     def _render() -> None:
-        name = active_name if dropdown is None else (dropdown.value or names[0])
+        if dataset_dropdown is not None:
+            name: str = dataset_dropdown.value  # pyright: ignore[reportAssignmentType]
+        else:
+            name = active_dataset
+
         df = datasets[name]
 
-        if idx is not None:
-            case_idx = idx.value - 1
-            case_idx = max(0, min(len(df) - 1, case_idx))
-        else:
-            case_idx = 0
+        case_idx = case_index.value - 1
+        case_idx = max(0, min(len(df) - 1, case_idx))
 
-        with out:
-            out.clear_output(wait=True)
-            fig = plot_func(case_idx, df=df, dataset_name=name, **plot_kwargs)
-            display(fig)
-            plt.close(fig)
+        _render_figure(
+            out=out,
+            plot_func=plot_func,
+            args=(case_idx,),
+            kwargs={
+                "df": df,
+                "dataset_name": name,
+                **plot_kwargs,
+            },
+        )
 
     def _step(delta: int) -> None:
-        if idx is None:
-            return
-        name = active_name if dropdown is None else (dropdown.value or names[0])
-        df = datasets[name]
-        idx.value = max(1, min(len(df), idx.value + delta))
+        case_index.value = max(
+            1,
+            min(case_index.max, case_index.value + delta),
+        )
 
-    if prev_btn is not None:
-        prev_btn.on_click(lambda _: _step(-1))
-    if next_btn is not None:
-        next_btn.on_click(lambda _: _step(1))
+    # ------------------------------------------------------------------
+    # Wiring
+    # ------------------------------------------------------------------
+    prev_btn.on_click(lambda _: _step(-1))
+    next_btn.on_click(lambda _: _step(1))
+    case_index.observe(lambda _: _render(), names="value")
 
-    if idx is not None:
-        idx.observe(lambda _: _render(), names="value")
-
-    if dropdown is not None:
+    if dataset_dropdown is not None:
 
         def _on_dataset_change(change: dict) -> None:
             df_new = datasets[change["new"]]
-            if idx is not None:
-                idx.max = len(df_new)
-                idx.value = min(idx.value, len(df_new))
+            case_index.max = len(df_new)
+            case_index.value = min(case_index.value, len(df_new))
             _render()
 
-        dropdown.observe(_on_dataset_change, names="value")
+        dataset_dropdown.observe(_on_dataset_change, names="value")
 
-    for widget in extra_widgets:
-        widget.observe(lambda _: _render(), names="value")
+    _attach_widget_rerender(extra_widgets, _render)
 
+    # Initial render
     _render()
 
-    header_items: list[widgets.Widget] = []
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+    header_items: list[widgets.Widget] = [
+        case_index,
+        prev_btn,
+        next_btn,
+        *extra_widgets,
+    ]
 
-    if idx is not None:
-        header_items.append(idx)
-    if prev_btn is not None:
-        header_items.append(prev_btn)
-    if next_btn is not None:
-        header_items.append(next_btn)
-
-    header_items.extend(extra_widgets)
-
-    if dropdown is not None:
-        header_items.append(dropdown)
+    if dataset_dropdown is not None:
+        header_items.append(dataset_dropdown)
 
     header = widgets.HBox(header_items)
 
     return widgets.VBox([header, out])
 
 
-# ============================================================================
-# 2) CASECOUNT VIEWER (unchanged — this is a separate mode)
-# ============================================================================
+# =============================================================================
+# 2) CASECOUNT VIEWER (multi-case aggregations)
+# =============================================================================
 
 
 def make_casecount_viewer(
@@ -191,126 +263,75 @@ def make_casecount_viewer(
     ----------
     plot_func : callable
         Function of the form:
-            plot_func(datasets={name: df}, max_cases=N, **kwargs)
+            plot_func(datasets=datasets, max_cases=N, **kwargs)
         Must return a matplotlib Figure.
     datasets : dict[str, DataFrame]
         Mapping: dataset_name -> dataset DataFrame.
     start_cases : int, optional
         Initial number of cases to include (default: 50).
     step_size : int, optional
-        Step size for the case count slider (default: 50).
+        Step size for increasing/decreasing case count (default: 50).
     extra_widgets : list[widgets.Widget] | None, optional
-        Additional widgets to include in the header (default: None).
-        These widgets will trigger re-rendering when their value changes.
-    **plot_kwargs : any
+        Additional widgets to include in the header.
+        These widgets trigger re-rendering on value change.
+    **plot_kwargs : Any
         Forwarded into the plot function.
 
     Returns
     -------
     widgets.VBox
+        Complete interactive viewer.
 
     """
     max_cases_global = min(len(df) for df in datasets.values())
 
-    case_slider = widgets.IntSlider(
-        value=min(start_cases, max_cases_global),
-        min=1,
-        max=max_cases_global,
-        step=step_size,
-        description="Cases:",
-        continuous_update=False,
-        readout=True,
+    case_count, prev_btn, next_btn = ui_step_case_count(
+        start_cases=min(start_cases, max_cases_global),
+        min_cases=0,
+        max_cases=max_cases_global,
+        step_size=step_size,
     )
 
-    prev_btn = widgets.Button(description="⟨")
-    next_btn = widgets.Button(description="⟩")
-
-    out = widgets.Output()
+    out = ui_output_plot()
     extra_widgets = extra_widgets or []
 
-    def _render(_change: None = None) -> None:
-        with out:
-            out.clear_output(wait=True)
-            fig = plot_func(datasets=datasets, max_cases=int(case_slider.value), **plot_kwargs)
-            display(fig)
-            plt.close(fig)
+    # ------------------------------------------------------------------
+    # Render logic
+    # ------------------------------------------------------------------
+    def _render() -> None:
+        _render_figure(
+            out=out,
+            plot_func=plot_func,
+            kwargs={
+                "datasets": datasets,
+                "max_cases": int(case_count.value),
+                **plot_kwargs,
+            },
+        )
 
     def _step(delta: int) -> None:
-        new_val = case_slider.value + delta * step_size
-        new_val = max(1, min(max_cases_global, new_val))
-        case_slider.value = new_val
+        new_val = case_count.value + delta * step_size
+        case_count.value = max(1, min(max_cases_global, new_val))
 
+    # ------------------------------------------------------------------
+    # Wiring
+    # ------------------------------------------------------------------
     prev_btn.on_click(lambda _: _step(-1))
     next_btn.on_click(lambda _: _step(1))
-    case_slider.observe(_render, names="value")
+    case_count.observe(lambda _: _render(), names="value")
 
-    for w in extra_widgets:
-        w.observe(_render, names="value")
+    _attach_widget_rerender(extra_widgets, _render)
 
+    # Initial render
     _render()
 
-    header = [case_slider, prev_btn, next_btn]
-    header.extend(extra_widgets)
+    header = widgets.HBox(
+        [
+            case_count,
+            prev_btn,
+            next_btn,
+            *extra_widgets,
+        ]
+    )
 
-    return widgets.VBox([widgets.HBox(header), out])
-
-
-# ============================================================================
-# 3) GLOBAL (NO-CASE) DROPDOWN VIEWER
-# ============================================================================
-
-
-def make_interactive_global_plot_dropdown(
-    plot_func: Callable[..., Any],
-    *,
-    datasets: dict[str, pd.DataFrame],
-    **plot_kwargs: Any,
-) -> widgets.VBox:
-    """
-    Viewer for global plots that do not depend on case indexing.
-
-    Parameters
-    ----------
-    plot_func : callable
-        Function of the form:
-            plot_func(dfs={name: df}, dataset_name=name, **kwargs)
-        Must return a matplotlib Figure.
-    datasets : dict[str, DataFrame]
-        Mapping: dataset_name -> dataset DataFrame.
-    **plot_kwargs : any
-        Forwarded into the plot function.
-
-    Returns
-    -------
-    widgets.VBox
-
-    """
-    names = list(datasets.keys())
-
-    if len(names) > 1:
-        dropdown = ui_dataset_dropdown(names)
-        active_name = dropdown.value or names[0]
-    else:
-        dropdown = None
-        active_name = names[0]
-
-    out = ui_output()
-
-    def _render() -> None:
-        name = active_name if dropdown is None else (dropdown.value or names[0])
-        df = datasets[name]
-        with out:
-            out.clear_output(wait=True)
-            fig = plot_func(dfs={name: df}, dataset_name=name, **plot_kwargs)
-            display(fig)
-            plt.close(fig)
-
-    if dropdown is not None:
-        dropdown.observe(lambda _: _render(), names="value")
-
-    _render()
-
-    if dropdown is None:
-        return widgets.VBox([out])
-
-    return widgets.VBox([widgets.HBox([dropdown]), out])
+    return widgets.VBox([header, out])

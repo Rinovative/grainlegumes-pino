@@ -9,10 +9,6 @@ shortcut, which automatically injects a dictionary of datasets:
 
     dfs : dict[str, pandas.DataFrame]
         Mapping dataset_name → evaluation_df
-
-Each function returns either:
-    - a Matplotlib Figure (for static plots), or
-    - an ipywidgets.VBox (for interactive dropdown-based plots).
 """
 
 from __future__ import annotations
@@ -588,11 +584,6 @@ def plot_global_gt_vs_pred(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
 # =============================================================================
 
 
-# =============================================================================
-# 1-4. MEAN ERROR MAPS — FULLY CACHED, MAE + REL SEPARATE
-# =============================================================================
-
-
 def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:  # noqa: C901, PLR0915
     """
     Interactive mean error maps across datasets.
@@ -617,7 +608,7 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox: 
     # -------------------------------------------------------
     # UI: MAE / Rel [%]
     # -------------------------------------------------------
-    error_selector = util.util_plot_components.ui_error_mode_selector()
+    error_selector = util.util_plot_components.ui_radio_error_mode()
 
     # -------------------------------------------------------
     # Cache structure (clean, mypy-safe)
@@ -648,7 +639,7 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox: 
         *,
         datasets: dict[str, pd.DataFrame],
         max_cases: int,
-        error_mode: widgets.RadioButtons,
+        error_mode: widgets.ValueWidget,
     ) -> Figure:
         """
         Plot mean error maps across datasets for the first `max_cases` samples.
@@ -661,8 +652,8 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox: 
                 - 'npz_path' : str (path to .npz with 'gt' and 'pred' arrays)
         max_cases : int
             Number of cases to include from each dataset.
-        error_mode : widgets.RadioButtons
-            Radio button widget indicating error mode ("MAE" or "Relative [%]").
+        error_mode : widgets.ValueWidget
+            Error mode selector widget.
 
         Returns
         -------
@@ -760,7 +751,7 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox: 
                 y = np.linspace(0, Ly, ny)
                 X, Y = np.meshgrid(x, y)
 
-                im = ax.contourf(X, Y, mean_map, levels=10, cmap="coolwarm")
+                im = ax.contourf(X, Y, mean_map, levels=10, cmap="magma")
 
                 metric = "MAE" if mode == "MAE" else "rel err [%]"
 
@@ -808,50 +799,159 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox: 
 
 
 # =============================================================================
-# 1-5. STD ERROR MAPS (INTERACTIVE DROPDOWN)
+# 1-5. STD ERROR MAPS
 # =============================================================================
 
 
-def plot_std_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
+def plot_std_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:  # noqa: C901, PLR0915
     """
-    Interactive standard deviation error map viewer across datasets.
-
-    Each evaluation dataframe must provide the column:
-        - 'err_std_map' : ndarray (H, W)
+    Interactive standard deviation error maps across datasets.
 
     Parameters
     ----------
     datasets : dict[str, pandas.DataFrame]
-        Mapping of dataset_name → evaluation dataframe.
+        Mapping dataset_name → evaluation DataFrame.
+        Must contain:
+            - 'npz_path' : str (path to .npz with 'gt' and 'pred' arrays)
 
     Returns
     -------
-    widgets.VBox
-        Interactive widget with dropdown + std error visualisation.
+    ipywidgets.VBox
+        Interactive widget with case count slider and standard deviation error maps.
 
     """
+    channels = ["p", "u", "v", "U"]
+    channel_idx = {"p": 0, "u": 1, "v": 2, "U": 3}
+    mask_threshold = 1e-4
 
-    def _plot_single_dataset(*, dfs: dict[str, pd.DataFrame], dataset_name: str) -> Figure:
-        df = dfs[dataset_name]
+    # -------------------------------------------------------
+    # Cache (Welford)
+    # -------------------------------------------------------
+    cache: dict[str, dict[str, Any]] = {}
 
-        if "err_std_map" not in df.columns:
-            msg = f"Dataset '{dataset_name}' is missing 'err_std_map'."
-            raise KeyError(msg)
+    for name in datasets:
+        cache[name] = {
+            "geom": None,
+            "loaded_until": 0,
+            "count": 0,
+            "mean": dict.fromkeys(channels),  # running mean
+            "M2": dict.fromkeys(channels),  # running sum of squares
+        }
 
-        std_map = df["err_std_map"].iloc[0]
+    # -------------------------------------------------------
+    # INTERNAL PLOT FUNCTION
+    # -------------------------------------------------------
+    def _plot(  # noqa: C901, PLR0912, PLR0915
+        *,
+        datasets: dict[str, pd.DataFrame],
+        max_cases: int,
+    ) -> Figure:
+        names = list(datasets.keys())
+        num_datasets = len(names)
+        num_channels = len(channels)
 
-        fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(std_map, cmap="viridis")
+        # ===================================================
+        # LOAD NEW CASES
+        # ===================================================
+        for name, df in datasets.items():
+            entry = cache[name]
+            loaded = entry["loaded_until"]
+            df_i = df.reset_index(drop=True)
 
-        ax.set_title(f"Std Error Map — {dataset_name}")
-        ax.set_xticks([])
-        ax.set_yticks([])
+            if entry["geom"] is None:
+                entry["geom"] = (
+                    float(df_i["geom_Lx"].iloc[0]),
+                    float(df_i["geom_Ly"].iloc[0]),
+                )
 
-        fig.colorbar(im, ax=ax, fraction=0.045)
-        fig.tight_layout()
+            if max_cases <= loaded:
+                continue
+
+            df_new = df_i.iloc[loaded:max_cases]
+
+            for path in df_new["npz_path"]:
+                data = np.load(path)
+                pred = data["pred"][0]
+                gt = data["gt"][0]
+
+                entry["count"] += 1
+                n = entry["count"]
+
+                for ch in channels:
+                    k = channel_idx[ch]
+
+                    abs_err = np.abs(pred[k] - gt[k])
+                    true_abs = np.abs(gt[k])
+                    abs_err[true_abs < mask_threshold] = np.nan
+
+                    if entry["mean"][ch] is None:
+                        entry["mean"][ch] = abs_err.astype(float)
+                        entry["M2"][ch] = np.zeros_like(abs_err, dtype=float)
+                    else:
+                        delta = abs_err - entry["mean"][ch]
+                        entry["mean"][ch] += delta / n
+                        delta2 = abs_err - entry["mean"][ch]
+                        entry["M2"][ch] += delta * delta2
+
+            entry["loaded_until"] = max_cases
+
+        # ===================================================
+        # BUILD FIGURE (identical layout to 1-4)
+        # ===================================================
+        fig = plt.figure(figsize=(6 * num_datasets, 9))
+        gs = fig.add_gridspec(num_channels, num_datasets, wspace=0.25, hspace=0.35)
+
+        for r, ch in enumerate(channels):
+            for c, name in enumerate(names):
+                ax = fig.add_subplot(gs[r, c])
+                entry = cache[name]
+
+                geom = entry["geom"]
+                Lx, Ly = geom
+                std_map = np.sqrt(entry["M2"][ch] / (entry["count"] - 1))
+
+                ny, nx = std_map.shape
+                x = np.linspace(0, Lx, nx)
+                y = np.linspace(0, Ly, ny)
+                X, Y = np.meshgrid(x, y)
+
+                im = ax.contourf(X, Y, std_map, levels=10, cmap="magma")
+
+                if r == 0:
+                    ax.set_title(f"Dataset: {name}\n{ch} STD error", fontsize=12, pad=20)
+                else:
+                    ax.set_title(f"{ch} STD error", fontsize=11)
+
+                if c == 0:
+                    ax.set_ylabel("y [m]")
+                    ax.set_yticks([0, Ly / 2, Ly])
+                else:
+                    ax.set_yticks([])
+
+                if r == num_channels - 1:
+                    ax.set_xlabel("x [m]")
+                    ax.set_xticks([0, Lx / 2, Lx])
+                else:
+                    ax.set_xticks([])
+
+                fig.colorbar(im, ax=ax, fraction=0.045)
+
+        fig.subplots_adjust(
+            top=0.92,
+            bottom=0.07,
+            left=0.07,
+            right=0.98,
+            hspace=0.35,
+            wspace=0.25,
+        )
         return fig
 
-    return util.util_plot.make_interactive_global_plot_dropdown(
-        plot_func=_plot_single_dataset,
+    # -------------------------------------------------------
+    # CASECOUNT VIEWER
+    # -------------------------------------------------------
+    return util.util_plot.make_casecount_viewer(
+        plot_func=_plot,
         datasets=datasets,
+        start_cases=100,
+        step_size=50,
     )
