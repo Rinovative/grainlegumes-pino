@@ -1,14 +1,31 @@
 """
-Evaluation panel builder.
+===============================================================================
+evaluation_panel.py
+===============================================================================
+Builder for interactive evaluation panels with tabbed sections and export.
 
-Builds evaluation panels from an explicit list of sections.
+Provides:
+  - build_evaluation_panel: construct tabbed panel from plot sections
+  - support for collapsible panels with open/close buttons
+  - PDF export integration via analysis_ui_notebook
+
+Responsibilities:
+  - organize multiple evaluation plot sections into a single interactive interface
+  - manage panel visibility and user interaction
+  - coordinate with analysis_ui_notebook for figure export
+
+This module does NOT:
+  - contain plot functions (those belong in evaluation_plot_*.py)
+  - handle figure creation or rendering (delegates to plot functions)
+  - manage dataset selection or case navigation (uses pre-made viewers)
+===============================================================================
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src import util
+from src import analysis
 from src.analysis import evaluation
 
 if TYPE_CHECKING:
@@ -227,7 +244,7 @@ def build_evaluation_panel(
         Which sections to include
 
     """
-    toggle = util.util_nb.make_toggle_shortcut(dfs=datasets_eval)
+    toggle = analysis.ui.notebook.make_toggle_shortcut(dfs=datasets_eval)
     registry = _build_sections(toggle)
 
     section_keys = list(registry.keys()) if sections == "all" else sections
@@ -239,10 +256,10 @@ def build_evaluation_panel(
 
     for key in section_keys:
         plots, tab_title = registry[key]
-        ui_sections.append(util.util_nb.make_dropdown_section(plots, export_state=export_state))
+        ui_sections.append(analysis.ui.notebook.make_dropdown_section(plots, export_state=export_state))
         tab_titles.append(tab_title)
 
-    return util.util_nb.make_lazy_panel_with_tabs(
+    return analysis.ui.notebook.make_lazy_panel_with_tabs(
         ui_sections,
         tab_titles=tab_titles,
         open_btn_text=f"{title} - Open Evaluation",

@@ -2,7 +2,6 @@
 Project source code organization.
 
 Core modules: common, domain, datasets, learning, analysis, experiments.
-Legacy modules (in transition): eda, util.
 
 Import subpackages explicitly when needed:
   from src import common

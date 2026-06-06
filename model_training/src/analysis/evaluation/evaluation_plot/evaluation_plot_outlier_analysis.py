@@ -1,7 +1,30 @@
 """
-Outlier and extreme case analysis plots for PINO/FNO evaluation.
+===============================================================================
+evaluation_plot_outlier_analysis.py
+===============================================================================
+Outlier and extreme case analysis for model evaluation.
 
-This module provides functions to analyze and visualize outlier cases
+Provides:
+  - identification and visualization of worst-performing cases
+  - extreme error case analysis and grouping
+  - per-case and multi-case outlier exploration
+  - interactive viewers for outlier investigation
+
+Responsibilities:
+  - identify cases with anomalous or extreme errors
+  - support visual inspection of outlier cases
+  - enable root-cause analysis for performance issues
+
+Design principles:
+  - outliers are ranked by error magnitude or statistical deviation
+  - plots support interactive case selection and comparison
+  - visual feedback identifies extreme performance regions
+
+This module does NOT:
+  - perform statistical outlier filtering or removal
+  - compute error decomposition (use evaluation_plot_error_decomposition)
+  - handle model retraining or refinement
+===============================================================================
 """
 
 from __future__ import annotations
@@ -16,7 +39,7 @@ import pandas as pd
 from IPython.display import Markdown, display
 from matplotlib import cm
 
-from src import domain, util
+from src import analysis, domain
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -130,7 +153,7 @@ def _load_npz(row: pd.Series | pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np
 
     """
     row = _as_series(row)
-    key = str(Path(row["npz_path"]))
+    key = str(Path(row.loc["npz_path"]))
     if key in _npz_cache:
         return _npz_cache[key]
 
@@ -370,8 +393,8 @@ def _plot_prediction_overview_case(
     """
     pred, gt, err, kappa, kappa_names = _load_npz(row)
 
-    Lx = float(row["geometry_Lx"])
-    Ly = float(row["geometry_Ly"])
+    Lx = float(row.loc["geometry_Lx"])
+    Ly = float(row.loc["geometry_Ly"])
     # -------------------------------------------------
     # Robust shape handling (C,H,W) vs (H,W)
     # -------------------------------------------------
@@ -388,10 +411,10 @@ def _plot_prediction_overview_case(
     fig, axes = plt.subplots(4, 4, figsize=(20, 9))
 
     kappa_field = _aggregate_kappa(kappa, kappa_names)
-    kappa_levels = util.util_plot_components.compute_levels(kappa_field, N_LEVELS)
+    kappa_levels = analysis.ui.components.compute_levels(kappa_field, N_LEVELS)
 
     kappa_log_field = np.log10(np.maximum(kappa_field, 1e-30))
-    kappa_log_levels = util.util_plot_components.compute_levels(kappa_log_field, N_LEVELS)
+    kappa_log_levels = analysis.ui.components.compute_levels(kappa_log_field, N_LEVELS)
 
     nrows = 4  # fixed layout
 
@@ -410,29 +433,29 @@ def _plot_prediction_overview_case(
             X,
             Y,
             field,
-            levels=util.util_plot_components.compute_levels(field),
+            levels=analysis.ui.components.compute_levels(field),
             cmap="turbo",
         )
         if ch in {"u", "v", "U"}:
             u = pred[CHANNEL_INDICES["u"]]
             v = pred[CHANNEL_INDICES["v"]]
-            util.util_plot_components.overlay_streamlines(ax, X, Y, u, v)
+            analysis.ui.components.overlay_streamlines(ax, X, Y, u, v)
         ax.set_title(f"{ch} pred [{UNIT_MAP[ch]}]")
         cb = fig.colorbar(im, ax=ax, fraction=0.04)
-        cb.ax.yaxis.set_major_formatter(util.util_plot_components.choose_colorbar_formatter(*im.get_clim()))
-        util.util_plot_components.apply_axis_labels(ax, 0, Lx, Ly, is_last_row=is_last)
+        cb.ax.yaxis.set_major_formatter(analysis.ui.components.choose_colorbar_formatter(*im.get_clim()))
+        analysis.ui.components.apply_axis_labels(ax, 0, Lx, Ly, is_last_row=is_last)
 
         # Ground truth
         ax = axes[r, 1]
-        im = ax.contourf(X, Y, gt[k], levels=util.util_plot_components.compute_levels(gt[k]), cmap="turbo")
+        im = ax.contourf(X, Y, gt[k], levels=analysis.ui.components.compute_levels(gt[k]), cmap="turbo")
         if ch in {"u", "v", "U"}:
             u = gt[CHANNEL_INDICES["u"]]
             v = gt[CHANNEL_INDICES["v"]]
-            util.util_plot_components.overlay_streamlines(ax, X, Y, u, v)
+            analysis.ui.components.overlay_streamlines(ax, X, Y, u, v)
         ax.set_title(f"{ch} true [{UNIT_MAP[ch]}]")
         cb = fig.colorbar(im, ax=ax, fraction=0.04)
-        cb.ax.yaxis.set_major_formatter(util.util_plot_components.choose_colorbar_formatter(*im.get_clim()))
-        util.util_plot_components.apply_axis_labels(ax, 1, Lx, Ly, is_last_row=is_last)
+        cb.ax.yaxis.set_major_formatter(analysis.ui.components.choose_colorbar_formatter(*im.get_clim()))
+        analysis.ui.components.apply_axis_labels(ax, 1, Lx, Ly, is_last_row=is_last)
 
         # Error
         ax = axes[r, 2]
@@ -460,8 +483,8 @@ def _plot_prediction_overview_case(
         im = ax.contourf(X, Y, field, levels=levels, cmap="Blues")
         ax.set_title(title)
         cb = fig.colorbar(im, ax=ax, fraction=0.04)
-        cb.ax.yaxis.set_major_formatter(util.util_plot_components.choose_colorbar_formatter(*im.get_clim()))
-        util.util_plot_components.apply_axis_labels(ax, 2, Lx, Ly, is_last_row=is_last)
+        cb.ax.yaxis.set_major_formatter(analysis.ui.components.choose_colorbar_formatter(*im.get_clim()))
+        analysis.ui.components.apply_axis_labels(ax, 2, Lx, Ly, is_last_row=is_last)
 
         # Kappa
         ax = axes[r, 3]
@@ -490,7 +513,7 @@ def _plot_prediction_overview_case(
 
         # HIER:
         fig.colorbar(im, ax=ax, fraction=0.04)
-        util.util_plot_components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last)
+        analysis.ui.components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last)
 
     fig.suptitle(f"{dataset_name} — {case_label}", fontsize=14)
     fig.tight_layout()
@@ -652,14 +675,14 @@ def plot_outlier_tables_per_channel(*, datasets: dict[str, pd.DataFrame], k: int
                     rels = _rel_l2_per_channel(err, gt)
 
                     r = {
-                        "case_index": int(row["case_index"]),
+                        "case_index": int(row.loc["case_index"]),
                         f"rel_l2[{ch}]": rels[ch],
-                        "rel_l2_global": _scalar(row["rel_l2"]),
-                        "l2_global": _scalar(row["l2"]),
+                        "rel_l2_global": _scalar(row.loc["rel_l2"]),
+                        "l2_global": _scalar(row.loc["l2"]),
                         "__kind__": "worst",
                     }
                     for p in par_cols:
-                        r[p] = _scalar(row[p])
+                        r[p] = _scalar(row.loc[p])
                     rows.append(r)
 
                 # Reference case (APPENDED)
@@ -669,10 +692,10 @@ def plot_outlier_tables_per_channel(*, datasets: dict[str, pd.DataFrame], k: int
                 rels = _rel_l2_per_channel(err, gt)
 
                 r = {
-                    "case_index": f"{int(row['case_index'])} (Ref)",
+                    "case_index": f"{int(row.loc['case_index'])} (Ref)",
                     f"rel_l2[{ch}]": rels[ch],
-                    "rel_l2_global": _scalar(row["rel_l2"]),
-                    "l2_global": _scalar(row["l2"]),
+                    "rel_l2_global": _scalar(row.loc["rel_l2"]),
+                    "l2_global": _scalar(row.loc["l2"]),
                     "__kind__": "reference",
                 }
                 for p in par_cols:
@@ -763,8 +786,8 @@ def plot_outlier_cases_per_channel(*, datasets: dict[str, pd.DataFrame], k: int 
             A VBox widget containing the interactive case viewer.
 
     """
-    ch_sel = util.util_plot_components.ui_dropdown_channel()
-    err_sel = util.util_plot_components.ui_radio_error_mode()
+    ch_sel = analysis.ui.components.ui_dropdown_channel()
+    err_sel = analysis.ui.components.ui_radio_error_mode()
 
     def _plot(idx: int, *, df: pd.DataFrame, dataset_name: str, focus_channel: widgets.ValueWidget, error_mode: widgets.ValueWidget) -> Figure:
         """
@@ -815,7 +838,7 @@ def plot_outlier_cases_per_channel(*, datasets: dict[str, pd.DataFrame], k: int 
             error_mode=error_mode,
         )
 
-    return util.util_plot.make_interactive_case_viewer(
+    return analysis.ui.viewers.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=datasets,
         enable_dataset_dropdown=True,
@@ -868,10 +891,10 @@ def plot_extreme_input_table(*, datasets: dict[str, pd.DataFrame]) -> widgets.HB
                     {
                         "parameter": p,
                         "min": col.min(),
-                        "ref": ref_row[p],
+                        "ref": ref_row.loc[p],
                         "max": col.max(),
-                        "min/ref": col.min() / ref_row[p] if ref_row[p] != 0 else np.nan,
-                        "max/ref": col.max() / ref_row[p] if ref_row[p] != 0 else np.nan,
+                        "min/ref": col.min() / ref_row.loc[p] if ref_row.loc[p] != 0 else np.nan,
+                        "max/ref": col.max() / ref_row.loc[p] if ref_row.loc[p] != 0 else np.nan,
                     }
                 )
 
@@ -988,8 +1011,8 @@ def _plot_prediction_overview_case_4x4(
 
     pred, gt, err, kappa, kappa_names = _load_npz(row)
 
-    Lx = float(row["geometry_Lx"])
-    Ly = float(row["geometry_Ly"])
+    Lx = float(row.loc["geometry_Lx"])
+    Ly = float(row.loc["geometry_Ly"])
     ny, nx = pred[CHANNEL_INDICES[CHANNELS[0]]].shape
 
     x = np.linspace(0, Lx, nx)
@@ -1000,10 +1023,10 @@ def _plot_prediction_overview_case_4x4(
 
     # ---- Kappa fields ----
     kappa_field = _aggregate_kappa(kappa, kappa_names)
-    kappa_levels = util.util_plot_components.compute_levels(kappa_field, n_levels)
+    kappa_levels = analysis.ui.components.compute_levels(kappa_field, n_levels)
 
     kappa_log_field = np.log10(np.maximum(kappa_field, 1e-30))
-    kappa_log_levels = util.util_plot_components.compute_levels(kappa_log_field, n_levels)
+    kappa_log_levels = analysis.ui.components.compute_levels(kappa_log_field, n_levels)
 
     nrows = 4  # fixed layout
 
@@ -1021,19 +1044,19 @@ def _plot_prediction_overview_case_4x4(
             X,
             Y,
             field,
-            levels=util.util_plot_components.compute_levels(field, n_levels),
+            levels=analysis.ui.components.compute_levels(field, n_levels),
             cmap=cmap_pred_true,
         )
 
         if label in {"u", "v", "U"}:
             u = pred[CHANNEL_INDICES["u"]]
             v = pred[CHANNEL_INDICES["v"]]
-            util.util_plot_components.overlay_streamlines(ax, X, Y, u, v)
+            analysis.ui.components.overlay_streamlines(ax, X, Y, u, v)
 
         ax.set_title(f"{label} pred [{UNIT_MAP[label]}]")
         cb = fig.colorbar(im, ax=ax, fraction=0.04)
-        cb.ax.yaxis.set_major_formatter(util.util_plot_components.choose_colorbar_formatter(*im.get_clim()))
-        util.util_plot_components.apply_axis_labels(ax, 0, Lx, Ly, is_last_row=is_last_row)
+        cb.ax.yaxis.set_major_formatter(analysis.ui.components.choose_colorbar_formatter(*im.get_clim()))
+        analysis.ui.components.apply_axis_labels(ax, 0, Lx, Ly, is_last_row=is_last_row)
 
         # -------------------------------------------------
         # Ground truth
@@ -1045,19 +1068,19 @@ def _plot_prediction_overview_case_4x4(
             X,
             Y,
             field,
-            levels=util.util_plot_components.compute_levels(field, n_levels),
+            levels=analysis.ui.components.compute_levels(field, n_levels),
             cmap=cmap_pred_true,
         )
 
         if label in {"u", "v", "U"}:
             u = gt[CHANNEL_INDICES["u"]]
             v = gt[CHANNEL_INDICES["v"]]
-            util.util_plot_components.overlay_streamlines(ax, X, Y, u, v)
+            analysis.ui.components.overlay_streamlines(ax, X, Y, u, v)
 
         ax.set_title(f"{label} true [{UNIT_MAP[label]}]")
         cb = fig.colorbar(im, ax=ax, fraction=0.04)
-        cb.ax.yaxis.set_major_formatter(util.util_plot_components.choose_colorbar_formatter(*im.get_clim()))
-        util.util_plot_components.apply_axis_labels(ax, 1, Lx, Ly, is_last_row=is_last_row)
+        cb.ax.yaxis.set_major_formatter(analysis.ui.components.choose_colorbar_formatter(*im.get_clim()))
+        analysis.ui.components.apply_axis_labels(ax, 1, Lx, Ly, is_last_row=is_last_row)
 
         # -------------------------------------------------
         # Error
@@ -1094,8 +1117,8 @@ def _plot_prediction_overview_case_4x4(
 
             ax.set_title(err_title)
             cb = fig.colorbar(im, ax=ax, fraction=0.04)
-            cb.ax.yaxis.set_major_formatter(util.util_plot_components.choose_colorbar_formatter(0.0, vmax))
-            util.util_plot_components.apply_axis_labels(ax, 2, Lx, Ly, is_last_row=is_last_row)
+            cb.ax.yaxis.set_major_formatter(analysis.ui.components.choose_colorbar_formatter(0.0, vmax))
+            analysis.ui.components.apply_axis_labels(ax, 2, Lx, Ly, is_last_row=is_last_row)
 
         # -------------------------------------------------
         # Kappa panels
@@ -1105,13 +1128,13 @@ def _plot_prediction_overview_case_4x4(
             im = ax.contourf(X, Y, kappa_field, levels=kappa_levels, cmap=cmap_kappa)
             ax.set_title("kappa [m²]")
             fig.colorbar(im, ax=ax, fraction=0.04)
-            util.util_plot_components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
+            analysis.ui.components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
 
         elif r == 1:
             im = ax.contourf(X, Y, kappa_log_field, levels=kappa_log_levels, cmap=cmap_kappa)
             ax.set_title("log10(kappa) [m²]")
             fig.colorbar(im, ax=ax, fraction=0.04)
-            util.util_plot_components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
+            analysis.ui.components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
 
         else:
             ax.axis("off")
@@ -1136,8 +1159,8 @@ def plot_extreme_input_cases(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
             A VBox widget containing the interactive case viewer.
 
     """
-    inp_sel = util.util_plot_components.ui_dropdown_input_parameter(parameters=_candidate_input_columns(datasets=datasets))
-    err_sel = util.util_plot_components.ui_radio_error_mode()
+    inp_sel = analysis.ui.components.ui_dropdown_input_parameter(parameters=_candidate_input_columns(datasets=datasets))
+    err_sel = analysis.ui.components.ui_radio_error_mode()
 
     def _plot(idx: int, *, df: pd.DataFrame, dataset_name: str, error_mode: widgets.ValueWidget) -> Figure:
         """
@@ -1173,7 +1196,7 @@ def plot_extreme_input_cases(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
         row = extremes.iloc[idx]
 
         kind = "MIN" if idx == 0 else "MAX"
-        value = row[column]
+        value = row.loc[column]
 
         # Case-Nummer sauber bestimmen
         case_id = row.get("case_index", idx)
@@ -1187,7 +1210,7 @@ def plot_extreme_input_cases(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
             error_mode=error_mode,
         )
 
-    return util.util_plot.make_interactive_case_viewer(
+    return analysis.ui.viewers.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=datasets,
         enable_dataset_dropdown=True,

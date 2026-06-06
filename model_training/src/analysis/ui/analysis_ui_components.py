@@ -1,8 +1,30 @@
 """
-Reusable UI components for interactive scientific viewers.
+===============================================================================
+analysis_ui_components.py
+===============================================================================
+Reusable UI components and plotting helpers for interactive scientific viewers.
 
-This module contains small, stateless widget constructors that are
-used by higher-level navigator functions in util_plot.py.
+Provides:
+  - CheckboxGroup protocol for widget grouping
+  - dropdown and radio button constructors
+  - checkbox group construction
+  - step control widgets (case index, case count sliders)
+  - output plot containers
+  - colorbar formatter selection and axis label application
+  - streamline overlay utilities
+
+Design principles:
+  - all constructors are stateless and return ipywidgets.Widget instances
+  - no semantic logic or navigation state
+  - used exclusively by analysis_ui_viewers for viewer construction
+  - colorbar formatters are automatically selected based on data range
+  - axis labels are applied consistently across plot types
+
+This module does NOT:
+  - contain navigation logic or re-render callbacks (use analysis_ui_viewers)
+  - handle notebook execution or display lifecycle
+  - contain plot functions or data processing
+===============================================================================
 """
 
 from __future__ import annotations

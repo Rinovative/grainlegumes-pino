@@ -1,26 +1,29 @@
 """
-Unified interactive plot navigators.
+===============================================================================
+analysis_ui_viewers.py
+===============================================================================
+Interactive plot navigators for case-level and aggregated analysis.
 
-This module provides exactly two viewer types:
+Provides:
+  - make_interactive_case_viewer: navigate through individual cases with dataset selection
+  - make_casecount_viewer: aggregate statistics across variable case counts
+  - _render_figure: common rendering logic with export context support
+  - set_export_context: context management for figure export during notebook execution
 
-1) make_interactive_case_viewer(...)
-    - Shows ONE case at a time
-    - Dataset selection via dropdown
-    - Case navigation via step control (index + arrows)
-    - Arbitrary extra widgets supported
-    - Used for all case-dependent visualisations
+Design principles:
+  - viewers are navigation and semantics containers
+  - all UI widget construction delegates to analysis_ui_components
+  - export context is thread-safe and managed at plot render time
+  - re-render callbacks support arbitrary widget combinations for filtering
+  - no duplicate widget construction between viewers
+  - internal dependencies use analysis_ui_components module
 
-2) make_casecount_viewer(...)
-    - Aggregates statistics over N cases
-    - Case-count navigation via step control (slider + arrows)
-    - Arbitrary extra widgets supported
-    - Used for global error metrics, GT-vs-Pred cached plots, etc.
-
-Design principles
------------------
-- Viewers contain logic and semantics
-- All UI elements are constructed via util_plot_components
-- No widget construction is duplicated here
+This module does NOT:
+  - construct individual UI widgets (use analysis_ui_components)
+  - handle notebook execution or display lifecycle
+  - contain plot functions (viewers call external plot functions)
+  - manage file I/O or path resolution
+===============================================================================
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ import matplotlib.pyplot as plt
 from IPython.display import display
 from matplotlib.figure import Figure
 
-from src.util.util_plot_components import (
+from .analysis_ui_components import (
     ui_dropdown_dataset,
     ui_output_plot,
     ui_step_case_count,
@@ -140,7 +143,7 @@ def _attach_widget_rerender(
 
 
 # =============================================================================
-# EXPORT CONTEXT (set by util_nb before running a plot)
+# EXPORT CONTEXT (set by analysis_ui_notebook before running a plot)
 # =============================================================================
 _EXPORT_CTX: dict[str, Any] = {}
 

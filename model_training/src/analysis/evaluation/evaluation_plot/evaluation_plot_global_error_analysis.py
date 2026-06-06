@@ -1,8 +1,30 @@
 """
-Global error analysis plots for PINO/FNO evaluation.
+===============================================================================
+evaluation_plot_global_error_analysis.py
+===============================================================================
+Global error analysis plots for aggregated model evaluation across datasets.
 
-This module provides high-level comparative plots across multiple
-evaluation groups based on aggregated evaluation DataFrames.
+Provides:
+  - comparative error metrics across evaluation groups
+  - global error statistics and histograms
+  - multi-dataset aggregated error analysis
+  - interactive viewers for error exploration across cases
+
+Responsibilities:
+  - compute and display aggregated error statistics
+  - support comparison of error distributions between datasets or model variants
+  - visualize global performance metrics
+
+Design principles:
+  - errors are aggregated across multiple cases and datasets
+  - group-level statistics enable comparative analysis
+  - plots use consistent color schemes and styling
+
+This module does NOT:
+  - compute per-case spatial error decomposition (use evaluation_plot_error_decomposition)
+  - handle individual case visualization details
+  - manage normalizer or unit conversion
+===============================================================================
 """
 
 from __future__ import annotations
@@ -16,7 +38,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from scipy.stats import gaussian_kde
 
-from src import domain, util
+from src import analysis, domain
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
@@ -408,7 +430,7 @@ def plot_error_distribution(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBo
 
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -584,7 +606,7 @@ def plot_global_gt_vs_pred(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
     # =========================================================================
     # Return viewer
     # =========================================================================
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -619,7 +641,7 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     # -------------------------------------------------------
     # UI: MAE / Rel [%]
     # -------------------------------------------------------
-    error_selector = util.util_plot_components.ui_radio_error_mode()
+    error_selector = analysis.ui.components.ui_radio_error_mode()
 
     # -------------------------------------------------------
     # Cache structure (clean, mypy-safe)
@@ -807,7 +829,7 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     # Connect to CASECOUNT viewer
     # -------------------------------------------------------
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -976,7 +998,7 @@ def plot_std_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     # -------------------------------------------------------
     # CASECOUNT VIEWER
     # -------------------------------------------------------
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,

@@ -12,7 +12,7 @@ from neuralop import H1Loss, LpLoss
 from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.models import UNO
 from neuralop.training import AdamW
-from src.util.util_metrics import RMSEOverall
+from src.learning.metrics import metrics as learning_metrics
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.optimizer import Optimizer
 
@@ -191,7 +191,7 @@ train_loss = H1Loss(d=2)
 eval_losses = {
     "h1": H1Loss(d=2),
     "l2": LpLoss(d=2, p=2),
-    "overall_rmse": RMSEOverall(),
+    "overall_rmse": learning_metrics.RMSEOverall(),
 }
 
 

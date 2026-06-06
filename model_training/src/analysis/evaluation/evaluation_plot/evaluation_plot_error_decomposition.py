@@ -1,10 +1,30 @@
 """
-Error decomposition plots for PINO/FNO evaluation.
+===============================================================================
+evaluation_plot_error_decomposition.py
+===============================================================================
+Spatial error decomposition analysis for model evaluation.
 
-This module focuses on *where* prediction errors occur by decomposing them
-with respect to:
-    1) distance from the domain boundary
-    2) output magnitude |GT|
+Provides:
+  - error heatmaps decomposed by distance from domain boundary
+  - error heatmaps decomposed by output magnitude |GT|
+  - interactive case viewers for spatial error investigation
+  - combined error statistics with boundary and magnitude grouping
+
+Responsibilities:
+  - identify spatial patterns in prediction errors
+  - correlate errors with boundary effects and field magnitude
+  - support per-case and multi-case error analysis
+
+Design principles:
+  - errors are spatially resolved on the computational grid
+  - decomposition uses domain-aware distance computation
+  - error statistics are grouped by physical regions of interest
+
+This module does NOT:
+  - compute global error metrics (use learning/metrics)
+  - handle time-dependent or transient analysis
+  - perform physics-based error attribution
+===============================================================================
 """
 
 from __future__ import annotations
@@ -16,14 +36,14 @@ import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src import domain, util
+from src import analysis, domain
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
     import pandas as pd
     from matplotlib.figure import Figure
 
-    from src.util.util_plot_components import CheckboxGroup
+    from src.analysis.ui.analysis_ui_components import CheckboxGroup
 
 # ============================================================================
 # CHANNEL DEFINITIONS
@@ -243,11 +263,11 @@ def plot_error_vs_gt_magnitude(*, datasets: dict[str, pd.DataFrame]) -> widgets.
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
-    dataset_selector = util.util_plot_components.ui_checkbox_datasets(
+    dataset_selector = analysis.ui.components.ui_checkbox_datasets(
         dataset_names=names,
     )
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -444,12 +464,12 @@ def plot_error_vs_boundary_distance(
     # ------------------------------------------------------------------
     # UI COMPONENTS
     # ------------------------------------------------------------------
-    channel_selector = util.util_plot_components.ui_checkbox_channels(default_on=CHANNELS)
+    channel_selector = analysis.ui.components.ui_checkbox_channels(default_on=CHANNELS)
 
     # ------------------------------------------------------------------
     # CASECOUNT VIEWER
     # ------------------------------------------------------------------
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,

@@ -1,18 +1,34 @@
 """
-Spectral analysis plots for PINO/FNO evaluation.
+===============================================================================
+evaluation_plot_spectral_analysis.py
+===============================================================================
+Spectral frequency analysis and Fourier diagnostics for model evaluation.
 
-This module provides a small set of spectral diagnostics:
+Provides:
+  - power spectral density comparison (GT vs prediction)
+  - spectral transfer ratio analysis R(k) = Pred / GT
+  - error spectrum visualization
+  - wavenumber-resolved model accuracy assessment
+  - interactive spectral diagnostics with case navigation
+  - optional learned spectral energy heatmap (if spectral_energy_aggregated.pt exists)
 
-1) GT spectral demand vs prediction spectral capacity, plus error spectrum
-2) Spectral transfer ratio R(k) = Pred / GT
-3) Error spectrum (error only)
-4) Optional learned spectral energy heatmap (if spectral_energy_aggregated.pt exists)
+Responsibilities:
+  - analyze frequency-domain model behavior
+  - identify spectral accuracy strengths and weaknesses
+  - support Fourier-space error investigation
 
-UI rules in this file
----------------------
-- No dataset selector: all datasets are always shown side by side
-- Channels can be toggled on/off via util.util_plot_components
-- No explicit raise, no try/except
+Design principles:
+  - spectral analysis uses 2D FFT with Hann windowing
+  - results are displayed in wavenumber coordinates
+  - transfer ratio indicates amplitude preservation by wavenumber
+  - all datasets shown side by side (no dataset selector)
+  - channels toggled via analysis.ui.components
+
+This module does NOT:
+  - compute spatial error statistics (use evaluation_plot_error_decomposition)
+  - perform physics constraint validation (use evaluation_plot_physical_consistency)
+  - handle time-series spectral analysis
+===============================================================================
 """
 
 from __future__ import annotations
@@ -27,7 +43,7 @@ import pandas as pd
 import torch
 from matplotlib.lines import Line2D
 
-from src import domain, util
+from src import analysis, domain
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -283,7 +299,7 @@ def _channel_color_map() -> dict[str, str]:
 
 def _active_channels_from_selector(channel_selector: Any) -> list[str]:
     """
-    Get active channels from util.util_plot_components checkbox widget.
+    Get active channels from analysis.ui.components checkbox widget.
 
     Parameters
     ----------
@@ -856,12 +872,12 @@ def plot_spectral_demand_prediction_error(*, datasets: dict[str, pd.DataFrame]) 
     cache = _init_spectra_cache(names)
     state: dict[str, Any] = {"normalise": True}
 
-    norm_cb = util.util_plot_components.ui_checkbox_normalise(
+    norm_cb = analysis.ui.components.ui_checkbox_normalise(
         description="Normalise",
         default=True,
         width="160px",
     )
-    channel_selector = util.util_plot_components.ui_checkbox_channels(default_on=CHANNELS)
+    channel_selector = analysis.ui.components.ui_checkbox_channels(default_on=CHANNELS)
     controls = widgets.HBox([norm_cb])
 
     ch_colors = _channel_color_map()
@@ -1002,7 +1018,7 @@ def plot_spectral_demand_prediction_error(*, datasets: dict[str, pd.DataFrame]) 
         fig.subplots_adjust(top=0.92, bottom=0.10, left=0.06, right=0.98)
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=50,
@@ -1042,7 +1058,7 @@ def plot_spectral_transfer_ratio(*, datasets: dict[str, pd.DataFrame]) -> widget
         return widgets.VBox([widgets.HTML("<b>No datasets provided.</b>")])
 
     cache = _init_spectra_cache(names)
-    channel_selector = util.util_plot_components.ui_checkbox_channels(default_on=CHANNELS)
+    channel_selector = analysis.ui.components.ui_checkbox_channels(default_on=CHANNELS)
     ch_colors = _channel_color_map()
 
     def _plot(
@@ -1158,7 +1174,7 @@ def plot_spectral_transfer_ratio(*, datasets: dict[str, pd.DataFrame]) -> widget
         fig.subplots_adjust(top=0.86, bottom=0.18, left=0.06, right=0.98)
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=50,
@@ -1323,7 +1339,7 @@ def plot_learned_layer_frequency_heatmap(*, datasets: dict[str, pd.DataFrame]) -
 
     learned_cache: dict[str, _LearnedHeatmapAcc] = {name: {"k": None, "layer_ids": [], "layer_k_energy": None} for name in names}
 
-    norm_layer_cb = util.util_plot_components.ui_checkbox_normalise(
+    norm_layer_cb = analysis.ui.components.ui_checkbox_normalise(
         description="Normalise per layer",
         default=True,
         width="220px",
@@ -1497,7 +1513,7 @@ def plot_learned_layer_frequency_heatmap(*, datasets: dict[str, pd.DataFrame]) -
         fig.subplots_adjust(top=0.86, bottom=0.16, left=0.06, right=0.98)
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=50,

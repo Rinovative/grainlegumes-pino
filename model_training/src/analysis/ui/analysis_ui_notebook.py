@@ -1,10 +1,29 @@
 """
-Jupyter notebook utility functions for interactive plotting and widgets.
+===============================================================================
+analysis_ui_notebook.py
+===============================================================================
+Jupyter notebook utilities for interactive plotting and collapsible widget panels.
 
-This module provides:
-- Functions for creating interactive plot dropdowns
-- Functions for creating collapsible widget panels with tabs
-- Helper functions for displaying and managing plots
+Provides:
+  - make_dropdown_section: interactive plot dropdown with figure export
+  - make_toggle_shortcut: dataset injection helper for viewer functions
+  - make_lazy_panel_with_tabs: collapsible tabbed panels with open/close buttons
+  - _show_anything: unified display function for figures, Plotly, and widgets
+  - _sanitize_name: filename-safe name conversion for exports
+
+Design principles:
+  - panels are collapsible to manage notebook space and interactivity
+  - export state is managed explicitly during dropdown plot selection
+  - viewers are called inside dropdown callbacks to ensure context setup
+  - display functions handle multiple result types uniformly
+  - integration with analysis_ui_viewers.set_export_context for PDF export
+
+This module does NOT:
+  - construct individual widgets (use analysis_ui_components)
+  - contain plot functions or analysis logic
+  - handle file I/O beyond export directory creation
+  - manage notebooks execution lifecycle
+===============================================================================
 """
 
 from collections.abc import Callable, Sequence
@@ -26,10 +45,12 @@ def _sanitize_name(name: str) -> str:
     Converts to lowercase, replaces spaces and various dashes,
     and removes invalid path characters.
 
-    Args:
+    Parameters
+    ----------
         name (str): Original plot name or title.
 
-    Returns:
+    Returns
+    -------
         str: Sanitized name suitable for filenames.
 
     """
@@ -46,10 +67,12 @@ def _show_anything(result: Any) -> None:
     - Strings
     - Generic displayable objects (e.g. DataFrames, widgets)
 
-    Args:
+    Parameters
+    ----------
         result: Object to display.
 
-    Returns:
+    Returns
+    -------
         None
 
     """
@@ -68,11 +91,13 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
     """
     Create an interactive dropdown section for multiple plots.
 
-    Args:
+    Parameters
+    ----------
         plots (list): List of tuples (title, plot_function, plot_name).
         export_state (dict, optional): Dictionary to store export information.
 
-    Returns:
+    Returns
+    -------
         widgets.VBox: A widget container suitable for direct notebook display.
 
     """
@@ -95,11 +120,11 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
             output.clear_output(wait=True)
             plt.close("all")
 
-            # Tell util_plot where to store figures rendered inside viewers/callbacks
+            # Tell analysis_ui_viewers where to store figures rendered inside viewers/callbacks
             if export_state is not None:
-                from src.util import util_plot as _util_plot  # local import to avoid circular import  # noqa: PLC0415
+                from . import analysis_ui_viewers as _viewers  # local import to avoid circular import  # noqa: PLC0415
 
-                _util_plot.set_export_context(export_state, plot_name=plot_name, title=title)
+                _viewers.set_export_context(export_state, plot_name=plot_name, title=title)
 
             result = plot_func()
             if isinstance(result, tuple):
@@ -111,7 +136,7 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
                 export_state["plot_name"] = plot_name
 
                 # WICHTIG: NICHT auf None ueberschreiben, wenn ein Viewer-Widget zurueckkommt.
-                # In dem Fall setzt util_plot._render_figure die Figure bereits in export_state.
+                # In dem Fall setzt analysis_ui_viewers._render_figure die Figure bereits in export_state.
                 if isinstance(result, Figure):
                     export_state["fig"] = result
 
@@ -195,7 +220,8 @@ def make_lazy_panel_with_tabs(
     The panel can be opened and closed using buttons, and each tab may contain
     arbitrary widgets (e.g., dropdown sections, plots, layouts).
 
-    Args:
+    Parameters
+    ----------
         sections (list): List of widget objects to be used as tabs.
         tab_titles (list, optional): Titles for the tabs. Defaults to numbered tabs.
         open_btn_text (str, optional): Label for the open button. Defaults to "Open section".
@@ -204,7 +230,8 @@ def make_lazy_panel_with_tabs(
         export_dir (str, optional): Directory to save exported files. Defaults to "exports".
         export_btn_text (str, optional): Label for the export button. Defaults to "Export PDF".
 
-    Returns:
+    Returns
+    -------
         widgets.Output: A widget container suitable for direct notebook display.
 
     """

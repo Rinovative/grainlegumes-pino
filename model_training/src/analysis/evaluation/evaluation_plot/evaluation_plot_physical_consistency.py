@@ -1,8 +1,31 @@
 """
-Physical consistency plots for PINO/FNO evaluation.
+===============================================================================
+evaluation_plot_physical_consistency.py
+===============================================================================
+Physical consistency and constraint validation for model evaluation.
 
-This module is INDEPENDENT of model architecture (FNO / PINO / UNO)
-and uses canonical field names defined after domain.permeability mapping and batch dataset construction.
+Provides:
+  - physics-based field constraint evaluation
+  - divergence, curl and boundary condition checks
+  - consistency metrics relative to domain physics
+  - interactive multi-case constraint visualization
+
+Responsibilities:
+  - verify model outputs satisfy physical constraints
+  - measure deviations from expected physics laws
+  - support physics-informed model debugging
+
+Design principles:
+  - independent of model architecture (FNO / PINO / UNO)
+  - uses canonical field names from domain.permeability mapping
+  - constraints are computed on physical grid with proper normalization
+  - visualization supports per-case and aggregated constraint analysis
+
+This module does NOT:
+  - perform error decomposition (use evaluation_plot_error_decomposition)
+  - handle model training or physics incorporation
+  - compute global error metrics
+===============================================================================
 """
 
 from __future__ import annotations
@@ -17,7 +40,7 @@ import pandas as pd
 from IPython.display import Markdown, display
 from matplotlib.lines import Line2D
 
-from src import util
+from src import analysis
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -677,7 +700,7 @@ def _plot_metric_cdf_viewer(
         fig.subplots_adjust(top=0.90, bottom=0.15, left=0.06, right=0.98)
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -794,7 +817,7 @@ def _plot_npz_scalar_cdf_viewer(
         fig.subplots_adjust(top=0.90, bottom=0.15, left=0.06, right=0.98)
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -917,14 +940,14 @@ def _plot_mean_field_map_viewer(
                 ax.set_yticks([])
 
             cb = fig.colorbar(im, ax=ax, fraction=0.025)
-            cb.ax.yaxis.set_major_formatter(util.util_plot_components.choose_colorbar_formatter(0.0, vmax))
+            cb.ax.yaxis.set_major_formatter(analysis.ui.components.choose_colorbar_formatter(0.0, vmax))
             cb.set_label(cbar_label)
 
         fig.suptitle(title, y=0.85)
         fig.subplots_adjust(top=0.95, bottom=0.12, left=0.06, right=0.98, wspace=0.25)
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -1399,7 +1422,7 @@ def plot_physical_consistency_cdf_grid(*, datasets: dict[str, pd.DataFrame]) -> 
         fig.subplots_adjust(top=0.92, bottom=0.10, left=0.06, right=0.98)
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,

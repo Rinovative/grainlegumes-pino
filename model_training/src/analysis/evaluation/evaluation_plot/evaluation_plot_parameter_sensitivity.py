@@ -1,8 +1,30 @@
 """
-Error sensitivity analysis for PINO/FNO evaluation.
+===============================================================================
+evaluation_plot_parameter_sensitivity.py
+===============================================================================
+Parameter sensitivity analysis for model error investigation.
 
-This module provides functions to analyze and visualize the sensitivity
-of model errors to various input parameters using evaluation datasets.
+Provides:
+  - error sensitivity to input parameter variations
+  - parameter-error correlation analysis
+  - scatter plots of errors against generator/input parameters
+  - interactive parameter-conditioned error exploration
+
+Responsibilities:
+  - correlate model errors with input parameters
+  - visualize error trends across parameter ranges
+  - support hypothesis testing about parameter sensitivity
+
+Design principles:
+  - sensitivity is measured via correlation or scatter plots
+  - plots enable parameter-space slicing and filtering
+  - interactive viewers support conditional case selection
+
+This module does NOT:
+  - perform statistical significance testing
+  - handle model derivatives or gradient analysis
+  - compute global metrics without parameter context
+===============================================================================
 """
 
 from __future__ import annotations
@@ -15,7 +37,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src import util
+from src import analysis
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
@@ -72,7 +94,7 @@ def _load_err_gt(row: pd.Series) -> tuple[np.ndarray, np.ndarray]:
         Ground-truth array.
 
     """
-    key = str(Path(row["npz_path"]))
+    key = str(Path(row.loc["npz_path"]))
     if key in _npz_cache:
         return _npz_cache[key]
 
@@ -225,7 +247,7 @@ def plot_parameter_error_heatmap(*, datasets: dict[str, pd.DataFrame]) -> widget
                     err_data[ch].append(_rel_l2(err[ci], gt[ci]))
 
                 for p in par_cols:
-                    par_data[p].append(float(row[p]))
+                    par_data[p].append(float(row.loc[p]))
 
             data[name] = {"err": err_data, "par": par_data}
 
@@ -290,7 +312,7 @@ def plot_parameter_error_heatmap(*, datasets: dict[str, pd.DataFrame]) -> widget
         fig.suptitle("Parameter-error correlation")
         return fig
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -434,7 +456,7 @@ def plot_error_vs_parameter_trend(*, datasets: dict[str, pd.DataFrame]) -> widge
                 err, gt = _load_err_gt(row)
 
                 for p in par_cols:
-                    entry["x"][p].append(float(row[p]))
+                    entry["x"][p].append(float(row.loc[p]))
                     for ci, ch in enumerate(CHANNELS):
                         entry["y"][p][ch].append(_rel_l2(err[ci], gt[ci]))
 
@@ -534,11 +556,11 @@ def plot_error_vs_parameter_trend(*, datasets: dict[str, pd.DataFrame]) -> widge
 
         return fig
 
-    channel_selector = util.util_plot_components.ui_checkbox_channels(
+    channel_selector = analysis.ui.components.ui_checkbox_channels(
         default_on=CHANNELS,
     )
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,

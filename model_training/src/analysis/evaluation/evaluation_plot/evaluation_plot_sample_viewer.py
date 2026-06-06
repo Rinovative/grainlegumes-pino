@@ -1,26 +1,41 @@
 """
-Interactive 4x4 PINO/FNO evaluation viewer with physical coordinates and independent color scales for each subplot.
+===============================================================================
+evaluation_plot_sample_viewer.py
+===============================================================================
+Interactive case-by-case evaluation viewer for field and error visualization.
 
-This viewer displays, per output field (p, u, v, U):
-    - prediction
-    - ground truth
-    - error map (switchable: MAE or relative error)
-    - aggregated permeability field kappa
+Provides:
+  - 4x4 field viewer for prediction, ground truth, error, and metadata
+  - per-output-field layout with independent color scales
+  - error type selection (MAE vs relative error)
+  - interactive case navigation and field toggling
+  - physical coordinate display and normalization awareness
 
-IMPORTANT — RELATIVE ERROR HANDLING
-Relative error is defined as:
+Responsibilities:
+  - provide detailed per-case visual evaluation interface
+  - display all output fields with consistent spatial reference
+  - enable field-by-field error inspection
+  - support interactive case exploration
 
-    rel = |pred - true| / (|true| + eps) * 100
+Design principles:
+  - one viewer instance per output field set (p, u, v, kappa)
+  - color scales adapt to data range automatically
+  - physical coordinates displayed for spatial reference
 
-Regions where |true| < mask_threshold (default: 1e-4) are masked (set to NaN),
-because relative error becomes mathematically meaningless there and would
-produce misleading artefacts. This is standard practice in CFD and operator-
-learning visualization.
+Relative error handling:
+  Relative error is defined as: rel = |pred - true| / (|true| + eps) * 100
+  Regions where |true| < mask_threshold (default: 1e-4) are masked (set to NaN)
+  to avoid meaningless artefacts in CFD and operator-learning visualization.
 
-Supported kappa aggregation logic:
-    • Schema-driven diagonal aggregation (kxx, kyy, kzz)
-    • Single-component passthrough
-    • Explicit mean over provided components (visualisation only)
+Kappa aggregation:
+  - Schema-driven diagonal aggregation (kxx, kyy, kzz)
+  - Single-component passthrough
+  - Explicit mean over provided components (visualization only)
+
+This module does NOT:
+  - compute statistical error metrics (use learning/metrics)
+  - perform spectral analysis (use evaluation_plot_spectral_analysis)
+===============================================================================
 """
 
 from __future__ import annotations
@@ -32,7 +47,7 @@ import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src import domain, util
+from src import analysis, domain
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -78,7 +93,7 @@ def _load_npz(row: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
         Component names for the permeability tensor.
 
     """
-    key = str(Path(row["npz_path"]))
+    key = str(Path(row.loc["npz_path"]))
 
     if key in _npz_cache:
         return _npz_cache[key]
@@ -175,8 +190,8 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
     # -------------------------------------------------------------
     # Widgets
     # -------------------------------------------------------------
-    error_selector = util.util_plot_components.ui_radio_error_mode()
-    pred_scale_selector = util.util_plot_components.ui_radio_pred_scale_mode()
+    error_selector = analysis.ui.components.ui_radio_error_mode()
+    pred_scale_selector = analysis.ui.components.ui_radio_pred_scale_mode()
 
     def _plot(  # noqa: PLR0915
         idx: int,
@@ -212,8 +227,8 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
         row = df.iloc[idx]
         pred, gt, err, kappa, kappa_names = _load_npz(row)
 
-        Lx = float(row["geometry_Lx"])
-        Ly = float(row["geometry_Ly"])
+        Lx = float(row.loc["geometry_Lx"])
+        Ly = float(row.loc["geometry_Ly"])
         ny, nx = pred[CHANNEL_INDICES[CHANNELS[0]]].shape
 
         x = np.linspace(0, Lx, nx)
@@ -224,10 +239,10 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
 
         # ---- Kappa fields ----
         kappa_field = _aggregate_kappa(kappa, kappa_names)
-        kappa_levels = util.util_plot_components.compute_levels(kappa_field, n_levels)
+        kappa_levels = analysis.ui.components.compute_levels(kappa_field, n_levels)
 
         kappa_log_field = np.log10(np.maximum(kappa_field, 1e-30))
-        kappa_log_levels = util.util_plot_components.compute_levels(kappa_log_field, n_levels)
+        kappa_log_levels = analysis.ui.components.compute_levels(kappa_log_field, n_levels)
 
         nrows = 4  # fixed layout
         shared_mode = pred_scale_mode.value == "Shared (GT)"
@@ -242,16 +257,16 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
             if shared_mode:
                 # Shared scaling driven by GT
                 gt_field = gt[k]
-                shared_levels = util.util_plot_components.compute_levels(gt_field, n_levels)
+                shared_levels = analysis.ui.components.compute_levels(gt_field, n_levels)
                 vmin = float(shared_levels.min())
                 vmax = float(shared_levels.max())
             else:
                 # Independent scales
                 gt_field = gt[k]
-                gt_levels = util.util_plot_components.compute_levels(gt_field, n_levels)
+                gt_levels = analysis.ui.components.compute_levels(gt_field, n_levels)
 
                 pred_field = pred[k]
-                pred_levels = util.util_plot_components.compute_levels(pred_field, n_levels)
+                pred_levels = analysis.ui.components.compute_levels(pred_field, n_levels)
 
             # =================================================
             # Prediction
@@ -274,7 +289,7 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
                 )
 
                 cb = fig.colorbar(im, ax=ax, fraction=0.04, ticks=shared_levels)
-                cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+                cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                     vmin,
                     vmax,
                     ticks=shared_levels,
@@ -292,7 +307,7 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
                 )
 
                 cb = fig.colorbar(im, ax=ax, fraction=0.04, ticks=pred_levels)
-                cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+                cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                     float(pred_levels.min()),
                     float(pred_levels.max()),
                     ticks=pred_levels,
@@ -302,10 +317,10 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
             if label in {"u", "v", "U"}:
                 u = pred[CHANNEL_INDICES["u"]]
                 v = pred[CHANNEL_INDICES["v"]]
-                util.util_plot_components.overlay_streamlines(ax, X, Y, u, v)
+                analysis.ui.components.overlay_streamlines(ax, X, Y, u, v)
 
             ax.set_title(f"{label} pred [{UNIT_MAP[label]}]")
-            util.util_plot_components.apply_axis_labels(ax, 0, Lx, Ly, is_last_row=is_last_row)
+            analysis.ui.components.apply_axis_labels(ax, 0, Lx, Ly, is_last_row=is_last_row)
 
             # =================================================
             # Ground truth
@@ -322,7 +337,7 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
                 )
 
                 cb = fig.colorbar(im, ax=ax, fraction=0.04, ticks=shared_levels)
-                cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+                cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                     vmin,
                     vmax,
                     ticks=shared_levels,
@@ -338,7 +353,7 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
                 )
 
                 cb = fig.colorbar(im, ax=ax, fraction=0.04, ticks=gt_levels)
-                cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+                cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                     float(gt_levels.min()),
                     float(gt_levels.max()),
                     ticks=gt_levels,
@@ -348,10 +363,10 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
             if label in {"u", "v", "U"}:
                 u = gt[CHANNEL_INDICES["u"]]
                 v = gt[CHANNEL_INDICES["v"]]
-                util.util_plot_components.overlay_streamlines(ax, X, Y, u, v)
+                analysis.ui.components.overlay_streamlines(ax, X, Y, u, v)
 
             ax.set_title(f"{label} true [{UNIT_MAP[label]}]")
-            util.util_plot_components.apply_axis_labels(ax, 1, Lx, Ly, is_last_row=is_last_row)
+            analysis.ui.components.apply_axis_labels(ax, 1, Lx, Ly, is_last_row=is_last_row)
 
             # =================================================
             # Error
@@ -388,14 +403,14 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
 
                 ax.set_title(err_title)
                 cb = fig.colorbar(im, ax=ax, fraction=0.04, ticks=levels_err)
-                cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+                cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                     0.0,
                     vmax_err,
                     ticks=levels_err,
                 )
                 cb.update_ticks()
 
-                util.util_plot_components.apply_axis_labels(ax, 2, Lx, Ly, is_last_row=is_last_row)
+                analysis.ui.components.apply_axis_labels(ax, 2, Lx, Ly, is_last_row=is_last_row)
 
             # =================================================
             # Kappa panels
@@ -405,13 +420,13 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
                 im = ax.contourf(X, Y, kappa_field, levels=kappa_levels, cmap=cmap_kappa)
                 ax.set_title("kappa [m²]")
                 cb = fig.colorbar(im, ax=ax, fraction=0.04, ticks=kappa_levels)
-                cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+                cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                     float(kappa_levels.min()),
                     float(kappa_levels.max()),
                     ticks=kappa_levels,
                 )
                 cb.update_ticks()
-                util.util_plot_components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
+                analysis.ui.components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
 
             elif r == 1:
                 im = ax.contourf(
@@ -423,13 +438,13 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
                 )
                 ax.set_title("log10(kappa) [m²]")
                 cb = fig.colorbar(im, ax=ax, fraction=0.04, ticks=kappa_log_levels)
-                cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+                cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                     float(kappa_log_levels.min()),
                     float(kappa_log_levels.max()),
                     ticks=kappa_log_levels,
                 )
                 cb.update_ticks()
-                util.util_plot_components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
+                analysis.ui.components.apply_axis_labels(ax, 3, Lx, Ly, is_last_row=is_last_row)
 
             else:
                 ax.axis("off")
@@ -441,7 +456,7 @@ def plot_sample_prediction_overview(*, datasets: dict[str, pd.DataFrame]) -> wid
         fig.tight_layout()
         return fig
 
-    return util.util_plot.make_interactive_case_viewer(
+    return analysis.ui.viewers.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_idx=0,
@@ -481,9 +496,9 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
     n_kappa_levels = 11
     mask_threshold = 1e-4
 
-    channel_selector = util.util_plot_components.ui_dropdown_channel()
-    error_selector = util.util_plot_components.ui_radio_error_mode()
-    kappa_scale_selector = util.util_plot_components.ui_radio_kappa_scale()
+    channel_selector = analysis.ui.components.ui_dropdown_channel()
+    error_selector = analysis.ui.components.ui_radio_error_mode()
+    kappa_scale_selector = analysis.ui.components.ui_radio_kappa_scale()
 
     # ------------------------------------------------------------------
     # Error computation
@@ -538,8 +553,8 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
         row = df.iloc[idx]
         _, gt, err, kappa, kappa_names = _load_npz(row)
 
-        Lx = float(row["geometry_Lx"])
-        Ly = float(row["geometry_Ly"])
+        Lx = float(row.loc["geometry_Lx"])
+        Ly = float(row.loc["geometry_Ly"])
         ny, nx = kappa.shape[1:]
 
         x = np.linspace(0.0, Lx, nx)
@@ -606,9 +621,9 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
             if lo > 0.0 and hi > lo:
                 levels_diag = np.logspace(np.log10(lo), np.log10(hi), n_kappa_levels)
             else:
-                levels_diag = util.util_plot_components.compute_levels(diag_vals, n_kappa_levels)
+                levels_diag = analysis.ui.components.compute_levels(diag_vals, n_kappa_levels)
         else:
-            levels_diag = util.util_plot_components.compute_levels(diag_vals, n_kappa_levels)
+            levels_diag = analysis.ui.components.compute_levels(diag_vals, n_kappa_levels)
 
         # --------------------------------------------------
         # Levels: off-diagonal (kxy / kyx)
@@ -621,14 +636,14 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
                 lo = float(np.nanpercentile(vals, 5.0))  # z.B. 5 %
                 hi = float(np.nanpercentile(vals, 95.0))  # z.B. 95 %
 
-                levels_offdiag = np.linspace(lo, hi, n_kappa_levels) if hi > lo else util.util_plot_components.compute_levels(vals, n_kappa_levels)
+                levels_offdiag = np.linspace(lo, hi, n_kappa_levels) if hi > lo else analysis.ui.components.compute_levels(vals, n_kappa_levels)
             else:
-                levels_offdiag = util.util_plot_components.compute_levels(
+                levels_offdiag = analysis.ui.components.compute_levels(
                     offdiag_vals,
                     n_kappa_levels,
                 )
         else:
-            levels_offdiag = util.util_plot_components.compute_levels(
+            levels_offdiag = analysis.ui.components.compute_levels(
                 offdiag_vals,
                 n_kappa_levels,
             )
@@ -670,7 +685,7 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
             else:
                 ax.set_title(f"{name} [m²]")
 
-            util.util_plot_components.apply_axis_labels(
+            analysis.ui.components.apply_axis_labels(
                 ax,
                 c,
                 Lx,
@@ -679,14 +694,14 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
             )
 
             cb = fig.colorbar(im, ax=ax, fraction=0.045, ticks=levels)
-            cb.formatter = util.util_plot_components.choose_colorbar_formatter(float(levels.min()), float(levels.max()))
+            cb.formatter = analysis.ui.components.choose_colorbar_formatter(float(levels.min()), float(levels.max()))
             cb.update_ticks()
 
         # --------------------------------------------------
         # Right column: GT
         # --------------------------------------------------
         ax_gt = axes[0, -1]
-        gt_levels = util.util_plot_components.compute_levels(gt[channel_idx], n_kappa_levels)
+        gt_levels = analysis.ui.components.compute_levels(gt[channel_idx], n_kappa_levels)
 
         im = ax_gt.contourf(X, Y, gt[channel_idx], levels=gt_levels, cmap="turbo")
 
@@ -695,10 +710,10 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
 
         ax_gt.set_title(f"{channel_name} true [{UNIT_MAP[channel_name]}]")
         cb = fig.colorbar(im, ax=ax_gt, fraction=0.045, ticks=gt_levels)
-        cb.formatter = util.util_plot_components.choose_colorbar_formatter(float(gt_levels.min()), float(gt_levels.max()))
+        cb.formatter = analysis.ui.components.choose_colorbar_formatter(float(gt_levels.min()), float(gt_levels.max()))
         cb.update_ticks()
 
-        util.util_plot_components.apply_axis_labels(ax_gt, ncols, Lx, Ly, is_last_row=False)
+        analysis.ui.components.apply_axis_labels(ax_gt, ncols, Lx, Ly, is_last_row=False)
 
         # --------------------------------------------------
         # Right column: error field
@@ -725,10 +740,10 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
             im = ax_err.contourf(X, Y, err_plot, levels=levels, cmap=cmap_obj)
 
             cb = fig.colorbar(im, ax=ax_err, fraction=0.045, ticks=levels)
-            cb.formatter = util.util_plot_components.choose_colorbar_formatter(0.0, vmax)
+            cb.formatter = analysis.ui.components.choose_colorbar_formatter(0.0, vmax)
             cb.update_ticks()
 
-        util.util_plot_components.apply_axis_labels(ax_err, ncols, Lx, Ly, is_last_row=True)
+        analysis.ui.components.apply_axis_labels(ax_err, ncols, Lx, Ly, is_last_row=True)
 
         # --------------------------------------------------
         # Supertitle
@@ -744,7 +759,7 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
         fig.tight_layout()
         return fig
 
-    return util.util_plot.make_interactive_case_viewer(
+    return analysis.ui.viewers.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_idx=0,
@@ -823,12 +838,12 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
     )
 
     # Scale toggle (shared vs independent)
-    pu_scale_selector = util.util_plot_components.ui_radio_pred_scale_mode()
+    pu_scale_selector = analysis.ui.components.ui_radio_pred_scale_mode()
 
     def _row_by_case_index(df: pd.DataFrame, case_index: int) -> pd.Series | None:
         if "case_index" not in df.columns:
             return None
-        hit = df[df["case_index"] == case_index]
+        hit = df.loc[df.loc[:, "case_index"] == case_index]
         if hit.shape[0] == 0:
             return None
         return hit.iloc[0]
@@ -880,7 +895,7 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
 
         # Align rows for both models: try case_index (if available), else positional idx
         if ("case_index" in row_ref.index) and ("case_index" in df1.columns) and ("case_index" in df2.columns):
-            case_id = int(row_ref["case_index"])
+            case_id = int(row_ref.loc["case_index"])
 
             row1 = _row_by_case_index(df1, case_id)
             if row1 is None:
@@ -902,8 +917,8 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
         pred2, _gt2, _, _, _ = _load_npz(row2)
 
         # Geometry
-        Lx = float(row1["geometry_Lx"])
-        Ly = float(row1["geometry_Ly"])
+        Lx = float(row1.loc["geometry_Lx"])
+        Ly = float(row1.loc["geometry_Ly"])
 
         # Coordinates
         ny, nx = gt1[CHANNEL_INDICES["p"]].shape
@@ -937,14 +952,14 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
                 im = ax.contourf(X, Y, field, levels=levels, cmap=cmap_pred_true)
 
             cb = fig.colorbar(im, ax=ax, fraction=0.045, ticks=levels)
-            cb.formatter = util.util_plot_components.choose_colorbar_formatter(
+            cb.formatter = analysis.ui.components.choose_colorbar_formatter(
                 float(levels.min()),
                 float(levels.max()),
                 ticks=levels,
             )
             cb.update_ticks()
             ax.set_title(title)
-            util.util_plot_components.apply_axis_labels(ax, col, Lx, Ly, is_last_row=is_last_row)
+            analysis.ui.components.apply_axis_labels(ax, col, Lx, Ly, is_last_row=is_last_row)
 
         shared_mode = pu_scale_mode.value == "Shared (GT)"
         # -----------------------------
@@ -955,13 +970,13 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
         p_m2 = pred2[CHANNEL_INDICES["p"]]
 
         if shared_mode:
-            p_levels = util.util_plot_components.compute_levels(p_gt, n_levels)
+            p_levels = analysis.ui.components.compute_levels(p_gt, n_levels)
             p_mask = (float(p_levels.min()), float(p_levels.max()))
             p_levels_gt = p_levels_m1 = p_levels_m2 = p_levels
         else:
-            p_levels_gt = util.util_plot_components.compute_levels(p_gt, n_levels)
-            p_levels_m1 = util.util_plot_components.compute_levels(p_m1, n_levels)
-            p_levels_m2 = util.util_plot_components.compute_levels(p_m2, n_levels)
+            p_levels_gt = analysis.ui.components.compute_levels(p_gt, n_levels)
+            p_levels_m1 = analysis.ui.components.compute_levels(p_m1, n_levels)
+            p_levels_m2 = analysis.ui.components.compute_levels(p_m2, n_levels)
             p_mask = None
 
         _panel(axes[0, 0], p_gt, levels=p_levels_gt, title=f"pressure ground truth [{UNIT_MAP['p']}]", col=0, is_last_row=False)
@@ -992,13 +1007,13 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
         U_m2 = pred2[CHANNEL_INDICES["U"]]
 
         if shared_mode:
-            U_levels = util.util_plot_components.compute_levels(U_gt, n_levels)
+            U_levels = analysis.ui.components.compute_levels(U_gt, n_levels)
             U_mask = (float(U_levels.min()), float(U_levels.max()))
             U_levels_gt = U_levels_m1 = U_levels_m2 = U_levels
         else:
-            U_levels_gt = util.util_plot_components.compute_levels(U_gt, n_levels)
-            U_levels_m1 = util.util_plot_components.compute_levels(U_m1, n_levels)
-            U_levels_m2 = util.util_plot_components.compute_levels(U_m2, n_levels)
+            U_levels_gt = analysis.ui.components.compute_levels(U_gt, n_levels)
+            U_levels_m1 = analysis.ui.components.compute_levels(U_m1, n_levels)
+            U_levels_m2 = analysis.ui.components.compute_levels(U_m2, n_levels)
             U_mask = None
 
         _panel(axes[0, 1], U_gt, levels=U_levels_gt, title=f"Velocity ground truth [{UNIT_MAP['U']}]", col=1, is_last_row=False)
@@ -1023,15 +1038,15 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
 
         u_gt = gt1[CHANNEL_INDICES["u"]]
         v_gt = gt1[CHANNEL_INDICES["v"]]
-        util.util_plot_components.overlay_streamlines(axes[0, 1], X, Y, u_gt, v_gt)
+        analysis.ui.components.overlay_streamlines(axes[0, 1], X, Y, u_gt, v_gt)
 
         u_1 = pred1[CHANNEL_INDICES["u"]]
         v_1 = pred1[CHANNEL_INDICES["v"]]
-        util.util_plot_components.overlay_streamlines(axes[1, 1], X, Y, u_1, v_1)
+        analysis.ui.components.overlay_streamlines(axes[1, 1], X, Y, u_1, v_1)
 
         u_2 = pred2[CHANNEL_INDICES["u"]]
         v_2 = pred2[CHANNEL_INDICES["v"]]
-        util.util_plot_components.overlay_streamlines(axes[2, 1], X, Y, u_2, v_2)
+        analysis.ui.components.overlay_streamlines(axes[2, 1], X, Y, u_2, v_2)
 
         # Row labels (links)
         axes[0, 0].set_ylabel("y [m]")
@@ -1041,7 +1056,7 @@ def plot_pu_two_model_comparison(*, datasets: dict[str, pd.DataFrame]) -> widget
         fig.tight_layout()
         return fig
 
-    return util.util_plot.make_interactive_case_viewer(
+    return analysis.ui.viewers.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=base_datasets,
         start_idx=0,

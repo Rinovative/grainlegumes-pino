@@ -22,7 +22,7 @@ import torch
 import wandb
 from neuralop import Trainer
 from src import datasets
-from src.util.util_metrics import RMSEChannelPhysical
+from src.learning.metrics import metrics as learning_metrics
 
 from training import (
     DATA_PROCESSED,
@@ -379,9 +379,9 @@ def train_base(
     if CONFIG.get("log_physical_rmse", False) and eval_losses is not None:
         eval_losses.update(
             {
-                "rmse_p_pa": RMSEChannelPhysical(0, data_processor.out_normalizer),
-                "rmse_u_ms": RMSEChannelPhysical(1, data_processor.out_normalizer),
-                "rmse_v_ms": RMSEChannelPhysical(2, data_processor.out_normalizer),
+                "rmse_p_pa": learning_metrics.RMSEChannelPhysical(0, data_processor.out_normalizer),
+                "rmse_u_ms": learning_metrics.RMSEChannelPhysical(1, data_processor.out_normalizer),
+                "rmse_v_ms": learning_metrics.RMSEChannelPhysical(2, data_processor.out_normalizer),
             }
         )
 

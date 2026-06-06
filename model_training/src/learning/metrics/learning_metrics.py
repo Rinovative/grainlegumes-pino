@@ -1,15 +1,28 @@
 """
-Utility functions for numerical error and statistics metrics.
+===============================================================================
+learning_metrics.py
+===============================================================================
+Error metrics and statistical measures for model training and evaluation.
 
-This module provides functions to:
-- Convert arbitrary numeric inputs into NumPy arrays
-- Compute classical error metrics (MSE, RMSE, MAE)
-- Compute relative and normalized errors
-- Build error maps across a sample axis (mean abs, std)
-- Compute Pearson correlations between numeric arrays
-- Aggregate per-sample error statistics for downstream analysis
+Provides:
+  - classical error metrics (MSE, RMSE, MAE)
+  - relative and normalized error variants
+  - per-sample and aggregated error statistics
+  - Pearson correlation computation
+  - PyTorch nn.Module implementations for training (RMSEOverall, RMSEChannelPhysical, RelRMSEChannel)
+  - error map construction across sample dimensions
 
-All functions operate on NumPy arrays.
+Design principles:
+  - all array functions operate on NumPy arrays
+  - PyTorch modules are used during training for device-aware computation
+  - metrics are deterministic and independent of dataset sampling
+  - physical units and denormalization are explicit in the API
+
+This module does NOT:
+  - handle logging or output writing
+  - contain dataset-specific metric aggregation (that belongs in analysis)
+  - include plot generation or visualization
+===============================================================================
 """
 
 from __future__ import annotations
@@ -39,11 +52,13 @@ def _to_numpy(array: Any, *, copy: bool = False) -> NumberArray:
     Supports NumPy arrays, PyTorch tensors and generic sequences. The output
     is always a float64 array for consistent behaviour across all metrics.
 
-    Args:
+    Parameters
+    ----------
         array: Input data (NumPy array, PyTorch tensor, list, tuple, etc.).
         copy: If True, force a copy of the underlying data.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Float64 NumPy array representation of the input.
 
     """
@@ -71,12 +86,14 @@ def mse(
     """
     Compute the mean squared error between prediction and ground truth.
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values.
         y_pred: Predicted values.
         axis: Axis or axes along which to average. If None, average over all elements.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Mean squared error as a float64 NumPy array.
 
     """
@@ -94,12 +111,14 @@ def rmse(
     """
     Compute the root mean squared error between prediction and ground truth.
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values.
         y_pred: Predicted values.
         axis: Axis or axes along which to average. If None, average over all elements.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Root mean squared error as a float64 NumPy array.
 
     """
@@ -114,12 +133,14 @@ def mae(
     """
     Compute the mean absolute error between prediction and ground truth.
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values.
         y_pred: Predicted values.
         axis: Axis or axes along which to average. If None, average over all elements.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Mean absolute error as a float64 NumPy array.
 
     """
@@ -145,13 +166,15 @@ def mean_relative_error(
     Defined elementwise as:
         |y_pred - y_true| / (|y_true| + eps)
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values.
         y_pred: Predicted values.
         axis: Axes along which to average. If None, use all elements.
         eps: Small constant added to avoid division by zero.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Mean absolute relative error as float64.
 
     """
@@ -173,13 +196,15 @@ def l1_relative_error(
     Defined as:
         ||y_pred - y_true||_1 / (||y_true||_1 + eps)
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values.
         y_pred: Predicted values.
         axis: Axes along which to sum. If None, sum over all elements.
         eps: Small constant to avoid division by zero.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: L1 relative error as float64.
 
     """
@@ -202,13 +227,15 @@ def l2_relative_error(
     Defined as:
         ||y_pred - y_true||_2 / (||y_true||_2 + eps)
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values.
         y_pred: Predicted values.
         axis: Axes along which to sum squares. If None, use all elements.
         eps: Small constant to avoid division by zero.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: L2 relative error as float64.
 
     """
@@ -233,12 +260,14 @@ def mean_absolute_error_map(
     """
     Compute a mean absolute error map across samples.
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values with a sample axis.
         y_pred: Predicted values.
         sample_axis: Axis indexing samples.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Mean absolute error per spatial location.
 
     """
@@ -256,13 +285,15 @@ def std_error_map(
     """
     Compute a standard deviation error map across samples.
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values with a sample axis.
         y_pred: Predicted values.
         sample_axis: Axis indexing samples.
         ddof: Delta degrees of freedom.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Standard deviation of signed error per location.
 
     """
@@ -287,12 +318,14 @@ def pearson_correlation(
 
     Both arrays are flattened before computing the correlation.
 
-    Args:
+    Parameters
+    ----------
         x: First input array.
         y: Second input array.
         eps: Small constant to avoid division by zero.
 
-    Returns:
+    Returns
+    -------
         float: Pearson correlation in the range [-1, 1].
 
     """
@@ -328,13 +361,15 @@ def per_sample_error_statistics(
 
     Aggregates all metrics along all non-sample axes.
 
-    Args:
+    Parameters
+    ----------
         y_true: Ground truth values with sample axis.
         y_pred: Predicted values.
         sample_axis: Axis indexing samples.
         eps: Small constant to avoid division by zero.
 
-    Returns:
+    Returns
+    -------
         Mapping[str, np.ndarray]: Metrics (shape n_samples,).
 
     """
@@ -406,13 +441,19 @@ class RMSEOverall(nn.Module):
         """
         Compute the overall RMSE.
 
-        Args:
-            pred: Predicted tensor of shape (batch, C, H, W).
-            y: Ground truth tensor with identical shape.
-            **kwargs: Ignored extra inputs for compatibility with Trainer.
+        Parameters
+        ----------
+        pred : torch.Tensor
+            Predicted tensor of shape (batch, C, H, W).
+        y : torch.Tensor
+            Ground truth tensor with identical shape.
+        **kwargs : torch.Tensor
+            Ignored extra inputs for compatibility with Trainer.
 
-        Returns:
-            torch.Tensor: Scalar RMSE value.
+        Returns
+        -------
+        torch.Tensor
+            Scalar RMSE value.
 
         """
         diff = pred - y
@@ -431,12 +472,14 @@ class RMSEChannelPhysical(nn.Module):
     This metric denormalizes both predictions and targets using the provided
     normalizer before computing the RMSE for the selected channel.
 
-    Args:
+    Parameters
+    ----------
         channel: Index of the output channel to evaluate.
         out_normalizer: Normalizer with an `inverse_transform` method
                         to denormalize model outputs.
 
-    Returns:
+    Returns
+    -------
         torch.Tensor: Scalar RMSE value for the specified channel.
 
     """
@@ -445,10 +488,12 @@ class RMSEChannelPhysical(nn.Module):
         """
         Initialize the channel-wise physical RMSE metric.
 
-        Args:
-            channel: Index of the output channel to evaluate.
-            out_normalizer: Normalizer with an `inverse_transform` method
-                            to denormalize model outputs.
+        Parameters
+        ----------
+        channel : int
+            Index of the output channel to evaluate.
+        out_normalizer
+            Normalizer with an `inverse_transform` method to denormalize model outputs.
 
         """
         super().__init__()
@@ -464,13 +509,19 @@ class RMSEChannelPhysical(nn.Module):
         """
         Compute the RMSE for the selected channel in physical units.
 
-        Args:
-            pred: Predicted tensor of shape (batch, C, H, W).
-            y: Ground truth tensor with identical shape.
-            **kwargs: Ignored additional arguments forwarded by Trainer.
+        Parameters
+        ----------
+        pred : torch.Tensor
+            Predicted tensor of shape (batch, C, H, W).
+        y : torch.Tensor
+            Ground truth tensor with identical shape.
+        **kwargs : torch.Tensor
+            Ignored additional arguments forwarded by Trainer.
 
-        Returns:
-            torch.Tensor: Scalar RMSE value for the channel.
+        Returns
+        -------
+        torch.Tensor
+            Scalar RMSE value for the channel.
 
         """
         # Denormalize predictions and targets
@@ -504,8 +555,10 @@ class RelRMSEChannel(nn.Module):
         """
         Initialize the channel-wise relative RMSE metric.
 
-        Args:
-            channel: Index of the output channel to evaluate.
+        Parameters
+        ----------
+        channel : int
+            Index of the output channel to evaluate.
 
         """
         super().__init__()
@@ -520,13 +573,19 @@ class RelRMSEChannel(nn.Module):
         """
         Compute the relative RMSE for the selected channel.
 
-        Args:
-            pred: Predicted tensor of shape (batch, C, H, W).
-            y: Ground truth tensor with identical shape.
-            **kwargs: Ignored additional arguments forwarded by Trainer.
+        Parameters
+        ----------
+        pred : torch.Tensor
+            Predicted tensor of shape (batch, C, H, W).
+        y : torch.Tensor
+            Ground truth tensor with identical shape.
+        **kwargs : torch.Tensor
+            Ignored additional arguments forwarded by Trainer.
 
-        Returns:
-            torch.Tensor: Scalar relative RMSE value (percent) for the channel.
+        Returns
+        -------
+        torch.Tensor
+            Scalar relative RMSE value (percent) for the channel.
 
         """
         yt = y[:, self.channel]

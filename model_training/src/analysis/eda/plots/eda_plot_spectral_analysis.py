@@ -1,10 +1,31 @@
 """
-Spectral analysis tools for exploratory data analysis of simulation fields.
+===============================================================================
+eda_plot_spectral_analysis.py
+===============================================================================
+Spectral frequency analysis for exploratory dataset analysis.
 
 Provides:
-  - 2D power spectral density (PSD) computation and visualization
-  - radial energy spectrum analysis
-  - interactive spectral field viewers
+  - 2D power spectral density visualization and wavenumber analysis
+  - radial energy spectrum computation and plotting
+  - spectral field comparison across dataset cases
+  - interactive spectral exploration with case navigation
+
+Responsibilities:
+  - enable frequency-domain dataset characterization
+  - identify dominant spatial scales in simulation fields
+  - support spectral quality assessment during EDA
+
+Design principles:
+  - spectral analysis uses 2D FFT with Hann windowing
+  - results are visualized in wavenumber coordinates
+  - interactive viewers allow per-case spectral inspection
+  - energy spectra reveal spatial complexity of fields
+
+This module does NOT:
+  - perform model evaluation (use evaluation_plot_spectral_analysis)
+  - compute physics-based diagnostics
+  - handle time-series or spectral dynamics
+===============================================================================
 """
 
 from __future__ import annotations
@@ -16,7 +37,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 
-from src import util
+from src import analysis
 from src.analysis.eda.plots.eda_plot_case_statistics import _selected_datasets
 
 if TYPE_CHECKING:
@@ -24,7 +45,7 @@ if TYPE_CHECKING:
     import pandas as pd
     from matplotlib.figure import Figure
 
-    from src.util.util_plot_components import CheckboxGroup
+    from src.analysis.ui.analysis_ui_components import CheckboxGroup
 
 
 # ======================================================================
@@ -259,7 +280,7 @@ def plot_spectral_overview(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
     `ALL_KEYS` into log-scaled 2D PSD maps using FFT. A separate subplot
     is shown for each field, including an individual colourbar.
 
-    Navigation across cases is handled by the generic util_plot navigator.
+    Navigation across cases is handled by the generic analysis.ui.viewers navigator.
 
     Parameters
     ----------
@@ -283,10 +304,10 @@ def plot_spectral_overview(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
         row = df.iloc[idx]
 
         field_keys = _infer_field_keys(df)
-        fields = {key: np.asarray(row[key], float) for key in field_keys}
+        fields = {key: np.asarray(row.loc[key], float) for key in field_keys}
 
-        x = np.asarray(row["x"])
-        y = np.asarray(row["y"])
+        x = np.asarray(row.loc["x"])
+        y = np.asarray(row.loc["y"])
         dx = float(np.nanmedian(np.diff(np.unique(x))))
         dy = float(np.nanmedian(np.diff(np.unique(y))))
 
@@ -330,7 +351,7 @@ def plot_spectral_overview(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
         fig.subplots_adjust(top=0.97, wspace=0.5, hspace=0.01)
         return fig
 
-    return util.util_plot.make_interactive_case_viewer(
+    return analysis.ui.viewers.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_idx=0,
@@ -352,7 +373,7 @@ def plot_spectral_vertical(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
     from a slice near mid-height. This highlights changes in spatial
     structure across the domain height.
 
-    Navigation across cases is handled by the generic util_plot navigator.
+    Navigation across cases is handled by the generic analysis.ui.viewers navigator.
 
     Parameters
     ----------
@@ -373,10 +394,10 @@ def plot_spectral_vertical(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
         """Plot vertical (bottom/mid) radial spectra for a single case."""
         row = df.iloc[idx]
         field_keys = _infer_field_keys(df)
-        fields = {key: np.asarray(row[key], float) for key in field_keys}
+        fields = {key: np.asarray(row.loc[key], float) for key in field_keys}
 
-        x_arr = np.asarray(row["x"])
-        y_arr = np.asarray(row["y"])
+        x_arr = np.asarray(row.loc["x"])
+        y_arr = np.asarray(row.loc["y"])
         dx = float(np.nanmedian(np.diff(np.unique(x_arr))))
         dy = float(np.nanmedian(np.diff(np.unique(y_arr))))
 
@@ -433,7 +454,7 @@ def plot_spectral_vertical(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
         fig.subplots_adjust(top=0.94, wspace=0.40, hspace=0.3)
         return fig
 
-    return util.util_plot.make_interactive_case_viewer(
+    return analysis.ui.viewers.make_interactive_case_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_idx=0,
@@ -504,10 +525,10 @@ def plot_spectral_cumulative(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
                 k_ref: np.ndarray | None = None
 
                 for _, row in df.iterrows():
-                    arr = np.asarray(row[field], float)
+                    arr = np.asarray(row.loc[field], float)
 
-                    x = np.asarray(row["x"])
-                    y = np.asarray(row["y"])
+                    x = np.asarray(row.loc["x"])
+                    y = np.asarray(row.loc["y"])
                     dx = float(np.nanmedian(np.diff(np.unique(x))))
                     dy = float(np.nanmedian(np.diff(np.unique(y))))
 
@@ -575,9 +596,9 @@ def plot_spectral_cumulative(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
 
         return fig
 
-    ds = util.util_plot_components.ui_checkbox_datasets(dataset_names=names)
+    ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,
@@ -653,10 +674,10 @@ def plot_spectral_cumulative_directional(*, datasets: dict[str, pd.DataFrame]) -
                 ky_ref: np.ndarray | None = None
 
                 for _, row in df.iterrows():
-                    arr = np.asarray(row[field], float)
+                    arr = np.asarray(row.loc[field], float)
 
-                    x = np.asarray(row["x"])
-                    y = np.asarray(row["y"])
+                    x = np.asarray(row.loc["x"])
+                    y = np.asarray(row.loc["y"])
                     dx = float(np.nanmedian(np.diff(np.unique(x))))
                     dy = float(np.nanmedian(np.diff(np.unique(y))))
 
@@ -737,9 +758,9 @@ def plot_spectral_cumulative_directional(*, datasets: dict[str, pd.DataFrame]) -
 
         return fig
 
-    ds = util.util_plot_components.ui_checkbox_datasets(dataset_names=names)
+    ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
 
-    return util.util_plot.make_casecount_viewer(
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=100,

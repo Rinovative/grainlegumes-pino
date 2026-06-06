@@ -1,10 +1,30 @@
 """
-Case-level statistics plots and visualizations for EDA.
+===============================================================================
+eda_plot_case_statistics.py
+===============================================================================
+Case-level statistical plots and metadata visualizations for EDA.
 
 Provides:
-  - metadata statistics distributions
-  - generator parameter distributions
-  - field value distributions (case-level aggregates)
+  - metadata statistics distributions (count, range, value histograms)
+  - generator parameter distributions across cases
+  - field value distributions with case-level aggregates
+  - interactive case viewers for statistical exploration
+
+Responsibilities:
+  - create publication-quality statistical plots
+  - display metadata and parameter ranges across dataset
+  - integrate with interactive analysis_ui_viewers for case navigation
+
+Design principles:
+  - statistics are aggregated per case (not per sample/grid point)
+  - distributions are plotted with normalized scaling
+  - metadata and generator parameters are treated as categorical/numeric distributions
+
+This module does NOT:
+  - compute derivatives or physics-specific metrics (use analysis modules)
+  - handle field-level statistics across space (use eda_plot_spectral_analysis)
+  - manage normalizers or unit conversion
+===============================================================================
 """
 
 from __future__ import annotations
@@ -18,7 +38,7 @@ from matplotlib.lines import Line2D
 from scipy.linalg import LinAlgError
 from scipy.stats import gaussian_kde
 
-from src import util
+from src import analysis
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
@@ -26,7 +46,7 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
-    from src.util.util_plot_components import CheckboxGroup
+    from src.analysis.ui.analysis_ui_components import CheckboxGroup
 
 
 # ============================================================================
@@ -437,8 +457,8 @@ def plot_meta_statistics(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
             title=f"Meta statistics distributions (first {max_cases} cases)",
         )
 
-    ds = util.util_plot_components.ui_checkbox_datasets(dataset_names=names)
-    return util.util_plot.make_casecount_viewer(
+    ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=250,
@@ -527,8 +547,8 @@ def plot_meta_parameters(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
             title=f"Meta parameter distributions (first {max_cases} cases)",
         )
 
-    ds = util.util_plot_components.ui_checkbox_datasets(dataset_names=names)
-    return util.util_plot.make_casecount_viewer(
+    ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=250,
@@ -703,8 +723,8 @@ def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widg
 
         return fig
 
-    ds = util.util_plot_components.ui_checkbox_datasets(dataset_names=names)
-    return util.util_plot.make_casecount_viewer(
+    ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
+    return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
         start_cases=250,
