@@ -1,9 +1,10 @@
 """
-Exploratory spectral analysis tools for porous-media simulation data.
+Spectral analysis tools for exploratory data analysis of simulation fields.
 
-This module provides utilities to compute spectral quantities
-(two-dimensional PSDs and radial energy spectra) and to build
-interactive spectral visualisations for simulation fields.
+Provides:
+  - 2D power spectral density (PSD) computation and visualization
+  - radial energy spectrum analysis
+  - interactive spectral field viewers
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import numpy as np
 from matplotlib.lines import Line2D
 
 from src import util
-from src.eda.eda_plot.eda_plot_case_statistics import _selected_datasets
+from src.analysis.eda.plots.eda_plot_case_statistics import _selected_datasets
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
@@ -90,11 +91,15 @@ def _hann2d(ny: int, nx: int) -> np.ndarray:
     A separable Hann weighting is applied in both spatial directions
     to reduce edge effects before computing the FFT.
 
-    Args:
-        ny (int): Number of points in the vertical direction.
-        nx (int): Number of points in the horizontal direction.
+    Parameters
+    ----------
+    ny : int
+        Number of grid points in the y direction.
+    nx : int
+        Number of grid points in the x direction.
 
-    Returns:
+    Returns
+    -------
         np.ndarray: Hann window of shape (ny, nx).
 
     """
@@ -109,12 +114,17 @@ def _fft2_psd(field: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.n
     is returned in centred form (fftshifted), together with the
     corresponding wavenumber grids.
 
-    Args:
-        field (np.ndarray): Two-dimensional scalar field.
-        dx (float): Grid spacing in the x direction.
-        dy (float): Grid spacing in the y direction.
+    Parameters
+    ----------
+    field : np.ndarray
+        2D array representing the spatial field to analyze.
+    dx : float
+        Grid spacing in the x direction.
+    dy : float
+        Grid spacing in the y direction.
 
-    Returns:
+    Returns
+    -------
         tuple:
             np.ndarray: Centred power spectral density.
             np.ndarray: Centred wavenumber grid kx.
@@ -147,13 +157,17 @@ def _radial_spectrum(
     The two-dimensional PSD is binned by radial wavenumber distance.
     The result is the mean spectral energy in each radial band.
 
-    Args:
-        PSD (np.ndarray): Power spectral density.
-        kx (np.ndarray): Wavenumber grid in the x direction.
-        ky (np.ndarray): Wavenumber grid in the y direction.
-        n_bins (int): Number of radial bins.
+    Parameters
+    ----------
+    PSD : np.ndarray
+        2D power spectral density.
+    kx, ky : np.ndarray
+        Wavenumber grids corresponding to the PSD.
+    n_bins : int
+        Number of radial bins to use.
 
-    Returns:
+    Returns
+    -------
         tuple:
             np.ndarray: Radial wavenumber centres.
             np.ndarray: Energy density E(k).
@@ -442,6 +456,17 @@ def plot_spectral_cumulative(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
     the effective spectral bandwidth of the data.
 
     The x-axis is intentionally limited to k <= 50.
+
+    Parameters
+    ----------
+    datasets : dict[str, pd.DataFrame]
+        Dictionary of datasets to plot.
+
+    Returns
+    -------
+    widgets.VBox
+        Interactive widget for viewing cumulative spectral energy distributions.
+
     """
     names = list(datasets.keys())
 
@@ -577,6 +602,17 @@ def plot_spectral_cumulative_directional(*, datasets: dict[str, pd.DataFrame]) -
     requirements for n_modes_x vs n_modes_y.
 
     The x-axis is limited to k <= 50.
+
+    Parameters
+    ----------
+    datasets : dict[str, pandas.DataFrame]
+        Dictionary of datasets to plot.
+
+    Returns
+    -------
+    widgets.VBox
+        Interactive widget for viewing cumulative directional spectral energy.
+
     """
     names = list(datasets.keys())
 

@@ -1,10 +1,10 @@
 """
-Utility functions for data loading and processing.
+EDA DataFrames: Load and convert simulation case data into pandas DataFrames.
 
-This module provides functions to:
-- Load and convert PyTorch tensors to NumPy arrays
-- Process COMSOL simulation case files
-- Generate pandas DataFrames from simulation data
+Provides:
+  - tensor-to-numpy conversion utilities
+  - COMSOL case file parsing and loading
+  - pandas DataFrame generation from simulation samples
 """
 
 from __future__ import annotations

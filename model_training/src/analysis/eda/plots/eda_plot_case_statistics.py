@@ -1,12 +1,10 @@
 """
-Case-level statistics plots for PINO/FNO EDA.
+Case-level statistics plots and visualizations for EDA.
 
-Distributions derived from:
-    1) meta["generator"][*]["statistics"]
-    2) meta["generator"][*]["parameters"]
-    3) reduced field statistics (min/mean/max per case)
-
-Fully data-driven and future-proof.
+Provides:
+  - metadata statistics distributions
+  - generator parameter distributions
+  - field value distributions (case-level aggregates)
 """
 
 from __future__ import annotations
@@ -126,6 +124,24 @@ def _flatten_dict_raw(dct: dict[str, Any]) -> dict[str, float]:
 
 
 def _selected_datasets(dataset_selector: CheckboxGroup) -> list[str]:
+    """
+    Get list of selected dataset names from the dataset selector widget.
+
+    Parameters    ----------
+    dataset_selector : CheckboxGroup
+        Dataset selector widget.
+
+    Returns
+    -------
+    list[str]
+        List of selected dataset names.
+
+    Raises
+    ------
+    ValueError
+        If no dataset is selected.
+
+    """
     active = [n for n, cb in dataset_selector.boxes.items() if cb.value]
     if not active:
         msg = "Select at least one dataset."
