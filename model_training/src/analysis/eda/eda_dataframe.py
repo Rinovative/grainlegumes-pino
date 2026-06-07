@@ -1,10 +1,35 @@
 """
-EDA DataFrames: Load and convert simulation case data into pandas DataFrames.
+===============================================================================
+eda_dataframe.py
+===============================================================================
+Load simulation case data and assemble exploratory data analysis DataFrames.
 
 Provides:
-  - tensor-to-numpy conversion utilities
-  - COMSOL case file parsing and loading
-  - pandas DataFrame generation from simulation samples
+  - Conversion utilities from PyTorch tensors/NumPy to unified arrays
+  - COMSOL case file parsing and ordered collection
+  - Automatic field extraction (input_fields, output_fields, metadata)
+  - pandas DataFrame assembly with minimal schema assumptions
+
+Responsibilities:
+  - Loads all case_XXXX.pt files from a dataset batch
+  - Converts all tensor/numpy fields to consistent NumPy representation
+  - Collects optional batch-level metadata (meta.pt)
+  - Produces exploratory summary DataFrame for downstream analysis
+
+Design principles:
+  - Fully data-driven: no field names are hard-coded
+  - Future-proof: handles arbitrary input/output field names
+  - Transparent logging: includes progress bar, shape hints, and diagnostics
+
+This module does NOT:
+  - Train or evaluate models (see learning.*)
+  - Generate artifact metrics (see analysis.analysis_artifacts)
+  - Perform statistical analysis (that is analysis/evaluation/* scope)
+
+Path resolution:
+  - base_dir: If None, dynamically resolved via common.paths.get_data_root()
+  - Ensures reproducibility across different working directories
+===============================================================================
 """
 
 from __future__ import annotations
@@ -16,6 +41,8 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import pandas as pd
 import torch
+
+from src import common
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -143,7 +170,7 @@ def _extract_fields(sample: Mapping[str, Any]) -> tuple[dict[str, Any], list[str
 
 def generate_eda_dataframe(
     dataset_name: str,
-    base_dir: str = "../../data/raw",
+    base_dir: str | None = None,
     show_progress: bool = False,
     max_cases: int | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
@@ -157,8 +184,9 @@ def generate_eda_dataframe(
     ----------
     dataset_name : str
         Name of the dataset batch.
-    base_dir : str
-        Base directory containing dataset batches.
+    base_dir : str | None, optional
+        Base directory containing dataset batches. If None, uses common.paths
+        to resolve the data root. Default is None.
     show_progress : bool
         If True, displays a progress bar during loading.
     max_cases : int or None
@@ -175,8 +203,9 @@ def generate_eda_dataframe(
     """
     logs: list[str] = []
 
-    base = Path(base_dir)
-    batch_dir = base / dataset_name
+    if base_dir is None:
+        base_dir = str(common.paths.get_data_root() / "raw")
+    batch_dir = Path(base_dir) / dataset_name
     cases_dir = batch_dir / "cases"
 
     if not batch_dir.exists():

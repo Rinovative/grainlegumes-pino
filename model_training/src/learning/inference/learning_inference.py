@@ -1,35 +1,33 @@
 """
 ===============================================================================
-analysis_interference.py
+learning_inference.py
 ===============================================================================
-Inference utilities for PINO and FNO model evaluation.
+Model reconstruction and deterministic inference context.
 
-This module reconstructs a complete, deterministic inference environment
-that mirrors the training setup bit for bit. Instead of relying on
-`neuralop.training.load_training_state`, all required components are
-rebuilt explicitly and transparently. This ensures reproducibility and
-consistent evaluation metrics across machines and training checkpoints.
+Rebuilds a complete, deterministic inference environment that mirrors the
+training setup. All required components are rebuilt explicitly and
+transparently, ensuring reproducibility and consistent evaluation metrics
+across machines and training checkpoints.
 
-The evaluation pipeline performs the following operations:
+The inference pipeline:
 
 1. Load `config.json` from the run directory.
 2. Rebuild the model architecture using stored hyperparameters.
 3. Load the trained model weights from `best_model_state_dict.pt`.
-4. Load and reconstruct the training normaliser (`normalizer.pt`)
-   using the four stored tensors (flat NeuralOp format).
+4. Load and reconstruct the training normalizer (`normalizer.pt`).
 5. Load the simulation dataset for inference.
 6. Create a deterministic evaluation DataLoader.
 
-The main entry point:
+Main entry point: load_inference_context(...)
 
-    load_inference_context(...)
+Returns tuple: (model, loader, processor, device)
 
-returns the tuple:
+Important:
+  - Temporarily imports UNOWithCheckpoint from training.train_uno
+  - TODO Phase 7: UNOWithCheckpoint will migrate to learning/models
+  - Do not add new imports from training/ for new code
+===============================================================================
 
-    (model, loader, processor, device)
-
-which can be used directly for evaluation, visualisation, or downstream
-postprocessing.
 """
 
 from __future__ import annotations
@@ -44,7 +42,7 @@ from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from neuralop.models import FNO
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from training.train_uno import UNOWithCheckpoint
+from training.train_uno import UNOWithCheckpoint  # TODO Phase 7: move to learning/models
 
 from src import domain
 from src.datasets.dataset_simulation import PhysicsDataset
@@ -67,14 +65,20 @@ def _load_config(config_path: Path) -> dict[str, Any]:
     """
     Load a JSON configuration file generated during training.
 
-    Args:
-        config_path (Path): Path to the `config.json` file.
+    Parameters
+    ----------
+    config_path : Path
+        Path to the `config.json` file.
 
-    Returns:
-        dict: Parsed configuration dictionary.
+    Returns
+    -------
+    dict[str, Any]
+        Parsed configuration dictionary.
 
-    Raises:
-        FileNotFoundError: If the file does not exist.
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
 
     """
     if not config_path.exists():
@@ -92,14 +96,20 @@ def _build_model_from_config(model_cfg: dict[str, Any]) -> nn.Module:
     """
     Reconstruct an FNO model from stored hyperparameters.
 
-    Args:
-        model_cfg (dict): The `"model"` section of the configuration.
+    Parameters
+    ----------
+    model_cfg : dict[str, Any]
+        The `"model"` section of the configuration.
 
-    Returns:
-        nn.Module: Fully initialised FNO model.
+    Returns
+    -------
+    nn.Module
+        Fully initialised FNO model.
 
-    Raises:
-        NotImplementedError: If the architecture type is unknown.
+    Raises
+    ------
+    NotImplementedError
+        If the architecture type is unknown.
 
     """
     arch = model_cfg["architecture"]
@@ -141,16 +151,24 @@ def _load_normalizer(normalizer_path: Path, *, device: torch.device) -> DefaultD
     These tensors are assigned to a fresh `DefaultDataProcessor`, ensuring
     that the preprocessing pipeline matches the training setup exactly.
 
-    Args:
-        normalizer_path (Path): Path to `normalizer.pt`.
-        device (torch.device): Target device for all tensors.
+    Parameters
+    ----------
+    normalizer_path : Path
+        Path to `normalizer.pt`.
+    device : torch.device
+        Target device for all tensors.
 
-    Returns:
-        DefaultDataProcessor: Fully reconstructed normalisation processor.
+    Returns
+    -------
+    DefaultDataProcessor
+        Fully reconstructed normalisation processor.
 
-    Raises:
-        FileNotFoundError: If the file does not exist.
-        RuntimeError: If expected keys are missing.
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    RuntimeError
+        If expected keys are missing.
 
     """
     if not normalizer_path.exists():
@@ -191,12 +209,17 @@ def _build_eval_loader(dataset: Dataset[Any], batch_size: int) -> DataLoader:
     """
     Build a deterministic evaluation DataLoader.
 
-    Args:
-        dataset (Dataset): Dataset containing simulation cases.
-        batch_size (int): Evaluation batch size.
+    Parameters
+    ----------
+    dataset : Dataset
+        Dataset containing simulation cases.
+    batch_size : int
+        Evaluation batch size.
 
-    Returns:
-        DataLoader: Deterministic DataLoader with no shuffling.
+    Returns
+    -------
+    DataLoader
+        Deterministic DataLoader with no shuffling.
 
     """
     return DataLoader(
@@ -224,18 +247,28 @@ def load_inference_context(
     This function reconstructs the model, normaliser, dataset, and DataLoader,
     ensuring that inference preprocessing matches the training phase exactly.
 
-    Args:
-        dataset_path (str | Path): Path to the evaluation dataset directory.
-        checkpoint_path (str | Path): Path to `best_model_state_dict.pt`.
-        batch_size (int, optional): Evaluation batch size. Default 1.
-        prefer_cuda (bool, optional): Use CUDA if available. Default True.
+    Parameters
+    ----------
+    dataset_path : str | Path
+        Path to the evaluation dataset directory.
+    checkpoint_path : str | Path
+        Path to `best_model_state_dict.pt`.
+    batch_size : int, optional
+        Evaluation batch size. Default is 1.
+    prefer_cuda : bool, optional
+        Use CUDA if available. Default is True.
 
-    Returns:
-        tuple:
-            model (nn.Module): Loaded neural operator model.
-            loader (DataLoader): Deterministic evaluation loader.
-            processor (DefaultDataProcessor): Preprocessing pipeline.
-            device (torch.device): Device used for inference.
+    Returns
+    -------
+    tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]
+        model : nn.Module
+            Loaded neural operator model.
+        loader : DataLoader
+            Deterministic evaluation loader.
+        processor : DefaultDataProcessor
+            Preprocessing pipeline.
+        device : torch.device
+            Device used for inference.
 
     """
     dataset_path = Path(dataset_path)

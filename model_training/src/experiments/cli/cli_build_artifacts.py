@@ -1,4 +1,35 @@
-"""Generate analysis artifacts for all models and datasets."""
+"""
+===============================================================================
+cli_build_artifacts.py
+===============================================================================
+Executable orchestrator for generating analysis artifacts across trained models.
+
+Provides:
+  - main() entry point for batch artifact generation
+  - run_or_load_artifacts() to generate or retrieve cached artifacts per model/dataset
+  - cleanup_gpu() for memory management after inference
+
+Responsibilities:
+  - Loads trained model checkpoints via learning.inference.learning_inference
+  - Generates Parquet (scalar metrics) and NPZ (full fields) artifacts per dataset
+  - Manages model/GPU lifecycle and artifact caching
+  - Orchestrates both in-distribution (ID) and out-of-distribution (OOD) evaluation
+
+Design principles:
+  - Deterministic: uses config.json, normalizer.pt, best_model_state_dict.pt
+  - Lazy: loads already-generated artifacts from disk when available
+  - Memory-safe: deletes model references and clears GPU cache after each run
+
+This module does NOT:
+  - Define new loss functions or metrics (see analysis.analysis_artifacts)
+  - Train or fine-tune models (scope limited to trained checkpoints)
+
+Important:
+  - Uses learning.inference.learning_inference to load model/normalizer/dataloader
+  - Imports analysis.analysis_artifacts.generate_artifacts for per-dataset artifact creation
+===============================================================================
+
+"""
 
 from __future__ import annotations
 
@@ -11,6 +42,7 @@ import torch
 
 from src import analysis
 from src.analysis import evaluation
+from src.learning.inference import learning_inference
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -18,8 +50,6 @@ if TYPE_CHECKING:
 # ======================================================================
 # Global config
 # ======================================================================
-
-# GPU aktiv lassen (leer setzen, falls CPU gewuenscht)
 # os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -30,7 +60,7 @@ PROCESSED_ROOT = PROJECT_ROOT / "model_training" / "data" / "processed"
 ID_DATASET = "lhs_var80_seed3001"
 OOD_DATASETS = ["lhs_var120_seed4001"]
 
-# Anzahl Cases begrenzen (None = alle)
+# Case limit for testing / debugging (set to None for full runs)
 MAX_CASES: int | None = None
 # ======================================================================
 # Utilities
@@ -38,7 +68,12 @@ MAX_CASES: int | None = None
 
 
 def cleanup_gpu() -> None:
-    """Aggressive GPU / memory cleanup after each model."""
+    """
+    Aggressively clean GPU memory after inference.
+
+    Performs garbage collection, clears CUDA cache, and collects IPC handles
+    to free GPU memory for the next batch. Safe to call when CUDA is unavailable.
+    """
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -46,7 +81,23 @@ def cleanup_gpu() -> None:
 
 
 def iter_model_dirs(root: Path) -> Iterable[str]:
-    """Iterate over all model directories in the given root."""
+    """
+    Iterate over all model directories that contain trained checkpoints.
+
+    A directory is considered a valid model if it contains either
+    `best_model_state_dict.pt` or `model_state_dict.pt`.
+
+    Parameters
+    ----------
+    root : Path
+        Root directory containing model run subdirectories.
+
+    Yields
+    ------
+    str
+        Name (basename) of each valid model directory, in sorted order.
+
+    """
     for p in sorted(root.iterdir()):
         if not p.is_dir():
             continue
@@ -61,7 +112,35 @@ def run_or_load_artifacts(
     dataset_name: str,
     max_cases: int | None,
 ) -> pd.DataFrame:
-    """Load or generate artifacts for one (model, dataset) pair."""
+    """
+    Load or generate artifacts for one (model, dataset) pair.
+
+    Checks for existing artifacts (Parquet or NPZ) and loads them if available.
+    If artifacts don't exist, runs deterministic inference via
+    learning.inference.learning_inference.load_inference_context() and
+    generates Parquet+NPZ artifacts via analysis.analysis_artifacts.generate_artifacts().
+
+    Parameters
+    ----------
+    model_name : str
+        Model directory name (assumed to exist in PROCESSED_ROOT).
+    dataset_name : str
+        Dataset name for evaluation (used to locate raw data and save artifacts).
+    max_cases : int or None
+        Maximum cases to process. If None, processes all cases in the dataset.
+
+    Returns
+    -------
+    pd.DataFrame
+        Artifact summary DataFrame (empty if artifacts were not generated or found).
+
+    Notes
+    -----
+    - Checkpoint priority: best_model_state_dict.pt > model_state_dict.pt
+    - Artifacts cached in model_name/analysis/{id,ood}/dataset_name/
+    - Exceptions during inference are logged and return empty DataFrame (no re-raise)
+
+    """
     run_dir = PROCESSED_ROOT / model_name
     best_ckpt = run_dir / "best_model_state_dict.pt"
     last_ckpt = run_dir / "model_state_dict.pt"
@@ -95,7 +174,7 @@ def run_or_load_artifacts(
         return pd.DataFrame()
 
     try:
-        model, loader, processor, device = analysis.analysis_interference.load_inference_context(
+        model, loader, processor, device = learning_inference.load_inference_context(
             dataset_path=dataset_path,
             checkpoint_path=checkpoint_path,
             batch_size=1,
@@ -128,7 +207,25 @@ def run_or_load_artifacts(
 
 
 def main() -> None:
-    """Generate all analysis artifacts for all models and datasets."""
+    """
+    Generate all analysis artifacts for all trained models and datasets.
+
+    Orchestrates evaluation across all models found in PROCESSED_ROOT and
+    all datasets (ID_DATASET and OOD_DATASETS). For each (model, dataset) pair,
+    calls run_or_load_artifacts() to generate or retrieve cached artifacts.
+
+    Configuration (hardcoded at module level):
+        - ID_DATASET: In-distribution dataset name
+        - OOD_DATASETS: Out-of-distribution dataset names
+        - MAX_CASES: Case limit per dataset (None = all)
+
+    Notes
+    -----
+    - Skips models if ID evaluation fails (no OOD evaluation for that model)
+    - Cleans GPU memory after each model to prevent fragmentation
+    - Prints detailed [INFO], [LOAD], [SKIP], [RUN] messages for debugging
+
+    """
     model_names = list(iter_model_dirs(PROCESSED_ROOT))
     print(f"[INFO] Found {len(model_names)} models")
 
