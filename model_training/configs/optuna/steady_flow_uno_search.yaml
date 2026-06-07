@@ -1,0 +1,92 @@
+study:
+  name: steady_flow_uno_search
+  direction: minimize
+  metric: eval_overall_rmse
+  seed: 9
+  n_trials: 30
+  budgets: [300, 400]
+  hard_prune_spike: true
+  sampler:
+    type: tpe
+    seed: 9
+  pruner:
+    type: median
+    n_startup_trials: 0
+    n_warmup_steps: 0
+    interval_steps: 1
+
+experiment:
+  task: steady_flow
+
+  run:
+    seed: 9
+    deterministic: true
+    device: cuda
+    prefix: optuna
+    suffix: null
+
+  model:
+    architecture: UNO
+    params:
+      modes_x: 64
+      modes_y: 64
+      hidden_channels: 32
+      n_layers: 5
+      mode_ratio: 0.5
+
+  loss:
+    type: supervised
+    data_loss: h1
+
+  physics:
+    enabled: false
+
+  optimizer:
+    type: adamw
+    lr: 3.883614530748613e-4
+    weight_decay: 1.0e-4
+
+  scheduler:
+    type: reduce_on_plateau
+    monitor: eval_overall_rmse
+    factor: 0.5
+    patience: 20
+
+  training:
+    n_epochs: 400
+    eval_interval: 5
+    mixed_precision: false
+    save_best_metric: eval_overall_rmse
+
+search_space:
+  model.params.modes_x:
+    name: modes_x
+    type: categorical
+    values: [24, 32, 48, 64, 96, 128]
+  model.params.modes_y:
+    name: modes_y
+    type: categorical
+    values: [24, 32, 48, 64, 96, 128]
+  model.params.hidden_channels:
+    name: hidden_channels
+    type: categorical
+    values: [32, 64, 96, 128]
+  model.params.n_layers:
+    name: n_layers
+    type: categorical
+    values: [5, 7]
+  model.params.mode_ratio:
+    name: mode_ratio
+    type: float
+    low: 0.1
+    high: 0.9
+  optimizer.lr:
+    name: lr
+    type: float
+    low: 1.0e-3
+    high: 1.5e-2
+    log: true
+  data.batch_size:
+    name: batch_size
+    type: categorical
+    values: [16, 32]

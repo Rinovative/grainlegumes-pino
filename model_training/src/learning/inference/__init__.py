@@ -5,7 +5,7 @@ from typing import Any
 
 
 def __getattr__(name: str) -> Any:
-    """Lazy-load inference modules to avoid training.train_uno import."""
+    """Lazy-load inference modules to avoid import-time reconstruction work."""
     if name == "learning_inference":
         return importlib.import_module(".learning_inference", __name__)
     msg = f"module {__name__!r} has no attribute {name!r}"

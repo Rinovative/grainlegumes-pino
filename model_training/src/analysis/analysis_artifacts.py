@@ -7,11 +7,6 @@ Create persistent evaluation artifacts for PINO and FNO models.
 This module runs deterministic inference on simulation datasets and stores
 reusable artifacts for all downstream evaluation and visualisation modules.
 
-Important:
-  - Temporarily imports PINOSpectralLossDiv from training.tools
-  - TODO Phase 7: PINOSpectralLossDiv will migrate to learning/losses
-  - Do not add new imports from training/ for new code
-
 Artifacts
 ---------
 Parquet (global, per case):
@@ -78,9 +73,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 import torch
-from training.tools.pino_brinkman_losses import PINOSpectralLossDiv  # TODO Phase 7: move to learning/losses
 
 from src import domain
+from src.learning.losses.learning_losses_pino import PINOSpectralLossDiv
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader

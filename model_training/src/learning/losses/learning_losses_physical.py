@@ -1,17 +1,31 @@
 """
 ===============================================================================
-pino_loss_physical.py
+ learning_losses_physical.py
 ===============================================================================
-Physics-Informed Physical-Space Loss for Stationary Brinkman Flow with conservative mass conservation.
+Physical-space derivative operators for PINO residual computation.
 
-Implements the PINO loss function consistent with COMSOL's formulation
-for simulating flow through heterogeneous porous media.
+Responsibilities:
+  - Compute gradients using torch.gradient (element-wise finite differences)
+  - Compute divergences using torch.gradient
+  - Support Brinkman residual and continuity residual evaluation
 
-Governing equations:
-    - Momentum (Brinkman):
-        -∇p + ∇·τ - μ K^{-1} u = 0
-    - Mass conservation (conservative form):
-        ∇·(ε u) = 0
+Design principles:
+  - Uniform grid assumption with spacing dx, dy
+  - Element-wise operators (not classical finite-difference stencils)
+  - Support 2D spatial domains (H, W dimensions)
+  - Maintain numerical stability with safe operations
+
+This module does NOT:
+  - Define loss functions or training objectives
+  - Manage model architecture or checkpointing
+  - Handle spectral/FFT-based derivatives (see learning_losses_spectral.py)
+  - Perform gradient scaling or normalization beyond physical units
+
+Physics context:
+  - Used for evaluating Brinkman momentum: -∇p + ∇·τ - μ K^{-1} u = 0
+  - Used for evaluating continuity: ∇·(ε u) = 0 or ∇·u = 0
+  - Consistent with COMSOL's deviatoric stress formulation
+===============================================================================
 """
 
 from collections.abc import Callable
@@ -19,8 +33,9 @@ from typing import Any
 
 import torch
 import wandb
-from src import domain
 from torch import nn
+
+from src import domain
 
 # ================================================================
 # Constants (from COMSOL)
@@ -219,7 +234,7 @@ class PINOPhysicalLoss(nn.Module):
         kyy_log = x_phys[:, self._in_idx["kyy"]]
         kxy_rel = x_phys[:, self._in_idx["kxy"]]
 
-        eps = x_phys[:, self._in_idx["eps"]].clamp_min(1e-6)
+        eps = x_phys[:, self._in_idx["phi"]].clamp_min(1e-6)
         p_bc = x_phys[:, self._in_idx["p_bc"]]
 
         kxx = torch.pow(10.0, kxx_log)

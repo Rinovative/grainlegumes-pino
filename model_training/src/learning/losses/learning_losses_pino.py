@@ -1,41 +1,50 @@
 """
 ===============================================================================
-pino_brinkman_losses.py
+ learning_losses_pino.py
 ===============================================================================
-Single entry-point for Brinkman PINO losses.
+Physics-informed neural operator (PINO) loss functions for Brinkman flow.
 
-Public API (4 losses):
-    - PINOPhysicalLossEps   : Physical derivatives + conservative continuity div(eps u)
-    - PINOPhysicalLossDiv   : Physical derivatives + plain continuity div(u)
-    - PINOSpectralLossEps   : Spectral derivatives + conservative continuity div(eps u)
-    - PINOSpectralLossDiv   : Spectral derivatives + plain continuity div(u)
+Responsibilities:
+  - Compute supervised data loss (H1 + Lp norms on model predictions)
+  - Compute Brinkman momentum and continuity residuals
+  - Support both physical-space and spectral-space (FFT) derivative computation
+  - Support both conservative div(ε u) and plain div(u) continuity formulations
+  - Provide 4 public loss variants: Physical-Eps, Physical-Div, Spectral-Eps, Spectral-Div
 
-All are thin wrappers around a shared internal implementation. The only
-differences are:
-    - derivative backend (Physical vs Spectral)
-    - continuity formulation (div(eps u) vs div(u))
+Provided classes:
+  - PINOPhysicalLossEps   : Physical derivatives + conservative continuity div(eps u)
+  - PINOPhysicalLossDiv   : Physical derivatives + plain continuity div(u)
+  - PINOSpectralLossEps   : Spectral derivatives + conservative continuity div(eps u)
+  - PINOSpectralLossDiv   : Spectral derivatives + plain continuity div(u)
 
-Physics (strong, stationary, incompressible, conservative form):
-    -∇p + ∇·tau - mu * K^{-1} u = 0
-    div(eps u) = 0   OR   div(u) = 0
-    tau = (mu/eps) * ( ∇u + ∇u^T - (2/3)(∇·u) I )
+Design principles:
+  - All variants wrap a consistent nn.Module interface
+  - Derivative computation is transparent and reproducible
+  - Air properties (μ) hardcoded to maintain consistency across runs
+  - Compatible with mixed-precision training and W&B logging
 
-Tensor conventions
-------------------
-All tensors are channels-first:
+This module does NOT:
+  - Handle model architecture (see learning_models_*)
+  - Orchestrate training (see learning_training_loop)
+  - Manage gradient clipping or loss scaling (training loop responsibility)
+  - Support arbitrary permeability schedules beyond training setup
 
-    inputs  x : (B, C_in, H, W)
-    outputs y : (B, C_out, H, W)
+Physics formulation (strong, stationary, heterogeneous porous media):
+    -∇p + ∇·τ - μ K^{-1} u = 0        (Brinkman momentum)
+    div(ε u) = 0   OR   div(u) = 0    (Conservative or plain continuity)
+    τ = (μ/ε) * (∇u + ∇u^T - (2/3)∇·u I)  (Deviatoric stress, COMSOL convention)
+
+Tensor conventions:
+    inputs  x : (B, C_in, H, W)     [coordinates, permeability, BC]
+    outputs y : (B, C_out, H, W)    [pressure, velocity u, velocity v]
     predictions pred : (B, C_out, H, W)
+    Spatial derivatives along last two dimensions (H, W)
 
-Spatial derivatives are taken along the last two dimensions (H, W).
-
-Notes
------
-- kxx, kyy are stored as log10(Kxx), log10(Kyy) with K in m^2
-- kxy is stored as kxy_hat = Kxy / sqrt(Kxx*Kyy) (dimensionless)
-- K^{-1} is constructed consistently as (1/K0) * Khat^{-1}, with K0 = sqrt(Kxx*Kyy)
-
+Field conventions:
+    - kxx, kyy are stored as log10(Kxx), log10(Kyy) with K in m^2
+    - kxy is stored as kxy_hat = Kxy / sqrt(Kxx*Kyy) (dimensionless)
+    - K^{-1} constructed consistently as (1/K0) * Khat^{-1}, with K0 = sqrt(Kxx*Kyy)
+===============================================================================
 """
 
 from __future__ import annotations
@@ -45,8 +54,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import wandb
-from src import domain
 from torch import nn
+
+from src import domain
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -413,7 +423,7 @@ class _PINOBrinkmanLossBase(nn.Module):
         # ------------------------------------------------------------
         # 4) Inputs
         # ------------------------------------------------------------
-        eps = x_phys[:, self.iidx["eps"]].clamp_min(self._eps_eps)
+        eps = x_phys[:, self.iidx["phi"]].clamp_min(self._eps_eps)
         p_bc = x_phys[:, self.iidx["p_bc"]]
 
         x_coord = x_phys[:, self.iidx["x"]]

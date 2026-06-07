@@ -1,37 +1,43 @@
 """
 ===============================================================================
-pino_loss_spectral.py
+ learning_losses_spectral.py
 ===============================================================================
-PINO loss for 2D stationary incompressible Brinkman flow (minimal + stable edges).
+Spectral-space derivative operators for PINO residual computation via FFT.
 
-- data loss + physics residual loss + pressure-BC loss
-- spectral derivatives via FFT with Reflect-Extension (default, non-periodic stabilisation)
-- interior-only physics loss (pad)
+Responsibilities:
+  - Compute gradients using Fast Fourier Transform (FFT-based differentiation)
+  - Support Reflect-Extension boundary handling to reduce edge artifacts
+  - Support plain FFT with periodic boundary assumption
+  - Compute divergences using spectral derivatives
+  - Support Brinkman and continuity residual evaluation
 
-Datenschema:
-- Inputs:
-    - kxx, kyy: log10(Kxx), log10(Kyy)  (K in m^2)
-    - kxy:      kxy_hat = Kxy / sqrt(Kxx*Kyy)  (dimensionless)
-    - eps:      Porosity (0..1)
-    - p_bc:     Pressure BC as volume field (0 except at inlet)
-    - x, y:     Coordinate fields
-- Outputs:
-    - p, u, v:  Physical fields (Pa, m/s, m/s) after inverse_transform
+Design principles:
+  - FFT-based differentiation for spectral accuracy
+  - Reflect-Extension padding reduces edge artifacts (default mode)
+  - Support 2D spatial domains with optional interior cropping
+  - Numerically stable with half-precision (float16, bfloat16) support
 
-Brinkman (strong, stationary, incompressible, conservative form):
-  -∇p + ∇·tau - mu * K^{-1} u = 0
-  ∇·(eps u) = 0   (mass conservation in heterogeneous porous media)
-  tau = (mu/eps) * ( ∇u + ∇u^T - (2/3)(∇·u) I )
+Supported modes:
+  - "fft": Plain FFT with periodic boundary assumption
+  - "fft_reflect": Reflect-Extension before FFT (reduces boundary artifacts)
 
-  Tensor conventions
-------------------
-All tensors follow a channels-first layout:
+This module does NOT:
+  - Define loss functions or training objectives
+  - Manage model architecture or checkpointing
+  - Handle physical-space derivatives (see learning_losses_physical.py)
+  - Perform gradient scaling or normalization beyond physical units
 
-    inputs  x : (B, C_in, H, W)
-    outputs y : (B, C_out, H, W)
-    predictions pred : (B, C_out, H, W)
+Physics context:
+  - Used for evaluating Brinkman momentum: -∇p + ∇·τ - μ K^{-1} u = 0
+  - Used for evaluating continuity: ∇·(ε u) = 0 or ∇·u = 0
+  - Consistent with COMSOL's deviatoric stress formulation
 
-Spatial derivatives are taken along the last two dimensions (H, W).
+Tensor conventions:
+  - inputs  x : (B, C_in, H, W)
+  - outputs y : (B, C_out, H, W)
+  - predictions pred : (B, C_out, H, W)
+  - Spatial derivatives along last two dimensions (H, W)
+===============================================================================
 """
 
 from __future__ import annotations
@@ -40,8 +46,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import wandb
-from src import domain
 from torch import nn
+
+from src import domain
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -256,7 +263,7 @@ class PINOSpectralLoss(nn.Module):
     - Inputs:
         - kxx, kyy: log10(Kxx), log10(Kyy)  (K in m^2)
         - kxy:      kxy_hat = Kxy / sqrt(Kxx*Kyy)  (dimensionless)
-        - eps:      Porosity (0..1)
+        - phi:      Porosity (0..1)
         - p_bc:     Pressure BC as volume field (0 except at inlet)
         - x, y:     Coordinate fields
     - Outputs:
@@ -410,7 +417,7 @@ class PINOSpectralLoss(nn.Module):
         # ------------------------------------------------------------
         # 4) Inputs
         # ------------------------------------------------------------
-        eps = x_phys[:, self.iidx["eps"]].clamp_min(self._eps_eps)
+        eps = x_phys[:, self.iidx["phi"]].clamp_min(self._eps_eps)
         p_bc = x_phys[:, self.iidx["p_bc"]]
 
         Kxx = 10.0 ** x_phys[:, self.iidx["kxx"]]
@@ -422,8 +429,10 @@ class PINOSpectralLoss(nn.Module):
 
         x_coord = x_phys[:, self.iidx["x"]]
         y_coord = x_phys[:, self.iidx["y"]]
-        dx = (x_coord[:, 0, 1] - x_coord[:, 0, 0]).abs().mean().clamp_min(1e-12)
-        dy = (y_coord[:, 1, 0] - y_coord[:, 0, 0]).abs().mean().clamp_min(1e-12)
+        dx_t = (x_coord[:, 0, 1] - x_coord[:, 0, 0]).abs().mean().clamp_min(1e-12)
+        dy_t = (y_coord[:, 1, 0] - y_coord[:, 0, 0]).abs().mean().clamp_min(1e-12)
+        dx = float(dx_t.detach().cpu().item())
+        dy = float(dy_t.detach().cpu().item())
 
         # ------------------------------------------------------------
         # 5) Spectral derivatives
@@ -492,7 +501,7 @@ class PINOSpectralLoss(nn.Module):
 
         # Outlet: mean pressure constraint (reference / gauge fix)
         y_max = y_coord.amax(dim=(-2, -1), keepdim=True)
-        outlet = (y_coord - y_max).abs() <= 0.5 * dy
+        outlet = (y_coord - y_max).abs() <= 0.5 * dy_t
 
         p_outlet_loss = (
             p[outlet].mean().pow(2) if outlet.any() else torch.zeros((), device=p.device, dtype=p.dtype)

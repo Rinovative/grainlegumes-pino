@@ -22,10 +22,17 @@ Main entry point: load_inference_context(...)
 
 Returns tuple: (model, loader, processor, device)
 
-Important:
-  - Temporarily imports UNOWithCheckpoint from training.train_uno
-  - TODO Phase 7: UNOWithCheckpoint will migrate to learning/models
-  - Do not add new imports from training/ for new code
+Responsibilities:
+  - Reconstruct saved model architecture and state
+  - Load and apply saved normalizer state
+  - Create deterministic inference dataloaders
+  - Provide transparent, reproducible inference interface
+
+This module does NOT:
+  - Perform training or optimization
+  - Generate artifacts or analysis (see src.analysis)
+  - Modify model weights during inference
+  - Manage run directories or checkpoints
 ===============================================================================
 
 """
@@ -42,10 +49,10 @@ from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from neuralop.models import FNO
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from training.train_uno import UNOWithCheckpoint  # TODO Phase 7: move to learning/models
 
 from src import domain
 from src.datasets.dataset_simulation import PhysicsDataset
+from src.learning.models.learning_models_uno import UNOWithCheckpoint
 
 if TYPE_CHECKING:
     from torch import Tensor

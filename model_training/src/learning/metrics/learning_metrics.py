@@ -27,7 +27,7 @@ This module does NOT:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import numpy as np
 import torch
@@ -38,6 +38,14 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 NumberArray: TypeAlias = NDArray[np.float64]
+
+
+class TensorNormalizer(Protocol):
+    """Normalizer interface required by physical-unit tensor metrics."""
+
+    def inverse_transform(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Convert a normalized tensor back to physical units."""
+        ...
 
 
 # ============================================================================
@@ -54,12 +62,14 @@ def _to_numpy(array: Any, *, copy: bool = False) -> NumberArray:
 
     Parameters
     ----------
-        array: Input data (NumPy array, PyTorch tensor, list, tuple, etc.).
-        copy: If True, force a copy of the underlying data.
+    array : Any
+        Input array-like data to convert.
+    copy : bool, optional
+        If True, always return a copy of the data. If False, avoid copying if
 
     Returns
     -------
-        np.ndarray: Float64 NumPy array representation of the input.
+        np.ndarray: Converted array in float64 dtype.
 
     """
     if isinstance(array, np.ndarray):
@@ -88,9 +98,12 @@ def mse(
 
     Parameters
     ----------
-        y_true: Ground truth values.
-        y_pred: Predicted values.
-        axis: Axis or axes along which to average. If None, average over all elements.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    axis : int or tuple of ints, optional
+        Axis or axes along which to average. If None, average over all elements.
 
     Returns
     -------
@@ -113,9 +126,13 @@ def rmse(
 
     Parameters
     ----------
-        y_true: Ground truth values.
-        y_pred: Predicted values.
-        axis: Axis or axes along which to average. If None, average over all elements.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    axis : int or tuple of ints, optional
+        Axis or axes along which to average. If None, average over all elements.
+
 
     Returns
     -------
@@ -135,9 +152,13 @@ def mae(
 
     Parameters
     ----------
-        y_true: Ground truth values.
-        y_pred: Predicted values.
-        axis: Axis or axes along which to average. If None, average over all elements.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    axis : int or tuple of ints, optional
+        Axis or axes along which to average. If None, average over all elements.
+
 
     Returns
     -------
@@ -168,10 +189,14 @@ def mean_relative_error(
 
     Parameters
     ----------
-        y_true: Ground truth values.
-        y_pred: Predicted values.
-        axis: Axes along which to average. If None, use all elements.
-        eps: Small constant added to avoid division by zero.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    axis : int or tuple of ints, optional
+        Axis or axes along which to average. If None, average over all elements.
+    eps : float, optional
+        Small constant added to the denominator to avoid division by zero. Default is 1e-12.
 
     Returns
     -------
@@ -198,10 +223,14 @@ def l1_relative_error(
 
     Parameters
     ----------
-        y_true: Ground truth values.
-        y_pred: Predicted values.
-        axis: Axes along which to sum. If None, sum over all elements.
-        eps: Small constant to avoid division by zero.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    axis : int or tuple of ints, optional
+        Axis or axes along which to sum. If None, sum over all elements.
+    eps : float, optional
+        Small constant added to the denominator to avoid division by zero. Default is 1e-12.
 
     Returns
     -------
@@ -229,10 +258,14 @@ def l2_relative_error(
 
     Parameters
     ----------
-        y_true: Ground truth values.
-        y_pred: Predicted values.
-        axis: Axes along which to sum squares. If None, use all elements.
-        eps: Small constant to avoid division by zero.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    axis : int or tuple of ints, optional
+        Axis or axes along which to sum. If None, sum over all elements.
+    eps : float, optional
+        Small constant added to the denominator to avoid division by zero. Default is 1e-12.
 
     Returns
     -------
@@ -262,9 +295,12 @@ def mean_absolute_error_map(
 
     Parameters
     ----------
-        y_true: Ground truth values with a sample axis.
-        y_pred: Predicted values.
-        sample_axis: Axis indexing samples.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    sample_axis : int, optional
+        Axis along which to compute the mean absolute error over samples. Default is 0.
 
     Returns
     -------
@@ -287,10 +323,14 @@ def std_error_map(
 
     Parameters
     ----------
-        y_true: Ground truth values with a sample axis.
-        y_pred: Predicted values.
-        sample_axis: Axis indexing samples.
-        ddof: Delta degrees of freedom.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    sample_axis : int, optional
+        Axis along which to compute the standard deviation of error over samples. Default is 0.
+    ddof : int, optional
+        Degrees of freedom for standard deviation calculation. Default is 0 (population std). Use ddof=1 for sample std.
 
     Returns
     -------
@@ -320,9 +360,12 @@ def pearson_correlation(
 
     Parameters
     ----------
-        x: First input array.
-        y: Second input array.
-        eps: Small constant to avoid division by zero.
+    x : Any
+        First input array. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y : Any
+        Second input array. Must be compatible in shape with `x`.
+    eps : float, optional
+        Small constant added to the denominator to avoid division by zero. Default is 1e-
 
     Returns
     -------
@@ -363,10 +406,14 @@ def per_sample_error_statistics(
 
     Parameters
     ----------
-        y_true: Ground truth values with sample axis.
-        y_pred: Predicted values.
-        sample_axis: Axis indexing samples.
-        eps: Small constant to avoid division by zero.
+    y_true : Any
+        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
+    y_pred : Any
+        Predicted values. Must be compatible in shape with `y_true`.
+    sample_axis : int, optional
+        Axis along which to compute the statistics over samples. Default is 0.
+    eps : float, optional
+        Small constant added to the denominator to avoid division by zero. Default is 1e-
 
     Returns
     -------
@@ -419,9 +466,8 @@ class RMSEOverall(nn.Module):
     """
     Compute the Root Mean Squared Error (RMSE) across all channels and spatial dimensions.
 
-    This metric accepts arbitrary keyword arguments to remain compatible
-    with `neuralop.Trainer`, which forwards additional keys such as
-    ``x=`` or ``meta=`` during evaluation.
+    This metric accepts arbitrary keyword arguments so evaluation callers can
+    forward additional keys such as ``x=`` or ``meta=``.
 
     The RMSE is computed as:
 
@@ -448,7 +494,7 @@ class RMSEOverall(nn.Module):
         y : torch.Tensor
             Ground truth tensor with identical shape.
         **kwargs : torch.Tensor
-            Ignored extra inputs for compatibility with Trainer.
+            Ignored extra inputs forwarded by evaluation callers.
 
         Returns
         -------
@@ -484,7 +530,7 @@ class RMSEChannelPhysical(nn.Module):
 
     """
 
-    def __init__(self, channel: int, out_normalizer: Any) -> None:
+    def __init__(self, channel: int, out_normalizer: TensorNormalizer) -> None:
         """
         Initialize the channel-wise physical RMSE metric.
 
@@ -516,7 +562,7 @@ class RMSEChannelPhysical(nn.Module):
         y : torch.Tensor
             Ground truth tensor with identical shape.
         **kwargs : torch.Tensor
-            Ignored additional arguments forwarded by Trainer.
+            Ignored additional arguments forwarded by evaluation callers.
 
         Returns
         -------
@@ -547,8 +593,7 @@ class RelRMSEChannel(nn.Module):
 
         rel_RMSE = 100 * RMSE / mean(|y|)
 
-    Extra keyword arguments are ignored to maintain compatibility with
-    `neuralop.Trainer`.
+    Extra keyword arguments are ignored so callers may forward batch metadata.
     """
 
     def __init__(self, channel: int) -> None:
@@ -580,7 +625,7 @@ class RelRMSEChannel(nn.Module):
         y : torch.Tensor
             Ground truth tensor with identical shape.
         **kwargs : torch.Tensor
-            Ignored additional arguments forwarded by Trainer.
+            Ignored additional arguments forwarded by evaluation callers.
 
         Returns
         -------
