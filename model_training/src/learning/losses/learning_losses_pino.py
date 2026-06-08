@@ -1,50 +1,42 @@
 """
 ===============================================================================
- learning_losses_pino.py
+learning_losses_pino.py
 ===============================================================================
-Physics-informed neural operator (PINO) loss functions for Brinkman flow.
+Compute physics-informed neural-operator losses for Brinkman flow.
 
 Responsibilities:
-  - Compute supervised data loss (H1 + Lp norms on model predictions)
-  - Compute Brinkman momentum and continuity residuals
-  - Support both physical-space and spectral-space (FFT) derivative computation
-  - Support both conservative div(ε u) and plain div(u) continuity formulations
-  - Provide 4 public loss variants: Physical-Eps, Physical-Div, Spectral-Eps, Spectral-Div
-
-Provided classes:
-  - PINOPhysicalLossEps   : Physical derivatives + conservative continuity div(eps u)
-  - PINOPhysicalLossDiv   : Physical derivatives + plain continuity div(u)
-  - PINOSpectralLossEps   : Spectral derivatives + conservative continuity div(eps u)
-  - PINOSpectralLossDiv   : Spectral derivatives + plain continuity div(u)
+  - Combine supervised data loss with Brinkman residual losses
+  - Support physical-space and spectral-space derivative backends
+  - Support conservative and plain continuity formulations
+  - Expose the four configured PINO loss variants
 
 Design principles:
-  - All variants wrap a consistent nn.Module interface
-  - Derivative computation is transparent and reproducible
-  - Air properties (μ) hardcoded to maintain consistency across runs
-  - Compatible with mixed-precision training and W&B logging
+  - Public variants share one internal implementation
+  - Derivative backends are explicit and reproducible
+  - Air properties stay fixed for run comparability
 
-This module does NOT:
-  - Handle model architecture (see learning_models_*)
-  - Orchestrate training (see learning_training_loop)
-  - Manage gradient clipping or loss scaling (training loop responsibility)
-  - Support arbitrary permeability schedules beyond training setup
+Boundaries:
+  - Model construction belongs to learning.models.factory
+  - Optimizer and scheduler behavior belongs to learning.training
 
-Physics formulation (strong, stationary, heterogeneous porous media):
-    -∇p + ∇·τ - μ K^{-1} u = 0        (Brinkman momentum)
-    div(ε u) = 0   OR   div(u) = 0    (Conservative or plain continuity)
-    τ = (μ/ε) * (∇u + ∇u^T - (2/3)∇·u I)  (Deviatoric stress, COMSOL convention)
+Notes:
+    Physics formulation (strong, stationary, heterogeneous porous media):
+        -∇p + ∇·τ - μ K^{-1} u = 0        (Brinkman momentum)
+        div(ε u) = 0   OR   div(u) = 0    (Conservative or plain continuity)
+        τ = (μ/ε) * (∇u + ∇u^T - (2/3)∇·u I)  (Deviatoric stress, COMSOL convention)
 
-Tensor conventions:
-    inputs  x : (B, C_in, H, W)     [coordinates, permeability, BC]
-    outputs y : (B, C_out, H, W)    [pressure, velocity u, velocity v]
-    predictions pred : (B, C_out, H, W)
-    Spatial derivatives along last two dimensions (H, W)
+    Tensor conventions:
+        inputs  x : (B, C_in, H, W)     [coordinates, permeability, BC]
+        outputs y : (B, C_out, H, W)    [pressure, velocity u, velocity v]
+        predictions pred : (B, C_out, H, W)
+        Spatial derivatives along last two dimensions (H, W)
 
-Field conventions:
-    - kxx, kyy are stored as log10(Kxx), log10(Kyy) with K in m^2
-    - kxy is stored as kxy_hat = Kxy / sqrt(Kxx*Kyy) (dimensionless)
-    - K^{-1} constructed consistently as (1/K0) * Khat^{-1}, with K0 = sqrt(Kxx*Kyy)
+    Field conventions:
+        - kxx, kyy are stored as log10(Kxx), log10(Kyy) with K in m^2
+        - kxy is stored as kxy_hat = Kxy / sqrt(Kxx*Kyy) (dimensionless)
+        - K^{-1} constructed consistently as (1/K0) * Khat^{-1}, with K0 = sqrt(Kxx*Kyy)
 ===============================================================================
+
 """
 
 from __future__ import annotations
@@ -107,9 +99,11 @@ class _DerivativeBackend:
     """Interface for spatial derivatives on uniform grids."""
 
     def grad(self, f: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute x/y gradients for a scalar field."""
         raise NotImplementedError
 
     def div(self, fx: torch.Tensor, fy: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+        """Compute divergence for a vector field."""
         raise NotImplementedError
 
 
@@ -118,12 +112,14 @@ class _PhysicalDerivatives(_DerivativeBackend):
     """Physical-space derivatives via torch.gradient."""
 
     def grad(self, f: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute torch.gradient-based x/y gradients."""
         # torch.gradient returns (df/dy, df/dx) if you request two dims
         dfdy = torch.gradient(f, dim=-2)[0] / dy
         dfdx = torch.gradient(f, dim=-1)[0] / dx
         return dfdx, dfdy
 
     def div(self, fx: torch.Tensor, fy: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+        """Compute torch.gradient-based vector divergence."""
         dfxdx = torch.gradient(fx, dim=-1)[0] / dx
         dfydy = torch.gradient(fy, dim=-2)[0] / dy
         return dfxdx + dfydy
@@ -187,6 +183,7 @@ class _SpectralDerivatives(_DerivativeBackend):
         return dfdx, dfdy
 
     def grad(self, f: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute spectral x/y gradients using the configured mode."""
         dx_f = _to_float(dx)
         dy_f = _to_float(dy)
 
@@ -198,6 +195,7 @@ class _SpectralDerivatives(_DerivativeBackend):
         raise ValueError(msg)
 
     def div(self, fx: torch.Tensor, fy: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+        """Compute spectral vector divergence."""
         dfxdx, _ = self.grad(fx, dx, dy)
         _, dfydy = self.grad(fy, dx, dy)
         return dfxdx + dfydy
@@ -236,6 +234,7 @@ class _PINOBrinkmanLossBase(nn.Module):
         kxy_hat_clip: float = 0.999,
         det_hat_min: float = 1e-4,
     ) -> None:
+        """Initialize shared PINO loss settings and numeric safeguards."""
         super().__init__()
 
         self.backend = backend
@@ -263,6 +262,7 @@ class _PINOBrinkmanLossBase(nn.Module):
         self.oidx = {n: i for i, n in enumerate(self.output_fields)}
 
     def set_normalizers(self, *, in_normalizer: Any, out_normalizer: Any) -> None:
+        """Attach input and output normalizers after construction."""
         self.in_normalizer = in_normalizer
         self.out_normalizer = out_normalizer
 
@@ -274,13 +274,23 @@ class _PINOBrinkmanLossBase(nn.Module):
         x: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """
-        Compute physics diagnostics using the exact same implementation as the training loss.
+        Compute physics diagnostics using the training-loss implementation.
 
-        Important:
-            pred and x must be in NORMALIZED space (same as forward()).
+        Parameters
+        ----------
+        pred : torch.Tensor
+            Normalized model predictions with shape ``(B, C_out, H, W)``.
+        x : torch.Tensor
+            Normalized model inputs with shape ``(B, C_in, H, W)``.
 
-        Returns:
-            Rx, Ry, Rc, div_u, div_eps_u as (B,1,H,W) and scalar MSE terms.
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Residual fields ``Rx``, ``Ry``, ``Rc``, ``div_u``, ``div_eps_u`` and scalar MSE terms.
+
+        Notes
+        -----
+        ``pred`` and ``x`` must use the same normalized space as ``forward``.
 
         """
         if self.in_normalizer is None or self.out_normalizer is None:
@@ -398,6 +408,7 @@ class _PINOBrinkmanLossBase(nn.Module):
         y: torch.Tensor,
         **_kwargs: Any,
     ) -> torch.Tensor:
+        """Compute supervised plus physics-informed PINO loss."""
         # ------------------------------------------------------------
         # 1) Data loss (normalized space)
         # ------------------------------------------------------------

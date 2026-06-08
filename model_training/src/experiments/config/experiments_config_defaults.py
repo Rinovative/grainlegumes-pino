@@ -1,26 +1,22 @@
 """
 ===============================================================================
- experiments_config_defaults.py
+experiments_config_defaults.py
 ===============================================================================
-Task-specific defaults and configuration resolution.
+Define task and component defaults for experiment configs.
 
 Responsibilities:
-  - Define task defaults (steady_flow, transient_heat_moisture, etc.)
-  - Map tasks to standard datasets, channels, and field selections
-  - Provide sensible defaults for model, loss, optimizer, scheduler, and training
-  - Enable minimal experiment YAMLs by avoiding repetition of fixed defaults
+  - Define task defaults for supported problem types
+  - Map tasks to standard datasets, channels and field selections
+  - Provide model, loss, optimizer, scheduler and training defaults
 
 Design principles:
-  - Task defaults are declarative data, not code logic
-  - Model/loss/training defaults are fixed unless explicitly overridden
-  - User-provided YAML values override task defaults
-  - Effective config must be fully expanded before training
+  - Defaults are declarative data
+  - User YAML values override defaults
+  - Resolved configs are complete enough for reproducible runs
 
-This module does NOT:
-  - Load or parse YAML files (see experiments_config_loader)
-  - Validate config schema (see experiments_config_schema)
-  - Handle file I/O or path resolution (see common.paths and config_loader)
-  - Execute training or perform any side effects
+Boundaries:
+  - YAML parsing and saving belong to experiments.config.loader
+  - Training execution belongs to learning.training.loop
 ===============================================================================
 """
 

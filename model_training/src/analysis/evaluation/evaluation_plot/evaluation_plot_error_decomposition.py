@@ -2,28 +2,21 @@
 ===============================================================================
 evaluation_plot_error_decomposition.py
 ===============================================================================
-Spatial error decomposition analysis for model evaluation.
-
-Provides:
-  - error heatmaps decomposed by distance from domain boundary
-  - error heatmaps decomposed by output magnitude |GT|
-  - interactive case viewers for spatial error investigation
-  - combined error statistics with boundary and magnitude grouping
+Plot spatial error decompositions for model evaluation.
 
 Responsibilities:
-  - identify spatial patterns in prediction errors
-  - correlate errors with boundary effects and field magnitude
-  - support per-case and multi-case error analysis
+  - Plot errors by boundary distance
+  - Plot errors by ground-truth magnitude
+  - Build per-case spatial error viewers
 
 Design principles:
-  - errors are spatially resolved on the computational grid
-  - decomposition uses domain-aware distance computation
-  - error statistics are grouped by physical regions of interest
+  - Error groups are computed on the spatial grid
+  - Domain-aware masks define physical regions
+  - Interactive viewers reuse shared analysis UI components
 
-This module does NOT:
-  - compute global error metrics (use learning/metrics)
-  - handle time-dependent or transient analysis
-  - perform physics-based error attribution
+Boundaries:
+  - Global metric summaries belong to evaluation_plot_global_error_analysis
+  - Physics residual plots belong to evaluation_plot_physical_consistency
 ===============================================================================
 """
 
@@ -43,7 +36,7 @@ if TYPE_CHECKING:
     import pandas as pd
     from matplotlib.figure import Figure
 
-    from src.analysis.ui.analysis_ui_components import CheckboxGroup
+    CheckboxGroup = analysis.ui.components.CheckboxGroup
 
 # ============================================================================
 # CHANNEL DEFINITIONS

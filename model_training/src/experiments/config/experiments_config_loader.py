@@ -1,31 +1,24 @@
 """
 ===============================================================================
- experiments_config_loader.py
+experiments_config_loader.py
 ===============================================================================
-Load and resolve experiment configurations from YAML files.
+Load, merge and resolve experiment configuration dictionaries.
 
 Responsibilities:
   - Load YAML experiment files
-  - Resolve inline experiment dictionaries
-  - Merge with task defaults and model/loss/training defaults
-  - Resolve paths using common.paths
-  - Generate run names from config parameters
-  - Validate required sections
-  - Save effective config to run directory
+  - Merge user configs with task and component defaults
+  - Resolve path roots and generated run names
+  - Build dataloaders from resolved data settings
 
 Design principles:
-  - Input YAMLs stay minimal (no repetition of defaults)
-  - Effective config is fully expanded (includes all defaults)
-  - Config resolution is deterministic and traceable
-  - Paths resolved through common.paths, not hardcoded
-  - Defaults applied consistently across all runs
+  - Input YAMLs stay minimal
+  - Effective configs are fully expanded
+  - Required sections fail fast when missing
 
-This module does NOT:
-  - Execute training or perform side effects
-  - Modify the input YAML files
-  - Manage run directories (caller creates them)
-  - Perform model initialization or validation beyond schema
-  - Handle checkpoint or artifact loading (those are training concerns)
+Boundaries:
+  - Defaults belong to experiments.config.defaults
+  - Model, loss and optimizer construction belong to learning factories
+  - Training execution belongs to learning.training.loop
 ===============================================================================
 """
 
@@ -36,16 +29,15 @@ import importlib
 from pathlib import Path
 from typing import Any, Protocol, TextIO, cast
 
-from src import common
-from src.datasets import simulation
-from src.datasets.dataset_base import create_dataloaders
-from src.experiments.config.experiments_config_defaults import (
-    LOSS_DEFAULTS,
-    MODEL_DEFAULTS,
-    OPTIMIZER_DEFAULTS,
-    SCHEDULER_DEFAULTS,
-    get_task_defaults,
-)
+from src import common, datasets
+
+from . import experiments_config_defaults as config_defaults
+
+LOSS_DEFAULTS = config_defaults.LOSS_DEFAULTS
+MODEL_DEFAULTS = config_defaults.MODEL_DEFAULTS
+OPTIMIZER_DEFAULTS = config_defaults.OPTIMIZER_DEFAULTS
+SCHEDULER_DEFAULTS = config_defaults.SCHEDULER_DEFAULTS
+get_task_defaults = config_defaults.get_task_defaults
 
 
 class _YamlModule(Protocol):
@@ -313,7 +305,7 @@ def create_dataloaders_from_config(config: dict[str, Any]) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Dictionary with keys: train, eval, normalizer, split_indices
+        Dictionary with keys: train, eval, data_processor, split_indices
 
     """
     data_cfg = config.get("data", {})
@@ -339,8 +331,8 @@ def create_dataloaders_from_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
     # Call real create_dataloaders
-    train_loader, test_loaders, normalizer, split_indices = create_dataloaders(
-        dataset_cls=simulation.PhysicsDataset,
+    train_loader, test_loaders, normalizer, split_indices = datasets.base.create_dataloaders(
+        dataset_cls=datasets.simulation.PhysicsDataset,
         path_train=str(path_train),
         path_test_ood=str(path_test_ood),
         train_ratio=data_cfg.get("train_ratio", 0.8),

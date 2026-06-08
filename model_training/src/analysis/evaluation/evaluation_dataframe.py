@@ -1,22 +1,33 @@
 """
-Utility functions for constructing evaluation-ready DataFrames.
+===============================================================================
+evaluation_dataframe.py
+===============================================================================
+Build evaluation-ready DataFrames from artifact tables.
 
-This module converts the raw Parquet files produced by the artifact
-generator into lightweight evaluation DataFrames.
+Responsibilities:
+  - Load raw Parquet artifact tables
+  - Flatten JSON metadata into scalar columns
+  - Preserve case-level metric columns for downstream plots
 
-Artifacts
----------
-Expected raw Parquet columns:
+Design principles:
+  - Artifact parsing is deterministic and side-effect free
+  - Metadata expansion is explicit and shallow
+  - Plot modules receive normalized tabular inputs
+
+Boundaries:
+  - Artifact generation belongs to analysis.artifacts
+  - Visualization belongs to analysis.evaluation.plots
+
+Notes:
+  Expected raw Parquet columns:
     - case_index
     - npz_path
     - l2
     - rel_l2
     - kappa_names
     - meta  (dict, JSON-safe metadata)
+===============================================================================
 
-After processing, the returned DataFrame additionally contains one column
-per extracted scalar metadata entry, with flattened column names derived
-from the nested meta structure.
 """
 
 from __future__ import annotations

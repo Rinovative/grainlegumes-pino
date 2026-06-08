@@ -2,22 +2,21 @@
 ===============================================================================
 evaluation_panel.py
 ===============================================================================
-Builder for interactive evaluation panels with tabbed sections and export.
-
-Provides:
-  - build_evaluation_panel: construct tabbed panel from plot sections
-  - support for collapsible panels with open/close buttons
-  - PDF export integration via analysis_ui_notebook
+Build interactive evaluation panels with tabbed sections and export.
 
 Responsibilities:
-  - organize multiple evaluation plot sections into a single interactive interface
-  - manage panel visibility and user interaction
-  - coordinate with analysis_ui_notebook for figure export
+  - Register plot functions into named evaluation sections
+  - Assemble dropdown sections into tabbed panels
+  - Pass export state through notebook UI helpers
 
-This module does NOT:
-  - contain plot functions (those belong in evaluation_plot_*.py)
-  - handle figure creation or rendering (delegates to plot functions)
-  - manage dataset selection or case navigation (uses pre-made viewers)
+Design principles:
+  - Panels compose existing plot functions
+  - Section registration is declarative
+  - Widget state stays local to the panel builder
+
+Boundaries:
+  - Plot rendering belongs to analysis.evaluation.plots
+  - Widget primitives belong to analysis.ui
 ===============================================================================
 """
 
@@ -26,7 +25,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from src import analysis
-from src.analysis import evaluation
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,19 +56,19 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
             [
                 toggle(
                     "Overview: Summary table",
-                    evaluation.evaluation_plot.evaluation_plot_overview_scoreboard.plot_overview_global_summary_table,
+                    analysis.evaluation.plots.overview.plot_overview_global_summary_table,
                 ),
                 toggle(
                     "Overview: Global comparison summary",
-                    evaluation.evaluation_plot.evaluation_plot_overview_scoreboard.plot_overview_scoreboard,
+                    analysis.evaluation.plots.overview.plot_overview_scoreboard,
                 ),
                 toggle(
                     "Overview: Pareto (Error vs Physics)",
-                    evaluation.evaluation_plot.evaluation_plot_overview_scoreboard.plot_overview_pareto_error_vs_physics,
+                    analysis.evaluation.plots.overview.plot_overview_pareto_error_vs_physics,
                 ),
                 toggle(
                     "Overview: Architecture & hyperparameter table",
-                    evaluation.evaluation_plot.evaluation_plot_overview_scoreboard.plot_overview_architecture_table,
+                    analysis.evaluation.plots.overview.plot_overview_architecture_table,
                 ),
             ],
             "Overview",
@@ -78,11 +76,11 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
         # --------------------------------------------------------------
         "global_error": (
             [
-                toggle("1-1. Global error metrics", evaluation.evaluation_plot.evaluation_plot_global_error_analysis.plot_global_error_metrics),
-                toggle("1-2. Global error distribution", evaluation.evaluation_plot.evaluation_plot_global_error_analysis.plot_error_distribution),
-                toggle("1-3. GT vs Prediction (mean)", evaluation.evaluation_plot.evaluation_plot_global_error_analysis.plot_global_gt_vs_pred),
-                toggle("1-4. Mean error maps", evaluation.evaluation_plot.evaluation_plot_global_error_analysis.plot_mean_error_maps),
-                toggle("1-5. Std error maps", evaluation.evaluation_plot.evaluation_plot_global_error_analysis.plot_std_error_maps),
+                toggle("1-1. Global error metrics", analysis.evaluation.plots.global_error.plot_global_error_metrics),
+                toggle("1-2. Global error distribution", analysis.evaluation.plots.global_error.plot_error_distribution),
+                toggle("1-3. GT vs Prediction (mean)", analysis.evaluation.plots.global_error.plot_global_gt_vs_pred),
+                toggle("1-4. Mean error maps", analysis.evaluation.plots.global_error.plot_mean_error_maps),
+                toggle("1-5. Std error maps", analysis.evaluation.plots.global_error.plot_std_error_maps),
             ],
             "Global Error Analysis",
         ),
@@ -91,21 +89,21 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
             [
                 toggle(
                     "2-1. Error vs architecture parameters",
-                    evaluation.evaluation_plot.evaluation_plot_architecture_sensitivity.plot_error_vs_architecture_parameters,
+                    analysis.evaluation.plots.architecture.plot_error_vs_architecture_parameters,
                 ),
                 toggle(
-                    "2-2. Capacity vs performance", evaluation.evaluation_plot.evaluation_plot_architecture_sensitivity.plot_capacity_vs_performance
+                    "2-2. Capacity vs performance", analysis.evaluation.plots.architecture.plot_capacity_vs_performance
                 ),
-                toggle("2-3. Parameter efficiency", evaluation.evaluation_plot.evaluation_plot_architecture_sensitivity.plot_parameter_efficiency),
+                toggle("2-3. Parameter efficiency", analysis.evaluation.plots.architecture.plot_parameter_efficiency),
             ],
             "Architecture Sensitivity",
         ),
         # --------------------------------------------------------------
         "error_decomposition": (
             [
-                toggle("3-1. Error vs |GT| magnitude", evaluation.evaluation_plot.evaluation_plot_error_decomposition.plot_error_vs_gt_magnitude),
+                toggle("3-1. Error vs |GT| magnitude", analysis.evaluation.plots.error_decomposition.plot_error_vs_gt_magnitude),
                 toggle(
-                    "3-2. Boundary vs interior error", evaluation.evaluation_plot.evaluation_plot_error_decomposition.plot_error_vs_boundary_distance
+                    "3-2. Boundary vs interior error", analysis.evaluation.plots.error_decomposition.plot_error_vs_boundary_distance
                 ),
             ],
             "Error Decomposition",
@@ -115,39 +113,39 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
             [
                 toggle(
                     "4-1. Physical consistency summary table",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_physical_consistency_summary_table,
+                    analysis.evaluation.plots.physical_consistency.plot_physical_consistency_summary_table,
                 ),
                 toggle(
                     "4-2. Physical consistency CDF grid (2x2)",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_physical_consistency_cdf_grid,
+                    analysis.evaluation.plots.physical_consistency.plot_physical_consistency_cdf_grid,
                 ),
                 toggle(
                     "4-3. Velocity divergence (∇·u)",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_velocity_divergence,
+                    analysis.evaluation.plots.physical_consistency.plot_velocity_divergence,
                 ),
                 toggle(
                     "4-4. Mass conservation error map",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_mass_conservation_error_map,
+                    analysis.evaluation.plots.physical_consistency.plot_mass_conservation_error_map,
                 ),
                 toggle(
                     "4-5. Darcy-Brinkman operator residual",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_brinkman_residual,
+                    analysis.evaluation.plots.physical_consistency.plot_brinkman_residual,
                 ),
                 toggle(
                     "4-6. Darcy-Brinkman momentum residual map",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_brinkman_momentum_residual_map,
+                    analysis.evaluation.plots.physical_consistency.plot_brinkman_momentum_residual_map,
                 ),
                 toggle(
                     "4-7. Pressure drop consistency (Δp)",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_pressure_drop_consistency,
+                    analysis.evaluation.plots.physical_consistency.plot_pressure_drop_consistency,
                 ),
                 toggle(
                     "4-8. Pressure boundary consistency (p_bc)",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_pressure_bc_consistency,
+                    analysis.evaluation.plots.physical_consistency.plot_pressure_bc_consistency,
                 ),
                 toggle(
                     "4-9. Porosity-weighted continuity residual map (∇·(εu))",
-                    evaluation.evaluation_plot.evaluation_plot_physical_consistency.plot_div_eps_u_error_map,
+                    analysis.evaluation.plots.physical_consistency.plot_div_eps_u_error_map,
                 ),
             ],
             "Physical Consistency",
@@ -157,15 +155,15 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
             [
                 toggle(
                     "5-1. Demand vs prediction + error",
-                    evaluation.evaluation_plot.evaluation_plot_spectral_analysis.plot_spectral_demand_prediction_error,
+                    analysis.evaluation.plots.spectral.plot_spectral_demand_prediction_error,
                 ),
                 toggle(
                     "5-2. Spectral transfer ratio (Pred/GT)",
-                    evaluation.evaluation_plot.evaluation_plot_spectral_analysis.plot_spectral_transfer_ratio,
+                    analysis.evaluation.plots.spectral.plot_spectral_transfer_ratio,
                 ),
                 toggle(
                     "5-3. Learned layer x frequency heatmap",
-                    evaluation.evaluation_plot.evaluation_plot_spectral_analysis.plot_learned_layer_frequency_heatmap,
+                    analysis.evaluation.plots.spectral.plot_learned_layer_frequency_heatmap,
                 ),
             ],
             "Spectral & Representation Analysis",
@@ -174,11 +172,11 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
             [
                 toggle(
                     "6-1. Parameter-error correlation (heatmap)",
-                    evaluation.evaluation_plot.evaluation_plot_parameter_sensitivity.plot_parameter_error_heatmap,
+                    analysis.evaluation.plots.parameter_sensitivity.plot_parameter_error_heatmap,
                 ),
                 toggle(
                     "6-2. Error vs input parameter (binned trend)",
-                    evaluation.evaluation_plot.evaluation_plot_parameter_sensitivity.plot_error_vs_parameter_trend,
+                    analysis.evaluation.plots.parameter_sensitivity.plot_error_vs_parameter_trend,
                 ),
             ],
             "Error Sensitivity",
@@ -186,14 +184,14 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
         # --------------------------------------------------------------
         "sample_viewer": (
             [
-                toggle("7-1. Sample GT vs Prediction", evaluation.evaluation_plot.evaluation_plot_sample_viewer.plot_sample_prediction_overview),
+                toggle("7-1. Sample GT vs Prediction", analysis.evaluation.plots.sample_viewer.plot_sample_prediction_overview),
                 toggle(
                     "7-2. Kappa tensor with error overlay",
-                    evaluation.evaluation_plot.evaluation_plot_sample_viewer.plot_sample_kappa_tensor_with_overlay,
+                    analysis.evaluation.plots.sample_viewer.plot_sample_kappa_tensor_with_overlay,
                 ),
                 toggle(
                     "7-3. Pressure & velocity field comparison",
-                    evaluation.evaluation_plot.evaluation_plot_sample_viewer.plot_pu_two_model_comparison,
+                    analysis.evaluation.plots.sample_viewer.plot_pu_two_model_comparison,
                 ),
             ],
             "Sample Viewer",
@@ -203,18 +201,18 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
             [
                 toggle(
                     "8-1. Worst per-channel cases (tables)",
-                    evaluation.evaluation_plot.evaluation_plot_outlier_analysis.plot_outlier_tables_per_channel,
+                    analysis.evaluation.plots.outliers.plot_outlier_tables_per_channel,
                 ),
                 toggle(
                     "8-2. Worst per-channel cases (field plots)",
-                    evaluation.evaluation_plot.evaluation_plot_outlier_analysis.plot_outlier_cases_per_channel,
+                    analysis.evaluation.plots.outliers.plot_outlier_cases_per_channel,
                 ),
                 toggle(
-                    "8-3. Extreme input parameters (table view)", evaluation.evaluation_plot.evaluation_plot_outlier_analysis.plot_extreme_input_table
+                    "8-3. Extreme input parameters (table view)", analysis.evaluation.plots.outliers.plot_extreme_input_table
                 ),
                 toggle(
                     "8-4. Extreme input parameter cases (field plots)",
-                    evaluation.evaluation_plot.evaluation_plot_outlier_analysis.plot_extreme_input_cases,
+                    analysis.evaluation.plots.outliers.plot_extreme_input_cases,
                 ),
             ],
             "Outlier & Extreme Case Analysis",

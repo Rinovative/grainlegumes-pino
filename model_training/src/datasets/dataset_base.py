@@ -2,28 +2,22 @@
 ===============================================================================
 dataset_base.py
 ===============================================================================
-Base dataset utilities for modular simulation datasets with deterministic splitting.
+Provide base dataset loading, splitting and dataloader construction helpers.
 
 Responsibilities:
-  - Generic dataset base class for .pt files
-  - Deterministic train/eval/OOD split creation with explicit indices
-  - Normalizer fitting on train split only (not eval/OOD)
-  - DataLoader construction with deterministic worker seeding
-  - Split indices return for persistence by training layer
-  - Optional split index reuse for resumed/reproduced runs
+  - Load serialized dataset dictionaries
+  - Build deterministic train/eval/OOD splits
+  - Construct data processors and dataloaders
+  - Return split indices for persistence by callers
 
 Design principles:
-  - Split indices must be explicit tensors, not implicit seed-based
-  - Normalizer statistics fitted only on training subset
-  - DataLoaders use explicit torch.Generator for reproducibility
-  - Worker seeding via worker_init_fn for deterministic shuffling
-  - Dataset layer returns split indices; training layer saves them
-  - This module does NOT handle split persistence; training layer does
+  - Split creation uses explicit seeds
+  - Normalizers are fit from training data only
+  - DataLoader settings are controlled by config values
 
-Phase 3 note:
-  - split_indices are returned as dict for caller to save/reload
-  - normalizer is constructed but NOT saved here (training layer responsibility)
-  - evaluation membership is explicit via saved indices (Phase 6 will consume)
+Boundaries:
+  - Split persistence belongs to experiments and training orchestration
+  - Simulation-specific sample construction belongs to datasets.simulation
 ===============================================================================
 """
 

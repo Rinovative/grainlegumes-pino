@@ -1,18 +1,16 @@
 """
-Project source code organization.
+Reusable project packages for data, learning, analysis and experiments.
 
-Core modules: common, domain, datasets, learning, analysis, experiments.
-
-Import subpackages explicitly when needed:
-  from src import common
-  from src import datasets
-  from src import domain
-  from src import learning
-  from src import analysis
-  from src import experiments
-
-Lazy imports avoid circular dependencies with training module.
+Provides:
+- analysis: artifact generation, EDA, evaluation and UI modules
+- common: shared path and utility modules
+- datasets: dataset abstractions, simulation datasets and dataset modules
+- domain: field contracts, permeability mappings and physics helpers
+- experiments: CLI, config loading and tuning modules
+- learning: models, losses, metrics, inference and training modules
 """
+
+from . import analysis, common, datasets, domain, experiments, learning
 
 __all__ = [
     "analysis",

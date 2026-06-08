@@ -2,27 +2,21 @@
 ===============================================================================
 analysis_ui_viewers.py
 ===============================================================================
-Interactive plot navigators for case-level and aggregated analysis.
+Build interactive viewers for case-level and aggregate analysis plots.
 
-Provides:
-  - make_interactive_case_viewer: navigate through individual cases with dataset selection
-  - make_casecount_viewer: aggregate statistics across variable case counts
-  - _render_figure: common rendering logic with export context support
-  - set_export_context: context management for figure export during notebook execution
+Responsibilities:
+  - Render case-by-case Matplotlib figures inside widgets
+  - Manage dataset and case navigation controls
+  - Store current figures for notebook export
 
 Design principles:
-  - viewers are navigation and semantics containers
-  - all UI widget construction delegates to analysis_ui_components
-  - export context is thread-safe and managed at plot render time
-  - re-render callbacks support arbitrary widget combinations for filtering
-  - no duplicate widget construction between viewers
-  - internal dependencies use analysis_ui_components module
+  - Viewer callbacks receive explicit datasets and render functions
+  - Widget construction delegates to analysis_ui_components
+  - Export context is updated only around rendered figures
 
-This module does NOT:
-  - construct individual UI widgets (use analysis_ui_components)
-  - handle notebook execution or display lifecycle
-  - contain plot functions (viewers call external plot functions)
-  - manage file I/O or path resolution
+Boundaries:
+  - Notebook section composition belongs to analysis_ui_notebook
+  - Domain-specific plot logic belongs to analysis plot modules
 ===============================================================================
 """
 
@@ -35,12 +29,7 @@ import matplotlib.pyplot as plt
 from IPython.display import display
 from matplotlib.figure import Figure
 
-from .analysis_ui_components import (
-    ui_dropdown_dataset,
-    ui_output_plot,
-    ui_step_case_count,
-    ui_step_case_index,
-)
+from . import analysis_ui_components as components
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -225,7 +214,7 @@ def make_interactive_case_viewer(
     # ------------------------------------------------------------------
     # Dataset selector
     # ------------------------------------------------------------------
-    dataset_dropdown = ui_dropdown_dataset(dataset_names) if enable_dataset_dropdown and len(dataset_names) > 1 else None
+    dataset_dropdown = components.ui_dropdown_dataset(dataset_names) if enable_dataset_dropdown and len(dataset_names) > 1 else None
 
     # ------------------------------------------------------------------
     # Case index step control
@@ -234,7 +223,7 @@ def make_interactive_case_viewer(
 
     n_cases_active = n_cases_fn(active_dataset, df_active) if n_cases_fn is not None else len(df_active)
 
-    case_index, prev_btn, next_btn = ui_step_case_index(
+    case_index, prev_btn, next_btn = components.ui_step_case_index(
         n_cases=n_cases_active,
         start_idx=start_idx,
     )
@@ -242,7 +231,7 @@ def make_interactive_case_viewer(
     # ------------------------------------------------------------------
     # Output container
     # ------------------------------------------------------------------
-    out = ui_output_plot()
+    out = components.ui_output_plot()
     extra_widgets = extra_widgets or []
 
     # ------------------------------------------------------------------
@@ -364,14 +353,14 @@ def make_casecount_viewer(
     """
     max_cases_global = min(len(df) for df in datasets.values())
 
-    case_count, prev_btn, next_btn = ui_step_case_count(
+    case_count, prev_btn, next_btn = components.ui_step_case_count(
         start_cases=min(start_cases, max_cases_global),
         min_cases=0,
         max_cases=max_cases_global,
         step_size=step_size,
     )
 
-    out = ui_output_plot()
+    out = components.ui_output_plot()
     extra_widgets = extra_widgets or []
 
     # ------------------------------------------------------------------

@@ -2,34 +2,27 @@
 ===============================================================================
 eda_dataframe.py
 ===============================================================================
-Load simulation case data and assemble exploratory data analysis DataFrames.
-
-Provides:
-  - Conversion utilities from PyTorch tensors/NumPy to unified arrays
-  - COMSOL case file parsing and ordered collection
-  - Automatic field extraction (input_fields, output_fields, metadata)
-  - pandas DataFrame assembly with minimal schema assumptions
+Load simulation case data and assemble EDA DataFrames.
 
 Responsibilities:
-  - Loads all case_XXXX.pt files from a dataset batch
-  - Converts all tensor/numpy fields to consistent NumPy representation
-  - Collects optional batch-level metadata (meta.pt)
-  - Produces exploratory summary DataFrame for downstream analysis
+  - Parse case files and optional batch metadata
+  - Convert tensor and NumPy fields to consistent arrays
+  - Extract input/output fields and metadata into tabular summaries
+  - Resolve default data roots through common.paths
 
 Design principles:
-  - Fully data-driven: no field names are hard-coded
-  - Future-proof: handles arbitrary input/output field names
-  - Transparent logging: includes progress bar, shape hints, and diagnostics
+  - DataFrame construction is data-driven and field-name agnostic
+  - Input files are read in deterministic order
+  - Diagnostics describe loaded shapes and skipped fields
 
-This module does NOT:
-  - Train or evaluate models (see learning.*)
-  - Generate artifact metrics (see analysis.analysis_artifacts)
-  - Perform statistical analysis (that is analysis/evaluation/* scope)
-
-Path resolution:
-  - base_dir: If None, dynamically resolved via common.paths.get_data_root()
-  - Ensures reproducibility across different working directories
-===============================================================================
+Boundaries:
+  - Model evaluation artifacts belong to analysis.artifacts
+  - Statistical evaluation plots belong to analysis.evaluation
+Notes:
+    Path resolution:
+    - base_dir: If None, dynamically resolved via common.paths.get_data_root()
+    - Ensures reproducibility across different working directories
+  ===============================================================================
 """
 
 from __future__ import annotations

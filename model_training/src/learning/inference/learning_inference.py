@@ -2,37 +2,37 @@
 ===============================================================================
 learning_inference.py
 ===============================================================================
-Model reconstruction and deterministic inference context.
-
-Rebuilds a complete, deterministic inference environment that mirrors the
-training setup. All required components are rebuilt explicitly and
-transparently, ensuring reproducibility and consistent evaluation metrics
-across machines and training checkpoints.
-
-The inference pipeline:
-
-1. Load `config.json` from the run directory.
-2. Rebuild the model architecture using stored hyperparameters.
-3. Load the trained model weights from `best_model_state_dict.pt`.
-4. Load and reconstruct the training normalizer (`normalizer.pt`).
-5. Load the simulation dataset for inference.
-6. Create a deterministic evaluation DataLoader.
-
-Main entry point: load_inference_context(...)
-
-Returns tuple: (model, loader, processor, device)
+Rebuild deterministic model inference contexts from saved run artifacts.
 
 Responsibilities:
-  - Reconstruct saved model architecture and state
-  - Load and apply saved normalizer state
-  - Create deterministic inference dataloaders
-  - Provide transparent, reproducible inference interface
+  - Reconstruct saved model architecture and weights
+  - Load saved normalizer state into a data processor
+  - Build deterministic evaluation datasets and dataloaders
+  - Validate domain field contracts against model and dataset channels
 
-This module does NOT:
-  - Perform training or optimization
-  - Generate artifacts or analysis (see src.analysis)
-  - Modify model weights during inference
-  - Manage run directories or checkpoints
+Design principles:
+  - Inference mirrors the saved training configuration
+  - Normalizers are reloaded instead of refit
+  - Field order checks fail fast on incompatible artifacts
+
+Boundaries:
+  - Training and optimization belong to learning.training
+  - Artifact generation belongs to analysis.artifacts
+  - Run-directory creation belongs to experiments.cli
+
+Notes:
+  - This module assumes a specific directory structure for saved runs:
+    run_dir/
+  ├── config.json
+  ├── normalizer.pt
+  ├── best_model_state_dict.pt
+  - The inference pipeline:
+    1. Load config.json to get model architecture and hyperparameters
+    2. Reconstruct the model and load weights from best_model_state_dict.pt
+    3. Load normalizer state from normalizer.pt into a DefaultDataProcessor
+    4. Build the evaluation dataset and DataLoader
+    5. Return the model, DataLoader, processor, and device for inference
+    6. Downstream code can then run inference with the loaded context, ensuring consistency with training.
 ===============================================================================
 
 """
@@ -50,9 +50,9 @@ from neuralop.models import FNO
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from src import domain
-from src.datasets.dataset_simulation import PhysicsDataset
-from src.learning.models.learning_models_uno import UNOWithCheckpoint
+from src import datasets, domain
+
+from ..models import learning_models_uno as uno
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -136,7 +136,7 @@ def _build_model_from_config(model_cfg: dict[str, Any]) -> nn.Module:
         return FNO(**params)
 
     if arch in {"UNO", "UNOWithCheckpoint"}:
-        return UNOWithCheckpoint(**params)
+        return uno.UNOWithCheckpoint(**params)
 
     msg = f"Unknown architecture: {arch}"
     raise NotImplementedError(msg)
@@ -289,14 +289,14 @@ def load_inference_context(
 
     model = _build_model_from_config(model_cfg)
     # ------------------------------
-    # HARD GUARDS: schema <-> model
+    # HARD GUARDS: field contract <-> model
     # ------------------------------
     if getattr(model, "in_channels", None) is not None and model.in_channels != len(INPUT_CHANNELS):
-        msg = f"in_channels mismatch: model.in_channels={model.in_channels} vs schema={len(INPUT_CHANNELS)} ({INPUT_CHANNELS})"
+        msg = f"in_channels mismatch: model.in_channels={model.in_channels} vs field contract={len(INPUT_CHANNELS)} ({INPUT_CHANNELS})"
         raise RuntimeError(msg)
 
     if getattr(model, "out_channels", None) is not None and model.out_channels != len(OUTPUT_CHANNELS):
-        msg = f"out_channels mismatch: model.out_channels={model.out_channels} vs schema={len(OUTPUT_CHANNELS)} ({OUTPUT_CHANNELS})"
+        msg = f"out_channels mismatch: model.out_channels={model.out_channels} vs field contract={len(OUTPUT_CHANNELS)} ({OUTPUT_CHANNELS})"
         raise RuntimeError(msg)
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -304,23 +304,23 @@ def load_inference_context(
 
     processor = _load_normalizer(run_dir / "normalizer.pt", device=device)
 
-    full_dataset = PhysicsDataset(
+    full_dataset = datasets.simulation.PhysicsDataset(
         str(dataset_path),
         include_inputs=INPUT_CHANNELS,
         include_outputs=OUTPUT_CHANNELS,
     )
     # ------------------------------
-    # HARD GUARDS: schema <-> dataset
+    # HARD GUARDS: field contract <-> dataset
     # ------------------------------
     ds_in = getattr(full_dataset, "include_inputs", None) or getattr(full_dataset, "input_fields", None)
     ds_out = getattr(full_dataset, "include_outputs", None) or getattr(full_dataset, "output_fields", None)
 
     if ds_in is not None and list(ds_in) != list(INPUT_CHANNELS):
-        msg = f"Dataset input schema mismatch.\nExpected: {INPUT_CHANNELS}\nGot: {list(ds_in)}"
+        msg = f"Dataset input field contract mismatch.\nExpected: {INPUT_CHANNELS}\nGot: {list(ds_in)}"
         raise RuntimeError(msg)
 
     if ds_out is not None and list(ds_out) != list(OUTPUT_CHANNELS):
-        msg = f"Dataset output schema mismatch.\nExpected: {OUTPUT_CHANNELS}\nGot: {list(ds_out)}"
+        msg = f"Dataset output field contract mismatch.\nExpected: {OUTPUT_CHANNELS}\nGot: {list(ds_out)}"
         raise RuntimeError(msg)
 
     dataset_eval = cast("Dataset[dict[str, Tensor]]", full_dataset)

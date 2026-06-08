@@ -2,28 +2,21 @@
 ===============================================================================
 evaluation_plot_parameter_sensitivity.py
 ===============================================================================
-Parameter sensitivity analysis for model error investigation.
-
-Provides:
-  - error sensitivity to input parameter variations
-  - parameter-error correlation analysis
-  - scatter plots of errors against generator/input parameters
-  - interactive parameter-conditioned error exploration
+Plot relationships between input parameters and model errors.
 
 Responsibilities:
-  - correlate model errors with input parameters
-  - visualize error trends across parameter ranges
-  - support hypothesis testing about parameter sensitivity
+  - Plot parameter/error correlations
+  - Plot binned error trends by input parameter
+  - Support parameter-conditioned case selection
 
 Design principles:
-  - sensitivity is measured via correlation or scatter plots
-  - plots enable parameter-space slicing and filtering
-  - interactive viewers support conditional case selection
+  - Sensitivity views use explicit metadata columns
+  - Plots expose trends without mutating evaluation tables
+  - Interactive controls delegate to analysis.ui
 
-This module does NOT:
-  - perform statistical significance testing
-  - handle model derivatives or gradient analysis
-  - compute global metrics without parameter context
+Boundaries:
+  - Architecture-parameter analysis belongs to evaluation_plot_architecture_sensitivity
+  - Global metric summaries belong to evaluation_plot_global_error_analysis
 ===============================================================================
 """
 

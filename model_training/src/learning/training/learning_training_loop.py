@@ -1,32 +1,24 @@
 """
 ===============================================================================
- learning_training_loop.py
+learning_training_loop.py
 ===============================================================================
-Custom training loop with checkpoint support and reproducibility.
+Run the custom training and evaluation loop with checkpoint support.
 
 Responsibilities:
-  - Execute training epochs with gradient computation and optimization
-  - Execute evaluation epochs with metric computation
-  - Manage learning rate scheduling
-  - Save and load checkpoints with full reproducibility state
-  - Track best metrics and training history
-  - Invoke optional epoch-end callbacks for tuning/reporting
-  - Handle mixed precision training (optional)
-  - W&B logging if enabled
-  - Support resume from saved checkpoint
+  - Execute training and evaluation epochs
+  - Manage scheduler updates, checkpoints and best metrics
+  - Track histories, RNG state and optional mixed precision
+  - Invoke optional epoch-end callbacks for tuning
 
 Design principles:
-  - Deterministic behavior with explicit seed control
-  - Split indices and normalizer loaded from dataset layer
-  - Full checkpoint state saved (model, optimizer, scheduler, RNG states)
-  - Custom loop owns controller behavior directly
-  - Clean separation between train/eval/checkpoint logic
+  - Reproducibility state is explicit in checkpoints
+  - Data, model and loss objects are caller-provided
+  - Controller behavior stays independent of model architecture
 
-This module does NOT:
-  - Define loss or model architectures (provided as inputs)
-  - Load or manage experiment configurations (caller handles)
-  - Create datasets or dataloaders (caller provides)
-  - Handle command-line argument parsing
+Boundaries:
+  - Config loading belongs to experiments.config.loader
+  - Model and loss construction belong to learning factories
+  - CLI argument parsing belongs to experiments.cli
 ===============================================================================
 """
 

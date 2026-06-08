@@ -2,28 +2,21 @@
 ===============================================================================
 evaluation_plot_global_error_analysis.py
 ===============================================================================
-Global error analysis plots for aggregated model evaluation across datasets.
-
-Provides:
-  - comparative error metrics across evaluation groups
-  - global error statistics and histograms
-  - multi-dataset aggregated error analysis
-  - interactive viewers for error exploration across cases
+Plot aggregate model errors across datasets and model variants.
 
 Responsibilities:
-  - compute and display aggregated error statistics
-  - support comparison of error distributions between datasets or model variants
-  - visualize global performance metrics
+  - Plot comparative global error metrics
+  - Plot error distributions and mean error maps
+  - Support multi-dataset aggregate comparisons
 
 Design principles:
-  - errors are aggregated across multiple cases and datasets
-  - group-level statistics enable comparative analysis
-  - plots use consistent color schemes and styling
+  - Errors are aggregated consistently across cases
+  - Group-level plots support model comparison
+  - Styling is shared across evaluation plots
 
-This module does NOT:
-  - compute per-case spatial error decomposition (use evaluation_plot_error_decomposition)
-  - handle individual case visualization details
-  - manage normalizer or unit conversion
+Boundaries:
+  - Per-case spatial decomposition belongs to evaluation_plot_error_decomposition
+  - Outlier inspection belongs to evaluation_plot_outlier_analysis
 ===============================================================================
 """
 
@@ -48,7 +41,7 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
-# GLOBAL OUTPUT CHANNEL CONFIGURATION (schema-derived)
+# GLOBAL OUTPUT CHANNEL CONFIGURATION (domain-derived)
 # =============================================================================
 
 CHANNELS = domain.fields.OUTPUT_FIELDS

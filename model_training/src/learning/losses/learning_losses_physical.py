@@ -1,31 +1,33 @@
 """
 ===============================================================================
- learning_losses_physical.py
+learning_losses_physical.py
 ===============================================================================
-Physical-space derivative operators for PINO residual computation.
+Compute physical-space derivatives for PINO residuals.
 
 Responsibilities:
-  - Compute gradients using torch.gradient (element-wise finite differences)
-  - Compute divergences using torch.gradient
-  - Support Brinkman residual and continuity residual evaluation
+  - Compute gradients using torch.gradient
+  - Compute vector divergences on uniform grids
+  - Support Brinkman and continuity residual evaluation
 
 Design principles:
-  - Uniform grid assumption with spacing dx, dy
-  - Element-wise operators (not classical finite-difference stencils)
-  - Support 2D spatial domains (H, W dimensions)
-  - Maintain numerical stability with safe operations
+  - Grid spacing is explicit through dx and dy
+  - Operators preserve input tensor device and dtype behavior
+  - Numerical safeguards stay local to derivative utilities
 
-This module does NOT:
-  - Define loss functions or training objectives
-  - Manage model architecture or checkpointing
-  - Handle spectral/FFT-based derivatives (see learning_losses_spectral.py)
-  - Perform gradient scaling or normalization beyond physical units
+Boundaries:
+  - FFT derivatives belong to learning.losses.spectral
+  - PINO loss weighting belongs to learning.losses.pino
 
-Physics context:
-  - Used for evaluating Brinkman momentum: -∇p + ∇·τ - μ K^{-1} u = 0
-  - Used for evaluating continuity: ∇·(ε u) = 0 or ∇·u = 0
-  - Consistent with COMSOL's deviatoric stress formulation
+Notes:
+  Physics formulation:
+    - derivatives support Brinkman momentum and continuity residuals
+    - stress terms follow the COMSOL deviatoric convention used by the project
+  Physics context:
+    - Used for evaluating Brinkman momentum: -∇p + ∇·τ - μ K^{-1} u = 0
+    - Used for evaluating continuity: ∇·(ε u) = 0 or ∇·u = 0
+    - Consistent with COMSOL's deviatoric stress formulation
 ===============================================================================
+
 """
 
 from collections.abc import Callable

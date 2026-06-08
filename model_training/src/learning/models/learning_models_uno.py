@@ -1,19 +1,22 @@
 """
 ===============================================================================
- learning_models_uno.py
+learning_models_uno.py
 ===============================================================================
-U-shaped Neural Operator (UNO) model construction and checkpoint utilities.
+Provide a UNO wrapper with checkpoint-friendly execution.
 
 Responsibilities:
-  - Build U-NO models with configurable mode schedules and scalings
-  - Provide UNOWithCheckpoint wrapper for deterministic inference checkpointing
-  - Support both base UNO and physics-informed UNO variants
+  - Preserve neuraloperator UNO construction behavior
+  - Route forward execution through gradient checkpointing when enabled
+  - Support training and inference paths that need checkpoint toggles
 
-This module does NOT:
-  - Handle training orchestration (see learning_training_loop)
-  - Define loss functions (see learning_losses_*)
-  - Manage data loading or normalization (see src.datasets)
-  - Create experiment configurations (see src.experiments.config)
+Design principles:
+  - Neuraloperator owns the underlying architecture
+  - Checkpoint behavior is isolated from factory dispatch
+  - Constructor semantics remain unchanged
+
+Boundaries:
+  - Config-driven model selection belongs to learning.models.factory
+  - Training orchestration belongs to learning.training.loop
 ===============================================================================
 """
 

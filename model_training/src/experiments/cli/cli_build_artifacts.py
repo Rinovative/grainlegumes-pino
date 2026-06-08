@@ -2,31 +2,27 @@
 ===============================================================================
 cli_build_artifacts.py
 ===============================================================================
-Executable orchestrator for generating analysis artifacts across trained models.
-
-Provides:
-  - main() entry point for batch artifact generation
-  - run_or_load_artifacts() to generate or retrieve cached artifacts per model/dataset
-  - cleanup_gpu() for memory management after inference
+Generate analysis artifacts for trained model runs.
 
 Responsibilities:
-  - Loads trained model checkpoints via learning.inference.learning_inference
-  - Generates Parquet (scalar metrics) and NPZ (full fields) artifacts per dataset
-  - Manages model/GPU lifecycle and artifact caching
-  - Orchestrates both in-distribution (ID) and out-of-distribution (OOD) evaluation
+  - Discover trained model directories
+  - Load saved inference contexts for each model/dataset pair
+  - Generate or reuse Parquet and NPZ analysis artifacts
+  - Release GPU memory between model runs
 
 Design principles:
-  - Deterministic: uses config.json, normalizer.pt, best_model_state_dict.pt
-  - Lazy: loads already-generated artifacts from disk when available
-  - Memory-safe: deletes model references and clears GPU cache after each run
+  - CLI orchestration stays thin
+  - Existing artifacts are reused when available
+  - Inference and artifact generation are delegated to reusable modules
 
-This module does NOT:
-  - Define new loss functions or metrics (see analysis.analysis_artifacts)
-  - Train or fine-tune models (scope limited to trained checkpoints)
+Boundaries:
+  - Inference context loading belongs to learning.inference.context
+  - Artifact writing belongs to analysis.artifacts
 
-Important:
-  - Uses learning.inference.learning_inference to load model/normalizer/dataloader
-  - Imports analysis.analysis_artifacts.generate_artifacts for per-dataset artifact creation
+Notes:
+  - Models are discovered by presence of checkpoints in PROCESSED_ROOT
+  - Artifacts are cached in model-specific analysis subdirectories
+  - GPU memory is aggressively cleaned after each model to prevent fragmentation
 ===============================================================================
 
 """
@@ -40,9 +36,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 import torch
 
-from src import analysis
-from src.analysis import evaluation
-from src.learning.inference import learning_inference
+from src import analysis, learning
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -117,8 +111,8 @@ def run_or_load_artifacts(
 
     Checks for existing artifacts (Parquet or NPZ) and loads them if available.
     If artifacts don't exist, runs deterministic inference via
-    learning.inference.learning_inference.load_inference_context() and
-    generates Parquet+NPZ artifacts via analysis.analysis_artifacts.generate_artifacts().
+    learning.inference.context.load_inference_context() and
+    generates Parquet+NPZ artifacts via analysis.artifacts.generate_artifacts().
 
     Parameters
     ----------
@@ -174,7 +168,7 @@ def run_or_load_artifacts(
         return pd.DataFrame()
 
     try:
-        model, loader, processor, device = learning_inference.load_inference_context(
+        model, loader, processor, device = learning.inference.context.load_inference_context(
             dataset_path=dataset_path,
             checkpoint_path=checkpoint_path,
             batch_size=1,
@@ -184,7 +178,7 @@ def run_or_load_artifacts(
         print(f"       Reason: {type(e).__name__}: {e}")
         return pd.DataFrame()
 
-    df, _ = analysis.analysis_artifacts.generate_artifacts(
+    df, _ = analysis.artifacts.generate_artifacts(
         model=model,
         loader=loader,
         processor=processor,
@@ -243,7 +237,7 @@ def main() -> None:
         if df_raw_id.empty:
             print(f"[SKIP] {model_name} | ID evaluation skipped")
             continue
-        _ = evaluation.evaluation_dataframe.build_eval_df(df_raw_id)
+        _ = analysis.evaluation.dataframe.build_eval_df(df_raw_id)
 
         # -----------------
         # OOD
@@ -259,7 +253,7 @@ def main() -> None:
                 print(f"[SKIP] {model_name} | OOD {ood} skipped")
                 continue
 
-            _ = evaluation.evaluation_dataframe.build_eval_df(df_raw_ood)
+            _ = analysis.evaluation.dataframe.build_eval_df(df_raw_ood)
 
         cleanup_gpu()
 

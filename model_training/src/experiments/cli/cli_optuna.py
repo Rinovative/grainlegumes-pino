@@ -1,23 +1,22 @@
 """
 ===============================================================================
- cli_optuna.py
+cli_optuna.py
 ===============================================================================
-Thin CLI entry point for config-driven Optuna studies.
+Run or validate config-driven Optuna studies from the command line.
 
 Responsibilities:
-  - Parse Optuna YAML path and small runtime overrides
-  - Validate Optuna study configs without starting training in dry-run mode
-  - Delegate study execution to src.experiments.tuning
+  - Parse Optuna YAML paths and runtime overrides
+  - Print dry-run study summaries without starting training
+  - Delegate study execution to experiments.tuning.optuna
 
 Design principles:
-  - CLI stays thin and side-effect-light
-  - Search spaces live in YAML files, not Python CONFIG dictionaries
-  - Reusable tuning logic belongs under experiments/tuning
+  - CLI code stays thin and side-effect-light
+  - Search spaces live in YAML files
+  - Runtime overrides are explicit command-line options
 
-This script does NOT:
-  - Define search spaces in Python
-  - Import or call model-specific study scripts
-  - Bypass the custom training loop controller
+Boundaries:
+  - Study orchestration belongs to experiments.tuning.optuna
+  - Trial search-space parsing belongs to experiments.tuning.search_space
 ===============================================================================
 """
 
@@ -26,6 +25,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+
+from src import experiments
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -80,19 +81,13 @@ def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
 
-    from src.experiments.tuning import (  # noqa: PLC0415
-        describe_optuna_study_config,
-        load_optuna_study_config,
-        run_optuna_study,
-    )
-
-    study_config = load_optuna_study_config(args.config_path)
+    study_config = experiments.tuning.optuna.load_optuna_study_config(args.config_path)
 
     if args.dry_run:
-        print(json.dumps(describe_optuna_study_config(study_config), indent=2))
+        print(json.dumps(experiments.tuning.optuna.describe_optuna_study_config(study_config), indent=2))
         return 0
 
-    study = run_optuna_study(
+    study = experiments.tuning.optuna.run_optuna_study(
         study_config,
         n_trials=args.n_trials,
         device=args.device,

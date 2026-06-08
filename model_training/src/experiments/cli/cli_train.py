@@ -1,28 +1,24 @@
 """
 ===============================================================================
- cli_train.py
+cli_train.py
 ===============================================================================
-Unified training entry point for config-driven training.
+Train a neural operator model from an experiment YAML.
 
 Responsibilities:
-  - Parse command-line arguments (config path, resume, device override)
-  - Load and resolve experiment configuration with defaults
-  - Create run output directory with reproducible structure
-  - Build dataset, model, loss, optimizer, scheduler components
-  - Execute training loop with logging and checkpointing
-  - Save effective config, split indices, normalizer to run directory
+  - Parse experiment config paths and runtime overrides
+  - Resolve configs and create run output directories
+  - Build data, model, loss, optimizer and scheduler components
+  - Execute the custom training loop and write run summaries
 
 Design principles:
-  - Thin orchestration layer; logic delegated to factories and training loop
-  - Single entry point replaces 4 model-specific train_*.py scripts
-  - Config-driven; no hardcoded defaults or architecture branching
-  - Minimal exception handling (fail fast, clear errors)
-  - No side effects before training starts (no model moves to device early)
+  - CLI code stays as thin orchestration
+  - Config resolution supplies defaults and run naming
+  - Training state is saved in the run directory
 
-This script does NOT:
-  - Define loss or model architectures (factory functions do)
-  - Manage Optuna (see cli_optuna.py)
-  - Handle checkpoint resumption logic (training loop does)
+Boundaries:
+  - Model and loss construction belong to learning factories
+  - Training execution belongs to learning.training.loop
+  - Optuna orchestration belongs to cli_optuna and experiments.tuning
 ===============================================================================
 """
 
@@ -36,21 +32,7 @@ from pathlib import Path
 
 import torch
 
-from src.experiments.config.experiments_config_loader import (
-    create_dataloaders_from_config,
-    load_and_resolve_config,
-    save_yaml,
-)
-from src.learning.losses.learning_losses_factory import (
-    build_eval_losses,
-    build_training_loss,
-)
-from src.learning.models.learning_models_factory import build_model
-from src.learning.training.learning_training_loop import train_loop
-from src.learning.training.learning_training_optim import (
-    build_optimizer,
-    build_scheduler,
-)
+from src import experiments, learning
 
 
 def main() -> int:
@@ -91,7 +73,7 @@ def main() -> int:
     args = parser.parse_args()
 
     # Load and resolve config
-    config = load_and_resolve_config(args.config_path)
+    config = experiments.config.loader.load_and_resolve_config(args.config_path)
 
     # Override device if specified
     if args.device:
@@ -112,12 +94,12 @@ def main() -> int:
 
     # Save effective config
     config_path = run_dir / "config.yaml"
-    save_yaml(config, config_path)
+    experiments.config.loader.save_yaml(config, config_path)
     print(f"Config saved: {config_path}")
 
     # Create dataloaders
     print("Creating dataloaders...")
-    dataloaders = create_dataloaders_from_config(config)
+    dataloaders = experiments.config.loader.create_dataloaders_from_config(config)
     train_loader = dataloaders["train"]
     eval_loader = dataloaders["eval"]
     data_processor = dataloaders["data_processor"]
@@ -135,23 +117,23 @@ def main() -> int:
 
     # Build model
     print(f"Building model: {config['model']['architecture']}")
-    model = build_model(config)
+    model = learning.models.factory.build_model(config)
 
     # Build loss functions
     print("Building loss functions...")
-    train_loss = build_training_loss(config)
+    train_loss = learning.losses.factory.build_training_loss(config)
     set_normalizers = getattr(train_loss, "set_normalizers", None)
     if callable(set_normalizers):
         set_normalizers(
             in_normalizer=data_processor.in_normalizer,
             out_normalizer=data_processor.out_normalizer,
         )
-    eval_losses = build_eval_losses(config, out_normalizer=data_processor.out_normalizer)
+    eval_losses = learning.losses.factory.build_eval_losses(config, out_normalizer=data_processor.out_normalizer)
 
     # Build optimizer and scheduler
     print("Building optimizer and scheduler...")
-    optimizer = build_optimizer(model, config)
-    scheduler = build_scheduler(optimizer, config)
+    optimizer = learning.training.optim.build_optimizer(model, config)
+    scheduler = learning.training.optim.build_scheduler(optimizer, config)
 
     # Determine checkpoint path if resuming
     checkpoint_path = None
@@ -167,7 +149,7 @@ def main() -> int:
     print("Starting training loop...")
     start_time = datetime.now(UTC)
 
-    result = train_loop(
+    result = learning.training.loop.train_loop(
         config=config,
         model=model,
         optimizer=optimizer,

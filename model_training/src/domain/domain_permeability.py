@@ -1,18 +1,23 @@
 """
 ===============================================================================
- domain_permeability.py
+domain_permeability.py
 ===============================================================================
-Single source of truth for permeability tensor (kappa) handling.
+Define permeability tensor naming, ordering and mapping rules.
 
-Defines:
-  - COMSOL-exported component names (full 3x3, 9 components)
-  - internal canonical component names (symmetric, reduced)
-  - strict deterministic ordering for internal channels
-  - mapping rules from COMSOL fields -> internal channels
-  - dimension detection (2D vs 3D) based on available fields
+Responsibilities:
+  - Declare COMSOL-exported permeability component names
+  - Declare internal canonical permeability component names
+  - Map source field names to internal tensor components
+  - Detect permeability dimensionality from available names
 
-This module contains NO torch / numpy code.
-It only defines names, order, and mapping logic.
+Design principles:
+  - Permeability contracts are declarative and deterministic
+  - Numeric tensor conversion is left to dataset modules
+  - Dimension detection is based only on field names
+
+Boundaries:
+  - Model input field sets belong to domain.field_sets
+  - Physics residual calculations belong to learning.losses
 ===============================================================================
 """
 
@@ -217,7 +222,7 @@ def resolve_internal_to_present_sources(
 
     Note:
     -----
-    This module does not inspect numerical values.
+    Only field names are inspected; numerical values are ignored.
     Decisions about physical activity (e.g. zero-valued fields)
     must be made by the data ingestion layer and passed explicitly
     via `nonzero_fields`.

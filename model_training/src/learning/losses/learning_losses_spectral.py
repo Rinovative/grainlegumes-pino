@@ -1,43 +1,39 @@
 """
 ===============================================================================
- learning_losses_spectral.py
+learning_losses_spectral.py
 ===============================================================================
-Spectral-space derivative operators for PINO residual computation via FFT.
+Compute FFT-based derivatives for PINO residuals.
 
 Responsibilities:
-  - Compute gradients using Fast Fourier Transform (FFT-based differentiation)
-  - Support Reflect-Extension boundary handling to reduce edge artifacts
-  - Support plain FFT with periodic boundary assumption
-  - Compute divergences using spectral derivatives
+  - Compute spectral gradients and divergences
+  - Support plain FFT and reflect-extension modes
   - Support Brinkman and continuity residual evaluation
 
 Design principles:
-  - FFT-based differentiation for spectral accuracy
-  - Reflect-Extension padding reduces edge artifacts (default mode)
-  - Support 2D spatial domains with optional interior cropping
-  - Numerically stable with half-precision (float16, bfloat16) support
+  - Reflect extension reduces boundary artifacts by default
+  - Half-precision inputs use stable working dtypes internally
+  - Operators return tensors in the caller's expected layout
 
-Supported modes:
-  - "fft": Plain FFT with periodic boundary assumption
-  - "fft_reflect": Reflect-Extension before FFT (reduces boundary artifacts)
+Boundaries:
+  - Physical-space derivatives belong to learning.losses.physical
+  - PINO loss weighting belongs to learning.losses.pino
 
-This module does NOT:
-  - Define loss functions or training objectives
-  - Manage model architecture or checkpointing
-  - Handle physical-space derivatives (see learning_losses_physical.py)
-  - Perform gradient scaling or normalization beyond physical units
+Notes:
+  Supported modes:
+    - fft assumes periodic boundaries
+    - fft_reflect uses reflect-extension before FFT
+  Physics context:
+    - Used for evaluating Brinkman momentum: -∇p + ∇·τ - μ K^{-1} u = 0
+    - Used for evaluating continuity: ∇·(ε u) = 0 or ∇·u = 0
+    - Consistent with COMSOL's deviatoric stress formulation
 
-Physics context:
-  - Used for evaluating Brinkman momentum: -∇p + ∇·τ - μ K^{-1} u = 0
-  - Used for evaluating continuity: ∇·(ε u) = 0 or ∇·u = 0
-  - Consistent with COMSOL's deviatoric stress formulation
-
-Tensor conventions:
-  - inputs  x : (B, C_in, H, W)
-  - outputs y : (B, C_out, H, W)
-  - predictions pred : (B, C_out, H, W)
-  - Spatial derivatives along last two dimensions (H, W)
+  Tensor conventions:
+    - inputs  x : (B, C_in, H, W)
+    - outputs y : (B, C_out, H, W)
+    - predictions pred : (B, C_out, H, W)
+    - Spatial derivatives along last two dimensions (H, W)
 ===============================================================================
+
 """
 
 from __future__ import annotations
@@ -259,7 +255,7 @@ class PINOSpectralLoss(nn.Module):
 
     Combines data loss, physics residual loss, and pressure-BC loss.
 
-    Dataschema:
+    Data layout:
     - Inputs:
         - kxx, kyy: log10(Kxx), log10(Kyy)  (K in m^2)
         - kxy:      kxy_hat = Kxy / sqrt(Kxx*Kyy)  (dimensionless)
@@ -356,7 +352,7 @@ class PINOSpectralLoss(nn.Module):
         self._eps_det = 1e-30
         self._kxy_hat_clip = 0.999
 
-        # field order from schema
+        # field order from domain.field_sets
         self.input_fields = domain.field_sets.DEFAULT_INPUTS_2D
         self.output_fields = domain.field_sets.DEFAULT_OUTPUTS_2D
         self.iidx = {n: i for i, n in enumerate(self.input_fields)}

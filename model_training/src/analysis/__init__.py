@@ -1,21 +1,19 @@
-"""Analysis, evaluation and visualization."""
+"""
+Analysis, evaluation, visualization and artifact generation.
 
-import importlib
-from typing import Any
+Provides:
+- artifacts: reusable artifact generation logic
+- eda: exploratory data analysis modules
+- evaluation: evaluation panels, tables and plots
+- ui: notebook and widget helpers
+"""
 
+from . import analysis_artifacts as artifacts
 from . import eda, evaluation, ui
 
-
-def __getattr__(name: str) -> Any:
-    """Lazy-load analysis_artifacts to avoid Phase 7 training dependencies."""
-    if name == "analysis_artifacts":
-        return importlib.import_module(f"{__name__}.analysis_artifacts")
-    msg = f"module {__name__!r} has no attribute {name!r}"
-    raise AttributeError(msg)
-
-
-def __dir__() -> list[str]:
-    return ["analysis_artifacts", "eda", "evaluation", "ui"]
-
-
-__all__ = ["analysis_artifacts", "eda", "evaluation", "ui"]
+__all__ = [
+    "artifacts",
+    "eda",
+    "evaluation",
+    "ui",
+]

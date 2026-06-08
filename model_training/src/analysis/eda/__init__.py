@@ -1,3 +1,15 @@
-from . import eda_dataframe, plots  # noqa: D104
+"""
+Exploratory data analysis modules.
 
-__all__ = ["eda_dataframe", "plots"]
+Provides:
+- dataframe: EDA DataFrame construction
+- plots: EDA plot modules
+"""
+
+from . import eda_dataframe as dataframe
+from . import plots
+
+__all__ = [
+    "dataframe",
+    "plots",
+]

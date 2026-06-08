@@ -1,17 +1,23 @@
 """
-Architecture sensitivity plots for PINO / FNO / UNO evaluation.
+===============================================================================
+evaluation_plot_architecture_sensitivity.py
+===============================================================================
+Plot architecture sensitivity for evaluated model runs.
 
-This module analyses how architectural design choices influence model performance.
-Architecture parameters are extracted on-the-fly from `config.json` using the
-stored `npz_path`. No architecture metadata is stored redundantly in the
-per-case evaluation DataFrames.
+Responsibilities:
+  - Extract architecture parameters from saved run configs
+  - Aggregate case-level errors to model-level points
+  - Plot capacity, parameter efficiency and architecture/error trends
 
-Design principles
------------------
-- One model = one architecture point
-- Errors are aggregated per model (median over cases)
-- Architecture parameters are loaded from config.json via npz_path
-- Evaluation DataFrames remain case-level only
+Design principles:
+  - One model run maps to one architecture point
+  - Evaluation DataFrames remain case-level inputs
+  - Architecture metadata is loaded only when needed
+
+Boundaries:
+  - Per-case field viewing belongs to evaluation_plot_sample_viewer
+  - Model construction belongs to learning.models.factory
+===============================================================================
 """
 
 from __future__ import annotations

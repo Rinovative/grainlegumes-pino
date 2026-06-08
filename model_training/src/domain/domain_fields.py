@@ -1,29 +1,29 @@
 """
 ===============================================================================
- domain_fields.py
+domain_fields.py
 ===============================================================================
-Single source of truth for non-kappa input and output field definitions.
+Define canonical field names and semantic field groups.
 
-Defines:
-  - coordinate input fields (x, y)
-  - scalar volume input fields with explicit COMSOL column mapping
-  - output field mapping from internal names to COMSOL variables
-  - canonical deterministic input channel ordering logic
+Responsibilities:
+  - Declare coordinate, permeability, boundary and output field names
+  - Group fields by physical role
+  - Provide stable names for datasets, losses and analysis
 
 Design principles:
-  - kappa (permeability tensor) is handled in domain_permeability.py
-  - this module is strictly declarative (names, order, mapping)
-  - no torch / numpy / numerical logic allowed
-  - deterministic channel ordering is enforced centrally
+  - Field names are declarative constants
+  - Semantic groups avoid duplicated string lists
+  - Naming stays independent of model architecture
 
-The canonical input order is:
-  [ coordinates | kappa components | scalar inputs ]
+Boundaries:
+  - Model tensor field order belongs to domain.field_sets
+  - Permeability tensor ordering belongs to domain.permeability
 
-This module does NOT decide:
-  - how kappa is computed, transformed, or normalised
-  - how fields are loaded or interpolated
-  - how tensors are stacked or consumed
+Notes:
+  - Coordinate fields are always present and define the spatial domain
+  - Kappa fields are dynamic based on the number of permeability components
+  - The canonical input order is: [coords, kappa fields, scalar inputs]
 ===============================================================================
+
 """
 
 from __future__ import annotations

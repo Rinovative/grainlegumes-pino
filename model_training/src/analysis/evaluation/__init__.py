@@ -1,3 +1,18 @@
-from . import evaluation_dataframe, evaluation_panel, evaluation_plot  # noqa: D104
+"""
+Evaluation tables, panels and plots.
 
-__all__ = ["evaluation_dataframe", "evaluation_panel", "evaluation_plot"]
+Provides:
+- dataframe: evaluation DataFrame construction
+- panel: interactive evaluation panel assembly
+- plots: evaluation plot modules
+"""
+
+from . import evaluation_dataframe as dataframe
+from . import evaluation_panel as panel
+from . import evaluation_plot as plots
+
+__all__ = [
+    "dataframe",
+    "panel",
+    "plots",
+]

@@ -2,40 +2,33 @@
 ===============================================================================
 evaluation_plot_sample_viewer.py
 ===============================================================================
-Interactive case-by-case evaluation viewer for field and error visualization.
-
-Provides:
-  - 4x4 field viewer for prediction, ground truth, error, and metadata
-  - per-output-field layout with independent color scales
-  - error type selection (MAE vs relative error)
-  - interactive case navigation and field toggling
-  - physical coordinate display and normalization awareness
+Build per-case viewers for fields, errors and permeability context.
 
 Responsibilities:
-  - provide detailed per-case visual evaluation interface
-  - display all output fields with consistent spatial reference
-  - enable field-by-field error inspection
-  - support interactive case exploration
+  - Display prediction, target and error fields per case
+  - Provide field-specific color scaling and error modes
+  - Visualize permeability context alongside model errors
 
 Design principles:
-  - one viewer instance per output field set (p, u, v, kappa)
-  - color scales adapt to data range automatically
-  - physical coordinates displayed for spatial reference
+  - Viewers preserve physical coordinates
+  - Error masking is explicit for near-zero targets
+  - Permeability aggregation is visualization-only
 
-Relative error handling:
-  Relative error is defined as: rel = |pred - true| / (|true| + eps) * 100
-  Regions where |true| < mask_threshold (default: 1e-4) are masked (set to NaN)
-  to avoid meaningless artefacts in CFD and operator-learning visualization.
+Boundaries:
+  - Global summary plots belong to evaluation_plot_global_error_analysis
+  - Physical tensor ordering belongs to domain.permeability
 
-Kappa aggregation:
-  - Schema-driven diagonal aggregation (kxx, kyy, kzz)
-  - Single-component passthrough
-  - Explicit mean over provided components (visualization only)
+Notes:
+  Relative error handling:
+    - Relative error is defined as: rel = |pred - true| / (|true| + eps) * 100
+    - relative error is masked (set to NaN) where ground-truth magnitude is below the threshold (default: 1e-4)
+    - masking avoids misleading percentages in near-zero regions
 
-This module does NOT:
-  - compute statistical error metrics (use learning/metrics)
-  - perform spectral analysis (use evaluation_plot_spectral_analysis)
+  Kappa aggregation:
+    - diagonal tensor components are aggregated only for visualization
+    - single-component fields pass through unchanged
 ===============================================================================
+
 """
 
 from __future__ import annotations
@@ -116,7 +109,7 @@ def _load_npz(row: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
 
 def _aggregate_kappa(kappa: np.ndarray, kappa_names: list[str]) -> np.ndarray:
     """
-    Aggregate permeability tensor to a scalar field using schema-based indexing.
+    Aggregate permeability tensor to a scalar field using domain-field indexing.
 
     Parameters
     ----------
@@ -134,7 +127,7 @@ def _aggregate_kappa(kappa: np.ndarray, kappa_names: list[str]) -> np.ndarray:
     idx = {name: i for i, name in enumerate(kappa_names)}
 
     # ------------------------------------------------------------------
-    # Diagonal-only cases (explicit, schema-driven)
+    # Diagonal-only cases (explicit, domain-contract driven)
     # ------------------------------------------------------------------
     if {"kxx", "kyy", "kzz"}.issubset(idx):
         return (kappa[idx["kxx"]] + kappa[idx["kyy"]] + kappa[idx["kzz"]]) / 3.0

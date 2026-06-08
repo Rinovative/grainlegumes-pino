@@ -2,28 +2,21 @@
 ===============================================================================
 analysis_ui_components.py
 ===============================================================================
-Reusable UI components and plotting helpers for interactive scientific viewers.
+Provide reusable widget constructors and UI helpers for analysis notebooks.
 
-Provides:
-  - CheckboxGroup protocol for widget grouping
-  - dropdown and radio button constructors
-  - checkbox group construction
-  - step control widgets (case index, case count sliders)
-  - output plot containers
-  - colorbar formatter selection and axis label application
-  - streamline overlay utilities
+Responsibilities:
+  - Define checkbox group protocols and constructors
+  - Build dropdown, radio and step-control widgets
+  - Provide output containers and colorbar formatters
 
 Design principles:
-  - all constructors are stateless and return ipywidgets.Widget instances
-  - no semantic logic or navigation state
-  - used exclusively by analysis_ui_viewers for viewer construction
-  - colorbar formatters are automatically selected based on data range
-  - axis labels are applied consistently across plot types
+  - Components are small and reusable
+  - Widget state is explicit in returned objects
+  - Plotting helpers stay independent of analysis data models
 
-This module does NOT:
-  - contain navigation logic or re-render callbacks (use analysis_ui_viewers)
-  - handle notebook execution or display lifecycle
-  - contain plot functions or data processing
+Boundaries:
+  - Notebook panel composition belongs to analysis_ui_notebook
+  - Case rendering belongs to analysis_ui_viewers
 ===============================================================================
 """
 

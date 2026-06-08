@@ -1,26 +1,28 @@
 """
 ===============================================================================
- common_paths.py
+common_paths.py
 ===============================================================================
-Central path resolver for the project.
+Resolve project, storage, dataset, run and artifact paths.
 
 Responsibilities:
-  - Reading PROJECT_ROOT, STORAGE_ROOT, DATA_ROOT, GEN_ROOT and TRAIN_ROOT
-  - Providing stable repo-relative and storage-relative paths
-  - Resolving dataset names to dataset directories
-  - Resolving run output directories
-  - Ensuring Docker, notebook and cluster execution consistency
+  - Read project and storage root environment variables
+  - Provide stable dataset and run-directory resolvers
+  - Resolve split-index, normalizer, checkpoint and artifact paths
 
-Environment variables (set by Docker or host):
-- PROJECT_ROOT: repository root inside Docker
-- STORAGE_ROOT: mounted external storage root
-- DATA_ROOT: shared storage data root
-- GEN_ROOT: data-generation storage root
-- TRAIN_ROOT: model-training storage root
+Design principles:
+  - Environment variables are the canonical path source
+  - Defaults keep local notebook and Docker execution usable
+  - Callers pass logical names instead of hardcoded storage paths
 
-This module provides fallback logic: if environment variables are not set,
-paths are resolved relative to this file's location or the project root.
+Boundaries:
+  - Dataset membership belongs to datasets and training code
+  - Experiment semantics belong to experiments.config
+
+Notes:
+  Fallback paths:
+    - missing environment variables resolve relative to the repository and storage roots
 ===============================================================================
+
 """
 
 import os

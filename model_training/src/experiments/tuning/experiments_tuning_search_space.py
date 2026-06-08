@@ -1,25 +1,22 @@
 """
 ===============================================================================
- experiments_tuning_search_space.py
+experiments_tuning_search_space.py
 ===============================================================================
-Parse and apply YAML-defined Optuna search spaces.
+Parse YAML-defined Optuna search spaces and apply trial overrides.
 
 Responsibilities:
   - Validate search_space blocks from Optuna YAML files
-  - Convert YAML parameter specs into Optuna trial suggestions
-  - Apply sampled values to resolved experiment configs by dotted paths
-  - Support dictionary keys and list indices in override paths
+  - Convert parameter specs into Optuna trial suggestions
+  - Apply sampled values to resolved configs by dotted paths
 
 Design principles:
-  - YAML is the normal interface for hyperparameter search spaces
-  - Search-space parsing has no dependency on model-specific scripts
-  - Trial overrides are explicit and auditable
-  - Invalid paths fail fast instead of silently creating new config keys
+  - Search-space paths are explicit and auditable
+  - Invalid paths fail fast
+  - Parsing is independent of model-specific code
 
-This module does NOT:
-  - Create or run Optuna studies
-  - Build models, losses, datasets, or optimizers
-  - Define model-specific Python search spaces
+Boundaries:
+  - Study creation and trial execution belong to experiments.tuning.optuna
+  - Model and optimizer construction belong to learning factories
 ===============================================================================
 """
 

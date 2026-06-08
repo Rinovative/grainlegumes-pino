@@ -1,27 +1,22 @@
 """
 ===============================================================================
- learning_training_hooks.py
+learning_training_hooks.py
 ===============================================================================
-Training hooks for diagnostics during model training.
+Provide training diagnostics hooks for neural-operator models.
 
 Responsibilities:
-  - Provide PyTorch forward hooks for extracting spectral information
-  - Aggregate spectral energy distributions from spectral convolution layers
-  - Support FNO, PI-FNO, UNO model diagnostics without modifying neuralop internals
-
-Provided classes:
-  - SpectralEnergyHook: Extracts and aggregates spectral energy per layer
+  - Register PyTorch forward hooks
+  - Extract and aggregate spectral energy diagnostics
+  - Support FNO, PI-FNO and UNO diagnostics
 
 Design principles:
-  - Lightweight, non-invasive hook implementation
-  - No modification to model internals required
-  - Spectral diagnostics independent of loss computation
+  - Hooks are lightweight and non-invasive
+  - Model internals are observed rather than modified
+  - Diagnostics stay independent of loss computation
 
-This module does NOT:
-  - Define loss functions or training objectives
-  - Orchestrate training loops (see learning_training_loop)
-  - Handle checkpoint saving or resumption
-  - Perform gradient computation or optimization
+Boundaries:
+  - Training-loop execution belongs to learning.training.loop
+  - Loss computation belongs to learning.losses
 ===============================================================================
 """
 
@@ -38,7 +33,7 @@ class SpectralEnergyHook:
         hook = SpectralEnergyHook()
         for layer in fno_model.fourier_layers:
             layer.register_forward_hook(hook.hook)
-        # After training/evaluation:
+        # After training and evaluation:
         spectral_energy = hook.aggregate()
 
     Attributes

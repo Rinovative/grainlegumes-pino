@@ -1,33 +1,15 @@
 """
-===============================================================================
- experiments.config
-===============================================================================
-Public API for experiment configuration infrastructure.
+Experiment defaults and YAML configuration loading.
 
-Responsibilities:
-  - Export config default lookup helpers
-  - Export YAML and inline config resolution helpers
-  - Export dataloader construction from resolved configs
-  - Export YAML serialization helpers
-
-This package does NOT:
-  - Execute training
-  - Define model, loss, optimizer, or scheduler factories
-===============================================================================
+Provides:
+- defaults: task, model, loss, optimizer and scheduler defaults
+- loader: YAML loading, config resolution and dataloader construction
 """
 
-from .experiments_config_defaults import get_task_defaults
-from .experiments_config_loader import (
-    create_dataloaders_from_config,
-    load_and_resolve_config,
-    resolve_config,
-    save_yaml,
-)
+from . import experiments_config_defaults as defaults
+from . import experiments_config_loader as loader
 
 __all__ = [
-    "create_dataloaders_from_config",
-    "get_task_defaults",
-    "load_and_resolve_config",
-    "resolve_config",
-    "save_yaml",
+    "defaults",
+    "loader",
 ]

@@ -1,10 +1,12 @@
 """
-Training metrics and error computation.
+Metric modules for training and evaluation.
 
 Provides:
-- metrics: Error metrics, RMSE variants, and correlation computation for model training
+- metrics: NumPy metrics and PyTorch metric modules
 """
 
 from . import learning_metrics as metrics
 
-__all__ = ["metrics"]
+__all__ = [
+    "metrics",
+]

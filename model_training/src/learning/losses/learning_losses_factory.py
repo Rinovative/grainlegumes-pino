@@ -1,27 +1,23 @@
 """
 ===============================================================================
- learning_losses_factory.py
+learning_losses_factory.py
 ===============================================================================
-Loss function construction factory for supervised and PINO training.
+Construct supervised, PINO and evaluation losses from configs.
 
 Responsibilities:
-  - Build supervised loss (data loss only)
-  - Build PINO loss (data loss + physics residuals)
-  - Build evaluation loss suite
-  - Support physical and spectral derivative modes
-  - Maintain parameter compatibility with old training scripts
+  - Build supervised data losses
+  - Build PINO losses with configured derivative modes
+  - Build evaluation loss dictionaries
+  - Inject normalizer requirements for physical-channel metrics
 
 Design principles:
-  - Use existing loss implementations (neuraloperator + custom PINO)
-  - Factory pattern for clean, testable loss construction
-  - Consistent interface across loss types
-  - Support optional normalizer injection for PINO
+  - Factory functions preserve YAML semantics
+  - Loss mathematics stays in loss classes and derivative modules
+  - Device placement remains a caller responsibility
 
-This module does NOT:
-  - Define loss mathematics (loss classes handle that)
-  - Manage training dynamics or loss weighting schedules
-  - Handle checkpoint saving or resumption
-  - Perform device placement (caller handles)
+Boundaries:
+  - PINO residual math belongs to learning.losses.pino
+  - Training dynamics belong to learning.training.loop
 ===============================================================================
 """
 
@@ -31,13 +27,9 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from neuralop import H1Loss, LpLoss
 
-from src.learning.losses.learning_losses_pino import (
-    PINOPhysicalLossDiv,
-    PINOPhysicalLossEps,
-    PINOSpectralLossDiv,
-    PINOSpectralLossEps,
-)
-from src.learning.metrics import metrics as learning_metrics
+from src import learning
+
+from . import learning_losses_pino as pino
 
 if TYPE_CHECKING:
     from torch import nn
@@ -128,7 +120,7 @@ def build_pino_loss(
         raise ValueError(msg) from e
 
     if loss_type in ("ps_eps", "ps_u", "ps_div"):
-        physical_loss_class = PINOPhysicalLossEps if loss_type == "ps_eps" else PINOPhysicalLossDiv
+        physical_loss_class = pino.PINOPhysicalLossEps if loss_type == "ps_eps" else pino.PINOPhysicalLossDiv
         return physical_loss_class(
             data_loss=data_loss_fn,
             lambda_phys=lambda_phys,
@@ -143,7 +135,7 @@ def build_pino_loss(
             msg = f"Unknown spectral grad_mode: {grad_mode}"
             raise ValueError(msg)
         grad_mode_value = cast('Literal["fft", "fft_reflect"]', grad_mode)
-        spectral_loss_class = PINOSpectralLossEps if loss_type == "sp_eps" else PINOSpectralLossDiv
+        spectral_loss_class = pino.PINOSpectralLossEps if loss_type == "sp_eps" else pino.PINOSpectralLossDiv
         return spectral_loss_class(
             data_loss=data_loss_fn,
             lambda_phys=lambda_phys,
@@ -174,9 +166,9 @@ def _str_loss_value(loss_config: dict[str, Any], name: str, default: str) -> str
 
 
 def _require_out_normalizer(
-    out_normalizer: learning_metrics.TensorNormalizer | None,
+    out_normalizer: learning.metrics.metrics.TensorNormalizer | None,
     loss_name: str,
-) -> learning_metrics.TensorNormalizer:
+) -> learning.metrics.metrics.TensorNormalizer:
     """Return the output normalizer required by physical-channel metrics."""
     if out_normalizer is None:
         msg = f"Evaluation loss {loss_name!r} requires an output normalizer."
@@ -231,7 +223,7 @@ def build_training_loss(config: dict[str, Any]) -> nn.Module:
 
 def build_eval_losses(
     config: dict[str, Any],
-    out_normalizer: learning_metrics.TensorNormalizer | None = None,
+    out_normalizer: learning.metrics.metrics.TensorNormalizer | None = None,
 ) -> dict[str, nn.Module]:
     """
     Build evaluation loss suite from configuration.
@@ -267,13 +259,13 @@ def build_eval_losses(
         elif loss_name == "l2":
             losses[loss_name] = _as_module(LpLoss(d=2, p=2))
         elif loss_name == "overall_rmse":
-            losses[loss_name] = learning_metrics.RMSEOverall()
+            losses[loss_name] = learning.metrics.metrics.RMSEOverall()
         elif loss_name == "rmse_p_pa":
-            losses[loss_name] = learning_metrics.RMSEChannelPhysical(0, _require_out_normalizer(out_normalizer, loss_name))
+            losses[loss_name] = learning.metrics.metrics.RMSEChannelPhysical(0, _require_out_normalizer(out_normalizer, loss_name))
         elif loss_name == "rmse_u_ms":
-            losses[loss_name] = learning_metrics.RMSEChannelPhysical(1, _require_out_normalizer(out_normalizer, loss_name))
+            losses[loss_name] = learning.metrics.metrics.RMSEChannelPhysical(1, _require_out_normalizer(out_normalizer, loss_name))
         elif loss_name == "rmse_v_ms":
-            losses[loss_name] = learning_metrics.RMSEChannelPhysical(2, _require_out_normalizer(out_normalizer, loss_name))
+            losses[loss_name] = learning.metrics.metrics.RMSEChannelPhysical(2, _require_out_normalizer(out_normalizer, loss_name))
         else:
             msg = f"Unknown evaluation loss: {loss_name}"
             raise ValueError(msg)

@@ -1,22 +1,22 @@
 """
 ===============================================================================
- domain_field_sets.py
+domain_field_sets.py
 ===============================================================================
-Training field sets defining which fields are used as model inputs and outputs.
+Define canonical input and output field sets for model tensors.
 
-This module defines:
-  - default input channel selections for training
-  - default output channel selections for training
-  - canonical ordering rules for training tensors
+Responsibilities:
+  - Declare default 2D and 3D model input fields
+  - Declare default 2D and 3D model output fields
+  - Return canonical field lists by problem dimension
 
 Design principles:
-  - purely declarative (no numerical logic)
-  - independent of data loading and preprocessing
-  - independent of model architecture (FNO / PINO / UNO)
-  - uses canonical field names defined elsewhere
+  - Field sets are declarative and side-effect free
+  - Tensor channel order is centralized here
+  - Model architecture stays independent from field selection
 
-This module answers ONLY:
-  "Which fields does the model see during training?"
+Boundaries:
+  - Field-name constants belong to domain.fields
+  - Permeability component mappings belong to domain.permeability
 ===============================================================================
 """
 

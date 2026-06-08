@@ -2,28 +2,21 @@
 ===============================================================================
 evaluation_plot_outlier_analysis.py
 ===============================================================================
-Outlier and extreme case analysis for model evaluation.
-
-Provides:
-  - identification and visualization of worst-performing cases
-  - extreme error case analysis and grouping
-  - per-case and multi-case outlier exploration
-  - interactive viewers for outlier investigation
+Plot outlier and extreme-case diagnostics for model evaluation.
 
 Responsibilities:
-  - identify cases with anomalous or extreme errors
-  - support visual inspection of outlier cases
-  - enable root-cause analysis for performance issues
+  - Rank worst-performing cases
+  - Plot per-channel outlier tables and fields
+  - Inspect extreme input-parameter cases
 
 Design principles:
-  - outliers are ranked by error magnitude or statistical deviation
-  - plots support interactive case selection and comparison
-  - visual feedback identifies extreme performance regions
+  - Outlier ranking uses explicit metric columns
+  - Plots support interactive case selection
+  - Field views preserve case-level context
 
-This module does NOT:
-  - perform statistical outlier filtering or removal
-  - compute error decomposition (use evaluation_plot_error_decomposition)
-  - handle model retraining or refinement
+Boundaries:
+  - Error decomposition belongs to evaluation_plot_error_decomposition
+  - Model retraining belongs to experiments.cli.train
 ===============================================================================
 """
 

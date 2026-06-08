@@ -1,20 +1,18 @@
 """
-Custom training loop and training utilities.
+Training loop, hook, optimizer and scheduler modules.
 
 Provides:
-  - train_loop: Main training loop with checkpointing and logging
-  - SpectralEnergyHook: Forward hook for spectral energy diagnostics
-  - build_optimizer: Build AdamW optimizer from config
-  - build_scheduler: Build ReduceLROnPlateau scheduler from config
+- hooks: training diagnostics hooks
+- loop: custom training and evaluation loop
+- optim: optimizer and scheduler factories
 """
 
-from .learning_training_hooks import SpectralEnergyHook
-from .learning_training_loop import train_loop
-from .learning_training_optim import build_optimizer, build_scheduler
+from . import learning_training_hooks as hooks
+from . import learning_training_loop as loop
+from . import learning_training_optim as optim
 
 __all__ = [
-    "SpectralEnergyHook",
-    "build_optimizer",
-    "build_scheduler",
-    "train_loop",
+    "hooks",
+    "loop",
+    "optim",
 ]

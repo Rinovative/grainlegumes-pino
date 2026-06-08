@@ -1,27 +1,24 @@
 """
 ===============================================================================
- experiments_tuning_optuna.py
+experiments_tuning_optuna.py
 ===============================================================================
-Reusable Optuna study and objective orchestration.
+Run reusable Optuna studies and trial objectives.
 
 Responsibilities:
-  - Load Optuna YAML files with inline base experiments and search spaces
-  - Resolve base experiment configs through the Phase 7B config loader
-  - Apply trial overrides to resolved experiment configs
-  - Build datasets, models, losses, optimizers, and schedulers from factories
-  - Run trials through the custom training loop with Optuna reporting/pruning
-  - Store trial configs, split indices, normalizers, summaries, and study DBs
+  - Load Optuna YAML files with inline base experiments
+  - Resolve base experiment configs and search spaces
+  - Apply trial overrides and run custom-loop trials
+  - Store trial configs, summaries, split indices and normalizers
 
 Design principles:
-  - Keep CLI code thin; reusable orchestration lives in this module
-  - Use YAML-defined search spaces instead of hardcoded Python ranges
-  - Avoid imports from deprecated script controllers
-  - Keep Optuna imports lazy so help and dry-run validation stay lightweight
+  - CLI code delegates reusable tuning behavior here
+  - Search spaces are YAML-defined and auditable
+  - Optuna imports stay lazy for help and dry-run validation
 
-This module does NOT:
-  - Define model-specific Optuna scripts
-  - Bypass the custom training loop controller
-  - Own legacy-code cleanup
+Boundaries:
+  - Search-space parsing belongs to experiments.tuning.search_space
+  - Training execution belongs to learning.training.loop
+  - Repository cleanup belongs outside Optuna orchestration
 ===============================================================================
 """
 
@@ -40,24 +37,9 @@ from typing import Any, Protocol, cast
 
 import torch
 
-from src.experiments.config.experiments_config_loader import (
-    create_dataloaders_from_config,
-    generate_run_name,
-    load_yaml,
-    resolve_config,
-    save_yaml,
-)
-from src.experiments.tuning.experiments_tuning_search_space import (
-    SearchSpaceParameter,
-    apply_trial_overrides,
-    parse_search_space,
-    search_space_summary,
-    suggest_trial_overrides,
-)
-from src.learning.losses.learning_losses_factory import build_eval_losses, build_training_loss
-from src.learning.models.learning_models_factory import build_model
-from src.learning.training.learning_training_loop import train_loop
-from src.learning.training.learning_training_optim import build_optimizer, build_scheduler
+from src import experiments, learning
+
+from . import experiments_tuning_search_space as search_space
 
 N_MODES_2D_LENGTH = 2
 
@@ -120,8 +102,8 @@ class OptunaStudyConfig:
     base_experiment : dict[str, Any]
         Inline base experiment block from the Optuna YAML
     base_config : dict[str, Any]
-        Base experiment resolved through Phase 7B defaults
-    search_space : tuple[SearchSpaceParameter, ...]
+        Base experiment resolved through config defaults
+    search_space : tuple[search_space.SearchSpaceParameter, ...]
         Parsed search-space parameters
 
     """
@@ -130,7 +112,7 @@ class OptunaStudyConfig:
     study: dict[str, Any]
     base_experiment: dict[str, Any]
     base_config: dict[str, Any]
-    search_space: tuple[SearchSpaceParameter, ...]
+    search_space: tuple[search_space.SearchSpaceParameter, ...]
 
 
 @dataclass
@@ -295,7 +277,7 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
 
     """
     source_path = Path(path)
-    raw = load_yaml(source_path)
+    raw = experiments.config.loader.load_yaml(source_path)
     raw_mapping = _as_mapping(raw, label="Optuna YAML")
 
     if "experiment" not in raw_mapping:
@@ -306,16 +288,16 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
         raise KeyError(msg)
 
     base_experiment = dict(copy.deepcopy(_as_mapping(raw_mapping["experiment"], label="experiment")))
-    base_config = resolve_config(base_experiment)
+    base_config = experiments.config.loader.resolve_config(base_experiment)
     study = _normalise_study(_as_mapping(raw_mapping.get("study", {}), label="study"), base_config, source_path)
-    search_space = parse_search_space(raw_mapping["search_space"])
+    search_parameters = search_space.parse_search_space(raw_mapping["search_space"])
 
     return OptunaStudyConfig(
         path=source_path,
         study=study,
         base_experiment=base_experiment,
         base_config=base_config,
-        search_space=search_space,
+        search_space=search_parameters,
     )
 
 
@@ -340,12 +322,12 @@ def describe_optuna_study_config(config: OptunaStudyConfig) -> dict[str, Any]:
         "base_run_name": config.base_config["run"]["name"],
         "task": config.base_config["task"],
         "model_architecture": config.base_config["model"]["architecture"],
-        "search_space": search_space_summary(config.search_space),
+        "search_space": search_space.search_space_summary(config.search_space),
     }
 
 
 def _study_dir(config: OptunaStudyConfig) -> Path:
-    """Return the study directory under the Phase 7B train root."""
+    """Return the study directory under the configured train root."""
     train_root = Path(config.base_config["paths"]["train_root"])
     return train_root / config.base_config["task"] / "optuna" / str(config.study["name"])
 
@@ -447,13 +429,13 @@ def _trial_capacity(config: dict[str, Any]) -> int | None:
 
 def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol) -> tuple[dict[str, Any], dict[str, Any]]:
     """Sample a trial, apply overrides, and assign trial run metadata."""
-    overrides = suggest_trial_overrides(trial, study_config.search_space)
-    config = apply_trial_overrides(study_config.base_config, overrides)
+    overrides = search_space.suggest_trial_overrides(trial, study_config.search_space)
+    config = search_space.apply_trial_overrides(study_config.base_config, overrides)
 
     config.setdefault("run", {})
     config["run"]["suffix"] = f"trial{trial.number:04d}"
     config["run"].pop("name", None)
-    config["run"]["name"] = generate_run_name(config)
+    config["run"]["name"] = experiments.config.loader.generate_run_name(config)
     config["optuna"] = {
         "study_name": study_config.study["name"],
         "trial_number": trial.number,
@@ -470,7 +452,7 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
 
 
 def _trial_run_dir(config: dict[str, Any]) -> Path:
-    """Return the Phase 7B run directory for a trial."""
+    """Return the configured run directory for a trial."""
     return Path(config["paths"]["train_root"]) / config["task"] / "runs" / config["run"]["name"]
 
 
@@ -535,7 +517,7 @@ def run_trial(study_config: OptunaStudyConfig, trial: TrialProtocol) -> float:
     config, _overrides = _prepare_trial_config(study_config, trial)
     run_dir = _trial_run_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
-    save_yaml(config, run_dir / "config.yaml")
+    experiments.config.loader.save_yaml(config, run_dir / "config.yaml")
 
     start_time = datetime.now(UTC)
     reporter = OptunaEpochReporter(
@@ -548,24 +530,24 @@ def run_trial(study_config: OptunaStudyConfig, trial: TrialProtocol) -> float:
     trial_pruned = _trial_pruned_error()
 
     try:
-        dataloaders = create_dataloaders_from_config(config)
+        dataloaders = experiments.config.loader.create_dataloaders_from_config(config)
         data_processor = dataloaders["data_processor"]
         torch.save(data_processor.state_dict(), run_dir / "normalizer.pt")
         torch.save(dataloaders["split_indices"], run_dir / "split_indices.pt")
 
-        model = build_model(config)
-        train_loss = build_training_loss(config)
+        model = learning.models.factory.build_model(config)
+        train_loss = learning.losses.factory.build_training_loss(config)
         set_normalizers = getattr(train_loss, "set_normalizers", None)
         if callable(set_normalizers):
             set_normalizers(
                 in_normalizer=data_processor.in_normalizer,
                 out_normalizer=data_processor.out_normalizer,
             )
-        eval_losses = build_eval_losses(config, out_normalizer=data_processor.out_normalizer)
-        optimizer = build_optimizer(model, config)
-        scheduler = build_scheduler(optimizer, config)
+        eval_losses = learning.losses.factory.build_eval_losses(config, out_normalizer=data_processor.out_normalizer)
+        optimizer = learning.training.optim.build_optimizer(model, config)
+        scheduler = learning.training.optim.build_scheduler(optimizer, config)
 
-        result = train_loop(
+        result = learning.training.loop.train_loop(
             config=config,
             model=model,
             optimizer=optimizer,
@@ -624,6 +606,7 @@ def create_objective(study_config: OptunaStudyConfig) -> Callable[[TrialProtocol
     """
 
     def objective(trial: TrialProtocol) -> float:
+        """Run one trial for Optuna's optimize loop."""
         return run_trial(study_config, trial)
 
     return objective

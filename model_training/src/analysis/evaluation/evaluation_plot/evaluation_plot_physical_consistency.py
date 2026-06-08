@@ -2,29 +2,21 @@
 ===============================================================================
 evaluation_plot_physical_consistency.py
 ===============================================================================
-Physical consistency and constraint validation for model evaluation.
-
-Provides:
-  - physics-based field constraint evaluation
-  - divergence, curl and boundary condition checks
-  - consistency metrics relative to domain physics
-  - interactive multi-case constraint visualization
+Plot physical consistency diagnostics for evaluated model outputs.
 
 Responsibilities:
-  - verify model outputs satisfy physical constraints
-  - measure deviations from expected physics laws
-  - support physics-informed model debugging
+  - Plot divergence, pressure-boundary and residual diagnostics
+  - Summarize physics-consistency metrics across cases
+  - Build per-case physical diagnostic viewers
 
 Design principles:
-  - independent of model architecture (FNO / PINO / UNO)
-  - uses canonical field names from domain.permeability mapping
-  - constraints are computed on physical grid with proper normalization
-  - visualization supports per-case and aggregated constraint analysis
+  - Diagnostics are architecture-independent
+  - Plots use canonical domain field names
+  - Physical units and normalization state are explicit in inputs
 
-This module does NOT:
-  - perform error decomposition (use evaluation_plot_error_decomposition)
-  - handle model training or physics incorporation
-  - compute global error metrics
+Boundaries:
+  - Residual computation belongs to learning.losses and analysis.artifacts
+  - Training-time physics weighting belongs to learning.training.loop
 ===============================================================================
 """
 

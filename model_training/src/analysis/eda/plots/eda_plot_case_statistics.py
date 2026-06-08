@@ -2,28 +2,21 @@
 ===============================================================================
 eda_plot_case_statistics.py
 ===============================================================================
-Case-level statistical plots and metadata visualizations for EDA.
-
-Provides:
-  - metadata statistics distributions (count, range, value histograms)
-  - generator parameter distributions across cases
-  - field value distributions with case-level aggregates
-  - interactive case viewers for statistical exploration
+Plot case-level statistics and metadata distributions for EDA.
 
 Responsibilities:
-  - create publication-quality statistical plots
-  - display metadata and parameter ranges across dataset
-  - integrate with interactive analysis_ui_viewers for case navigation
+  - Plot metadata and generator-parameter distributions
+  - Plot case-level field-value summaries
+  - Build interactive case-statistics viewers
 
 Design principles:
-  - statistics are aggregated per case (not per sample/grid point)
-  - distributions are plotted with normalized scaling
-  - metadata and generator parameters are treated as categorical/numeric distributions
+  - Statistics are aggregated per case
+  - Dataset comparisons use consistent normalized scaling
+  - Widget construction is delegated to analysis.ui
 
-This module does NOT:
-  - compute derivatives or physics-specific metrics (use analysis modules)
-  - handle field-level statistics across space (use eda_plot_spectral_analysis)
-  - manage normalizers or unit conversion
+Boundaries:
+  - Frequency-domain EDA belongs to eda_plot_spectral_analysis
+  - Model-evaluation diagnostics belong to analysis.evaluation
 ===============================================================================
 """
 
@@ -46,7 +39,7 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
-    from src.analysis.ui.analysis_ui_components import CheckboxGroup
+    CheckboxGroup = analysis.ui.components.CheckboxGroup
 
 
 # ============================================================================

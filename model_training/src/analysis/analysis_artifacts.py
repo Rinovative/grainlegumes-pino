@@ -2,65 +2,84 @@
 ===============================================================================
 analysis_artifacts.py
 ===============================================================================
-Create persistent evaluation artifacts for PINO and FNO models.
+Create persistent evaluation artifacts from trained neural-operator runs.
 
-This module runs deterministic inference on simulation datasets and stores
-reusable artifacts for all downstream evaluation and visualisation modules.
+Responsibilities:
+  - Run deterministic inference over explicit evaluation loaders
+  - Write Parquet scalar metrics and NPZ field artifacts
+  - Compute field, physics, boundary and metadata diagnostics
+  - Keep artifact columns stable for downstream analysis modules
 
-Artifacts
----------
-Parquet (global, per case):
-    - case_index        : integer case id
-    - npz_path          : path to the corresponding NPZ artifact
+Design principles:
+  - Artifacts are reproducible and split-aware
+  - Physical units and domain field order are explicit
+  - Heavy inference work stays out of plotting modules
 
-    # Absolute field errors (physical units, full domain unless noted)
-    - l2                : absolute RMSE on [p, u, v] over the full domain
-    - h1                : absolute H1-like error on [p, u, v] over the interior (cropped by EVAL_PAD)
+Boundaries:
+  - Model reconstruction belongs to learning.inference.context
+  - Interactive visualization belongs to analysis.evaluation and analysis.ui
 
-    # Relative field errors (dimensionless, channel-balanced)
-    - rel_l2            : channel-balanced mean relative L2 on [p, u, v] over the full domain
-    - rel_h1            : channel-balanced mean relative H1 on [p, u, v] over the interior (cropped by EVAL_PAD)
+Notes:
+  Artifact contents:
+    - Parquet stores case-level scalar metrics, artifact paths and JSON-safe metadata
+    - NPZ stores predictions, targets, errors, kappa fields, raw tensors and residual fields
+    - residual metrics use the same canonical evaluation crop for model comparability
+  Schema:
+    Artifacts
+    ---------
+    Parquet (global, per case):
+        - case_index        : integer case id
+        - npz_path          : path to the corresponding NPZ artifact
 
-    # Book-friendly metrics (physical units, intuitive)
-    - rmse_p            : RMSE of pressure p over the full domain
-    - rmse_U            : RMSE of speed magnitude U=sqrt(u^2+v^2) over the full domain
+        # Absolute field errors (physical units, full domain unless noted)
+        - l2                : absolute RMSE on [p, u, v] over the full domain
+        - h1                : absolute H1-like error on [p, u, v] over the interior (cropped by EVAL_PAD)
 
-    # Physics residual metrics (interior-cropped by EVAL_PAD)
-    - mom_mse           : MSE of Brinkman momentum residual
-    - cont_mse          : MSE of continuity residual div(u) computed with SP (reflect-FFT)
-    - phys_mse          : mom_mse + cont_mse (convenience scalar)
+        # Relative field errors (dimensionless, channel-balanced)
+        - rel_l2            : channel-balanced mean relative L2 on [p, u, v] over the full domain
+        - rel_h1            : channel-balanced mean relative H1 on [p, u, v] over the interior (cropped by EVAL_PAD)
 
-    # Boundary condition metric (no crop, evaluated on inlet/outlet masks)
-    - bc_mse            : pressure BC mismatch on inlet/outlet boundaries
+        # Book-friendly metrics (physical units, intuitive)
+        - rmse_p            : RMSE of pressure p over the full domain
+        - rmse_U            : RMSE of speed magnitude U=sqrt(u^2+v^2) over the full domain
 
-    # Diagnostics
-    - cont_mse_divepsu  : MSE of div(eps u) on interior (cropped by EVAL_PAD), diagnostic even if cont_mse is div(u)
-    - kappa_names       : list of available permeability tensor components
-    - meta              : JSON-safe metadata dictionary (stored as JSON string)
+        # Physics residual metrics (interior-cropped by EVAL_PAD)
+        - mom_mse           : MSE of Brinkman momentum residual
+        - cont_mse          : MSE of continuity residual div(u) computed with SP (reflect-FFT)
+        - phys_mse          : mom_mse + cont_mse (convenience scalar)
 
-NPZ (local, full fields per case):
-    - pred         : (4, H, W) prediction [p, u, v, U]
-    - gt           : (4, H, W) ground truth [p, u, v, U]
-    - err          : (4, H, W) prediction error (pred - gt) for [p, u, v, U]
+        # Boundary condition metric (no crop, evaluated on inlet/outlet masks)
+        - bc_mse            : pressure BC mismatch on inlet/outlet boundaries
 
-    - kappa_log    : (C_kappa, H, W) log10-permeability components
-    - kappa        : (C_kappa, H, W) physical permeability components
-    - kappa_names  : list[str], same order as kappa channels
-    - p_bc         : (1, H, W) pressure boundary condition
+        # Diagnostics
+        - cont_mse_divepsu  : MSE of div(eps u) on interior (cropped by EVAL_PAD), diagnostic even if cont_mse is div(u)
+        - kappa_names       : list of available permeability tensor components
+        - meta              : JSON-safe metadata dictionary (stored as JSON string)
 
-    # Raw inputs/targets for compatibility with downstream tools
-    - x_raw        : (C_in, H, W) raw input tensor (physical units)
-    - y_raw        : (C_out, H, W) raw target tensor (physical units)
-    - input_fields : list[str] canonical input channel names
+    NPZ (local, full fields per case):
+        - pred         : (4, H, W) prediction [p, u, v, U]
+        - gt           : (4, H, W) ground truth [p, u, v, U]
+        - err          : (4, H, W) prediction error (pred - gt) for [p, u, v, U]
 
-    # Physics diagnostic fields (full fields, not cropped)
-    - Rx           : (H, W) x-momentum residual field
-    - Ry           : (H, W) y-momentum residual field
-    - Rc           : (H, W) continuity residual field (here: div(u))
-    - div_u        : (H, W) divergence field div(u)
-    - div_eps_u    : (H, W) divergence field div(eps u)
+        - kappa_log    : (C_kappa, H, W) log10-permeability components
+        - kappa        : (C_kappa, H, W) physical permeability components
+        - kappa_names  : list[str], same order as kappa channels
+        - p_bc         : (1, H, W) pressure boundary condition
 
-    - meta         : JSON string with full metadata
+        # Raw inputs/targets for compatibility with downstream tools
+        - x_raw        : (C_in, H, W) raw input tensor (physical units)
+        - y_raw        : (C_out, H, W) raw target tensor (physical units)
+        - input_fields : list[str] canonical input channel names
+
+        # Physics diagnostic fields (full fields, not cropped)
+        - Rx           : (H, W) x-momentum residual field
+        - Ry           : (H, W) y-momentum residual field
+        - Rc           : (H, W) continuity residual field (here: div(u))
+        - div_u        : (H, W) divergence field div(u)
+        - div_eps_u    : (H, W) divergence field div(eps u)
+
+        - meta         : JSON string with full metadata
+===============================================================================
 
 """
 
@@ -74,8 +93,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src import domain
-from src.learning.losses.learning_losses_pino import PINOSpectralLossDiv
+from src import domain, learning
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
@@ -312,7 +330,7 @@ def generate_artifacts(  # noqa: PLR0915
         return pred.new_zeros(())
 
     # Canonical eval physics: spectral derivatives (reflect-FFT) + div(u), fixed interior crop
-    loss_obj = PINOSpectralLossDiv(
+    loss_obj = learning.losses.pino.PINOSpectralLossDiv(
         data_loss=_zero_data_loss,
         lambda_phys=1.0,
         lambda_p=0.0,
@@ -336,7 +354,7 @@ def generate_artifacts(  # noqa: PLR0915
 
     rows: list[dict[str, Any]] = []
 
-    # Detect available kappa channels from schema
+    # Detect available kappa channels from field contracts
     kappa_names = detect_kappa_channels_from_inputs(domain.field_sets.DEFAULT_INPUTS_2D)
 
     for idx, batch in enumerate(loader):

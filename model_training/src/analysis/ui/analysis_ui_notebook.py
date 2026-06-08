@@ -2,27 +2,21 @@
 ===============================================================================
 analysis_ui_notebook.py
 ===============================================================================
-Jupyter notebook utilities for interactive plotting and collapsible widget panels.
+Build notebook dropdown sections, lazy panels and figure exports.
 
-Provides:
-  - make_dropdown_section: interactive plot dropdown with figure export
-  - make_toggle_shortcut: dataset injection helper for viewer functions
-  - make_lazy_panel_with_tabs: collapsible tabbed panels with open/close buttons
-  - _show_anything: unified display function for figures, Plotly, and widgets
-  - _sanitize_name: filename-safe name conversion for exports
+Responsibilities:
+  - Assemble plot functions into dropdown sections
+  - Build collapsible tabbed notebook panels
+  - Manage Matplotlib figure export state
 
 Design principles:
-  - panels are collapsible to manage notebook space and interactivity
-  - export state is managed explicitly during dropdown plot selection
-  - viewers are called inside dropdown callbacks to ensure context setup
-  - display functions handle multiple result types uniformly
-  - integration with analysis_ui_viewers.set_export_context for PDF export
+  - Panels render lazily to keep notebooks responsive
+  - Export state is passed explicitly between callbacks
+  - Display helpers handle figures, widgets and rich objects uniformly
 
-This module does NOT:
-  - construct individual widgets (use analysis_ui_components)
-  - contain plot functions or analysis logic
-  - handle file I/O beyond export directory creation
-  - manage notebooks execution lifecycle
+Boundaries:
+  - Primitive widgets belong to analysis_ui_components
+  - Case-level renderers belong to analysis_ui_viewers
 ===============================================================================
 """
 
@@ -47,7 +41,8 @@ def _sanitize_name(name: str) -> str:
 
     Parameters
     ----------
-        name (str): Original plot name or title.
+    name: str
+        The original name to sanitize.
 
     Returns
     -------
@@ -69,7 +64,8 @@ def _show_anything(result: Any) -> None:
 
     Parameters
     ----------
-        result: Object to display.
+    result: Any
+        The object to display.
 
     Returns
     -------
@@ -93,8 +89,14 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
 
     Parameters
     ----------
-        plots (list): List of tuples (title, plot_function, plot_name).
-        export_state (dict, optional): Dictionary to store export information.
+    plots: list
+        A list of tuples in the form (title, plot_function, plot_name).
+        - title: str - Display name for the dropdown option.
+        - plot_function: Callable - A function that generates the plot when called.
+        - plot_name: str - A sanitized name used for export context.
+    export_state: dict, optional
+        A dictionary to store export information (e.g., current figure, plot name).
+        This allows the export button in the panel to access the current plot for PDF export.
 
     Returns
     -------
@@ -110,6 +112,7 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
     last_idx = {"idx": None}
 
     def on_plot_change(change: dict) -> None:
+        """Render the selected plot and update export state."""
         idx = change["new"]
         if last_idx["idx"] == idx:
             return
@@ -186,6 +189,7 @@ def make_toggle_shortcut(
     dataset_map = dfs if isinstance(dfs, dict) else {f"df{i}": df for i, df in enumerate(dfs)}
 
     def toggle(title: str, func: Callable[..., Any], plot_name: str | None = None, **kwargs: Any) -> tuple[str, Callable[[], Any], str]:
+        """Return one dropdown entry with dataset injection applied."""
         # auto-generate plot name
         if plot_name is None:
             plot_name = f"plot_{counter['i']:03d}"
@@ -222,13 +226,21 @@ def make_lazy_panel_with_tabs(
 
     Parameters
     ----------
-        sections (list): List of widget objects to be used as tabs.
-        tab_titles (list, optional): Titles for the tabs. Defaults to numbered tabs.
-        open_btn_text (str, optional): Label for the open button. Defaults to "Open section".
-        close_btn_text (str, optional): Label for the close button. Defaults to "Close".
-        export_state (dict, optional): Dictionary to store export information.
-        export_dir (str, optional): Directory to save exported files. Defaults to "exports".
-        export_btn_text (str, optional): Label for the export button. Defaults to "Export PDF".
+    sections: Sequence[widgets.Widget]
+        A sequence of widget containers to be placed in individual tabs.
+    tab_titles: Sequence[str], optional
+        Titles for each tab. If not provided, tabs will be titled "Tab 1", "Tab 2", etc.
+    open_btn_text: str, optional
+        Text for the button that opens the panel. Default is "Open section".
+    close_btn_text: str, optional
+        Text for the button that closes the panel. Default is "Close".
+    export_state: dict, optional
+        A dictionary to store export information (e.g., current figure, plot name).
+        This allows the export button in the panel to access the current plot for PDF export.
+    export_dir: str, optional
+        Directory where exported PDF files will be saved. Default is "exports".
+    export_btn_text: str, optional
+        Text for the button that triggers PDF export. Default is "Export PDF".
 
     Returns
     -------
@@ -256,6 +268,7 @@ def make_lazy_panel_with_tabs(
     )
 
     def do_export(_: None = None) -> None:
+        """Export the current Matplotlib figure to PDF."""
         with status_out:
             status_out.clear_output(wait=True)
 
@@ -284,11 +297,13 @@ def make_lazy_panel_with_tabs(
     panel = widgets.VBox([header, status_out, tabs])
 
     def show_panel(_: None = None) -> None:
+        """Display the expanded panel."""
         with main_out:
             clear_output()
             display(panel)
 
     def show_open(_: None = None) -> None:
+        """Display the collapsed open button."""
         with main_out:
             clear_output()
             display(open_btn)

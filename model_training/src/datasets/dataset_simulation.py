@@ -2,26 +2,58 @@
 ===============================================================================
 dataset_simulation.py
 ===============================================================================
-Dataset definition for simulation-based PINO/FNO training and evaluation.
+Load simulation-based steady-flow samples for training and evaluation.
 
-This module implements the PhysicsDataset, which combines
-the BaseDataset with a physics-specific FlowModule. It provides
-input/output tensors (x, y) formatted for neural operator training
-and supports both
+Responsibilities:
+  - Load merged training datasets or directories of case files
+  - Delegate flow-field tensor construction to dataset modules
+  - Return x/y tensors and optional case metadata
 
-    - merged training datasets (single `<batch_name>.pt` file)
-    - directories of individual `case_XXXX.pt` files for evaluation.
+Design principles:
+  - Merged and case-directory layouts share one sample interface
+  - Case ordering is deterministic through sorted case paths
+  - Channel ordering is delegated to domain-aware flow modules
 
-In both modes, __getitem__ returns a dictionary with at least
+Boundaries:
+  - Split creation and DataLoader construction belong to datasets.base
+  - Model, loss and training orchestration belong to learning
 
-    - "x": Tensor [C_in, H, W]
-    - "y": Tensor [C_out, H, W]
+Notes:
+  Data layouts:
+    1) Merged training dataset (single `.pt` file)
+       -------------------------------------------------
+       Produced by `merge_batch_cases.py`, with structure:
+              {
+                "inputs":  Tensor [N, C_in, H, W],
+                "outputs": Tensor [N, C_out, H, W],
+                "fields": {
+                     "inputs":  list[str],  # channel names in order
+                     "outputs": list[str],
+                },
+              }
+         In this mode, the dataset behaves like a standard
+        operator-learning dataset over N samples.
 
-In case-mode, an additional entry
+    2) Evaluation dataset from individual case files
+       -------------------------------------------------
+       A directory containing `case_XXXX.pt` files produced by
+       `build_batch_dataset.py`, each with structure:
+              {
+                "input_fields":  dict[str, 2D-array],
+                "output_fields": dict[str, 2D-array],
+                "meta":          dict,
+              }
+         These cases are converted on-the-fly into tensors with a
+         synthetic batch dimension of size 1, then reduced back to
+         [C_in, H, W] / [C_out, H, W] via the FlowModule.
 
-    - "meta": dict
+    In both modes, the FlowModule constructs model-ready tensors for
+    PINO/FNO models, and __getitem__ returns:
+        {"x": Tensor, "y": Tensor}          # merged mode
+        {"x": Tensor, "y": Tensor, "meta": dict}  # cases mode
 
-is provided with case-specific metadata.
+===============================================================================
+
 """
 
 from __future__ import annotations
@@ -31,14 +63,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from src.datasets.dataset_base import BaseDataset
-from src.datasets.dataset_modules.dataset_module_flow import FlowModule
+from . import dataset_base as base
+from .dataset_modules import flow
 
 if TYPE_CHECKING:
     from torch import Tensor
 
 
-class PhysicsDataset(BaseDataset):
+class PhysicsDataset(base.BaseDataset):
     """
     Dataset for steady-state flow simulations with permeability fields.
 
@@ -108,7 +140,7 @@ class PhysicsDataset(BaseDataset):
 
         self.mode: str
         self.case_files: list[Path] = []
-        self.flow_module: FlowModule | None = None
+        self.flow_module: flow.FlowModule | None = None
         self.include_inputs = include_inputs
         self.include_outputs = include_outputs
 
@@ -137,7 +169,7 @@ class PhysicsDataset(BaseDataset):
         super().__init__(data_path)  # self.data: dict[str, Tensor]
 
         # FlowModule handles channel ordering and selection for merged data
-        self.flow_module = FlowModule(
+        self.flow_module = flow.FlowModule(
             self.data,  # type: ignore[arg-type]
             include_inputs=include_inputs,
             include_outputs=include_outputs,
@@ -192,7 +224,7 @@ class PhysicsDataset(BaseDataset):
         case_path = self.case_files[idx]
         case_dict: dict[str, Any] = torch.load(case_path)
 
-        module = FlowModule(
+        module = flow.FlowModule(
             case_dict,
             include_inputs=self.include_inputs,
             include_outputs=self.include_outputs,

@@ -1,19 +1,12 @@
-"""Model reconstruction and inference context."""
+"""
+Model reconstruction and inference context modules.
 
-import importlib
-from typing import Any
+Provides:
+- context: saved-run model, normalizer and dataloader reconstruction
+"""
 
+from . import learning_inference as context
 
-def __getattr__(name: str) -> Any:
-    """Lazy-load inference modules to avoid import-time reconstruction work."""
-    if name == "learning_inference":
-        return importlib.import_module(".learning_inference", __name__)
-    msg = f"module {__name__!r} has no attribute {name!r}"
-    raise AttributeError(msg)
-
-
-def __dir__() -> list[str]:
-    return ["learning_inference"]
-
-
-__all__ = []
+__all__ = [
+    "context",
+]

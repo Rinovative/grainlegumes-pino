@@ -1,25 +1,22 @@
 """
 ===============================================================================
- learning_training_optim.py
+learning_training_optim.py
 ===============================================================================
-Optimizer and scheduler construction for training.
+Construct optimizers and schedulers for training.
 
 Responsibilities:
-  - Build AdamW optimizer from config
-  - Build learning rate scheduler from config
-  - Support typical scheduler types (ReduceLROnPlateau)
-  - Maintain compatibility with old training scripts
+  - Build AdamW optimizers from resolved configs
+  - Build ReduceLROnPlateau schedulers from resolved configs
+  - Return no scheduler when scheduler config is absent
 
 Design principles:
-  - Factory pattern for clean optimizer/scheduler construction
-  - Configuration-driven, not hardcoded
-  - Support optional scheduler None (if scheduler config missing)
+  - YAML semantics map directly to optimizer arguments
+  - Factory functions avoid hidden training side effects
+  - Unsupported types fail fast
 
-This module does NOT:
-  - Manage optimization dynamics or gradient flow
-  - Handle checkpoint saving or resumption
-  - Perform device placement
-  - Define optimizer/scheduler algorithms (PyTorch does that)
+Boundaries:
+  - Gradient execution belongs to learning.training.loop
+  - Optimizer state persistence belongs to checkpoints
 ===============================================================================
 """
 

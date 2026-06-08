@@ -1,14 +1,15 @@
 """
-Model construction and checkpoint utilities.
+Model factory and UNO implementation modules.
 
 Provides:
-  - UNOWithCheckpoint: U-NO model with checkpoint support
-  - build_fno: Build Fourier Neural Operator models
-  - build_uno: Build U-shaped Neural Operator models
-  - build_model: Config-driven model factory
+- factory: config-driven FNO and UNO construction
+- uno: UNO checkpoint wrapper
 """
 
-from .learning_models_factory import build_fno, build_model, build_uno
-from .learning_models_uno import UNOWithCheckpoint
+from . import learning_models_factory as factory
+from . import learning_models_uno as uno
 
-__all__ = ["UNOWithCheckpoint", "build_fno", "build_model", "build_uno"]
+__all__ = [
+    "factory",
+    "uno",
+]

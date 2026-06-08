@@ -2,33 +2,27 @@
 ===============================================================================
 evaluation_plot_spectral_analysis.py
 ===============================================================================
-Spectral frequency analysis and Fourier diagnostics for model evaluation.
-
-Provides:
-  - power spectral density comparison (GT vs prediction)
-  - spectral transfer ratio analysis R(k) = Pred / GT
-  - error spectrum visualization
-  - wavenumber-resolved model accuracy assessment
-  - interactive spectral diagnostics with case navigation
-  - optional learned spectral energy heatmap (if spectral_energy_aggregated.pt exists)
+Plot spectral diagnostics for evaluated model predictions.
 
 Responsibilities:
-  - analyze frequency-domain model behavior
-  - identify spectral accuracy strengths and weaknesses
-  - support Fourier-space error investigation
+  - Compare prediction and target power spectra
+  - Plot spectral transfer ratios and error spectra
+  - Visualize learned spectral energy summaries when available
 
 Design principles:
-  - spectral analysis uses 2D FFT with Hann windowing
-  - results are displayed in wavenumber coordinates
-  - transfer ratio indicates amplitude preservation by wavenumber
-  - all datasets shown side by side (no dataset selector)
-  - channels toggled via analysis.ui.components
+  - Spectral analysis uses Hann-windowed 2D FFTs
+  - Wavenumber plots expose scale-dependent model behavior
+  - Dataset comparisons are shown side by side
 
-This module does NOT:
-  - compute spatial error statistics (use evaluation_plot_error_decomposition)
-  - perform physics constraint validation (use evaluation_plot_physical_consistency)
-  - handle time-series spectral analysis
+Boundaries:
+  - Dataset-only spectral EDA belongs to eda_plot_spectral_analysis
+  - Spatial error decomposition belongs to evaluation_plot_error_decomposition
+
+Notes:
+  Learned spectral energy:
+    - heatmaps are shown only when spectral_energy_aggregated.pt is available
 ===============================================================================
+
 """
 
 from __future__ import annotations
@@ -138,7 +132,7 @@ class _LearnedHeatmapAcc(TypedDict):
 
 
 # =============================================================================
-# HELPERS: schema, geometry, npz loading, run dir
+# HELPERS: field contracts, geometry, npz loading, run dir
 # =============================================================================
 
 

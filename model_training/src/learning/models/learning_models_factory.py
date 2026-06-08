@@ -1,27 +1,22 @@
 """
 ===============================================================================
- learning_models_factory.py
+learning_models_factory.py
 ===============================================================================
-Model construction factory for FNO and UNO architectures.
+Construct FNO and UNO models from resolved experiment configs.
 
 Responsibilities:
-  - Build FNO and UNO models from config parameters
-  - Handle architecture-specific mode schedules and channel configurations
-  - Support model variants (baseline and physics-informed)
-  - Use UNOWithCheckpoint wrapper for checkpoint support
-  - Maintain behavior equivalent to old training scripts
+  - Build FNO models from channel, mode and layer settings
+  - Build UNO models with configured mode schedules
+  - Dispatch architecture names from resolved configs
 
 Design principles:
-  - Use neuraloperator model classes as implementation components
-  - Delegate to specific builder functions per architecture
-  - Keep parameter passing explicit and traceable
-  - No side effects or state mutation
+  - Neuraloperator provides the architecture implementations
+  - Parameter passing stays explicit and traceable
+  - Device placement happens only when requested by the caller
 
-This module does NOT:
-  - Define model architectures (neuraloperator does that)
-  - Handle training or optimization
-  - Manage checkpointing or resumption
-  - Perform device placement (caller handles .to(device))
+Boundaries:
+  - UNO checkpoint wrapping belongs to learning.models.uno
+  - Training orchestration belongs to learning.training.loop
 ===============================================================================
 """
 
@@ -32,7 +27,7 @@ from typing import Any, Literal, cast
 import torch
 from neuralop.models import FNO, UNO
 
-from src.learning.models.learning_models_uno import UNOWithCheckpoint
+from . import learning_models_uno as uno
 
 _SkipConnection = Literal["linear", "identity", "soft-gating"]
 _UNO_LAYERS_5 = 5
@@ -132,7 +127,7 @@ def build_uno(
     channel_mlp_skip: str = "linear",
     device: torch.device | str | None = None,
     use_checkpoint: bool = True,
-) -> UNO | UNOWithCheckpoint:
+) -> UNO | uno.UNOWithCheckpoint:
     """
     Build a U-shaped Neural Operator (UNO) model.
 
@@ -163,7 +158,7 @@ def build_uno(
 
     Returns
     -------
-    UNO | UNOWithCheckpoint
+    UNO | uno.UNOWithCheckpoint
         Initialized UNO model, optionally wrapped with checkpoint support
 
     """
@@ -223,7 +218,7 @@ def build_uno(
     uno_out_channels = [hidden_channels] * n_layers
 
     # Build UNO
-    model_class = UNOWithCheckpoint if use_checkpoint else UNO
+    model_class = uno.UNOWithCheckpoint if use_checkpoint else UNO
     model = model_class(
         in_channels=in_channels,
         out_channels=out_channels,

@@ -1,10 +1,23 @@
 """
-Overview and model-level comparison plots for PINO/FNO/UNO evaluation.
+===============================================================================
+evaluation_plot_overview_scoreboard.py
+===============================================================================
+Create overview tables and model-level comparison plots.
 
-This module provides high-level summary plots intended for:
-    - model comparison
-    - tradeoff analysis (accuracy vs physics)
-    - decision support (which model class dominates)
+Responsibilities:
+  - Summarize global model performance across evaluation DataFrames
+  - Plot accuracy/physics tradeoffs for model comparison
+  - Produce compact overview tables for notebook panels
+
+Design principles:
+  - Overview plots aggregate over cases before comparing models
+  - Decision-support plots stay architecture-neutral
+  - Detailed diagnostics remain in specialized plot modules
+
+Boundaries:
+  - Spatial error decomposition belongs to evaluation_plot_error_decomposition
+  - Physics residual visualization belongs to evaluation_plot_physical_consistency
+===============================================================================
 """
 
 from __future__ import annotations

@@ -2,29 +2,21 @@
 ===============================================================================
 eda_plot_spectral_analysis.py
 ===============================================================================
-Spectral frequency analysis for exploratory dataset analysis.
-
-Provides:
-  - 2D power spectral density visualization and wavenumber analysis
-  - radial energy spectrum computation and plotting
-  - spectral field comparison across dataset cases
-  - interactive spectral exploration with case navigation
+Plot frequency-domain summaries for exploratory dataset analysis.
 
 Responsibilities:
-  - enable frequency-domain dataset characterization
-  - identify dominant spatial scales in simulation fields
-  - support spectral quality assessment during EDA
+  - Compute and plot 2D power spectra
+  - Compute radial energy spectra
+  - Build interactive spectral dataset viewers
 
 Design principles:
-  - spectral analysis uses 2D FFT with Hann windowing
-  - results are visualized in wavenumber coordinates
-  - interactive viewers allow per-case spectral inspection
-  - energy spectra reveal spatial complexity of fields
+  - Spectral summaries use Hann-windowed FFTs
+  - Wavenumber plots expose dominant spatial scales
+  - Dataset selection is shared with EDA case-statistics helpers
 
-This module does NOT:
-  - perform model evaluation (use evaluation_plot_spectral_analysis)
-  - compute physics-based diagnostics
-  - handle time-series or spectral dynamics
+Boundaries:
+  - Model spectral diagnostics belong to evaluation_plot_spectral_analysis
+  - Physics residual diagnostics belong to learning.losses and analysis.evaluation
 ===============================================================================
 """
 
@@ -38,14 +30,13 @@ import numpy as np
 from matplotlib.lines import Line2D
 
 from src import analysis
-from src.analysis.eda.plots.eda_plot_case_statistics import _selected_datasets
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
     import pandas as pd
     from matplotlib.figure import Figure
 
-    from src.analysis.ui.analysis_ui_components import CheckboxGroup
+    CheckboxGroup = analysis.ui.components.CheckboxGroup
 
 
 # ======================================================================
@@ -497,7 +488,7 @@ def plot_spectral_cumulative(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
         datasets: dict[str, pd.DataFrame],
         dataset_selector: CheckboxGroup,
     ) -> Figure:
-        active = _selected_datasets(dataset_selector)
+        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)
 
         sample_df = datasets[active[0]]
         field_keys = _infer_field_keys(sample_df)
@@ -643,7 +634,7 @@ def plot_spectral_cumulative_directional(*, datasets: dict[str, pd.DataFrame]) -
         datasets: dict[str, pd.DataFrame],
         dataset_selector: CheckboxGroup,
     ) -> Figure:
-        active = _selected_datasets(dataset_selector)
+        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)
 
         sample_df = datasets[active[0]]
         field_keys = _infer_field_keys(sample_df)

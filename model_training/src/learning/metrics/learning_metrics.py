@@ -2,26 +2,21 @@
 ===============================================================================
 learning_metrics.py
 ===============================================================================
-Error metrics and statistical measures for model training and evaluation.
+Compute NumPy and PyTorch metrics for training and evaluation.
 
-Provides:
-  - classical error metrics (MSE, RMSE, MAE)
-  - relative and normalized error variants
-  - per-sample and aggregated error statistics
-  - Pearson correlation computation
-  - PyTorch nn.Module implementations for training (RMSEOverall, RMSEChannelPhysical, RelRMSEChannel)
-  - error map construction across sample dimensions
+Responsibilities:
+  - Compute classical and relative error metrics
+  - Compute per-sample and aggregated statistics
+  - Provide PyTorch metric modules for training-time evaluation
 
 Design principles:
-  - all array functions operate on NumPy arrays
-  - PyTorch modules are used during training for device-aware computation
-  - metrics are deterministic and independent of dataset sampling
-  - physical units and denormalization are explicit in the API
+  - NumPy functions operate on arrays without side effects
+  - PyTorch modules stay device-aware
+  - Physical-unit metrics require explicit denormalization
 
-This module does NOT:
-  - handle logging or output writing
-  - contain dataset-specific metric aggregation (that belongs in analysis)
-  - include plot generation or visualization
+Boundaries:
+  - Dataset-specific aggregation belongs to analysis modules
+  - Logging and persistence belong to callers
 ===============================================================================
 """
 

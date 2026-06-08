@@ -2,56 +2,57 @@
 ===============================================================================
 dataset_module_flow.py
 ===============================================================================
-FlowModule for PINO/FNO datasets (merged + single-case).
+Convert flow dataset dictionaries into neural-operator tensors.
 
-This class provides a unified interface for loading flow-related
-datasets used in operator learning. It supports two dataset formats:
+Responsibilities:
+  - Support merged dataset dictionaries and single-case dictionaries
+  - Select input and output fields in canonical domain order
+  - Populate sample dictionaries with model-ready x/y tensors
 
-1) Merged datasets
-   ----------------
-   Expected structure:
-       data = {
-           "inputs":  Tensor [N, C_in, H, W],
-           "outputs": Tensor [N, C_out, H, W],
-           "fields": {
-               "inputs":  [...],   # ordered list of input channel names
-               "outputs": [...],   # ordered list of output channel names
-           }
-       }
+Design principles:
+  - Channel selection is explicit and deterministic
+  - Domain field sets define canonical tensor order
+  - Data conversion stays separate from DataLoader construction
 
-   Input channels (in canonical order):
-       x, y,
-       kappaxx, kappayx, kappazx,
-       kappaxy, kappayy, kappazy,
-       kappaxz, kappayz, kappazz
-   These represent the spatial coordinates and the 3x3 permeability tensor
-   stored in Voigt-like flattened form.
+Boundaries:
+  - Dataset splitting and normalization belong to datasets.base
+  - Model construction belongs to learning.models
 
-   Output channels:
-       p, u, v, U
-   Pressure, velocity components (u, v) and velocity magnitude U.
+Notes:
+  Expected input formats:
+    1) Merged dataset format:
+       -------------------------------------------------
+       Produced by `merge_batch_cases.py`, with structure:
+              {
+                "inputs":  Tensor [N, C_in, H, W],
+                "outputs": Tensor [N, C_out, H, W],
+                "fields": {
+                     "inputs":  list[str],  # channel names in order
+                     "outputs": list[str],
+                },
+              }
+         In this mode, the module behaves like a standard
+        operator-learning dataset over N samples.
 
-   All channels are stacked along the channel dimension.
+    2) Single-case format:
+       -------------------------------------------------
+       A dictionary with structure:
+              {
+                "input_fields":  dict[str, 2D-array],
+                "output_fields": dict[str, 2D-array],
+                "meta":          dict,
+              }
+         These are converted on-the-fly into tensors with a synthetic batch dimension of size 1, then reduced back to
+         [C_in, H, W] / [C_out, H, W] via the FlowModule.
+         The module returns a single sample with index 0 in this mode.
 
-2) Single-case datasets
-   ----------------------
-   Expected structure:
-       data = {
-           "input_fields":  dict[field_name → 2D array],
-           "output_fields": dict[field_name → 2D array],
-           "meta": {...}
-       }
+    In both modes, the FlowModule constructs model-ready tensors for
+    PINO/FNO models, and __getitem__ returns:
+        {"x": Tensor, "y": Tensor}          # merged mode
+        {"x": Tensor, "y": Tensor, "meta": dict}  # single-case mode
 
-   Each case is stored individually and converted to tensors with an
-   artificial batch dimension of size 1. Channel names are taken directly
-   from the dictionary keys.
+===============================================================================
 
-Both dataset formats produce a unified interface via:
-    module.apply(i, sample)
-
-which inserts:
-    sample["x"]["input"]  → Tensor [C_in_sel, H, W]
-    sample["y"]["output"] → Tensor [C_out_sel, H, W]
 """
 
 from __future__ import annotations
