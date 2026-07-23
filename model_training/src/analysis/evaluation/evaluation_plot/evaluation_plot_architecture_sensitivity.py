@@ -5,14 +5,14 @@ evaluation_plot_architecture_sensitivity.py
 Plot architecture sensitivity for evaluated model runs.
 
 Responsibilities:
-  - Extract architecture parameters from saved run configs
+  - Extract architecture parameters from current saved-run config.yaml files
   - Aggregate case-level errors to model-level points
   - Plot capacity, parameter efficiency and architecture/error trends
 
 Design principles:
   - One model run maps to one architecture point
   - Evaluation DataFrames remain case-level inputs
-  - Architecture metadata is loaded only when needed
+  - Architecture metadata comes from model.architecture and model.params
 
 Boundaries:
   - Per-case field viewing belongs to evaluation_plot_sample_viewer
@@ -22,12 +22,14 @@ Boundaries:
 
 from __future__ import annotations
 
-import json
 import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
+
+from src import common, experiments
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -37,11 +39,55 @@ if TYPE_CHECKING:
 # ======================================================================
 # Helpers: architecture extraction
 # ======================================================================
+def _as_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
+    """Return a config section mapping or raise a current-schema error."""
+    if not isinstance(value, Mapping):
+        msg = f"Expected {label} to be a mapping in config.yaml."
+        raise TypeError(msg)
+    return value
+
+
+def _infer_run_dir_from_npz_path(npz_path: Path) -> Path:
+    """Infer the current saved-run directory that owns an NPZ artifact."""
+    for parent in [npz_path.parent, *npz_path.parents]:
+        if common.paths.resolve_run_config_path(parent).is_file():
+            return parent
+
+    msg = f"Could not find current run config.yaml for npz_path: {npz_path}"
+    raise FileNotFoundError(msg)
+
+
+def _load_current_run_config_from_npz_path(npz_path: str | Path) -> dict[str, Any]:
+    """Load the owning run's current config.yaml for an NPZ artifact."""
+    run_dir = _infer_run_dir_from_npz_path(Path(npz_path).expanduser())
+    return experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(run_dir))
+
+
+def _current_config_sections(cfg: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Return current-schema model, model.params and loss sections."""
+    model_cfg = _as_mapping(cfg.get("model"), label='config["model"]')
+    params = _as_mapping(model_cfg.get("params"), label='config["model"]["params"]')
+    loss_cfg = _as_mapping(cfg.get("loss"), label='config["loss"]')
+
+    # Validate these current run sections here even though this plot only needs
+    # model and loss metadata. Their presence distinguishes resolved run configs
+    # from old ad hoc metadata files.
+    _as_mapping(cfg.get("data"), label='config["data"]')
+    _as_mapping(cfg.get("run"), label='config["run"]')
+
+    return model_cfg, params, loss_cfg
+
+
+def _mean_pair(values: Any) -> float | None:
+    """Return the mean of a two-entry mode pair when available."""
+    if not isinstance(values, (list, tuple)) or len(values) != 2:  # noqa: PLR2004
+        return None
+    return 0.5 * (float(values[0]) + float(values[1]))
 
 
 def _load_arch_from_npz_path(npz_path: str | Path) -> dict[str, Any]:
     """
-    Load architecture and physics parameters from config.json via npz_path.
+    Load architecture and loss parameters from config.yaml via npz_path.
 
     Parameters
     ----------
@@ -51,33 +97,11 @@ def _load_arch_from_npz_path(npz_path: str | Path) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Architecture and physics parameters.
+        Architecture and loss parameters.
 
     """
-    npz_path_p = Path(npz_path)
-
-    # npz -> cases -> analysis -> (id|ood) -> run_dir
-    run_dir = None
-    for parent in npz_path_p.parents:
-        if parent.name == "analysis":
-            run_dir = parent.parent
-            break
-
-    if run_dir is None:
-        msg = f"Could not determine run directory from npz_path: {npz_path}"
-        raise FileNotFoundError(msg)
-
-    cfg_path = run_dir / "config.json"
-
-    if not cfg_path.exists():
-        msg = f"config.json not found for run: {run_dir}"
-        raise FileNotFoundError(msg)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    model_cfg = cfg.get("model", {})
-    params = model_cfg.get("model_params", {})
-    physics = cfg.get("physics", {})
+    cfg = _load_current_run_config_from_npz_path(npz_path)
+    _, params, loss_cfg = _current_config_sections(cfg)
 
     arch: dict[str, Any] = {}
 
@@ -90,29 +114,27 @@ def _load_arch_from_npz_path(npz_path: str | Path) -> dict[str, Any]:
     # ------------------------------------------------------------------
     # Spectral capacity (FNO / PI-FNO / UNO unified)
     # ------------------------------------------------------------------
-    if "n_modes" in params and isinstance(params["n_modes"], list):
+    modes_mean = _mean_pair(params.get("n_modes"))
+    if modes_mean is not None:
         # FNO-style
-        mx, my = params["n_modes"]
-        arch["n_modes"] = 0.5 * (mx + my)
+        arch["n_modes"] = modes_mean
 
-    elif "uno_n_modes" in params and isinstance(params["uno_n_modes"], list):
-        # UNO: all layers have same modes → take first
-        mx, my = params["uno_n_modes"][0]
-        arch["n_modes"] = 0.5 * (mx + my)
+    elif "modes_x" in params and "modes_y" in params:
+        # UNO current config stores base modes directly.
+        arch["n_modes"] = 0.5 * (float(params["modes_x"]) + float(params["modes_y"]))
 
     # ------------------------------------------------------------------
-    # UNO-specific: U-shape scaling (REAL differentiator)
+    # UNO-specific capacity metadata
     # ------------------------------------------------------------------
-    if "uno_scalings" in params and isinstance(params["uno_scalings"], list):
-        scales = [float(s[0]) for s in params["uno_scalings"]]
-        arch["uno_scale_mean"] = float(sum(scales) / len(scales))
-        arch["uno_scale_max"] = float(max(scales))
+    mode_ratio = params.get("mode_ratio")
+    if mode_ratio is not None:
+        arch["mode_ratio"] = float(mode_ratio)
 
     # ------------------------------------------------------------------
     # Physics weights (PI models only, otherwise None)
     # ------------------------------------------------------------------
-    arch["lambda_phys"] = physics.get("lambda_phys")
-    arch["lambda_p"] = physics.get("lambda_p")
+    arch["lambda_phys"] = loss_cfg.get("lambda_phys")
+    arch["lambda_p"] = loss_cfg.get("lambda_p")
 
     return arch
 
@@ -123,7 +145,7 @@ def _summarise_model(df: pd.DataFrame) -> dict[str, Any]:
 
     One model = one architecture point.
     1. Aggregate error as median relative L2 over all cases.
-    2. Load architecture parameters from config.json via npz_path.
+    2. Load architecture parameters from config.yaml via npz_path.
     3. Return combined summary dictionary.
 
     Parameters

@@ -293,7 +293,12 @@ def load_and_resolve_config(yaml_path: Path | str) -> dict[str, Any]:
     return resolve_config(load_yaml(yaml_path))
 
 
-def create_dataloaders_from_config(config: dict[str, Any]) -> dict[str, Any]:
+def create_dataloaders_from_config(
+    config: dict[str, Any],
+    *,
+    split_indices: dict[str, Any] | None = None,
+    data_processor: Any | None = None,
+) -> dict[str, Any]:
     """
     Create dataloaders from config dictionary.
 
@@ -301,6 +306,12 @@ def create_dataloaders_from_config(config: dict[str, Any]) -> dict[str, Any]:
     ----------
     config : dict[str, Any]
         Resolved configuration dictionary with data section
+    split_indices : dict[str, Any] | None, optional
+        Previously saved split membership to reuse. When provided, no new
+        train/eval/OOD membership is generated.
+    data_processor : Any | None, optional
+        Previously restored data processor to reuse. When provided, the
+        dataset layer must not fit replacement normalizers.
 
     Returns
     -------
@@ -338,6 +349,8 @@ def create_dataloaders_from_config(config: dict[str, Any]) -> dict[str, Any]:
         train_ratio=data_cfg.get("train_ratio", 0.8),
         ood_fraction=data_cfg.get("ood_fraction", 0.2),
         split_seed=config.get("run", {}).get("seed", 9),
+        split_indices=split_indices,
+        data_processor=data_processor,
         **dataloader_cfg,
     )
 

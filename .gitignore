@@ -1,6 +1,7 @@
 mlenv/
 model_training/data_temp/
 .claude/
+_llm_workflow/
 # ================================
 # IDE / Editor files
 # ================================

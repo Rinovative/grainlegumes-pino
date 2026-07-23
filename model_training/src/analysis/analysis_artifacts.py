@@ -14,6 +14,7 @@ Design principles:
   - Artifacts are reproducible and split-aware
   - Physical units and domain field order are explicit
   - Heavy inference work stays out of plotting modules
+  - Saved-run detection uses the current run artifact contract
 
 Boundaries:
   - Model reconstruction belongs to learning.inference.context
@@ -28,7 +29,9 @@ Notes:
     Artifacts
     ---------
     Parquet (global, per case):
-        - case_index        : integer case id
+        - case_index        : stable one-based source case id
+        - source_index      : zero-based original merged-dataset index
+        - split_local_index : zero-based position in the saved split
         - npz_path          : path to the corresponding NPZ artifact
 
         # Absolute field errors (physical units, full domain unless noted)
@@ -57,6 +60,9 @@ Notes:
         - meta              : JSON-safe metadata dictionary (stored as JSON string)
 
     NPZ (local, full fields per case):
+        - case_index   : stable one-based source case id
+        - source_index : zero-based original merged-dataset index
+        - split_local_index : zero-based position in the saved split
         - pred         : (4, H, W) prediction [p, u, v, U]
         - gt           : (4, H, W) ground truth [p, u, v, U]
         - err          : (4, H, W) prediction error (pred - gt) for [p, u, v, U]
@@ -85,7 +91,9 @@ Notes:
 
 from __future__ import annotations
 
+import hashlib
 import json
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -93,7 +101,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src import domain, learning
+from src import common, domain, learning
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
@@ -105,6 +113,9 @@ if TYPE_CHECKING:
 
 INTERNAL_KAPPA_NAMES = set(domain.permeability.INTERNAL_KAPPA_2D_ORDER) | set(domain.permeability.INTERNAL_KAPPA_3D_ORDER)
 MU_AIR = 1.8139e-5  # must be consistent with training
+ARTIFACT_SCHEMA_VERSION = 2
+ARTIFACT_PROVENANCE_SCHEMA_VERSION = 1
+ARTIFACT_PROVENANCE_FILENAME = "artifact_provenance.json"
 
 # ----------------------------------------------------------------------------
 # Canonical evaluation settings (for model-to-model comparability)
@@ -164,6 +175,120 @@ def meta_to_jsonable(obj: Any) -> Any:
         return [meta_to_jsonable(v) for v in obj]
 
     return obj
+
+
+def ordered_indices_sha256(indices: Iterable[int]) -> str:
+    """Return the canonical SHA-256 digest for ordered integer membership."""
+    payload = json.dumps(list(indices), separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def artifact_provenance_path(save_root: str | Path) -> Path:
+    """Return the versioned provenance sidecar path for an artifact root."""
+    return Path(save_root) / ARTIFACT_PROVENANCE_FILENAME
+
+
+def write_artifact_provenance(save_root: str | Path, provenance: Mapping[str, Any]) -> Path:
+    """Atomically write provenance after all artifact payloads are complete."""
+    provenance_path = artifact_provenance_path(save_root)
+    if provenance_path.exists():
+        msg = f"Refusing to overwrite existing artifact provenance: {provenance_path}"
+        raise FileExistsError(msg)
+
+    payload = meta_to_jsonable(dict(provenance))
+    if not isinstance(payload, dict):
+        msg = "Artifact provenance must normalise to a JSON object."
+        raise TypeError(msg)
+
+    temp_path = provenance_path.with_name(f".{provenance_path.name}.tmp")
+    if temp_path.exists():
+        msg = f"Interrupted artifact provenance write exists: {temp_path}"
+        raise FileExistsError(msg)
+
+    provenance_path.parent.mkdir(parents=True, exist_ok=True)
+    with temp_path.open("x", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+        file.write("\n")
+    temp_path.replace(provenance_path)
+    return provenance_path
+
+
+def _require_batch_scalar_int(batch: Mapping[str, Any], key: str) -> int:
+    """Return one integer identity value from a batch-size-one collated field."""
+    if key not in batch:
+        msg = f"Artifact batches must provide top-level {key!r} identity."
+        raise KeyError(msg)
+
+    value = batch[key]
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1 or value.dtype == torch.bool or value.is_floating_point() or value.is_complex():
+            msg = f"Artifact batch {key!r} must contain exactly one integer value; got {value!r}."
+            raise TypeError(msg)
+        return int(value.detach().cpu().item())
+
+    if isinstance(value, np.ndarray):
+        if value.size != 1 or not np.issubdtype(value.dtype, np.integer):
+            msg = f"Artifact batch {key!r} must contain exactly one integer value; got {value!r}."
+            raise TypeError(msg)
+        return int(value.reshape(-1)[0])
+
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            msg = f"Artifact batch {key!r} must contain exactly one integer value; got {value!r}."
+            raise TypeError(msg)
+        value = value[0]
+
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        msg = f"Artifact batch {key!r} must be an integer; got {type(value).__name__}."
+        raise TypeError(msg)
+    return int(value)
+
+
+def _artifact_effective_case_count(provenance: Mapping[str, Any]) -> int:
+    """Return the required generated row count from validated provenance."""
+    selection = provenance.get("selection")
+    if not isinstance(selection, Mapping):
+        msg = "Artifact provenance must contain a selection mapping."
+        raise TypeError(msg)
+
+    count = selection.get("effective_case_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        msg = "Artifact provenance selection.effective_case_count must be a positive integer."
+        raise ValueError(msg)
+    return count
+
+
+def _validate_generated_source_indices(provenance: Mapping[str, Any], source_indices: list[int]) -> None:
+    """Prove generated loader identity matches the provenance before completion."""
+    selection = provenance.get("selection")
+    if not isinstance(selection, Mapping):
+        msg = "Artifact provenance must contain a selection mapping."
+        raise TypeError(msg)
+    expected_digest = selection.get("effective_ordered_source_indices_sha256")
+    if not isinstance(expected_digest, str) or not expected_digest:
+        msg = "Artifact provenance must contain an effective ordered source-index digest."
+        raise TypeError(msg)
+    actual_digest = ordered_indices_sha256(source_indices)
+    if actual_digest != expected_digest:
+        msg = f"Generated ordered source_index values do not match artifact provenance: expected digest {expected_digest}, got {actual_digest}."
+        raise RuntimeError(msg)
+
+
+def _ensure_artifact_targets_absent(save_root: Path, dataset_name: str) -> None:
+    """Refuse to overwrite complete or interrupted artifact outputs."""
+    npz_dir = save_root / "npz"
+    candidates = [
+        save_root / f"{dataset_name}.parquet",
+        artifact_provenance_path(save_root),
+        *sorted(npz_dir.glob("*.npz")),
+        *sorted(save_root.glob(".*.tmp")),
+        *sorted(npz_dir.glob(".*.tmp")),
+    ]
+    existing = [path for path in candidates if path.exists()]
+    if existing:
+        formatted = "\n".join(f"  - {path}" for path in existing)
+        msg = f"Refusing to overwrite existing or interrupted artifacts:\n{formatted}"
+        raise FileExistsError(msg)
 
 
 # =============================================================================
@@ -252,6 +377,27 @@ def extract_kappa(
 
 
 # =============================================================================
+# Run-directory utilities
+# =============================================================================
+
+
+def infer_current_run_dir(save_root: Path) -> Path:
+    """
+    Infer the current-contract run directory from an artifact save root.
+
+    This is used only for artifact metadata/logging. Artifact generation itself
+    continues to consume the explicit model, loader, processor and device passed
+    by callers.
+    """
+    candidate = Path(save_root)
+    while candidate.parent != candidate:
+        if common.paths.is_current_run_dir(candidate):
+            return candidate
+        candidate = candidate.parent
+    return Path(save_root)
+
+
+# =============================================================================
 # Main artifact generator
 # =============================================================================
 
@@ -264,6 +410,7 @@ def generate_artifacts(  # noqa: PLR0915
     device: torch.device,
     save_root: str | Path,
     dataset_name: str,
+    provenance: Mapping[str, Any],
     max_cases: int | None = None,
 ) -> tuple[pd.DataFrame, Path]:
     """
@@ -289,6 +436,9 @@ def generate_artifacts(  # noqa: PLR0915
         Root directory for all generated artifacts.
     dataset_name : str
         Base name for the Parquet summary file.
+    provenance : Mapping[str, Any]
+        Exact versioned generation contract. Written only after all payloads
+        complete successfully.
     max_cases : int or None, optional
         Maximum number of cases to process. If None, process all cases.
 
@@ -300,17 +450,13 @@ def generate_artifacts(  # noqa: PLR0915
         Path to the written Parquet file.
 
     """
+    save_root = Path(save_root)
+    expected_case_count = _artifact_effective_case_count(provenance)
+    _ensure_artifact_targets_absent(save_root, dataset_name)
     model.eval()
 
-    save_root = Path(save_root)
-
-    # Infer run_dir from save_root (.../processed/<run>/analysis/...)
-    run_dir = save_root
-    while run_dir.name not in {"processed", ""} and not (run_dir / "best_model_state_dict.pt").exists():
-        if run_dir.parent == run_dir:
-            break
-        run_dir = run_dir.parent
-
+    # Infer run_dir from save_root for logging/metadata only.
+    run_dir = infer_current_run_dir(save_root)
     run_name = run_dir.name
     physics_variant = "divu-SP"
 
@@ -346,13 +492,8 @@ def generate_artifacts(  # noqa: PLR0915
     npz_dir = save_root / "npz"
     npz_dir.mkdir(parents=True, exist_ok=True)
 
-    # Normalisation tensors
-    in_mean = processor.in_normalizer.mean.to(device)
-    in_std = processor.in_normalizer.std.to(device)
-    out_mean = processor.out_normalizer.mean.to(device)
-    out_std = processor.out_normalizer.std.to(device)
-
     rows: list[dict[str, Any]] = []
+    generated_source_indices: list[int] = []
 
     # Detect available kappa channels from field contracts
     kappa_names = detect_kappa_channels_from_inputs(domain.field_sets.DEFAULT_INPUTS_2D)
@@ -360,13 +501,33 @@ def generate_artifacts(  # noqa: PLR0915
     for idx, batch in enumerate(loader):
         if max_cases is not None and idx >= max_cases:
             break
-        case_id = idx + 1
+        split_local_index = _require_batch_scalar_int(batch, "split_local_index")
+        source_index = _require_batch_scalar_int(batch, "source_index")
+        if split_local_index != idx:
+            msg = f"Artifact loader order does not match saved split-local identity: iteration={idx}, split_local_index={split_local_index}."
+            raise RuntimeError(msg)
+        if source_index < 0:
+            msg = f"Artifact source_index must be non-negative, got {source_index}."
+            raise ValueError(msg)
+        case_id = source_index + 1
+        generated_source_indices.append(source_index)
 
         x = batch["x"].to(device)
         y = batch["y"].to(device)
 
         # Metadata (generator-side)
-        meta_clean = meta_to_jsonable(batch.get("meta", {}))
+        source_meta = meta_to_jsonable(batch.get("meta", {}))
+        meta_clean = dict(source_meta) if isinstance(source_meta, dict) else {"source_meta": source_meta}
+        reserved_meta_keys = {"case_index", "source_index", "split_local_index"}.intersection(meta_clean)
+        if reserved_meta_keys:
+            msg = (
+                "Source metadata contains reserved artifact identity keys and cannot be "
+                f"preserved unambiguously: {sorted(reserved_meta_keys)}."
+            )
+            raise KeyError(msg)
+        meta_clean["case_index"] = case_id
+        meta_clean["source_index"] = source_index
+        meta_clean["split_local_index"] = split_local_index
 
         # Pressure boundary condition (stored for diagnostics)
         p_bc_idx = domain.field_sets.DEFAULT_INPUTS_2D.index("p_bc")
@@ -391,9 +552,9 @@ def generate_artifacts(  # noqa: PLR0915
             start_time.record(torch.cuda.current_stream())
 
         with torch.no_grad():
-            x_norm = (x - in_mean) / (in_std + 1e-12)
+            x_norm = processor.in_normalizer.transform(x)
             y_hat_norm = model(x_norm)
-            y_hat = y_hat_norm * (out_std + 1e-12) + out_mean
+            y_hat = processor.out_normalizer.inverse_transform(y_hat_norm)
 
         # --------------------------------------------------
         # Physics diagnostics (exact training-consistent implementation)
@@ -515,11 +676,17 @@ def generate_artifacts(  # noqa: PLR0915
         # Write NPZ artifact
         # --------------------------------------------------
         npz_path = npz_dir / f"case_{case_id:04d}.npz"
+        if npz_path.exists():
+            msg = f"Refusing to overwrite an existing NPZ artifact: {npz_path}"
+            raise FileExistsError(msg)
         x_raw = x.squeeze(0).detach().cpu().numpy()  # (C_in,H,W)
         y_raw = y.squeeze(0).detach().cpu().numpy()  # (C_out,H,W)
 
         np.savez_compressed(
             npz_path,
+            case_index=np.int64(case_id),
+            source_index=np.int64(source_index),
+            split_local_index=np.int64(split_local_index),
             pred=y_hat_ext.squeeze(0).cpu().numpy(),
             gt=y_ext.squeeze(0).cpu().numpy(),
             err=err_ext.squeeze(0).cpu().numpy(),
@@ -545,6 +712,8 @@ def generate_artifacts(  # noqa: PLR0915
             {
                 "inference_time_ms": inference_time_ms,
                 "case_index": case_id,
+                "source_index": source_index,
+                "split_local_index": split_local_index,
                 "npz_path": str(npz_path),
                 "l2": l2,
                 "h1": h1,
@@ -563,8 +732,19 @@ def generate_artifacts(  # noqa: PLR0915
         )
 
     df = pd.DataFrame(rows)
+    _validate_generated_source_indices(provenance, generated_source_indices)
+    if len(df) != expected_case_count:
+        msg = f"Artifact generation produced {len(df)} cases, expected {expected_case_count} from provenance."
+        raise RuntimeError(msg)
+
     parquet_path = save_root / f"{dataset_name}.parquet"
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(parquet_path, index=False)
+    parquet_temp_path = parquet_path.with_name(f".{parquet_path.name}.tmp")
+    if parquet_temp_path.exists():
+        msg = f"Interrupted Parquet write exists: {parquet_temp_path}"
+        raise FileExistsError(msg)
+    df.to_parquet(parquet_temp_path, index=False)
+    parquet_temp_path.replace(parquet_path)
+    write_artifact_provenance(save_root, provenance)
 
     return df, parquet_path

@@ -8,6 +8,7 @@ Responsibilities:
   - Compare prediction and target power spectra
   - Plot spectral transfer ratios and error spectra
   - Visualize learned spectral energy summaries when available
+  - Infer run metadata from current config.yaml markers
 
 Design principles:
   - Spectral analysis uses Hann-windowed 2D FFTs
@@ -37,7 +38,7 @@ import pandas as pd
 import torch
 from matplotlib.lines import Line2D
 
-from src import analysis, domain
+from src import analysis, common, domain
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -233,7 +234,7 @@ def _infer_run_dir_from_df(df: pd.DataFrame) -> Path:
 
     Heuristic:
     - pick a valid npz_path (first file found within a small probe window)
-    - walk upward until we find either config.json or spectral_energy_aggregated.pt
+    - walk upward until we find either config.yaml or spectral_energy_aggregated.pt
 
     Parameters
     ----------
@@ -261,7 +262,7 @@ def _infer_run_dir_from_df(df: pd.DataFrame) -> Path:
             break
 
     for parent in [npz_path.parent, *npz_path.parents]:
-        if (parent / "spectral_energy_aggregated.pt").is_file() or (parent / "config.json").is_file():
+        if (parent / "spectral_energy_aggregated.pt").is_file() or common.paths.resolve_run_config_path(parent).is_file():
             return parent
 
     return npz_path.parent

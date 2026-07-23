@@ -7,11 +7,13 @@ Create overview tables and model-level comparison plots.
 Responsibilities:
   - Summarize global model performance across evaluation DataFrames
   - Plot accuracy/physics tradeoffs for model comparison
+  - Load model metadata from current saved-run config.yaml files
   - Produce compact overview tables for notebook panels
 
 Design principles:
   - Overview plots aggregate over cases before comparing models
   - Decision-support plots stay architecture-neutral
+  - Architecture metadata comes from model.architecture and model.params
   - Detailed diagnostics remain in specialized plot modules
 
 Boundaries:
@@ -22,7 +24,7 @@ Boundaries:
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,7 +34,7 @@ import numpy as np
 import pandas as pd
 from IPython.display import Markdown, display
 
-from src import domain
+from src import common, domain, experiments
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -115,86 +117,116 @@ def _median_physics_residual(
 # =============================================================================
 # Model metadata loading
 # =============================================================================
+def _as_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
+    """Return a config section mapping or raise a current-schema error."""
+    if not isinstance(value, Mapping):
+        msg = f"Expected {label} to be a mapping in config.yaml."
+        raise TypeError(msg)
+    return value
+
+
+def _find_current_config_from_npz_path(npz_path: Path) -> Path | None:
+    """Find the current run config.yaml that owns an artifact path."""
+    for parent in [npz_path.parent, *npz_path.parents]:
+        cfg_path = common.paths.resolve_run_config_path(parent)
+        if cfg_path.is_file():
+            return cfg_path
+    return None
+
+
+def _load_current_config_from_df(df: pd.DataFrame) -> dict[str, Any] | None:
+    """Load config.yaml for the run represented by an evaluation DataFrame."""
+    if df.empty or "npz_path" not in df.columns:
+        return None
+
+    cfg_path = _find_current_config_from_npz_path(Path(df.iloc[0]["npz_path"]).expanduser())
+    if cfg_path is None:
+        return None
+    return experiments.config.loader.load_yaml(cfg_path)
+
+
+def _current_config_sections(
+    cfg: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Return current-schema model, params, loss, data and run sections."""
+    model_cfg = _as_mapping(cfg.get("model"), label='config["model"]')
+    params = _as_mapping(model_cfg.get("params"), label='config["model"]["params"]')
+    loss_cfg = _as_mapping(cfg.get("loss"), label='config["loss"]')
+    data_cfg = _as_mapping(cfg.get("data"), label='config["data"]')
+    run_cfg = _as_mapping(cfg.get("run"), label='config["run"]')
+    return model_cfg, params, loss_cfg, data_cfg, run_cfg
+
+
+def _display_architecture(model_cfg: Mapping[str, Any], loss_cfg: Mapping[str, Any], run_cfg: Mapping[str, Any]) -> str | None:
+    """Return a display architecture label from current config sections."""
+    architecture = model_cfg.get("architecture")
+    if not isinstance(architecture, str) or not architecture:
+        return None
+    if architecture.startswith("PI-"):
+        return architecture
+
+    loss_type = loss_cfg.get("type")
+    run_name = run_cfg.get("name")
+    if loss_type == "pino" or (isinstance(run_name, str) and run_name.startswith("PI-")):
+        return f"PI-{architecture}"
+    return architecture
+
+
+def _mode_pair_from_params(params: Mapping[str, Any]) -> tuple[float, float] | None:
+    """Return FNO or UNO mode coordinates from current model.params."""
+    n_modes = params.get("n_modes")
+    if isinstance(n_modes, (list, tuple)) and len(n_modes) == 2:  # noqa: PLR2004
+        return float(n_modes[0]), float(n_modes[1])
+
+    if "modes_x" in params and "modes_y" in params:
+        return float(params["modes_x"]), float(params["modes_y"])
+
+    return None
 
 
 def _load_model_metadata(df: pd.DataFrame) -> dict[str, Any]:
     """
-    Load model-level architecture and physics parameters from config.json.
+    Load model-level architecture and loss parameters from config.yaml.
 
-    One model = one config.json, resolved via npz_path of first case.
+    One model = one current saved-run config.yaml, resolved via npz_path of
+    the first case. Legacy read-only tolerance is limited to returning empty
+    metadata when no current config.yaml is present; old config formats are not
+    parsed.
     """
-    if df.empty:
+    cfg = _load_current_config_from_df(df)
+    if cfg is None:
         return {}
 
-    npz_path = Path(df.iloc[0]["npz_path"])
-
-    cfg_path = None
-    for p in npz_path.parents:
-        cand = p / "config.json"
-        if cand.exists():
-            cfg_path = cand
-            break
-
-    if cfg_path is None:
-        return {}
-
-    if not cfg_path.exists():
-        return {}
-
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    model_cfg = cfg.get("model", {})
-    params = model_cfg.get("model_params", {})
-    physics = cfg.get("physics", {})
+    model_cfg, params, loss_cfg, _data_cfg, run_cfg = _current_config_sections(cfg)
 
     meta: dict[str, Any] = {}
 
     # --------------------------------------------------
-    # Architecture (base + PI flag)
+    # Architecture
     # --------------------------------------------------
-    base_arch = model_cfg.get("architecture")
-
-    # Detect physics-informed training
-    train_loss = model_cfg.get("train_loss")
-    run_name = cfg.get("general", {}).get("run_name", "")
-
-    is_pi = False
-    if (isinstance(train_loss, str) and "PINO" in train_loss) or "PI-" in run_name:
-        is_pi = True
-
-    if base_arch is not None:
-        meta["architecture"] = f"PI-{base_arch}" if is_pi else base_arch
-    else:
-        meta["architecture"] = None
-
+    meta["architecture"] = _display_architecture(model_cfg, loss_cfg, run_cfg)
     meta["n_layers"] = params.get("n_layers")
     meta["hidden_channels"] = params.get("hidden_channels")
 
     # Modes
-    if "n_modes" in params:
-        mx, my = params["n_modes"]
-        meta["modes_x"] = mx
-        meta["modes_y"] = my
-        meta["modes_mean"] = 0.5 * (mx + my)
-
-    elif "uno_n_modes" in params:
-        mx, my = params["uno_n_modes"][0]
+    modes = _mode_pair_from_params(params)
+    if modes is not None:
+        mx, my = modes
         meta["modes_x"] = mx
         meta["modes_y"] = my
         meta["modes_mean"] = 0.5 * (mx + my)
 
     # UNO bottleneck
-    if "uno_scalings" in params:
-        scales = [float(s[0]) for s in params["uno_scalings"]]
-        meta["mode_ratio"] = float(sum(scales) / len(scales))
+    mode_ratio = params.get("mode_ratio")
+    if mode_ratio is not None:
+        meta["mode_ratio"] = float(mode_ratio)
         meta["bottleneck_strength"] = 1.0 / meta["mode_ratio"]
 
     # --------------------------------------------------
-    # Physics weights
+    # Physics-informed loss weights
     # --------------------------------------------------
-    meta["lambda_phys"] = physics.get("lambda_phys")
-    meta["lambda_p"] = physics.get("lambda_p")
+    meta["lambda_phys"] = loss_cfg.get("lambda_phys")
+    meta["lambda_p"] = loss_cfg.get("lambda_p")
 
     return meta
 

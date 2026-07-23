@@ -58,6 +58,7 @@ Notes:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -236,7 +237,11 @@ class PhysicsDataset(base.BaseDataset):
 
         x_tensor: Tensor = sample["x"]["input"]
         y_tensor: Tensor = sample["y"]["output"]
-        meta: dict[str, Any] = case_dict.get("meta", {})
+        raw_meta = case_dict.get("meta", {})
+        if not isinstance(raw_meta, Mapping):
+            msg = f"Case metadata must be a mapping: {case_path}"
+            raise TypeError(msg)
+        meta = dict(raw_meta)
 
         return {"x": x_tensor, "y": y_tensor, "meta": meta}
 
