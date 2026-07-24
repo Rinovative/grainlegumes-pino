@@ -3,7 +3,7 @@
 %
 % CSV columns (row-wise, flattened):
 %   x ; y ;
-%   Kxx ; Kyy ; Kxy ;
+%   Kxx ; Kxy ; Kyy ;
 %   eps ;
 %   [p_bc]
 %
@@ -57,13 +57,13 @@ M = [
     X(:), ...
     Y(:), ...
     Kxx(:), ...
-    Kyy(:), ...
     Kxy(:), ...
+    Kyy(:), ...
     eps(:), ...
     p_bc(:)
 ];
 
-col_names = {'x','y','Kxx','Kyy','Kxy','eps','p_bc'};
+col_names = {'x','y','Kxx','Kxy','Kyy','eps','p_bc'};
 
 %% === File naming ============================================
 if strlength(opts.file_tag) > 0

@@ -26,8 +26,6 @@ import argparse
 import json
 import sys
 
-from src import experiments
-
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the Optuna CLI argument parser."""
@@ -58,7 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-root",
         type=str,
         default=None,
-        help="Override training output root directory",
+        help="Override only the study and trial run/output root",
     )
     parser.add_argument(
         "--show-progress-bar",
@@ -68,32 +66,30 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    """
-    Run the Optuna CLI entry point.
-
-    Returns
-    -------
-    int
-        Exit code, 0 on success
-
-    """
+def main(argv: list[str] | None = None) -> int:
+    """Run the delegated Optuna entry point and return a process exit code."""
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    try:
+        from src.experiments.tuning import experiments_tuning_optuna as optuna  # noqa: PLC0415
 
-    study_config = experiments.tuning.optuna.load_optuna_study_config(args.config_path)
-
-    if args.dry_run:
-        print(json.dumps(experiments.tuning.optuna.describe_optuna_study_config(study_config), indent=2))
-        return 0
-
-    study = experiments.tuning.optuna.run_optuna_study(
-        study_config,
-        n_trials=args.n_trials,
-        device=args.device,
-        output_root=args.output_root,
-        show_progress_bar=args.show_progress_bar,
-    )
+        study_config = optuna.load_optuna_study_config(args.config_path)
+        if args.dry_run:
+            print(json.dumps(optuna.describe_optuna_study_config(study_config), indent=2))
+            return 0
+        study = optuna.run_optuna_study(
+            study_config,
+            n_trials=args.n_trials,
+            device=args.device,
+            output_root=args.output_root,
+            show_progress_bar=args.show_progress_bar,
+        )
+    except KeyboardInterrupt:
+        print("Optuna study interrupted.", file=sys.stderr)
+        return 130
+    except Exception as error:  # noqa: BLE001
+        print(f"Optuna study failed: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
 
     print("Optuna study complete")
     print(f"  Study name: {study.study_name}")

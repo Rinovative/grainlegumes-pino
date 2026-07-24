@@ -23,13 +23,15 @@ Boundaries:
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import ipywidgets as widgets
 import matplotlib.ticker as mticker
 import numpy as np
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from matplotlib.axes import Axes
 
 # =============================================================================
@@ -318,7 +320,7 @@ def ui_step_case_index(
     prev_btn.layout = widgets.Layout(width="40px")
     next_btn.layout = widgets.Layout(width="40px")
 
-    return control, prev_btn, next_btn  # type: ignore[return-value]
+    return cast("widgets.BoundedIntText", control), prev_btn, next_btn
 
 
 def ui_step_case_count(
@@ -358,7 +360,7 @@ def ui_step_case_count(
         prev_label="⟨",
         next_label="⟩",
     )
-    return control, prev_btn, next_btn  # type: ignore[return-value]
+    return cast("widgets.IntSlider", control), prev_btn, next_btn
 
 
 # =============================================================================
@@ -535,8 +537,8 @@ def ui_radio_kappa_scale() -> widgets.RadioButtons:
 
 def ui_checkbox_channels(
     *,
-    channels: list[str] | None = None,
-    default_on: list[str] | None = None,
+    channels: Sequence[str] | None = None,
+    default_on: Sequence[str] | None = None,
 ) -> widgets.VBox:
     """
     Checkbox selector for output channels.
@@ -560,12 +562,12 @@ def ui_checkbox_channels(
     functions to determine which channels are active.
 
     """
-    channels = channels or ["p", "u", "v", "U"]
-    default_on = default_on or channels
+    resolved_channels = list(channels or ["p", "u", "v", "U"])
+    resolved_defaults = list(default_on or resolved_channels)
 
     return _build_checkbox_group(
-        options=channels,
-        defaults=default_on,
+        options=resolved_channels,
+        defaults=resolved_defaults,
     )
 
 
@@ -687,39 +689,6 @@ def ui_output_plot() -> widgets.Output:
 # COLORBAR FORMATTERS
 
 
-def _max_decimals_from_ticks(ticks: np.ndarray, *, cap: int = 6) -> int:
-    """
-    Determine the maximum number of decimals needed across ticks AFTER stripping trailing zeros per tick.
-
-    Example:
-        ticks contain 0.18 -> max_decimals = 2 -> show 0.20 (not 0.2)
-
-    Parameters
-    ----------
-    ticks : np.ndarray
-        Tick values.
-    cap : int, optional
-        Maximum number of decimals to consider (default: 6).
-
-    Returns
-    -------
-    int
-        Maximum number of decimals needed.
-
-    """
-    t = np.asarray(ticks, dtype=float)
-    t = t[np.isfinite(t)]
-    if t.size == 0:
-        return 0
-
-    max_dec = 0
-    for x in t:
-        s = f"{x:.{cap}f}".rstrip("0").rstrip(".")
-        if "." in s:
-            max_dec = max(max_dec, len(s.split(".")[1]))
-    return max_dec
-
-
 def choose_colorbar_formatter(
     vmin: float,
     vmax: float,
@@ -826,8 +795,8 @@ def compute_levels(arr: np.ndarray, n: int = 10) -> np.ndarray:
     vmin, vmax = float(q_lo), float(q_hi)
 
     if vmin == vmax:
-        eps = 1e-12
-        return np.linspace(vmin - eps, vmax + eps, n)
+        range_padding = 1e-12
+        return np.linspace(vmin - range_padding, vmax + range_padding, n)
 
     # Use MaxNLocator to get "nice" levels
     locator = mticker.MaxNLocator(nbins=n)

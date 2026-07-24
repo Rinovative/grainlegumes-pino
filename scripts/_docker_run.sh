@@ -1,27 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if (( $# < 3 )); then
+  echo "Usage: $0 <gpu-id> <train|optuna|artifacts> <log-basename> [command arguments...]" >&2
+  exit 2
+fi
+
 GPU_ID="$1"
-SCRIPT_NAME="$2"
+JOB_TYPE="$2"
 LOG_BASENAME="$3"
 shift 3
 
+if [[ ! "${GPU_ID}" =~ ^[0-9]+$ ]]; then
+  echo "GPU ID must be a non-negative integer, got: ${GPU_ID@Q}" >&2
+  exit 2
+fi
+if [ -z "${LOG_BASENAME}" ] || [[ "${LOG_BASENAME}" == */* ]] || [[ "${LOG_BASENAME}" == "." || "${LOG_BASENAME}" == ".." ]]; then
+  echo "Log name must be one non-empty basename, got: ${LOG_BASENAME@Q}" >&2
+  exit 2
+fi
+
+case "${JOB_TYPE}" in
+  train)
+    MODULE="src.experiments.cli.cli_train"
+    ;;
+  optuna)
+    MODULE="src.experiments.cli.cli_optuna"
+    ;;
+  artifacts)
+    MODULE="src.experiments.cli.cli_build_artifacts"
+    ;;
+  *)
+    echo "Unsupported job type: ${JOB_TYPE}" >&2
+    exit 2
+    ;;
+esac
+
 IMAGE_NAME="grainlegumes-pino-airflow"
-
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-STORAGE_DIR="$(cd "${PROJECT_DIR}/../storage" && pwd)"
+HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
+mkdir -p "${PROJECT_DIR}/logs" "${HOST_STORAGE_ROOT}"
+STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd)"
 DOCKER_HOME="${STORAGE_DIR}/.docker_home"
-LOG_FILE="/workspace/repo/logs/${LOG_BASENAME}"
-
-mkdir -p \
-  "${PROJECT_DIR}/logs" \
-  "${PROJECT_DIR}/data" \
-  "${PROJECT_DIR}/data_generation/data" \
-  "${PROJECT_DIR}/model_training/data" \
-  "${STORAGE_DIR}/data" \
-  "${STORAGE_DIR}/data_generation" \
-  "${STORAGE_DIR}/data_training" \
-  "${DOCKER_HOME}"
+LOG_FILE="${PROJECT_DIR}/logs/${LOG_BASENAME}"
+mkdir -p "${DOCKER_HOME}"
 
 # ----------------------------------------------------------------------
 # Create runtime user mapping for container
@@ -39,29 +61,19 @@ EOF
 chmod 644 "${DOCKER_HOME}/passwd" "${DOCKER_HOME}/group"
 
 # ----------------------------------------------------------------------
-# Resolve script by filename
+# Resolve optional W&B authentication for standard Docker env pass-through
 # ----------------------------------------------------------------------
-SCRIPT_ABS_PATH="$(
-  find "${PROJECT_DIR}" \
-    -path "${PROJECT_DIR}/.git" -prune -o \
-    -path "${PROJECT_DIR}/logs" -prune -o \
-    -type f -name "${SCRIPT_NAME}" -print \
-    | head -n 1
-)"
-
-if [ -z "${SCRIPT_ABS_PATH}" ]; then
-  echo "Script not found by name: ${SCRIPT_NAME}"
-  exit 1
+WANDB_ENV_ARGS=()
+if [ -z "${WANDB_API_KEY:-}" ] && [ -r "${HOME}/wandb_key.txt" ]; then
+  WANDB_API_KEY="$(< "${HOME}/wandb_key.txt")"
+  if [ -n "${WANDB_API_KEY}" ]; then
+    export WANDB_API_KEY
+  else
+    unset WANDB_API_KEY
+  fi
 fi
-
-SCRIPT_RELATIVE_PATH="${SCRIPT_ABS_PATH#${PROJECT_DIR}/}"
-
-# ----------------------------------------------------------------------
-# Load W&B key if available
-# ----------------------------------------------------------------------
-WANDB_API_KEY_VALUE="${WANDB_API_KEY:-}"
-if [ -z "${WANDB_API_KEY_VALUE}" ] && [ -f "${HOME}/wandb_key.txt" ]; then
-  WANDB_API_KEY_VALUE="$(cat "${HOME}/wandb_key.txt")"
+if [ -n "${WANDB_API_KEY:-}" ]; then
+  WANDB_ENV_ARGS=(-e WANDB_API_KEY)
 fi
 
 # ----------------------------------------------------------------------
@@ -73,28 +85,21 @@ if [ -d "${HOME}/.ssh" ]; then
 fi
 
 # ----------------------------------------------------------------------
-# Run queued job inside Docker
+# Run the selected semantic CLI inside Docker and preserve its exit code
 # ----------------------------------------------------------------------
 docker run --rm \
-  --gpus "\"device=${GPU_ID}\"" \
+  --gpus "device=${GPU_ID}" \
   --user "$(id -u):$(id -g)" \
   --shm-size=16G \
-  --workdir /workspace/repo \
+  --workdir /workspace/repo/model_training \
   -e HOME=/workspace/storage/.docker_home \
-  -e PROJECT_ROOT=/workspace/repo \
   -e STORAGE_ROOT=/workspace/storage \
-  -e DATA_ROOT=/workspace/storage/data \
-  -e GEN_ROOT=/workspace/storage/data_generation \
-  -e TRAIN_ROOT=/workspace/storage/data_training \
-  -e WANDB_API_KEY="${WANDB_API_KEY_VALUE}" \
+  "${WANDB_ENV_ARGS[@]}" \
   -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   -v "${DOCKER_HOME}/passwd:/etc/passwd:ro" \
   -v "${DOCKER_HOME}/group:/etc/group:ro" \
   -v "${PROJECT_DIR}:/workspace/repo:rw" \
   -v "${STORAGE_DIR}:/workspace/storage:rw" \
-  -v "${STORAGE_DIR}/data:/workspace/repo/data:rw" \
-  -v "${STORAGE_DIR}/data_generation:/workspace/repo/data_generation/data:rw" \
-  -v "${STORAGE_DIR}/data_training:/workspace/repo/model_training/data:rw" \
   "${SSH_ARGS[@]}" \
   "${IMAGE_NAME}" \
-  bash -lc "mkdir -p /workspace/repo/logs && python '/workspace/repo/${SCRIPT_RELATIVE_PATH}' \"\$@\" > '${LOG_FILE}' 2>&1" -- "$@"
+  python -m "${MODULE}" "$@" > "${LOG_FILE}" 2>&1

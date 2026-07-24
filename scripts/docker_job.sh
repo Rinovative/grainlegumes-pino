@@ -4,46 +4,96 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="${PROJECT_DIR}/logs"
 
-mkdir -p "${LOG_DIR}"
+usage() {
+  cat >&2 <<EOF
+Usage:
+  $0 train <config.yaml> [train arguments...]
+  $0 optuna <config.yaml> [Optuna arguments...]
+  $0 artifacts [artifact arguments...]
+EOF
+}
 
-SCRIPT_PATH="${1:-model_training/src/util/util_gpu_test.py}"
-shift || true
+if (( $# == 0 )); then
+  usage
+  exit 2
+fi
 
-SCRIPT_HOST_PATH="${PROJECT_DIR}/${SCRIPT_PATH}"
-if [ ! -f "${SCRIPT_HOST_PATH}" ]; then
-  echo "Script not found: ${SCRIPT_HOST_PATH}"
+JOB_TYPE="$1"
+shift
+case "${JOB_TYPE}" in
+  train|optuna)
+    if (( $# == 0 )); then
+      echo "${JOB_TYPE} requires a YAML config path." >&2
+      usage
+      exit 2
+    fi
+    ;;
+  artifacts)
+    ;;
+  *)
+    echo "Unsupported job type: ${JOB_TYPE}" >&2
+    usage
+    exit 2
+    ;;
+esac
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "nvidia-smi is required for GPU selection." >&2
+  exit 1
+fi
+if ! command -v runTSGPU.py >/dev/null 2>&1; then
+  echo "runTSGPU.py is required on PATH." >&2
   exit 1
 fi
 
-SCRIPT_NAME="$(basename "${SCRIPT_PATH}")"
+mkdir -p "${LOG_DIR}"
 
 echo "Current GPU usage:"
 nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total \
   --format=csv,noheader,nounits
 echo "------------------------------------------------------------"
 
-AUTO_GPU=$(nvidia-smi --query-gpu=index,memory.used \
-  --format=csv,noheader,nounits \
-  | sort -t, -k2 -n \
-  | head -n1 \
-  | cut -d',' -f1 \
-  | xargs)
+GPU_IDS="$(
+  nvidia-smi --query-gpu=index --format=csv,noheader,nounits \
+    | sed 's/[[:space:]]//g;/^$/d'
+)"
+if [ -z "${GPU_IDS}" ]; then
+  echo "No GPUs were reported by nvidia-smi." >&2
+  exit 1
+fi
 
-read -r -p "Select GPU (0-3, press Enter for ${AUTO_GPU}): " GPU_ID
-GPU_ID="${GPU_ID:-$AUTO_GPU}"
+AUTO_GPU="$(
+  nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
+    | sort -t, -k2,2n \
+    | head -n 1 \
+    | cut -d, -f1 \
+    | xargs
+)"
+if ! printf '%s\n' "${GPU_IDS}" | grep -Fqx -- "${AUTO_GPU}"; then
+  echo "Could not determine a valid automatic GPU proposal." >&2
+  exit 1
+fi
+
+GPU_LIST="$(printf '%s\n' "${GPU_IDS}" | paste -sd, -)"
+read -r -p "Select GPU (${GPU_LIST}; Enter for proposed ${AUTO_GPU}): " GPU_ID
+GPU_ID="${GPU_ID:-${AUTO_GPU}}"
+if ! printf '%s\n' "${GPU_IDS}" | grep -Fqx -- "${GPU_ID}"; then
+  echo "GPU ${GPU_ID@Q} is not one of the available indices: ${GPU_LIST}." >&2
+  exit 2
+fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-SCRIPT_TAG="$(basename "${SCRIPT_NAME}" .py)"
-LOG_BASENAME="${TIMESTAMP}__${SCRIPT_TAG}__gpu${GPU_ID}.log"
+LOG_PATH="$(mktemp --suffix=.log "${LOG_DIR}/${TIMESTAMP}__${JOB_TYPE}__gpu${GPU_ID}__XXXXXX")"
+LOG_BASENAME="$(basename "${LOG_PATH}")"
 
 cd "${PROJECT_DIR}"
-
-runTSGPU.py -g"${GPU_ID}" -- scripts/_docker_run.sh \
+runTSGPU.py -g"${GPU_ID}" -- "${PROJECT_DIR}/scripts/_docker_run.sh" \
   "${GPU_ID}" \
-  "${SCRIPT_NAME}" \
+  "${JOB_TYPE}" \
   "${LOG_BASENAME}" \
   "$@"
 
-echo "Queued Docker job on GPU ${GPU_ID}: ${SCRIPT_NAME}"
+echo "Queued ${JOB_TYPE} job on GPU ${GPU_ID}."
 echo "Queue: runTSGPU.py -g${GPU_ID} -s"
-echo "Tail:  tail -f ${LOG_DIR}/${LOG_BASENAME}"
+echo "Log:   ${LOG_PATH}"
+echo "Tail:  tail -F ${LOG_PATH}"

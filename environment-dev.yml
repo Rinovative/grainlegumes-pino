@@ -1,10 +1,31 @@
-name: dev
+name: grainlegumes-pino-dev
 channels:
+  - pytorch
   - conda-forge
 dependencies:
   - python=3.11
+  - pytorch=2.4
+  - cpuonly
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - tqdm
+  - pyarrow
+  - pyyaml
+  - ipywidgets
+  - ipython
+  - pytest
   - ruff
   - mypy
-  - nbqa
   - radon
+  - setuptools
+  - wheel
   - pip
+  - pip:
+      - basedpyright
+      - pandas-stubs
+      - neuraloperator==2.0.*
+      - optuna
+      - wandb

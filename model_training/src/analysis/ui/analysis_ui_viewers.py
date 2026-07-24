@@ -126,9 +126,11 @@ def _attach_widget_rerender(
         # ---------------------------------------------
         # Case 2: checkbox group (VBox with .boxes)
         # ---------------------------------------------
-        if hasattr(w, "boxes"):
-            for cb in w.boxes.values():  # type: ignore[attr-defined]
-                cb.observe(lambda _: render_func(), names="value")
+        boxes = getattr(w, "boxes", None)
+        if isinstance(boxes, dict):
+            for checkbox in boxes.values():
+                if isinstance(checkbox, widgets.Checkbox):
+                    checkbox.observe(lambda _: render_func(), names="value")
 
 
 # =============================================================================
@@ -239,7 +241,11 @@ def make_interactive_case_viewer(
     # ------------------------------------------------------------------
     def _render() -> None:
         if dataset_dropdown is not None:
-            name: str = dataset_dropdown.value  # pyright: ignore[reportAssignmentType]
+            selected_name = dataset_dropdown.value
+            if not isinstance(selected_name, str):
+                msg = "Dataset dropdown must contain string values."
+                raise TypeError(msg)
+            name = selected_name
         else:
             name = active_dataset
 

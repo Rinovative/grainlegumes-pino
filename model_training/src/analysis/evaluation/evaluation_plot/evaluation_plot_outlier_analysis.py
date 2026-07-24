@@ -22,6 +22,8 @@ Boundaries:
 
 from __future__ import annotations
 
+from functools import partial
+from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -40,7 +42,7 @@ if TYPE_CHECKING:
 # =============================================================================
 # CHANNELS AND UNITS
 # =============================================================================
-CHANNELS = domain.fields.OUTPUT_FIELDS
+CHANNELS = domain.fields.ANALYSIS_FIELDS
 CHANNEL_INDICES = {name: i for i, name in enumerate(CHANNELS)}
 UNIT_MAP = {
     "p": "Pa",
@@ -150,7 +152,7 @@ def _load_npz(row: pd.Series | pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np
     if key in _npz_cache:
         return _npz_cache[key]
 
-    data = np.load(key, allow_pickle=True)
+    data = np.load(key, allow_pickle=False)
     pred = np.asarray(data["pred"])
     gt = np.asarray(data["gt"])
     err = np.asarray(data["err"])
@@ -178,7 +180,7 @@ def _load_npz(row: pd.Series | pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np
     gt = _to_chw(gt)
     err = _to_chw(err)
 
-    # kappa: commonly (1, K, H, W) or (K, H, W)
+    # Accept batched or unbatched channel-first permeability tensors.
     if kappa.ndim == 4 and kappa.shape[0] == 1:  # noqa: PLR2004
         kappa = kappa[0]
     elif kappa.ndim != 3:  # noqa: PLR2004
@@ -299,11 +301,14 @@ def _select_topk_per_channel(*, datasets: dict[str, pd.DataFrame], k: int) -> di
         out[name] = {}
         for ch in CHANNELS:
             ch_idx = CHANNEL_INDICES[ch]
-            scores = []
+            scores: list[tuple[int, float]] = []
             for idx, row in df.iterrows():
+                if not isinstance(idx, Integral):
+                    msg = f"Outlier table index must be integral, got {idx!r}."
+                    raise TypeError(msg)
                 _, gt, err, _, _ = _load_npz(row)
                 if ch_idx < err.shape[0] and ch_idx < gt.shape[0]:
-                    scores.append((idx, _rel_l2(err[ch_idx], gt[ch_idx])))
+                    scores.append((int(idx), _rel_l2(err[ch_idx], gt[ch_idx])))
             scores.sort(key=lambda x: x[1], reverse=True)
             out[name][ch] = [i for i, _ in scores[:k_top]]
 
@@ -590,6 +595,11 @@ def _style_rank_diverging(df: pd.DataFrame, columns: list[str], kind: pd.Series)
     return pd.DataFrame(out)
 
 
+def _style_reference_column(column: pd.Series, *, kind: pd.Series) -> list[str]:
+    """Keep reference cells unfilled and give other identity cells a white fill."""
+    return ["" if kind.loc[index] == "reference" else "background-color: white" for index in column.index]
+
+
 def _short_parameter_name(c: str) -> str:
     """
     Shorten parameter column names for display only.
@@ -671,7 +681,6 @@ def plot_outlier_tables_per_channel(*, datasets: dict[str, pd.DataFrame], k: int
                         "case_index": int(row.loc["case_index"]),
                         f"rel_l2[{ch}]": rels[ch],
                         "rel_l2_global": _scalar(row.loc["rel_l2"]),
-                        "l2_global": _scalar(row.loc["l2"]),
                         "__kind__": "worst",
                     }
                     for p in par_cols:
@@ -688,7 +697,6 @@ def plot_outlier_tables_per_channel(*, datasets: dict[str, pd.DataFrame], k: int
                     "case_index": f"{int(row.loc['case_index'])} (Ref)",
                     f"rel_l2[{ch}]": rels[ch],
                     "rel_l2_global": _scalar(row.loc["rel_l2"]),
-                    "l2_global": _scalar(row.loc["l2"]),
                     "__kind__": "reference",
                 }
                 for p in par_cols:
@@ -700,21 +708,16 @@ def plot_outlier_tables_per_channel(*, datasets: dict[str, pd.DataFrame], k: int
                 rename_map = {c: _short_parameter_name(c) for c in df_out.columns}
                 df_out = df_out.rename(columns=rename_map)
 
+                numeric_columns = [str(column) for column in df_out.columns if pd.api.types.is_numeric_dtype(df_out[column])]
+                rank_columns = [column for column in numeric_columns if column != "case_index"]
+
+                style_rank = partial(_style_rank_diverging, columns=rank_columns, kind=kind)
+                style_reference = partial(_style_reference_column, kind=kind)
+
                 display(
-                    df_out.style.format({c: _fmt_num for c in df_out.columns if pd.api.types.is_numeric_dtype(df_out[c])})
-                    .apply(
-                        lambda _, df_out=df_out, kind=kind: _style_rank_diverging(
-                            df_out,
-                            [c for c in df_out.columns if pd.api.types.is_numeric_dtype(df_out[c]) and c != "case_index"],
-                            kind,
-                        ),
-                        axis=None,
-                    )
-                    .apply(
-                        lambda _, df_out=df_out, kind=kind: ["" if kind.loc[i] == "reference" else "background-color: white" for i in df_out.index],
-                        axis=0,
-                        subset=["case_index"],
-                    )
+                    df_out.style.format(dict.fromkeys(numeric_columns, _fmt_num))
+                    .apply(style_rank, axis=None)
+                    .apply(style_reference, axis=0, subset=["case_index"])
                 )
 
     run_btn.on_click(_render)

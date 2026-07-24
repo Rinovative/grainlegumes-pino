@@ -2,204 +2,109 @@
 ===============================================================================
 dataset_module_flow.py
 ===============================================================================
-Convert flow dataset dictionaries into neural-operator tensors.
+Convert validated task datasets into neural-operator tensors.
 
 Responsibilities:
-  - Support merged dataset dictionaries and single-case dictionaries
-  - Select input and output fields in canonical domain order
-  - Populate sample dictionaries with model-ready x/y tensors
+  - Validate current merged-dataset and single-case payloads
+  - Preserve the exact task-owned input and output channel order
+  - Populate sample dictionaries with model-ready tensors
 
 Design principles:
-  - Channel selection is explicit and deterministic
-  - Domain field sets define canonical tensor order
-  - Data conversion stays separate from DataLoader construction
+  - No field filtering, aliasing, reordering, or schema coercion is allowed
+  - Case and merged inputs use the same task contract and validator
+  - Tensor construction is independent of any concrete task field names
 
 Boundaries:
-  - Dataset splitting and normalization belong to datasets.base
-  - Model construction belongs to learning.models
-
-Notes:
-  Expected input formats:
-    1) Merged dataset format:
-       -------------------------------------------------
-       Produced by `merge_batch_cases.py`, with structure:
-              {
-                "inputs":  Tensor [N, C_in, H, W],
-                "outputs": Tensor [N, C_out, H, W],
-                "fields": {
-                     "inputs":  list[str],  # channel names in order
-                     "outputs": list[str],
-                },
-              }
-         In this mode, the module behaves like a standard
-        operator-learning dataset over N samples.
-
-    2) Single-case format:
-       -------------------------------------------------
-       A dictionary with structure:
-              {
-                "input_fields":  dict[str, 2D-array],
-                "output_fields": dict[str, 2D-array],
-                "meta":          dict,
-              }
-         These are converted on-the-fly into tensors with a synthetic batch dimension of size 1, then reduced back to
-         [C_in, H, W] / [C_out, H, W] via the FlowModule.
-         The module returns a single sample with index 0 in this mode.
-
-    In both modes, the FlowModule constructs model-ready tensors for
-    PINO/FNO models, and __getitem__ returns:
-        {"x": Tensor, "y": Tensor}          # merged mode
-        {"x": Tensor, "y": Tensor, "meta": dict}  # single-case mode
-
+  - Dataset identity algorithms belong to datasets.identity
+  - Splitting and normalization belong to datasets.base
 ===============================================================================
-
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+from src.datasets import dataset_identity as identity
 
-from src import domain
+if TYPE_CHECKING:
+    from src.domain.tasks.domain_task_spec import TaskSpec
 
 
 class FlowModule:
-    """Unified loader for flow datasets with optional channel selection."""
+    """Expose strict task tensors from a merged or single-case payload."""
 
     def __init__(
         self,
         data: dict[str, Any],
-        include_inputs: list[str] | None = None,
-        include_outputs: list[str] | None = None,
+        *,
+        task: TaskSpec,
     ) -> None:
         """
-        Initialize the module for merged or single-case dataset formats.
+        Validate and materialize a current dataset payload.
 
         Parameters
         ----------
-        data : dict
-            Dataset dictionary. Two formats are supported:
+        data : dict[str, Any]
+            Current merged-dataset or single-case payload.
+        task : TaskSpec
+            Authoritative task contract used for exact schema validation.
 
-            Merged dataset format:
-                Required keys:
-                    - "inputs":  Tensor [N, C_in, H, W]
-                                Input channels (in canonical internal order):
-                                    x, y,
-                                    kxx, kyy (, kzz),
-                                    kxy (, kxz, kyz),
-                                    eps, p_bc
-                    - "outputs": Tensor [N, C_out, H, W]
-                                 Channels:
-                                     p, u, v, U
-                    - "fields": {
-                          "inputs":  list of input channel names,
-                          "outputs": list of output channel names,
-                      }
-
-            Single-case format:
-                Required keys:
-                    - "input_fields":  dict[field_name → 2D array]
-                    - "output_fields": dict[field_name → 2D array]
-                    - "meta": metadata dictionary
-                These are converted into tensors with a batch dimension (size 1).
-
-        include_inputs : list[str] | None
-            Optional list of input channel names to select.
-            If None, all input channels are used.
-
-        include_outputs : list[str] | None
-            Optional list of output channel names to select.
-            If None, all output channels are used.
+        Raises
+        ------
+        ValueError
+            If schema, fields, shapes, sample identity, or stored fingerprint
+            are invalid, or strict content verification finds a mismatch.
 
         """
         self.raw_data = data
-
-        # -------------------------------------------------------------
-        # Detect dataset mode
-        # -------------------------------------------------------------
-        if all(k in data for k in ("inputs", "outputs", "fields")):
+        self.task = task
+        schema_kind = data.get("schema_kind")
+        self.dataset_identity: identity.DatasetIdentity | None
+        if schema_kind == identity.MERGED_DATASET_SCHEMA_KIND:
             self.mode = "merged"
-
-            self.inputs = data["inputs"]  # [N, C_in, H, W]
-            self.outputs = data["outputs"]  # [N, C_out, H, W]
-            self.fields = data["fields"]  # {"inputs": [...], "outputs": [...]}
-
-        elif all(k in data for k in ("input_fields", "output_fields", "meta")):
+            self.dataset_identity = identity.validate_merged_dataset_payload(
+                data,
+                task=task,
+                verify_content=True,
+            )
+            self.inputs = data["inputs"]
+            self.outputs = data["outputs"]
+        elif schema_kind == identity.CASE_SCHEMA_KIND:
             self.mode = "single"
-
-            input_dict = data["input_fields"]
-            output_dict = data["output_fields"]
-
-            available_inputs = list(input_dict.keys())
-
-            # --- Dimension robust bestimmen ---
-            dim = 3 if {"kxx", "kyy", "kzz"}.issubset(available_inputs) else 2
-
-            # --- Kanonische Reihenfolge aus Schema ---
-            input_names = domain.field_sets.default_training_inputs(dim)
-            output_names = domain.field_sets.default_training_outputs(dim)
-
-            # --- Safety: nur vorhandene Felder ---
-            input_names = [k for k in input_names if k in input_dict]
-            output_names = [k for k in output_names if k in output_dict]
-
-            # Convert arrays → tensors
-            input_stack = torch.stack([torch.tensor(input_dict[name], dtype=torch.float32) for name in input_names], dim=0)
-            output_stack = torch.stack([torch.tensor(output_dict[name], dtype=torch.float32) for name in output_names], dim=0)
-
-            # Artificial batch dimension
-            self.inputs = input_stack.unsqueeze(0)
-            self.outputs = output_stack.unsqueeze(0)
-
-            self.fields = {
-                "inputs": input_names,
-                "outputs": output_names,
-            }
-
+            validated = identity.validate_case_payload(
+                data,
+                task=task,
+                verify_content=True,
+            )
+            self.dataset_identity = None
+            self.inputs = validated.inputs.unsqueeze(0)
+            self.outputs = validated.outputs.unsqueeze(0)
         else:
             msg = (
-                "Unsupported dataset format. Expected either:\n"
-                "  merged dataset:      keys ['inputs','outputs','fields']\n"
-                "  single-case dataset: keys ['input_fields','output_fields','meta']\n"
-                f"Got keys: {list(data.keys())}"
+                "Unsupported dataset schema. Expected schema_kind "
+                f"{identity.MERGED_DATASET_SCHEMA_KIND!r} or {identity.CASE_SCHEMA_KIND!r}; "
+                f"got {schema_kind!r}."
             )
-            raise KeyError(msg)
+            raise ValueError(msg)
 
-        # -------------------------------------------------------------
-        # Channel selection
-        # -------------------------------------------------------------
-        all_in = self.fields["inputs"]
-        all_out = self.fields["outputs"]
+        self.fields = {
+            "inputs": list(task.input_names),
+            "outputs": list(task.output_names),
+        }
 
-        if include_inputs is None:
-            self.input_idx = list(range(len(all_in)))
-        else:
-            self.input_idx = [all_in.index(name) for name in include_inputs]
-
-        if include_outputs is None:
-            self.output_idx = list(range(len(all_out)))
-        else:
-            self.output_idx = [all_out.index(name) for name in include_outputs]
-
-    # -------------------------------------------------------------
     def apply(self, idx: int, sample: dict[str, Any]) -> None:
         """
-        Insert a selected (x, y) pair into a dataset sample.
+        Insert one exact task input/output tensor pair into a sample.
 
         Parameters
         ----------
         idx : int
-            Case index. Must be 0 for single-case datasets.
-
-        sample : dict
-            Sample dictionary to be populated. On return contains:
-                sample["x"]["input"]  : Tensor [C_in_sel, H, W]
-                sample["y"]["output"] : Tensor [C_out_sel, H, W]
+            Source sample index. Single-case payloads accept only zero.
+        sample : dict[str, Any]
+            Mutable sample populated under ``x.input`` and ``y.output``.
 
         """
         x = sample.setdefault("x", {})
         y = sample.setdefault("y", {})
-
-        x["input"] = self.inputs[idx, self.input_idx]
-        y["output"] = self.outputs[idx, self.output_idx]
+        x["input"] = self.inputs[idx]
+        y["output"] = self.outputs[idx]

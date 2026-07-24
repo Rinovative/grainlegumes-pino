@@ -2,23 +2,23 @@
 ===============================================================================
 experiments_config_loader.py
 ===============================================================================
-Load, merge and resolve experiment configuration dictionaries.
+Load and strictly resolve semantic experiment configurations.
 
 Responsibilities:
-  - Load YAML experiment files
-  - Merge user configs with task and component defaults
-  - Resolve path roots and generated run names
-  - Build dataloaders from resolved data settings
+  - Parse YAML mappings under the strict experiment schema
+  - Reject unknown keys, identifiers, fields, and contradictory settings
+  - Derive task-fixed channels, defaults, objective, and task-contract digest
+  - Construct dataloaders from an already resolved configuration
 
 Design principles:
-  - Input YAMLs stay minimal
-  - Effective configs are fully expanded
-  - Required sections fail fast when missing
+  - Resolution is strict, path-aware, deterministic, and side-effect free
+  - Task-fixed semantics come only from domain.tasks
+  - Saved configuration identifiers never depend on Python class names
 
 Boundaries:
-  - Defaults belong to experiments.config.defaults
-  - Model, loss and optimizer construction belong to learning factories
-  - Training execution belongs to learning.training.loop
+  - Dataset construction enforces the declared task schema and fingerprint
+  - Physics equations and metric mathematics remain outside config resolution
+  - Checkpoint, resume, run-directory, and artifact lifecycle belong elsewhere
 ===============================================================================
 """
 
@@ -26,18 +26,18 @@ from __future__ import annotations
 
 import copy
 import importlib
+from collections.abc import Mapping, Sequence
+from io import StringIO
 from pathlib import Path
 from typing import Any, Protocol, TextIO, cast
 
-from src import common, datasets
+from src import common, datasets, domain
 
 from . import experiments_config_defaults as config_defaults
 
-LOSS_DEFAULTS = config_defaults.LOSS_DEFAULTS
-MODEL_DEFAULTS = config_defaults.MODEL_DEFAULTS
-OPTIMIZER_DEFAULTS = config_defaults.OPTIMIZER_DEFAULTS
-SCHEDULER_DEFAULTS = config_defaults.SCHEDULER_DEFAULTS
-get_task_defaults = config_defaults.get_task_defaults
+
+class ConfigError(ValueError):
+    """Raised when a semantic config violates a path-specific contract."""
 
 
 class _YamlModule(Protocol):
@@ -58,236 +58,836 @@ class _YamlModule(Protocol):
 
 
 yaml = cast("_YamlModule", importlib.import_module("yaml"))
-_FNO_MODE_DIMENSIONS = 2
+_ROOT_KEYS = frozenset(
+    {
+        "task",
+        "run",
+        "data",
+        "model",
+        "loss",
+        "evaluation",
+        "optimizer",
+        "scheduler",
+        "training",
+        "tracking",
+    }
+)
+_TASK_FIXED_KEYS = frozenset(
+    {
+        "input_fields",
+        "output_fields",
+        "in_channels",
+        "out_channels",
+        "task_contract",
+        "preprocessing",
+        "physics",
+        "paths",
+    }
+)
+_ADAM_BETA_COUNT = 2
+_SECTION_KEYS = {
+    "run": frozenset({"seed", "deterministic", "device", "prefix", "suffix", "name"}),
+    "data": frozenset(
+        {
+            "train_dataset",
+            "ood_datasets",
+            "train_ratio",
+            "ood_fraction",
+            "batch_size",
+            "num_workers",
+            "pin_memory",
+            "persistent_workers",
+        }
+    ),
+    "model": frozenset({"kind", "params"}),
+    "loss": frozenset({"data", "physics"}),
+    "evaluation": frozenset({"metrics", "objective"}),
+    "optimizer": frozenset({"kind", "lr", "weight_decay", "betas", "second_moment_floor"}),
+    "scheduler": frozenset({"kind", "factor", "patience", "min_lr"}),
+    "training": frozenset({"epochs", "evaluation_interval", "mixed_precision"}),
+    "tracking": frozenset({"wandb"}),
+}
+
+
+def _as_mapping(value: Any, *, path: str) -> dict[str, Any]:
+    """Return a mutable mapping copy with path-rich type errors."""
+    if not isinstance(value, Mapping):
+        msg = f"{path} must be a mapping, got {type(value).__name__}."
+        raise ConfigError(msg)
+    return dict(value)
+
+
+def _reject_unknown(mapping: Mapping[str, Any], allowed: frozenset[str], *, path: str) -> None:
+    """Reject keys outside one strict schema node."""
+    unknown = sorted(set(mapping).difference(allowed))
+    if unknown:
+        msg = f"{path} contains unknown key(s): {unknown}. Allowed keys: {sorted(allowed)}."
+        raise ConfigError(msg)
+
+
+def _validate_input_schema(user_config: Mapping[str, Any]) -> None:
+    """Reject noncanonical task-fixed overrides and unknown nested keys."""
+    fixed = sorted(set(user_config).intersection(_TASK_FIXED_KEYS))
+    if fixed:
+        msg = f"Task-fixed config key(s) cannot be overridden: {fixed}. Select a registered task instead."
+        raise ConfigError(msg)
+    _reject_unknown(user_config, _ROOT_KEYS, path="config")
+
+    for section, allowed in _SECTION_KEYS.items():
+        if section not in user_config or user_config[section] is None:
+            continue
+        section_mapping = _as_mapping(user_config[section], path=section)
+        _reject_unknown(section_mapping, allowed, path=section)
+
+    model = _as_mapping(user_config.get("model"), path="model")
+    params = _as_mapping(model.get("params"), path="model.params")
+    fixed_channels = sorted({"in_channels", "out_channels"}.intersection(params))
+    if fixed_channels:
+        msg = f"model.params task-fixed channel key(s) cannot be overridden: {fixed_channels}."
+        raise ConfigError(msg)
+
+    if "loss" in user_config:
+        loss = _as_mapping(user_config["loss"], path="loss")
+        if "data" in loss:
+            data_loss = _as_mapping(loss["data"], path="loss.data")
+            _reject_unknown(data_loss, frozenset({"kind", "space", "weight"}), path="loss.data")
+        if "physics" in loss:
+            physics = _as_mapping(loss["physics"], path="loss.physics")
+            _reject_unknown(
+                physics,
+                frozenset(
+                    {
+                        "enabled",
+                        "derivatives",
+                        "interior_crop",
+                        "residual_weight",
+                        "boundary_weight",
+                    }
+                ),
+                path="loss.physics",
+            )
+            if "derivatives" in physics:
+                derivatives = _as_mapping(physics["derivatives"], path="loss.physics.derivatives")
+                _reject_unknown(
+                    derivatives,
+                    frozenset({"kind", "extension"}),
+                    path="loss.physics.derivatives",
+                )
+            for weight_name in ("residual_weight", "boundary_weight"):
+                if weight_name not in physics:
+                    continue
+                weight = _as_mapping(physics[weight_name], path=f"loss.physics.{weight_name}")
+                _reject_unknown(
+                    weight,
+                    frozenset({"target", "warmup"}),
+                    path=f"loss.physics.{weight_name}",
+                )
+                if "warmup" in weight:
+                    warmup = _as_mapping(weight["warmup"], path=f"loss.physics.{weight_name}.warmup")
+                    _reject_unknown(
+                        warmup,
+                        frozenset({"kind", "epochs"}),
+                        path=f"loss.physics.{weight_name}.warmup",
+                    )
+
+    if "tracking" in user_config:
+        tracking = _as_mapping(user_config["tracking"], path="tracking")
+        if "wandb" in tracking:
+            wandb = _as_mapping(tracking["wandb"], path="tracking.wandb")
+            _reject_unknown(
+                wandb,
+                frozenset({"enabled", "project", "entity", "group", "tags", "mode"}),
+                path="tracking.wandb",
+            )
+
+    if "evaluation" in user_config:
+        evaluation = _as_mapping(user_config["evaluation"], path="evaluation")
+        if "metrics" in evaluation:
+            metrics = evaluation["metrics"]
+            if isinstance(metrics, (str, bytes)) or not isinstance(metrics, Sequence):
+                msg = "evaluation.metrics must be a list of metric mappings."
+                raise ConfigError(msg)
+            for index, raw_metric in enumerate(metrics):
+                metric = _as_mapping(raw_metric, path=f"evaluation.metrics[{index}]")
+                _reject_unknown(
+                    metric,
+                    frozenset({"id", "kind", "space", "fields", "field", "reduction"}),
+                    path=f"evaluation.metrics[{index}]",
+                )
+                if "field" in metric and "fields" in metric:
+                    msg = f"evaluation.metrics[{index}] cannot contain both field and fields."
+                    raise ConfigError(msg)
+        if "objective" in evaluation:
+            objective = _as_mapping(evaluation["objective"], path="evaluation.objective")
+            _reject_unknown(
+                objective,
+                frozenset({"id"}),
+                path="evaluation.objective",
+            )
 
 
 def load_yaml(path: Path | str) -> dict[str, Any]:
     """
-    Load a YAML file.
+    Load one YAML experiment mapping under the strict schema.
 
     Parameters
     ----------
-    path : Path | str
-        Path to the YAML file
+    path : Path or str
+        YAML source path.
 
     Returns
     -------
     dict[str, Any]
-        Parsed YAML content
+        Raw semantic experiment mapping.
 
     Raises
     ------
     FileNotFoundError
-        If the file does not exist
-    yaml.YAMLError
-        If the YAML is malformed
+        If `path` does not exist.
+    ConfigError
+        If the YAML root is not a mapping.
 
     """
-    path = Path(path)
-    if not path.exists():
-        msg = f"Config file not found: {path}"
+    source_path = Path(path)
+    if not source_path.exists():
+        msg = f"Config file not found: {source_path}"
         raise FileNotFoundError(msg)
-
-    with path.open(encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    with source_path.open(encoding="utf-8") as stream:
+        payload = yaml.safe_load(stream) or {}
+    if not isinstance(payload, Mapping):
+        msg = f"YAML root must be a mapping: {source_path}"
+        raise ConfigError(msg)
+    return dict(payload)
 
 
 def save_yaml(config: dict[str, Any], path: Path | str) -> None:
     """
-    Save a config dictionary to a YAML file.
+    Save a resolved semantic config mapping.
 
     Parameters
     ----------
     config : dict[str, Any]
-        Configuration dictionary
-    path : Path | str
-        Path where to save the YAML file
+        Fully resolved semantic configuration.
+    path : Path or str
+        Destination YAML path.
 
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    destination = Path(path)
+    stream = StringIO()
+    yaml.dump(config, stream, default_flow_style=False, sort_keys=False)
+    common.serialization.atomic_write_text(destination, stream.getvalue())
 
 
-def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+def deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
     """
-    Deep merge override into base dictionary.
-
-    Override values take precedence. Recursive for nested dicts.
+    Recursively merge mappings while replacing scalar and list leaves.
 
     Parameters
     ----------
     base : dict[str, Any]
-        Base configuration
-    override : dict[str, Any]
-        Override values
+        Base mapping copied before merge.
+    override : Mapping[str, Any]
+        Values that override matching base paths.
 
     Returns
     -------
     dict[str, Any]
-        Merged configuration
+        Independent merged mapping.
 
     """
     result = copy.deepcopy(base)
     for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+        if key in result and isinstance(result[key], dict) and isinstance(value, Mapping):
             result[key] = deep_merge(result[key], value)
         else:
             result[key] = copy.deepcopy(value)
     return result
 
 
+def _semantic_modules() -> tuple[Any, Any, Any]:
+    """Import registries lazily to avoid package-initialization cycles."""
+    model_factory = importlib.import_module("src.learning.models.learning_models_factory")
+    loss_factory = importlib.import_module("src.learning.losses.learning_losses_factory")
+    metric_registry = importlib.import_module("src.learning.metrics.learning_metrics")
+    return model_factory, loss_factory, metric_registry
+
+
+def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) -> None:
+    """Resolve semantic loss and task-selected physics identifiers."""
+    _, loss_factory, _ = _semantic_modules()
+    loss = _as_mapping(config["loss"], path="loss")
+    data_loss = _as_mapping(loss["data"], path="loss.data")
+    kind = str(data_loss["kind"])
+    if kind not in task.data_losses:
+        msg = f"loss.data.kind {kind!r} is not allowed by task {task.id!r}: {list(task.data_losses)}."
+        raise ConfigError(msg)
+    try:
+        loss_factory.validate_data_loss_semantics(kind, space=str(data_loss["space"]))
+    except ValueError as error:
+        msg = f"loss.data: {error}"
+        raise ConfigError(msg) from error
+    weight = float(data_loss["weight"])
+    if weight < 0:
+        msg = f"loss.data.weight must be non-negative, got {weight}."
+        raise ConfigError(msg)
+    data_loss["weight"] = weight
+
+    physics = _as_mapping(loss["physics"], path="loss.physics")
+    if not isinstance(physics["enabled"], bool):
+        msg = "loss.physics.enabled must be a boolean."
+        raise ConfigError(msg)
+    selected_physics = domain.tasks.registry.resolve_physics(task.physics.kind)
+    if selected_physics != task.physics:
+        msg = f"Task {task.id!r} physics registry entry does not match its task contract."
+        raise ConfigError(msg)
+    derivatives = _as_mapping(physics["derivatives"], path="loss.physics.derivatives")
+    try:
+        loss_factory.resolve_derivative_kind(
+            str(derivatives["kind"]),
+            extension=str(derivatives["extension"]),
+        )
+    except ValueError as error:
+        msg = f"loss.physics.derivatives: {error}"
+        raise ConfigError(msg) from error
+    interior_crop = int(physics["interior_crop"])
+    if interior_crop < 0:
+        msg = f"loss.physics.interior_crop must be non-negative, got {interior_crop}."
+        raise ConfigError(msg)
+    physics["interior_crop"] = interior_crop
+
+    for weight_name in ("residual_weight", "boundary_weight"):
+        weight_config = _as_mapping(physics[weight_name], path=f"loss.physics.{weight_name}")
+        target = float(weight_config["target"])
+        if target < 0:
+            msg = f"loss.physics.{weight_name}.target must be non-negative, got {target}."
+            raise ConfigError(msg)
+        weight_config["target"] = target
+        warmup = _as_mapping(weight_config["warmup"], path=f"loss.physics.{weight_name}.warmup")
+        if warmup["kind"] != "linear":
+            msg = f"Unknown warmup identifier {warmup['kind']!r} at loss.physics.{weight_name}.warmup.kind; expected 'linear'."
+            raise ConfigError(msg)
+        epochs = int(warmup["epochs"])
+        if epochs < 0:
+            msg = f"loss.physics.{weight_name}.warmup.epochs must be non-negative, got {epochs}."
+            raise ConfigError(msg)
+        warmup["epochs"] = epochs
+        weight_config["warmup"] = warmup
+        physics[weight_name] = weight_config
+
+    loss["data"] = data_loss
+    loss["physics"] = physics
+    config["loss"] = loss
+
+
+def _metric_fields(
+    metric: dict[str, Any],
+    *,
+    task: domain.tasks.spec.TaskSpec,
+    path: str,
+) -> tuple[str, ...]:
+    """Validate and normalize one output-field selection."""
+    raw_field = metric.pop("field", None)
+    raw_fields = metric.get("fields", "all")
+    if raw_field is not None:
+        raw_fields = [raw_field]
+        metric["fields"] = raw_fields
+    if raw_fields == "all":
+        fields = task.output_names
+        metric["fields"] = list(fields)
+        return fields
+    if isinstance(raw_fields, (str, bytes)) or not isinstance(raw_fields, Sequence):
+        msg = f"{path}.fields must be 'all' or a non-empty list of output fields."
+        raise ConfigError(msg)
+    fields = tuple(str(field) for field in raw_fields)
+    if not fields:
+        msg = f"{path}.fields must not be empty."
+        raise ConfigError(msg)
+    if len(fields) != len(set(fields)):
+        msg = f"{path}.fields contains duplicates: {list(fields)}."
+        raise ConfigError(msg)
+    unknown = [field for field in fields if field not in task.output_names]
+    if unknown:
+        msg = f"{path}.fields references unknown task output field(s): {unknown}. Available outputs: {list(task.output_names)}."
+        raise ConfigError(msg)
+    metric["fields"] = list(fields)
+    return fields
+
+
+def _validate_resolved_metric_keys(config: Mapping[str, Any]) -> None:
+    """Require every resolved metric to use the exact canonical schema."""
+    evaluation = _as_mapping(config.get("evaluation"), path="evaluation")
+    metrics = evaluation.get("metrics")
+    if not isinstance(metrics, list):
+        return
+    expected_keys = {"id", "kind", "space", "fields", "reduction", "direction"}
+    for index, raw_metric in enumerate(metrics):
+        path = f"evaluation.metrics[{index}]"
+        metric = _as_mapping(raw_metric, path=path)
+        if set(metric) != expected_keys:
+            msg = f"Resolved {path} must contain exactly {sorted(expected_keys)}, got {sorted(metric)}."
+            raise ConfigError(msg)
+
+
+def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) -> None:
+    """Resolve semantic metrics and materialize one complete objective."""
+    _, _, metric_registry = _semantic_modules()
+    evaluation = _as_mapping(config["evaluation"], path="evaluation")
+    raw_metrics = evaluation["metrics"]
+    if not isinstance(raw_metrics, list) or not raw_metrics:
+        msg = "evaluation.metrics must be a non-empty list."
+        raise ConfigError(msg)
+
+    metrics: list[dict[str, Any]] = []
+    metric_by_id: dict[str, dict[str, Any]] = {}
+    for index, raw_metric in enumerate(raw_metrics):
+        path = f"evaluation.metrics[{index}]"
+        metric = _as_mapping(raw_metric, path=path)
+        metric_id = metric.get("id")
+        if not isinstance(metric_id, str) or not metric_id:
+            msg = f"{path}.id must be a non-empty string."
+            raise ConfigError(msg)
+        if metric_id in metric_by_id:
+            msg = f"Duplicate evaluation metric id {metric_id!r} at {path}."
+            raise ConfigError(msg)
+        kind = str(metric.get("kind"))
+        space = str(metric.get("space"))
+        reduction = str(metric.get("reduction"))
+        try:
+            metric_kind = metric_registry.validate_metric_semantics(
+                kind,
+                space=space,
+                reduction=reduction,
+            )
+        except ValueError as error:
+            msg = f"{path}: {error}"
+            raise ConfigError(msg) from error
+        fields = _metric_fields(metric, task=task, path=path)
+        if space == "physical" and len(fields) != 1:
+            units = {task.field(field).unit for field in fields}
+            if len(units) > 1:
+                msg = f"{path} cannot aggregate physical fields with incompatible units: {sorted(units)}."
+                raise ConfigError(msg)
+            msg = f"{path} physical metrics must select exactly one output field."
+            raise ConfigError(msg)
+        requested_direction = metric.get("direction", metric_kind.direction)
+        if requested_direction != metric_kind.direction:
+            msg = f"{path}.direction {requested_direction!r} contradicts metric {kind!r} direction {metric_kind.direction!r}."
+            raise ConfigError(msg)
+        metric["direction"] = metric_kind.direction
+        metrics.append(metric)
+        metric_by_id[metric_id] = metric
+
+    selection = _as_mapping(evaluation["objective"], path="evaluation.objective")
+    objective_id = selection.get("id")
+    if not isinstance(objective_id, str) or not objective_id:
+        msg = "evaluation.objective.id must be a non-empty metric identifier."
+        raise ConfigError(msg)
+    if objective_id not in metric_by_id:
+        msg = f"evaluation.objective.id {objective_id!r} is not a declared metric id. Available ids: {sorted(metric_by_id)}."
+        raise ConfigError(msg)
+
+    selected = metric_by_id[objective_id]
+    objective = {
+        "id": selected["id"],
+        "kind": selected["kind"],
+        "space": selected["space"],
+        "fields": copy.deepcopy(selected["fields"]),
+        "reduction": selected["reduction"],
+        "direction": selected["direction"],
+    }
+    selection_keys = set(selection)
+    if selection_keys != {"id"} and selection != objective:
+        msg = f"Resolved evaluation.objective must exactly equal its selected metric definition; expected {objective!r}, got {selection!r}."
+        raise ConfigError(msg)
+
+    evaluation["metrics"] = metrics
+    evaluation["objective"] = objective
+    config["evaluation"] = evaluation
+
+
+def get_resolved_objective(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return and validate the complete canonical objective from a resolved config."""
+    evaluation = _as_mapping(config.get("evaluation"), path="evaluation")
+    objective = _as_mapping(evaluation.get("objective"), path="evaluation.objective")
+    expected_keys = {"id", "kind", "space", "fields", "reduction", "direction"}
+    if set(objective) != expected_keys:
+        msg = f"Resolved evaluation.objective must contain exactly {sorted(expected_keys)}, got {sorted(objective)}."
+        raise ConfigError(msg)
+    for key in ("id", "kind", "space", "reduction"):
+        if not isinstance(objective[key], str) or not objective[key]:
+            msg = f"Resolved evaluation.objective.{key} must be a non-empty string."
+            raise ConfigError(msg)
+    fields = objective["fields"]
+    if not isinstance(fields, list) or not fields or not all(isinstance(field, str) and field for field in fields):
+        msg = "Resolved evaluation.objective.fields must be a non-empty exact field list."
+        raise ConfigError(msg)
+    if len(fields) != len(set(fields)):
+        msg = f"Resolved evaluation.objective.fields contains duplicates: {fields!r}."
+        raise ConfigError(msg)
+    if objective["direction"] not in {"minimize", "maximize"}:
+        msg = "Resolved evaluation.objective.direction must be 'minimize' or 'maximize'."
+        raise ConfigError(msg)
+
+    metrics = evaluation.get("metrics")
+    if not isinstance(metrics, list):
+        msg = "Resolved evaluation.metrics must be a list."
+        raise ConfigError(msg)
+    selected = [metric for metric in metrics if isinstance(metric, Mapping) and metric.get("id") == objective["id"]]
+    if len(selected) != 1:
+        msg = f"Resolved objective id {objective['id']!r} must select exactly one evaluation metric."
+        raise ConfigError(msg)
+    selected_objective = {key: copy.deepcopy(selected[0].get(key)) for key in expected_keys}
+    if selected_objective != objective:
+        msg = "Resolved evaluation.objective does not exactly match its evaluation metric definition."
+        raise ConfigError(msg)
+    return copy.deepcopy(objective)
+
+
+def _single_ood_dataset(data: Mapping[str, Any], *, path: str) -> str:
+    """Return the sole current-contract OOD dataset identifier."""
+    value = data.get("ood_datasets")
+    if not isinstance(value, list) or len(value) != 1:
+        msg = f"{path}.ood_datasets must contain exactly one logical dataset id."
+        raise ConfigError(msg)
+    dataset_id = value[0]
+    try:
+        return common.paths.validate_logical_name(dataset_id, label=f"{path}.ood_datasets[0]")
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+
+
+def _validate_tracking(config: dict[str, Any]) -> None:
+    """Validate the strict optional W&B configuration without credential access."""
+    tracking = _as_mapping(config["tracking"], path="tracking")
+    _reject_unknown(tracking, frozenset({"wandb"}), path="tracking")
+    wandb = _as_mapping(tracking.get("wandb"), path="tracking.wandb")
+    _reject_unknown(
+        wandb,
+        frozenset({"enabled", "project", "entity", "group", "tags", "mode"}),
+        path="tracking.wandb",
+    )
+    enabled = wandb.get("enabled")
+    if not isinstance(enabled, bool):
+        msg = "tracking.wandb.enabled must be boolean."
+        raise ConfigError(msg)
+    project = wandb.get("project")
+    if not isinstance(project, str) or not project or project.strip() != project:
+        msg = "tracking.wandb.project must be a non-empty trimmed string."
+        raise ConfigError(msg)
+    for key in ("entity", "group"):
+        value = wandb.get(key)
+        if value is not None and (not isinstance(value, str) or not value or value.strip() != value):
+            msg = f"tracking.wandb.{key} must be null or a non-empty trimmed string."
+            raise ConfigError(msg)
+    tags = wandb.get("tags")
+    if not isinstance(tags, list) or any(not isinstance(tag, str) or not tag or tag.strip() != tag for tag in tags):
+        msg = "tracking.wandb.tags must be a list of non-empty trimmed strings."
+        raise ConfigError(msg)
+    if len(tags) != len(set(tags)):
+        msg = "tracking.wandb.tags must be unique."
+        raise ConfigError(msg)
+    mode = wandb.get("mode")
+    if mode not in {"online", "offline"}:
+        msg = "tracking.wandb.mode must be 'online' or 'offline'."
+        raise ConfigError(msg)
+    tracking["wandb"] = wandb
+    config["tracking"] = tracking
+
+
+def _validate_runtime_sections(config: dict[str, Any]) -> None:
+    """Validate generic optimizer, scheduler, training, data, run, and tracking settings."""
+    optimizer = _as_mapping(config["optimizer"], path="optimizer")
+    if optimizer["kind"] != "adamw":
+        msg = f"Unknown optimizer identifier {optimizer['kind']!r}. Available optimizers: adamw."
+        raise ConfigError(msg)
+    if "lr" not in optimizer:
+        msg = "optimizer.lr is required."
+        raise ConfigError(msg)
+    betas = optimizer["betas"]
+    if isinstance(betas, (str, bytes)) or not isinstance(betas, Sequence) or len(betas) != _ADAM_BETA_COUNT:
+        msg = f"optimizer.betas must contain exactly two values, got {betas!r}."
+        raise ConfigError(msg)
+
+    scheduler = config.get("scheduler")
+    if scheduler is not None:
+        scheduler_mapping = _as_mapping(scheduler, path="scheduler")
+        if scheduler_mapping["kind"] != "reduce_on_plateau":
+            msg = f"Unknown scheduler identifier {scheduler_mapping['kind']!r}. Available schedulers: reduce_on_plateau."
+            raise ConfigError(msg)
+
+    training = _as_mapping(config["training"], path="training")
+    if int(training["epochs"]) <= 0:
+        msg = "training.epochs must be positive."
+        raise ConfigError(msg)
+    if int(training["evaluation_interval"]) <= 0:
+        msg = "training.evaluation_interval must be positive."
+        raise ConfigError(msg)
+    data = _as_mapping(config["data"], path="data")
+    try:
+        common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    _single_ood_dataset(data, path="data")
+
+    _validate_tracking(config)
+
+    run = _as_mapping(config["run"], path="run")
+    for key in ("prefix", "suffix", "name"):
+        value = run.get(key)
+        if value is None:
+            continue
+        try:
+            common.paths.validate_logical_name(value, label=f"run.{key}")
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+
+
 def generate_run_name(config: dict[str, Any]) -> str:
     """
-    Generate a unique run name from config parameters.
-
-    Pattern: <prefix>__<task>__<model>__<key_params>__s<seed>__<suffix>
+    Generate a descriptive run name from semantic model and loss settings.
 
     Parameters
     ----------
     config : dict[str, Any]
-        Configuration dictionary
+        Resolved experiment configuration.
 
     Returns
     -------
     str
-        Generated run name
+        Deterministic task/model/loss/seed name with optional prefix and suffix.
+
+    Raises
+    ------
+    ConfigError
+        If required semantic model settings are invalid.
 
     """
-    task = config["task"]
-    arch = config["model"]["architecture"]
-    seed = config["run"]["seed"]
-    prefix = config["run"].get("prefix")
-    suffix = config["run"].get("suffix")
+    task = str(config["task"])
+    model = _as_mapping(config["model"], path="model")
+    kind = str(model["kind"])
+    params = _as_mapping(model["params"], path="model.params")
+    run = _as_mapping(config["run"], path="run")
 
-    # Model key parameters
-    model_params = config["model"].get("params", {})
-    if arch in ("FNO", "PI-FNO"):
-        n_modes = model_params.get("n_modes")
-        if not isinstance(n_modes, (list, tuple)) or len(n_modes) != _FNO_MODE_DIMENSIONS:
-            msg = f"FNO run name requires model.params.n_modes with two entries, got: {n_modes!r}"
-            raise ValueError(msg)
-        h_ch = model_params.get("hidden_channels", 0)
-        n_layers = model_params.get("n_layers", 0)
-        model_key = f"{arch.lower()}_m{n_modes[0]}x{n_modes[1]}_h{h_ch}_l{n_layers}"
-    elif arch in ("UNO", "PI-UNO"):
-        h_ch = model_params.get("hidden_channels", 0)
-        n_layers = model_params.get("n_layers", 0)
-        model_key = f"{arch.lower()}_h{h_ch}_l{n_layers}"
+    if kind == "fno":
+        modes = params["n_modes"]
+        model_key = f"fno_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
+    elif kind == "uno":
+        model_key = f"uno_h{params['hidden_channels']}_l{params['n_layers']}"
     else:
-        model_key = arch.lower()
+        domain.tasks.registry.get_task(task)
+        msg = f"Unknown model identifier {kind!r} while generating a run name."
+        raise ConfigError(msg)
 
-    name_parts = [task, model_key, f"s{seed}"]
-    if prefix:
-        name_parts.insert(0, str(prefix))
-    if suffix:
-        name_parts.append(suffix)
-
-    return "__".join(name_parts)
+    loss_mode = "physics" if bool(config["loss"]["physics"]["enabled"]) else "data"
+    parts = [task, model_key, loss_mode, f"s{run['seed']}"]
+    if run.get("prefix"):
+        parts.insert(0, str(run["prefix"]))
+    if run.get("suffix"):
+        parts.append(str(run["suffix"]))
+    return "__".join(parts)
 
 
 def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     """
-    Resolve an experiment configuration dictionary with all defaults.
+    Strictly resolve one semantic experiment configuration.
 
     Parameters
     ----------
     user_config : dict[str, Any]
-        Experiment configuration dictionary
+        Raw semantic experiment mapping.
 
     Returns
     -------
     dict[str, Any]
-        Fully expanded effective configuration
+        Fully resolved configuration with task contract, digest, channels, and paths.
 
     Raises
     ------
-    KeyError
-        If required task or config sections missing
+    ConfigError
+        If the schema, identifiers, fields, or settings violate the contract.
+    ValueError
+        If a referenced semantic identifier is not registered.
 
     """
-    # Get task
-    if "task" not in user_config:
-        msg = "Missing required 'task' in config"
-        raise KeyError(msg)
-    task = user_config["task"]
+    if not isinstance(user_config, Mapping):
+        msg = "Experiment config must be a mapping."
+        raise ConfigError(msg)
+    _validate_input_schema(user_config)
+    task_id = user_config.get("task")
+    if not isinstance(task_id, str) or not task_id:
+        msg = "Missing required non-empty config task identifier."
+        raise ConfigError(msg)
+    try:
+        task = domain.tasks.registry.get_task(task_id)
+    except ValueError as error:
+        msg = f"config.task: {error}"
+        raise ConfigError(msg) from error
 
-    # Get task defaults
-    task_defaults = get_task_defaults(task)
+    effective = deep_merge(config_defaults.get_task_defaults(task_id), user_config)
+    effective["task"] = task_id
 
-    # Start with task defaults and merge user config
-    effective_config = deep_merge(task_defaults, user_config)
+    model_factory, _, _ = _semantic_modules()
+    model = _as_mapping(effective["model"], path="model")
+    kind = model.get("kind")
+    if not isinstance(kind, str):
+        msg = "model.kind is required and must be a semantic string identifier."
+        raise ConfigError(msg)
+    params = _as_mapping(model.get("params"), path="model.params")
+    try:
+        params = deep_merge(model_factory.model_defaults(kind), params)
+        model_factory.validate_model_params(
+            kind,
+            params,
+            require_channels=False,
+            operator_dimensionality=task.operator_dimensionality,
+        )
+    except ValueError as error:
+        msg = f"model: {error}"
+        raise ConfigError(msg) from error
+    params["in_channels"] = task.in_channels
+    params["out_channels"] = task.out_channels
+    model["params"] = params
+    effective["model"] = model
 
-    # Merge model defaults if not present
-    model_arch = effective_config["model"]["architecture"]
-    if model_arch in MODEL_DEFAULTS:
-        model_user = effective_config["model"].copy()
-        model_defaults = MODEL_DEFAULTS[model_arch].copy()
-        effective_config["model"] = deep_merge(model_defaults, model_user)
+    optimizer = _as_mapping(effective["optimizer"], path="optimizer")
+    optimizer_kind = str(optimizer.get("kind"))
+    if optimizer_kind not in config_defaults.OPTIMIZER_DEFAULTS:
+        msg = f"Unknown optimizer identifier {optimizer_kind!r}. Available optimizers: {sorted(config_defaults.OPTIMIZER_DEFAULTS)}."
+        raise ConfigError(msg)
+    effective["optimizer"] = deep_merge(config_defaults.OPTIMIZER_DEFAULTS[optimizer_kind], optimizer)
 
-    # Ensure in/out channels are set
-    if "in_channels" not in effective_config["model"]["params"]:
-        effective_config["model"]["params"]["in_channels"] = effective_config["in_channels"]
-    if "out_channels" not in effective_config["model"]["params"]:
-        effective_config["model"]["params"]["out_channels"] = effective_config["out_channels"]
+    scheduler = effective.get("scheduler")
+    if scheduler is not None:
+        scheduler_mapping = _as_mapping(scheduler, path="scheduler")
+        scheduler_kind = str(scheduler_mapping.get("kind"))
+        if scheduler_kind not in config_defaults.SCHEDULER_DEFAULTS:
+            msg = f"Unknown scheduler identifier {scheduler_kind!r}. Available schedulers: {sorted(config_defaults.SCHEDULER_DEFAULTS)}."
+            raise ConfigError(msg)
+        effective["scheduler"] = deep_merge(config_defaults.SCHEDULER_DEFAULTS[scheduler_kind], scheduler_mapping)
 
-    # Merge loss defaults
-    loss_type = effective_config["loss"].get("type", "supervised")
-    if loss_type in LOSS_DEFAULTS:
-        effective_config["loss"] = deep_merge(LOSS_DEFAULTS[loss_type], effective_config["loss"])
+    _validate_loss(effective, task=task)
+    _validate_evaluation(effective, task=task)
+    _validate_runtime_sections(effective)
 
-    # Merge optimizer defaults
-    opt_type = effective_config["optimizer"].get("type", "adamw")
-    if opt_type in OPTIMIZER_DEFAULTS:
-        opt_user = effective_config["optimizer"].copy()
-        opt_defaults = OPTIMIZER_DEFAULTS[opt_type].copy()
-        effective_config["optimizer"] = deep_merge(opt_defaults, opt_user)
-
-    # Merge scheduler defaults
-    sched_type = effective_config["scheduler"].get("type", "reduce_on_plateau")
-    if sched_type in SCHEDULER_DEFAULTS:
-        sched_user = effective_config["scheduler"].copy()
-        sched_defaults = SCHEDULER_DEFAULTS[sched_type].copy()
-        effective_config["scheduler"] = deep_merge(sched_defaults, sched_user)
-
-    # Add path roots to config
-    effective_config["paths"] = {
+    effective["task_contract"] = task.resolved_contract()
+    effective["paths"] = {
         "project_root": str(common.paths.get_project_root()),
         "storage_root": str(common.paths.get_storage_root()),
-        "data_root": str(common.paths.get_data_root()),
-        "train_root": str(common.paths.get_train_root()),
+        "dataset_root": str(common.paths.get_dataset_root()),
+        "generated_data_root": str(common.paths.get_generated_data_root()),
+        "output_root": str(common.paths.get_output_root()),
     }
+    run = _as_mapping(effective["run"], path="run")
+    if not run.get("name"):
+        run["name"] = generate_run_name(effective)
+    try:
+        common.paths.validate_logical_name(run["name"], label="run.name")
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    effective["run"] = run
+    return effective
 
-    # Generate run name if not present
-    if "name" not in effective_config["run"]:
-        effective_config["run"]["name"] = generate_run_name(effective_config)
 
-    return effective_config
+def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.spec.TaskSpec:
+    """
+    Validate the persisted task contract in an effective configuration.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Resolved or saved semantic configuration.
+
+    Returns
+    -------
+    domain.tasks.spec.TaskSpec
+        Registered task matching the saved identifier and digest.
+
+    Raises
+    ------
+    ConfigError
+        If task identity, digest, or derived channel counts do not match.
+    ValueError
+        If the task identifier is unknown.
+
+    """
+    task_id = config.get("task")
+    if not isinstance(task_id, str):
+        msg = "Resolved config must contain a string task identifier."
+        raise ConfigError(msg)
+    task = domain.tasks.registry.get_task(task_id)
+    contract = config.get("task_contract")
+    if not isinstance(contract, Mapping):
+        msg = "Resolved config must contain the current task_contract."
+        raise ConfigError(msg)
+    digest = contract.get("digest")
+    if digest != task.contract_digest:
+        msg = f"Resolved task contract digest mismatch for {task_id!r}: expected {task.contract_digest}, got {digest!r}."
+        raise ConfigError(msg)
+    if contract.get("in_channels") != task.in_channels or contract.get("out_channels") != task.out_channels:
+        msg = f"Resolved task contract channel counts do not match registered task {task_id!r}."
+        raise ConfigError(msg)
+    return task
+
+
+def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and return an isolated canonical resolved experiment config."""
+    if not isinstance(config, Mapping):
+        msg = "Resolved experiment config must be a mapping."
+        raise ConfigError(msg)
+    effective = copy.deepcopy(dict(config))
+    allowed = _ROOT_KEYS.union({"task_contract", "paths"})
+    missing = sorted(allowed.difference(effective))
+    unknown = sorted(set(effective).difference(allowed))
+    if missing or unknown:
+        msg = f"Resolved config keys do not match. Missing: {missing}; unknown: {unknown}."
+        raise ConfigError(msg)
+
+    task = validate_resolved_task_contract(effective)
+    model_factory, _, _ = _semantic_modules()
+    model = _as_mapping(effective["model"], path="model")
+    kind = model.get("kind")
+    if not isinstance(kind, str) or not kind:
+        msg = "Resolved model.kind must be a non-empty semantic identifier."
+        raise ConfigError(msg)
+    params = _as_mapping(model.get("params"), path="model.params")
+    try:
+        model_factory.validate_model_params(
+            kind,
+            params,
+            require_channels=True,
+            operator_dimensionality=task.operator_dimensionality,
+        )
+    except ValueError as error:
+        msg = f"model: {error}"
+        raise ConfigError(msg) from error
+    if params.get("in_channels") != task.in_channels or params.get("out_channels") != task.out_channels:
+        msg = "Resolved model channels do not match the task contract."
+        raise ConfigError(msg)
+    model["params"] = params
+    effective["model"] = model
+
+    _validate_loss(effective, task=task)
+    _validate_resolved_metric_keys(effective)
+    _validate_evaluation(effective, task=task)
+    _validate_runtime_sections(effective)
+    get_resolved_objective(effective)
+    _as_mapping(effective["paths"], path="paths")
+    return effective
 
 
 def load_and_resolve_config(yaml_path: Path | str) -> dict[str, Any]:
     """
-    Load experiment YAML and resolve to effective config with all defaults.
+    Load and strictly resolve one experiment YAML.
 
     Parameters
     ----------
-    yaml_path : Path | str
-        Path to experiment YAML file
+    yaml_path : Path or str
+        Semantic experiment YAML path.
 
     Returns
     -------
     dict[str, Any]
-        Fully expanded effective configuration
-
-    Raises
-    ------
-    FileNotFoundError
-        If YAML file not found
-    KeyError
-        If required task or config sections missing
-    yaml.YAMLError
-        If YAML is malformed
+        Fully resolved semantic configuration.
 
     """
     return resolve_config(load_yaml(yaml_path))
@@ -298,73 +898,76 @@ def create_dataloaders_from_config(
     *,
     split_indices: dict[str, Any] | None = None,
     data_processor: Any | None = None,
+    seed_plan: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """
-    Create dataloaders from config dictionary.
+    Create current dataloaders after validating the resolved task contract.
 
     Parameters
     ----------
     config : dict[str, Any]
-        Resolved configuration dictionary with data section
-    split_indices : dict[str, Any] | None, optional
-        Previously saved split membership to reuse. When provided, no new
-        train/eval/OOD membership is generated.
-    data_processor : Any | None, optional
-        Previously restored data processor to reuse. When provided, the
-        dataset layer must not fit replacement normalizers.
+        Fully resolved experiment configuration.
+    split_indices : dict[str, Any] or None, optional
+        Existing split membership to reuse.
+    data_processor : Any or None, optional
+        Existing data processor passed through to the current loader.
+    seed_plan : Mapping[str, int] | None, optional
+        Stable labeled ``split``, ``loader``, and ``worker`` seeds. Defaults to
+        ``run.seed`` for isolated direct loader callers.
 
     Returns
     -------
     dict[str, Any]
-        Dictionary with keys: train, eval, data_processor, split_indices
+        Train/evaluation loaders, data processor, and resolved split membership.
+
+    Raises
+    ------
+    ConfigError
+        If the task contract or required data settings are invalid.
+
+    Notes
+    -----
+    The shared task dataset factory validates schema and fingerprint before splitting.
 
     """
-    data_cfg = config.get("data", {})
-    dataset_root = Path(config["paths"]["train_root"])
+    task = validate_resolved_task_contract(config)
+    data_cfg = _as_mapping(config.get("data"), path="data")
+    dataset_root = Path(config["paths"]["dataset_root"])
 
-    # Resolve dataset paths
-    train_dataset_name = str(data_cfg.get("train_dataset", "lhs_var80_seed3001"))
-    ood_datasets = data_cfg.get("ood_datasets") or ["lhs_var120_seed4001"]
-    if not isinstance(ood_datasets, list) or not ood_datasets:
-        msg = f"data.ood_datasets must be a non-empty list, got: {ood_datasets!r}"
-        raise ValueError(msg)
-    ood_dataset_name = str(ood_datasets[0])
+    train_dataset_name = common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset")
+    ood_dataset_name = _single_ood_dataset(data_cfg, path="data")
 
-    path_train = dataset_root / train_dataset_name / f"{train_dataset_name}.pt"
-    path_test_ood = dataset_root / ood_dataset_name / f"{ood_dataset_name}.pt"
-
-    # Extract dataloader config
-    dataloader_cfg = {
-        "batch_size": data_cfg.get("batch_size", 32),
-        "num_workers": data_cfg.get("num_workers", 8),
-        "pin_memory": data_cfg.get("pin_memory", True),
-        "persistent_workers": data_cfg.get("persistent_workers", True),
-    }
-
-    # Call real create_dataloaders
+    path_train = common.paths.resolve_dataset_path(train_dataset_name, dataset_root=dataset_root)
+    path_test_ood = common.paths.resolve_dataset_path(ood_dataset_name, dataset_root=dataset_root)
+    seeds = dict(seed_plan or {})
+    run_seed = int(config["run"]["seed"])
     train_loader, test_loaders, normalizer, split_indices = datasets.base.create_dataloaders(
-        dataset_cls=datasets.simulation.PhysicsDataset,
+        dataset_factory=datasets.simulation.create_task_dataset,
         path_train=str(path_train),
         path_test_ood=str(path_test_ood),
-        train_ratio=data_cfg.get("train_ratio", 0.8),
-        ood_fraction=data_cfg.get("ood_fraction", 0.2),
-        split_seed=config.get("run", {}).get("seed", 9),
+        task=task,
+        train_dataset_id=train_dataset_name,
+        ood_dataset_id=ood_dataset_name,
+        train_ratio=data_cfg["train_ratio"],
+        ood_fraction=data_cfg["ood_fraction"],
+        batch_size=data_cfg["batch_size"],
+        num_workers=data_cfg["num_workers"],
+        pin_memory=data_cfg["pin_memory"],
+        persistent_workers=data_cfg["persistent_workers"],
+        split_seed=seeds.get("split", run_seed),
+        loader_seed=seeds.get("loader", run_seed),
+        worker_seed=seeds.get("worker", run_seed),
         split_indices=split_indices,
         data_processor=data_processor,
-        **dataloader_cfg,
     )
-
-    # Return in expected format
     eval_loader = test_loaders.get("eval")
-    if eval_loader is None and test_loaders:
-        eval_loader = next(iter(test_loaders.values()))
     if eval_loader is None:
         msg = "No evaluation dataloader was created."
-        raise ValueError(msg)
-
+        raise ConfigError(msg)
     return {
         "train": train_loader,
         "eval": eval_loader,
+        "ood": test_loaders["ood"],
         "data_processor": normalizer,
         "split_indices": split_indices,
     }

@@ -2,638 +2,484 @@
 ===============================================================================
 learning_metrics.py
 ===============================================================================
-Compute NumPy and PyTorch metrics for training and evaluation.
+Compute task-resolved PyTorch metrics for training and evaluation.
 
 Responsibilities:
-  - Compute classical and relative error metrics
-  - Compute per-sample and aggregated statistics
-  - Provide PyTorch metric modules for training-time evaluation
+  - Register and validate semantic metric identifiers
+  - Resolve metric fields, spaces, reductions and directions
+  - Accumulate dataset metrics from explicit normalized or physical views
 
 Design principles:
-  - NumPy functions operate on arrays without side effects
-  - PyTorch modules stay device-aware
-  - Physical-unit metrics require explicit denormalization
+  - Dataset accumulators use mathematically sufficient statistics
+  - Metric implementations never own or apply normalizers
+  - Semantic identifiers remain independent of metric implementation classes
 
 Boundaries:
-  - Dataset-specific aggregation belongs to analysis modules
+  - Tensor-view construction belongs to evaluation orchestration
   - Logging and persistence belong to callers
 ===============================================================================
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
-from numpy.typing import NDArray
-from torch import nn
+from neuralop import H1Loss
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+from src import domain
 
-NumberArray: TypeAlias = NDArray[np.float64]
-
-
-class TensorNormalizer(Protocol):
-    """Normalizer interface required by physical-unit tensor metrics."""
-
-    def inverse_transform(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Convert a normalized tensor back to physical units."""
-        ...
+MetricSpace = Literal["normalized", "physical"]
+MetricReduction = Literal["sample_mean", "element_mean"]
+MetricDirection = Literal["minimize", "maximize"]
+_MIN_METRIC_TENSOR_RANK = 3
 
 
-# ============================================================================
-# Conversion utilities
-# ============================================================================
-
-
-def _to_numpy(array: Any, *, copy: bool = False) -> NumberArray:
+@dataclass(frozen=True, slots=True)
+class MetricKindSpec:
     """
-    Convert arbitrary numeric input into a float64 NumPy array.
+    Describe schema and optimization semantics for one metric identifier.
 
-    Supports NumPy arrays, PyTorch tensors and generic sequences. The output
-    is always a float64 array for consistent behaviour across all metrics.
-
-    Parameters
+    Attributes
     ----------
-    array : Any
-        Input array-like data to convert.
-    copy : bool, optional
-        If True, always return a copy of the data. If False, avoid copying if
-
-    Returns
-    -------
-        np.ndarray: Converted array in float64 dtype.
-
-    """
-    if isinstance(array, np.ndarray):
-        if array.dtype == np.float64 and not copy:
-            return array
-        return array.astype(np.float64, copy=copy)
-
-    if torch is not None and isinstance(array, torch.Tensor):
-        return array.detach().cpu().numpy().astype(np.float64)
-
-    return np.asarray(array, dtype=np.float64)
-
-
-# ============================================================================
-# Core error metrics
-# ============================================================================
-
-
-def mse(
-    y_true: Any,
-    y_pred: Any,
-    axis: int | tuple[int, ...] | None = None,
-) -> NumberArray:
-    """
-    Compute the mean squared error between prediction and ground truth.
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    axis : int or tuple of ints, optional
-        Axis or axes along which to average. If None, average over all elements.
-
-    Returns
-    -------
-        np.ndarray: Mean squared error as a float64 NumPy array.
+    kind : str
+        Canonical saved configuration identifier.
+    spaces : frozenset[MetricSpace]
+        Supported tensor spaces.
+    reductions : frozenset[MetricReduction]
+        Supported reduction semantics.
+    direction : MetricDirection
+        Required optimization direction.
 
     """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-    diff = yp - yt
-    return np.asarray(np.mean(diff * diff, axis=axis), dtype=np.float64)
 
-
-def rmse(
-    y_true: Any,
-    y_pred: Any,
-    axis: int | tuple[int, ...] | None = None,
-) -> NumberArray:
-    """
-    Compute the root mean squared error between prediction and ground truth.
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    axis : int or tuple of ints, optional
-        Axis or axes along which to average. If None, average over all elements.
-
-
-    Returns
-    -------
-        np.ndarray: Root mean squared error as a float64 NumPy array.
-
-    """
-    return np.sqrt(mse(y_true=y_true, y_pred=y_pred, axis=axis))
-
-
-def mae(
-    y_true: Any,
-    y_pred: Any,
-    axis: int | tuple[int, ...] | None = None,
-) -> NumberArray:
-    """
-    Compute the mean absolute error between prediction and ground truth.
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    axis : int or tuple of ints, optional
-        Axis or axes along which to average. If None, average over all elements.
-
-
-    Returns
-    -------
-        np.ndarray: Mean absolute error as a float64 NumPy array.
-
-    """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-    return np.asarray(np.mean(np.abs(yp - yt), axis=axis), dtype=np.float64)
-
-
-# ============================================================================
-# Relative error metrics
-# ============================================================================
-
-
-def mean_relative_error(
-    y_true: Any,
-    y_pred: Any,
-    axis: int | tuple[int, ...] | None = None,
-    eps: float = 1e-12,
-) -> NumberArray:
-    """
-    Compute the mean absolute relative error.
-
-    Defined elementwise as:
-        |y_pred - y_true| / (|y_true| + eps)
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    axis : int or tuple of ints, optional
-        Axis or axes along which to average. If None, average over all elements.
-    eps : float, optional
-        Small constant added to the denominator to avoid division by zero. Default is 1e-12.
-
-    Returns
-    -------
-        np.ndarray: Mean absolute relative error as float64.
-
-    """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-    rel = np.abs(yp - yt) / (np.abs(yt) + eps)
-    return np.asarray(np.mean(rel, axis=axis), dtype=np.float64)
-
-
-def l1_relative_error(
-    y_true: Any,
-    y_pred: Any,
-    axis: int | tuple[int, ...] | None = None,
-    eps: float = 1e-12,
-) -> NumberArray:
-    """
-    Compute the L1 relative error.
-
-    Defined as:
-        ||y_pred - y_true||_1 / (||y_true||_1 + eps)
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    axis : int or tuple of ints, optional
-        Axis or axes along which to sum. If None, sum over all elements.
-    eps : float, optional
-        Small constant added to the denominator to avoid division by zero. Default is 1e-12.
-
-    Returns
-    -------
-        np.ndarray: L1 relative error as float64.
-
-    """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-    num = np.sum(np.abs(yp - yt), axis=axis)
-    denom = np.sum(np.abs(yt), axis=axis) + eps
-    return num / denom
-
-
-def l2_relative_error(
-    y_true: Any,
-    y_pred: Any,
-    axis: int | tuple[int, ...] | None = None,
-    eps: float = 1e-12,
-) -> NumberArray:
-    """
-    Compute the L2 relative error.
-
-    Defined as:
-        ||y_pred - y_true||_2 / (||y_true||_2 + eps)
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    axis : int or tuple of ints, optional
-        Axis or axes along which to sum. If None, sum over all elements.
-    eps : float, optional
-        Small constant added to the denominator to avoid division by zero. Default is 1e-12.
-
-    Returns
-    -------
-        np.ndarray: L2 relative error as float64.
-
-    """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-    diff = yp - yt
-    num = np.sqrt(np.sum(diff * diff, axis=axis))
-    denom = np.sqrt(np.sum(yt * yt, axis=axis)) + eps
-    return num / denom
-
-
-# ============================================================================
-# Error maps
-# ============================================================================
-
-
-def mean_absolute_error_map(
-    y_true: Any,
-    y_pred: Any,
-    sample_axis: int = 0,
-) -> NumberArray:
-    """
-    Compute a mean absolute error map across samples.
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    sample_axis : int, optional
-        Axis along which to compute the mean absolute error over samples. Default is 0.
-
-    Returns
-    -------
-        np.ndarray: Mean absolute error per spatial location.
-
-    """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-    return np.mean(np.abs(yp - yt), axis=sample_axis)
-
-
-def std_error_map(
-    y_true: Any,
-    y_pred: Any,
-    sample_axis: int = 0,
-    ddof: int = 0,
-) -> NumberArray:
-    """
-    Compute a standard deviation error map across samples.
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    sample_axis : int, optional
-        Axis along which to compute the standard deviation of error over samples. Default is 0.
-    ddof : int, optional
-        Degrees of freedom for standard deviation calculation. Default is 0 (population std). Use ddof=1 for sample std.
-
-    Returns
-    -------
-        np.ndarray: Standard deviation of signed error per location.
-
-    """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-    diff = yp - yt
-    return np.std(diff, axis=sample_axis, ddof=ddof)
-
-
-# ============================================================================
-# Correlation
-# ============================================================================
-
-
-def pearson_correlation(
-    x: Any,
-    y: Any,
-    eps: float = 1e-12,
-) -> float:
-    """
-    Compute the Pearson correlation coefficient between two arrays.
-
-    Both arrays are flattened before computing the correlation.
-
-    Parameters
-    ----------
-    x : Any
-        First input array. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y : Any
-        Second input array. Must be compatible in shape with `x`.
-    eps : float, optional
-        Small constant added to the denominator to avoid division by zero. Default is 1e-
-
-    Returns
-    -------
-        float: Pearson correlation in the range [-1, 1].
-
-    """
-    x_arr = _to_numpy(x).ravel()
-    y_arr = _to_numpy(y).ravel()
-
-    if x_arr.size != y_arr.size:
-        msg = "Input arrays must have the same number of elements."
-        raise ValueError(msg)
-
-    x_centered = x_arr - np.mean(x_arr)
-    y_centered = y_arr - np.mean(y_arr)
-
-    num = float(np.mean(x_centered * y_centered))
-    denom = float(np.sqrt(np.mean(x_centered**2)) * np.sqrt(np.mean(y_centered**2)) + eps)
-
-    return num / denom
-
-
-# ============================================================================
-# Per-sample aggregated statistics
-# ============================================================================
-
-
-def per_sample_error_statistics(
-    y_true: Any,
-    y_pred: Any,
-    sample_axis: int = 0,
-    eps: float = 1e-12,
-) -> Mapping[str, NumberArray]:
-    """
-    Compute a set of error statistics per sample.
-
-    Aggregates all metrics along all non-sample axes.
-
-    Parameters
-    ----------
-    y_true : Any
-        Ground truth values. Can be a NumPy array, PyTorch tensor, or any array-like structure.
-    y_pred : Any
-        Predicted values. Must be compatible in shape with `y_true`.
-    sample_axis : int, optional
-        Axis along which to compute the statistics over samples. Default is 0.
-    eps : float, optional
-        Small constant added to the denominator to avoid division by zero. Default is 1e-
-
-    Returns
-    -------
-        Mapping[str, np.ndarray]: Metrics (shape n_samples,).
-
-    """
-    yt = _to_numpy(y_true)
-    yp = _to_numpy(y_pred)
-
-    if sample_axis != 0:
-        yt = np.moveaxis(yt, sample_axis, 0)
-        yp = np.moveaxis(yp, sample_axis, 0)
-
-    n_samples = yt.shape[0]
-    yt_flat = yt.reshape(n_samples, -1)
-    yp_flat = yp.reshape(n_samples, -1)
-    diff_flat = yp_flat - yt_flat
-
-    mse_vals = np.mean(diff_flat * diff_flat, axis=1)
-    rmse_vals = np.sqrt(mse_vals)
-    mae_vals = np.mean(np.abs(diff_flat), axis=1)
-
-    denom_abs = np.abs(yt_flat) + eps
-    mean_rel_vals = np.mean(np.abs(diff_flat) / denom_abs, axis=1)
-
-    num_l1 = np.sum(np.abs(diff_flat), axis=1)
-    denom_l1 = np.sum(np.abs(yt_flat), axis=1) + eps
-    l1_rel_vals = num_l1 / denom_l1
-
-    num_l2 = np.sqrt(np.sum(diff_flat * diff_flat, axis=1))
-    denom_l2 = np.sqrt(np.sum(yt_flat * yt_flat, axis=1)) + eps
-    l2_rel_vals = num_l2 / denom_l2
-
-    return {
-        "mse": mse_vals,
-        "rmse": rmse_vals,
-        "mae": mae_vals,
-        "mean_relative_error": mean_rel_vals,
-        "l1_relative_error": l1_rel_vals,
-        "l2_relative_error": l2_rel_vals,
+    kind: str
+    spaces: frozenset[MetricSpace]
+    reductions: frozenset[MetricReduction]
+    direction: MetricDirection
+
+
+_METRIC_KINDS = MappingProxyType(
+    {
+        "relative_h1": MetricKindSpec(
+            kind="relative_h1",
+            spaces=frozenset({"normalized"}),
+            reductions=frozenset({"sample_mean"}),
+            direction="minimize",
+        ),
+        "relative_l2": MetricKindSpec(
+            kind="relative_l2",
+            spaces=frozenset({"normalized"}),
+            reductions=frozenset({"sample_mean"}),
+            direction="minimize",
+        ),
+        "rmse": MetricKindSpec(
+            kind="rmse",
+            spaces=frozenset({"normalized", "physical"}),
+            reductions=frozenset({"element_mean"}),
+            direction="minimize",
+        ),
     }
+)
 
 
-# ============================================================================
-# Overall RMSE (absolute)
-# ============================================================================
-
-
-class RMSEOverall(nn.Module):
+def available_metric_kinds() -> tuple[str, ...]:
     """
-    Compute the Root Mean Squared Error (RMSE) across all channels and spatial dimensions.
-
-    This metric accepts arbitrary keyword arguments so evaluation callers can
-    forward additional keys such as ``x=`` or ``meta=``.
-
-    The RMSE is computed as:
-
-        RMSE = sqrt( mean( (pred - y)^2 ) )
-
-    Both ``pred`` and ``y`` must have identical shapes.
-
-    Returns a scalar tensor.
-    """
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        y: torch.Tensor,
-        **kwargs: torch.Tensor,  # noqa: ARG002
-    ) -> torch.Tensor:
-        """
-        Compute the overall RMSE.
-
-        Parameters
-        ----------
-        pred : torch.Tensor
-            Predicted tensor of shape (batch, C, H, W).
-        y : torch.Tensor
-            Ground truth tensor with identical shape.
-        **kwargs : torch.Tensor
-            Ignored extra inputs forwarded by evaluation callers.
-
-        Returns
-        -------
-        torch.Tensor
-            Scalar RMSE value.
-
-        """
-        diff = pred - y
-        return torch.sqrt(torch.mean(diff * diff))
-
-
-# ============================================================================
-# Channel-wise RMSE in PHYSICAL units
-# ============================================================================
-
-
-class RMSEChannelPhysical(nn.Module):
-    """
-    Compute the RMSE for a specific output channel in physical units.
-
-    This metric denormalizes both predictions and targets using the provided
-    normalizer before computing the RMSE for the selected channel.
-
-    Parameters
-    ----------
-        channel: Index of the output channel to evaluate.
-        out_normalizer: Normalizer with an `inverse_transform` method
-                        to denormalize model outputs.
+    Return registered semantic metric identifiers.
 
     Returns
     -------
-        torch.Tensor: Scalar RMSE value for the specified channel.
+    tuple[str, ...]
+        Exact metric kinds accepted by the registry.
 
     """
+    return tuple(sorted(_METRIC_KINDS))
 
-    def __init__(self, channel: int, out_normalizer: TensorNormalizer) -> None:
-        """
-        Initialize the channel-wise physical RMSE metric.
 
-        Parameters
-        ----------
-        channel : int
-            Index of the output channel to evaluate.
-        out_normalizer
-            Normalizer with an `inverse_transform` method to denormalize model outputs.
+def resolve_metric_kind(kind: str) -> MetricKindSpec:
+    """
+    Resolve an exact semantic metric identifier.
 
-        """
-        super().__init__()
-        self.channel = channel
-        self.out_normalizer = out_normalizer
+    Parameters
+    ----------
+    kind : str
+        Canonical metric kind.
 
-    def forward(
-        self,
-        pred: torch.Tensor,
-        y: torch.Tensor,
-        **kwargs: torch.Tensor,  # noqa: ARG002
-    ) -> torch.Tensor:
-        """
-        Compute the RMSE for the selected channel in physical units.
+    Returns
+    -------
+    MetricKindSpec
+        Immutable metric-space, reduction, and direction descriptor.
 
-        Parameters
-        ----------
-        pred : torch.Tensor
-            Predicted tensor of shape (batch, C, H, W).
-        y : torch.Tensor
-            Ground truth tensor with identical shape.
-        **kwargs : torch.Tensor
-            Ignored additional arguments forwarded by evaluation callers.
+    Raises
+    ------
+    ValueError
+        If `kind` is not registered.
 
-        Returns
-        -------
-        torch.Tensor
-            Scalar RMSE value for the channel.
+    """
+    try:
+        return _METRIC_KINDS[kind]
+    except KeyError as error:
+        available = ", ".join(available_metric_kinds())
+        msg = f"Unknown metric identifier {kind!r}. Available metrics: {available}."
+        raise ValueError(msg) from error
 
-        """
-        # Denormalize predictions and targets
-        pred_phys = self.out_normalizer.inverse_transform(pred)
-        y_phys = self.out_normalizer.inverse_transform(y)
 
-        diff = pred_phys[:, self.channel] - y_phys[:, self.channel]
-        return torch.sqrt(torch.mean(diff * diff))
+def validate_metric_semantics(
+    kind: str,
+    *,
+    space: str,
+    reduction: str,
+) -> MetricKindSpec:
+    """
+    Validate a metric space and reduction against its registry entry.
+
+    Parameters
+    ----------
+    kind : str
+        Canonical metric kind.
+    space : str
+        Requested normalized or physical tensor space.
+    reduction : str
+        Requested dataset/sample reduction identifier.
+
+    Returns
+    -------
+    MetricKindSpec
+        Validated semantic metric descriptor.
+
+    Raises
+    ------
+    ValueError
+        If the metric kind, space, or reduction is unsupported.
+
+    """
+    spec = resolve_metric_kind(kind)
+    if space not in spec.spaces:
+        msg = f"Metric {kind!r} does not support space {space!r}; expected one of {sorted(spec.spaces)}."
+        raise ValueError(msg)
+    if reduction not in spec.reductions:
+        msg = f"Metric {kind!r} does not support reduction {reduction!r}; expected one of {sorted(spec.reductions)}."
+        raise ValueError(msg)
+    return spec
 
 
 # ============================================================================
-# Channel-wise relative RMSE (percent)
+# Explicit-space dataset metric accumulators
 # ============================================================================
 
 
-class RelRMSEChannel(nn.Module):
-    """
-    Compute the relative RMSE (in percent) for a specific output channel.
+@dataclass(frozen=True, slots=True)
+class ResolvedMetric:
+    """Describe one task-resolved evaluation metric and its physical unit."""
 
-    This metric is physically interpretable and allows direct comparison
-    across channels with different numerical scales (for example pressure
-    vs velocity). It is defined as:
+    id: str
+    kind: str
+    space: MetricSpace
+    fields: tuple[str, ...]
+    field_indices: tuple[int, ...]
+    reduction: MetricReduction
+    direction: MetricDirection
+    unit: str
+    operator_dimensionality: int
 
-        rel_RMSE = 100 * RMSE / mean(|y|)
 
-    Extra keyword arguments are ignored so callers may forward batch metadata.
-    """
+class DatasetMetric:
+    """Accumulate one explicit-space dataset metric by sufficient statistics."""
 
-    def __init__(self, channel: int) -> None:
-        """
-        Initialize the channel-wise relative RMSE metric.
+    def __init__(self, definition: ResolvedMetric) -> None:
+        """Store the immutable definition and clear sufficient statistics."""
+        self.definition = definition
+        self.reset()
 
-        Parameters
-        ----------
-        channel : int
-            Index of the output channel to evaluate.
+    @property
+    def id(self) -> str:
+        """Return the configured metric identifier."""
+        return self.definition.id
 
-        """
-        super().__init__()
-        self.channel = channel
+    @property
+    def space(self) -> MetricSpace:
+        """Return the tensor space this metric requires."""
+        return self.definition.space
 
-    def forward(
+    @property
+    def fields(self) -> tuple[str, ...]:
+        """Return exact selected task output fields."""
+        return self.definition.fields
+
+    @property
+    def unit(self) -> str:
+        """Return the task-owned physical unit or dimensionless unit ``1``."""
+        return self.definition.unit
+
+    def reset(self) -> None:
+        """Clear dataset sufficient statistics."""
+        self._sum = 0.0
+        self._count = 0
+
+    def _validate_update(
         self,
         pred: torch.Tensor,
-        y: torch.Tensor,
-        **kwargs: torch.Tensor,  # noqa: ARG002
-    ) -> torch.Tensor:
-        """
-        Compute the relative RMSE for the selected channel.
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Validate space, shape, finiteness, and select task fields."""
+        if space != self.space:
+            msg = f"Metric {self.id!r} expects {self.space!r} tensors, got {space!r}."
+            raise ValueError(msg)
+        if pred.shape != target.shape:
+            msg = f"Metric {self.id!r} prediction/target shapes differ: {tuple(pred.shape)} != {tuple(target.shape)}."
+            raise ValueError(msg)
+        if pred.ndim < _MIN_METRIC_TENSOR_RANK:
+            msg = f"Metric {self.id!r} requires batch, channel, and spatial axes."
+            raise ValueError(msg)
+        if not bool(torch.isfinite(pred).all().item()) or not bool(torch.isfinite(target).all().item()):
+            msg = f"Metric {self.id!r} received non-finite values in evaluation batch {batch_index}."
+            raise FloatingPointError(msg)
+        maximum_index = max(self.definition.field_indices)
+        if pred.shape[1] <= maximum_index:
+            msg = f"Metric {self.id!r} field index {maximum_index} exceeds {pred.shape[1]} channels."
+            raise ValueError(msg)
+        indices = torch.tensor(self.definition.field_indices, device=pred.device)
+        return pred.index_select(1, indices), target.index_select(1, indices)
 
-        Parameters
-        ----------
-        pred : torch.Tensor
-            Predicted tensor of shape (batch, C, H, W).
-        y : torch.Tensor
-            Ground truth tensor with identical shape.
-        **kwargs : torch.Tensor
-            Ignored additional arguments forwarded by evaluation callers.
+    def update(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+    ) -> None:
+        """Accumulate one evaluation batch."""
+        raise NotImplementedError
 
-        Returns
-        -------
-        torch.Tensor
-            Scalar relative RMSE value (percent) for the channel.
+    def compute(self) -> float:
+        """Finalize one dataset metric after all batches."""
+        raise NotImplementedError
 
-        """
-        yt = y[:, self.channel]
-        pt = pred[:, self.channel]
 
-        diff = pt - yt
-        rmse = torch.sqrt(torch.mean(diff * diff))
+class RMSEMetric(DatasetMetric):
+    """Accumulate global squared error and take one final square root."""
 
-        denom = torch.mean(torch.abs(yt)) + 1e-8  # avoid division by zero
+    def update(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+    ) -> None:
+        """Add squared-error sum and exact selected element count."""
+        selected_pred, selected_target = self._validate_update(
+            pred,
+            target,
+            space=space,
+            batch_index=batch_index,
+        )
+        squared_error = (selected_pred.double() - selected_target.double()).square()
+        batch_sum = float(squared_error.sum().detach().cpu().item())
+        if not np.isfinite(batch_sum):
+            msg = f"Metric {self.id!r} produced non-finite squared error in evaluation batch {batch_index}."
+            raise FloatingPointError(msg)
+        self._sum += batch_sum
+        self._count += squared_error.numel()
 
-        return 100.0 * rmse / denom
+    def compute(self) -> float:
+        """Return ``sqrt(total squared error / total element count)``."""
+        if self._count == 0:
+            msg = f"Metric {self.id!r} cannot finalize without samples."
+            raise RuntimeError(msg)
+        value = float(np.sqrt(self._sum / self._count))
+        if not np.isfinite(value):
+            msg = f"Metric {self.id!r} finalized to a non-finite value."
+            raise FloatingPointError(msg)
+        return value
+
+
+class RelativeL2Metric(DatasetMetric):
+    """Accumulate one combined selected-field relative L2 value per sample."""
+
+    def update(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+    ) -> None:
+        """Add finite per-sample relative L2 values."""
+        selected_pred, selected_target = self._validate_update(
+            pred,
+            target,
+            space=space,
+            batch_index=batch_index,
+        )
+        flat_difference = (selected_pred.double() - selected_target.double()).flatten(start_dim=1)
+        flat_target = selected_target.double().flatten(start_dim=1)
+        values = torch.linalg.vector_norm(flat_difference, dim=1) / (torch.linalg.vector_norm(flat_target, dim=1) + 1e-8)
+        self._accumulate_samples(values, batch_index=batch_index)
+
+    def _accumulate_samples(self, values: torch.Tensor, *, batch_index: int) -> None:
+        """Accumulate finite sample values with sample context on failure."""
+        finite = torch.isfinite(values)
+        if not bool(finite.all().item()):
+            first = int((~finite).nonzero(as_tuple=False)[0, 0].item())
+            msg = f"Metric {self.id!r} produced a non-finite value in evaluation batch {batch_index}, sample {first}."
+            raise FloatingPointError(msg)
+        self._sum += float(values.sum().detach().cpu().item())
+        self._count += values.numel()
+
+    def compute(self) -> float:
+        """Return the arithmetic mean of defined per-sample values."""
+        if self._count == 0:
+            msg = f"Metric {self.id!r} cannot finalize without samples."
+            raise RuntimeError(msg)
+        value = self._sum / self._count
+        if not np.isfinite(value):
+            msg = f"Metric {self.id!r} finalized to a non-finite value."
+            raise FloatingPointError(msg)
+        return float(value)
+
+
+class RelativeH1Metric(RelativeL2Metric):
+    """Accumulate NeuralOp-compatible relative H1 values per sample."""
+
+    def __init__(self, definition: ResolvedMetric) -> None:
+        """Build the task-dimensional relative H1 implementation."""
+        super().__init__(definition)
+        self._implementation = H1Loss(
+            d=definition.operator_dimensionality,
+            reduction="sum",
+        )
+
+    def update(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+    ) -> None:
+        """Compute and accumulate one relative H1 value per sample."""
+        selected_pred, selected_target = self._validate_update(
+            pred,
+            target,
+            space=space,
+            batch_index=batch_index,
+        )
+        values = torch.stack(
+            [
+                self._implementation(
+                    selected_pred[index : index + 1],
+                    selected_target[index : index + 1],
+                ).reshape(())
+                for index in range(selected_pred.shape[0])
+            ]
+        )
+        self._accumulate_samples(values.double(), batch_index=batch_index)
+
+
+def _resolved_metric_fields(
+    raw_fields: Any,
+    *,
+    task_fields: tuple[str, ...],
+    metric_id: str,
+) -> tuple[str, ...]:
+    """Return exact fields from an already resolved config metric."""
+    if raw_fields == "all":
+        return task_fields
+    if not isinstance(raw_fields, list) or not raw_fields or not all(isinstance(field, str) for field in raw_fields):
+        msg = f"Evaluation metric {metric_id!r} fields must be 'all' or a non-empty list of strings."
+        raise TypeError(msg)
+    fields = tuple(raw_fields)
+    if len(fields) != len(set(fields)):
+        msg = f"Evaluation metric {metric_id!r} contains duplicate fields: {list(fields)}."
+        raise ValueError(msg)
+    unknown = [field for field in fields if field not in task_fields]
+    if unknown:
+        msg = f"Evaluation metric {metric_id!r} references unknown output fields: {unknown}."
+        raise ValueError(msg)
+    return fields
+
+
+def build_evaluation_metrics(config: dict[str, Any]) -> dict[str, DatasetMetric]:
+    """
+    Build explicit-space dataset accumulators from semantic config.
+
+    Metric implementations do not receive or own normalizers. Physical units
+    come from the resolved task field contract, and physical metrics select one
+    field so incompatible units can never be silently combined.
+    """
+    task = domain.tasks.registry.get_task(str(config["task"]))
+    evaluation = config.get("evaluation")
+    if not isinstance(evaluation, dict):
+        msg = "Resolved config must contain an evaluation mapping."
+        raise TypeError(msg)
+    raw_metrics = evaluation.get("metrics")
+    if not isinstance(raw_metrics, list):
+        msg = "evaluation.metrics must be a list."
+        raise TypeError(msg)
+
+    built: dict[str, DatasetMetric] = {}
+    for raw_metric in raw_metrics:
+        if not isinstance(raw_metric, dict):
+            msg = "Each evaluation metric must be a mapping."
+            raise TypeError(msg)
+        metric_id = str(raw_metric["id"])
+        if metric_id in built:
+            msg = f"Duplicate evaluation metric id {metric_id!r}."
+            raise ValueError(msg)
+        kind = str(raw_metric["kind"])
+        space = str(raw_metric["space"])
+        reduction = str(raw_metric["reduction"])
+        kind_spec = validate_metric_semantics(kind, space=space, reduction=reduction)
+        fields = _resolved_metric_fields(
+            raw_metric["fields"],
+            task_fields=task.output_names,
+            metric_id=metric_id,
+        )
+        if space == "physical" and len(fields) != 1:
+            units = sorted({task.field(field).unit for field in fields})
+            msg = f"Physical metric {metric_id!r} must select exactly one field; selected units are {units}."
+            raise ValueError(msg)
+        direction = str(raw_metric.get("direction", kind_spec.direction))
+        if direction != kind_spec.direction:
+            msg = f"Metric {metric_id!r} direction {direction!r} contradicts {kind!r}."
+            raise ValueError(msg)
+        definition = ResolvedMetric(
+            id=metric_id,
+            kind=kind,
+            space=cast("MetricSpace", space),
+            fields=fields,
+            field_indices=tuple(task.output_names.index(field) for field in fields),
+            reduction=cast("MetricReduction", reduction),
+            direction=cast("MetricDirection", direction),
+            unit=task.field(fields[0]).unit if space == "physical" else "1",
+            operator_dimensionality=task.operator_dimensionality,
+        )
+        if kind == "rmse":
+            built[metric_id] = RMSEMetric(definition)
+        elif kind == "relative_l2":
+            built[metric_id] = RelativeL2Metric(definition)
+        elif kind == "relative_h1":
+            built[metric_id] = RelativeH1Metric(definition)
+        else:
+            msg = f"No dataset accumulator exists for metric identifier {kind!r}."
+            raise ValueError(msg)
+    return built
+
+
+def reset_metrics(metrics: dict[str, DatasetMetric]) -> None:
+    """Reset every configured dataset accumulator."""
+    for metric in metrics.values():
+        metric.reset()
+
+
+def finalize_metrics(metrics: dict[str, DatasetMetric]) -> dict[str, float]:
+    """Finalize every configured dataset accumulator exactly once."""
+    return {metric_id: metric.compute() for metric_id, metric in metrics.items()}

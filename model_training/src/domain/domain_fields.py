@@ -2,12 +2,12 @@
 ===============================================================================
 domain_fields.py
 ===============================================================================
-Define canonical field names and semantic field groups.
+Define reusable canonical field names and semantic field groups.
 
 Responsibilities:
-  - Declare coordinate, permeability, boundary and output field names
+  - Declare coordinate, permeability, boundary and state field primitives
   - Group fields by physical role
-  - Provide stable names for datasets, losses and analysis
+  - Validate exact canonical names without aliases
 
 Design principles:
   - Field names are declarative constants
@@ -15,59 +15,59 @@ Design principles:
   - Naming stays independent of model architecture
 
 Boundaries:
-  - Model tensor field order belongs to domain.field_sets
-  - Permeability tensor ordering belongs to domain.permeability
+  - Task-specific tensor field order belongs to domain.tasks
+  - Permeability tensor representation belongs to domain.permeability
 
 Notes:
-  - Coordinate fields are always present and define the spatial domain
-  - Kappa fields are dynamic based on the number of permeability components
-  - The canonical input order is: [coords, kappa fields, scalar inputs]
+  - These groups are reusable vocabulary, not a learned tensor contract
+  - The only authoritative learned ordering belongs to a registered TaskSpec
+
 ===============================================================================
 
 """
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------
-# Coordinate fields (always present)
-# ---------------------------------------------------------------------
-COORD_FIELDS = ["x", "y"]
+COORDINATE_FIELDS = ("x", "y")
+PERMEABILITY_FIELDS = ("kxx", "kxy", "kyy")
+POROSITY_FIELDS = ("eps",)
+BOUNDARY_FIELDS = ("p_bc",)
+STATE_FIELDS = ("p", "u", "v")
+DERIVED_ANALYSIS_FIELDS = ("U",)
+ANALYSIS_FIELDS = (*STATE_FIELDS, *DERIVED_ANALYSIS_FIELDS)
+KNOWN_FIELDS = frozenset(
+    (
+        *COORDINATE_FIELDS,
+        *PERMEABILITY_FIELDS,
+        *POROSITY_FIELDS,
+        *BOUNDARY_FIELDS,
+        *STATE_FIELDS,
+    )
+)
 
-# ---------------------------------------------------------------------
-# Scalar field inputs (material properties, boundary conditions, etc.)
-# All are represented as volume fields in COMSOL
-# ---------------------------------------------------------------------
-SCALAR_INPUT_FIELDS = {
-    "eps": "int4(x,y)",  # porosity (material field)
-    "p_bc": "int5(x,y)",  # pressure boundary condition (volume-encoded)
-}
-# ---------------------------------------------------------------------
-# Output fields
-# ---------------------------------------------------------------------
-OUTPUT_FIELDS = ["p", "u", "v", "U"]
 
-
-# ---------------------------------------------------------------------
-# Canonical input field order (without kappa!)
-# kappa is inserted dynamically between coords and scalars
-# ---------------------------------------------------------------------
-def canonical_input_order(kappa_fields: list[str]) -> list[str]:
+def require_known_field(name: str) -> str:
     """
-    Get the canonical input field order, given the kappa component names.
+    Validate and return one canonical field name.
 
     Parameters
     ----------
-    kappa_fields : list[str]
-        List of kappa component names to include.
+    name : str
+        Candidate machine-readable field name.
 
     Returns
     -------
-    list[str]
-        Canonical input field order.
+    str
+        The unchanged canonical field name.
+
+    Raises
+    ------
+    ValueError
+        If `name` is not part of the reusable canonical field vocabulary.
 
     """
-    return [
-        *COORD_FIELDS,
-        *kappa_fields,
-        *SCALAR_INPUT_FIELDS.keys(),
-    ]
+    if name not in KNOWN_FIELDS:
+        available = ", ".join(sorted(KNOWN_FIELDS))
+        msg = f"Unknown field {name!r}. Available canonical fields: {available}."
+        raise ValueError(msg)
+    return name

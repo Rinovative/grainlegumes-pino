@@ -42,13 +42,14 @@ if TYPE_CHECKING:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-EPS = 1e-12
+PRESSURE_DROP_DENOMINATOR_FLOOR = 1e-12
+CDF_POSITIVE_FLOOR = 1e-12
 CLIP_Q = 99.5
 MU_AIR = 1.8139e-5
 
 # training-like safeties (nur numerisch, nicht fuer "robustness")
-EPS_EPS = 1e-6
-EPS_K0 = 1e-30
+POROSITY_FLOOR = 1e-6
+PERMEABILITY_SCALE_FLOOR = 1e-30
 KXY_HAT_CLIP = 0.999
 DET_HAT_MIN = 1e-4
 
@@ -76,31 +77,6 @@ def _npz_scalar(v: Any) -> Any:
     if isinstance(v, np.ndarray) and v.shape == ():
         return v.item()
     return v
-
-
-def _npz_str(z: Any, key: str) -> str:
-    """
-    Extract a string from an NPZ file, handling potential 0-dim array formats.
-
-    Parameters
-    ----------
-    z : Any
-        NPZ file loaded as a dictionary.
-    key : str
-        Key to extract from the NPZ file.
-
-    Returns
-    -------
-    str
-        The string value extracted from the NPZ file.
-
-    Raises
-    ------
-    KeyError
-        If the key is not found in the NPZ file.
-
-    """
-    return str(_npz_scalar(z[key]))
 
 
 def _npz_list_str(z: Any, key: str) -> list[str]:
@@ -133,7 +109,7 @@ def _npz_list_str(z: Any, key: str) -> list[str]:
 
 def _get_input_field(z: Any, name: str) -> np.ndarray:
     """
-    Get an input field by name from the NPZ file, handling potential name variations for compatibility.
+    Get an input field by its exact declared name from the NPZ file.
 
     Parameters
     ----------
@@ -156,14 +132,7 @@ def _get_input_field(z: Any, name: str) -> np.ndarray:
     fields = _npz_list_str(z, "input_fields")
     x_raw = np.asarray(z["x_raw"], dtype=float)  # (Cin,H,W)
 
-    if name not in fields:
-        # minimal compatibility for old artifacts
-        if name == "eps" and "phi" in fields:
-            name = "phi"
-        elif name == "phi" and "eps" in fields:
-            name = "eps"
-
-    idx = fields.index(name)  # raises if missing (wanted)
+    idx = fields.index(name)
     return x_raw[idx]
 
 
@@ -292,11 +261,9 @@ def _df0_float(df: pd.DataFrame, col: str) -> float:
 # =============================================================================
 # GT METRICS (computed from NPZ fields, fail-fast)
 # =============================================================================
-def _gt_cont_mse_divu(z: Any) -> float:
+def _gt_cont_mse(z: Any) -> float:
     """
-    Compute GT continuity residual as MSE of velocity divergence over the interior.
-
-    The interior crop uses the fixed canonical padding EVAL_PAD.
+    Compute GT conservative continuity MSE over the canonical interior.
 
     Parameters
     ----------
@@ -306,21 +273,16 @@ def _gt_cont_mse_divu(z: Any) -> float:
     Returns
     -------
     float
-        Mean squared divergence of GT velocity.
+        Mean squared ``div(eps * velocity)`` residual.
 
     """
-    pad = EVAL_PAD
     dx, dy = _infer_dx_dy(z)
-
-    gt = np.asarray(z["gt"], dtype=float)  # (C,H,W)
-    u = _crop2(gt[1], pad)
-    v = _crop2(gt[2], pad)
-
-    _du_dy, du_dx = np.gradient(u, dy, dx, edge_order=1)
-    dv_dy, _dv_dx = np.gradient(v, dy, dx, edge_order=1)
-    div_u = du_dx + dv_dy
-
-    return float(np.mean(div_u**2))
+    gt = np.asarray(z["gt"], dtype=float)
+    eps = _get_input_field(z, "eps")
+    _depsu_dy, depsu_dx = np.gradient(eps * gt[1], dy, dx, edge_order=1)
+    depsv_dy, _depsv_dx = np.gradient(eps * gt[2], dy, dx, edge_order=1)
+    residual = _crop2(depsu_dx + depsv_dy, EVAL_PAD)
+    return float(np.mean(residual**2))
 
 
 def _gt_bc_mse(z: Any) -> float:
@@ -378,22 +340,18 @@ def _gt_mom_mse(z: Any) -> float:
     v = _crop2(gt[2], pad)
 
     eps = _crop2(_get_input_field(z, "eps"), pad)
-    eps = np.maximum(eps, EPS_EPS)
+    eps = np.maximum(eps, POROSITY_FLOOR)
 
     kxx_log = _crop2(_get_input_field(z, "kxx"), pad)
     kyy_log = _crop2(_get_input_field(z, "kyy"), pad)
 
-    # kxy_hat optional (falls nicht vorhanden -> 0)
-    try:
-        kxy_hat = _crop2(_get_input_field(z, "kxy"), pad)
-    except ValueError:
-        kxy_hat = np.zeros_like(kxx_log)
+    kxy_hat = _crop2(_get_input_field(z, "kxy"), pad)
 
     kxy_hat = np.clip(kxy_hat, -KXY_HAT_CLIP, KXY_HAT_CLIP)
 
-    Kxx = np.maximum(10.0**kxx_log, EPS_K0)
-    Kyy = np.maximum(10.0**kyy_log, EPS_K0)
-    K0 = np.sqrt(np.maximum(Kxx * Kyy, EPS_K0))
+    Kxx = np.maximum(10.0**kxx_log, PERMEABILITY_SCALE_FLOOR)
+    Kyy = np.maximum(10.0**kyy_log, PERMEABILITY_SCALE_FLOOR)
+    K0 = np.sqrt(np.maximum(Kxx * Kyy, PERMEABILITY_SCALE_FLOOR))
 
     # Derivatives
     dp_dy, dp_dx = np.gradient(p, dy, dx, edge_order=1)
@@ -461,9 +419,9 @@ def _gt_metric_from_npz(npz_path: str | Path, metric: str) -> float:
         If ``metric`` is not supported.
 
     """
-    with np.load(Path(npz_path), allow_pickle=True) as z:
+    with np.load(Path(npz_path), allow_pickle=False) as z:
         if metric == "cont_mse":
-            return _gt_cont_mse_divu(z)
+            return _gt_cont_mse(z)
         if metric == "bc_mse":
             return _gt_bc_mse(z)
         if metric == "mom_mse":
@@ -477,7 +435,7 @@ def _gt_metric_from_npz(npz_path: str | Path, metric: str) -> float:
 # =============================================================================
 def _dp_rel_err_from_npz(z: Any, *, use_gt: bool) -> float:
     """
-    Rel = |dp_pred - dp_bc| / (|dp_bc| + EPS): dp_* computed from inlet/outlet masks (y-based).
+    Rel = |dp_pred - dp_bc| / (|dp_bc| + PRESSURE_DROP_DENOMINATOR_FLOOR): dp_* computed from inlet/outlet masks (y-based).
 
     Parameters
     ----------
@@ -504,14 +462,14 @@ def _dp_rel_err_from_npz(z: Any, *, use_gt: bool) -> float:
         return float("nan")
 
     dp_bc = float(np.mean(p_bc[inlet]) - np.mean(p_bc[outlet]))
-    if abs(dp_bc) <= EPS or not np.isfinite(dp_bc):
+    if abs(dp_bc) <= PRESSURE_DROP_DENOMINATOR_FLOOR or not np.isfinite(dp_bc):
         return float("nan")
 
     dp_p = float(np.mean(p[inlet]) - np.mean(p[outlet]))
     if not np.isfinite(dp_p):
         return float("nan")
 
-    return float(abs(dp_p - dp_bc) / (abs(dp_bc) + EPS))
+    return float(abs(dp_p - dp_bc) / (abs(dp_bc) + PRESSURE_DROP_DENOMINATOR_FLOOR))
 
 
 # =============================================================================
@@ -579,7 +537,7 @@ def _plot_cdf(
     v = v[np.isfinite(v)]
     if v.size == 0:
         return None
-    x = np.maximum(np.sort(v), EPS)
+    x = np.maximum(np.sort(v), CDF_POSITIVE_FLOOR)
     y = np.linspace(0.0, 1.0, x.size)
     (line,) = ax.plot(x, y, lw=2, label=label, color=color, linestyle=ls, zorder=zorder)
     return line
@@ -768,7 +726,7 @@ def _plot_npz_scalar_cdf_viewer(
                 nmax = min(max_cases, len(df))
                 for i in range(loaded, nmax):
                     npz_path = str(df.loc[i, "npz_path"])
-                    with np.load(Path(npz_path), allow_pickle=True) as z:
+                    with np.load(Path(npz_path), allow_pickle=False) as z:
                         vals_list.append(float(compute_scalar(z)))
                 entry["vals"] = vals_list
                 entry["loaded_until"] = max_cases
@@ -786,7 +744,7 @@ def _plot_npz_scalar_cdf_viewer(
             nmax = min(max_cases, len(df_ref))
             for i in range(loaded, nmax):
                 npz_path = str(df_ref.loc[i, "npz_path"])
-                with np.load(Path(npz_path), allow_pickle=True) as z:
+                with np.load(Path(npz_path), allow_pickle=False) as z:
                     vals_list.append(float(gt_compute_scalar(z)))
             gt_cache["vals"] = vals_list
             gt_cache["loaded_until"] = max_cases
@@ -888,7 +846,7 @@ def _plot_mean_field_map_viewer(
                 nmax = min(max_cases, len(df))
                 for i in range(loaded, nmax):
                     npz_path = str(df.loc[i, "npz_path"])
-                    with np.load(Path(npz_path), allow_pickle=True) as z:
+                    with np.load(Path(npz_path), allow_pickle=False) as z:
                         field = np.asarray(reducer(z), dtype=float)
                     if entry["sum"] is None:
                         entry["sum"] = np.zeros_like(field, dtype=float)
@@ -1000,9 +958,9 @@ def _style_numeric_block_blue(block: pd.DataFrame, columns: list[str]) -> pd.Dat
 def build_physical_consistency_summary_table(
     datasets_eval: dict[str, pd.DataFrame],
     *,
-    metrics: tuple[str, ...] = ("phys_mse", "cont_mse", "mom_mse", "bc_mse"),
+    metrics: tuple[str, ...] = ("mom_mse", "cont_mse", "bc_mse"),
     stats: tuple[str, ...] = ("median", "mean", "q90", "q95"),
-    sort_by: str = "phys_mse_median",
+    sort_by: str = "mom_mse_median",
 ) -> pd.DataFrame:
     """
     Build a summary table of aggregate physical-consistency metrics by model.
@@ -1050,9 +1008,9 @@ def plot_physical_consistency_summary_table(
     *,
     datasets: dict[str, pd.DataFrame],
     title: str = "Physical consistency summary",
-    metrics: tuple[str, ...] = ("phys_mse", "cont_mse", "mom_mse", "bc_mse"),
+    metrics: tuple[str, ...] = ("mom_mse", "cont_mse", "bc_mse"),
     stats: tuple[str, ...] = ("median", "mean", "q90", "q95"),
-    sort_by: str = "phys_mse_median",
+    sort_by: str = "mom_mse_median",
 ) -> widgets.VBox:
     """
     Render a styled table view of physical-consistency summary statistics.
@@ -1209,32 +1167,9 @@ def plot_mass_conservation_error_map(*, datasets: dict[str, pd.DataFrame]) -> wi
     """
     return _plot_mean_field_map_viewer(
         datasets=datasets,
-        reducer=lambda z: np.abs(np.asarray(z["div_u"], dtype=float)),
-        cbar_label=r"mean $|\nabla \cdot \mathbf{u}|$",
-        title="Mean absolute mass conservation error map",
-    )
-
-
-def plot_div_eps_u_error_map(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
-    """
-    Plot mean absolute porosity-weighted continuity residual maps.
-
-    Parameters
-    ----------
-    datasets : dict[str, pd.DataFrame]
-        Mapping of model names to evaluation DataFrames.
-
-    Returns
-    -------
-    widgets.VBox
-        Interactive map viewer widget.
-
-    """
-    return _plot_mean_field_map_viewer(
-        datasets=datasets,
-        reducer=lambda z: np.abs(np.asarray(z["div_eps_u"], dtype=float)),
+        reducer=lambda z: np.abs(np.asarray(z["Rc"], dtype=float)),
         cbar_label=r"mean $|\nabla \cdot (\varepsilon \mathbf{u})|$",
-        title="Mean absolute porosity-weighted continuity residual map",
+        title="Mean absolute task-selected mass-conservation residual",
     )
 
 
@@ -1308,7 +1243,7 @@ def plot_physical_consistency_cdf_grid(*, datasets: dict[str, pd.DataFrame]) -> 
                 nmax = min(max_cases, len(df))
                 for i in range(loaded, nmax):
                     npz_path = str(df.loc[i, "npz_path"])
-                    with np.load(Path(npz_path), allow_pickle=True) as z:
+                    with np.load(Path(npz_path), allow_pickle=False) as z:
                         vals_list.append(float(_dp_rel_err_from_npz(z, use_gt=False)))
                 entry["vals"] = vals_list
                 entry["loaded_until"] = max_cases
@@ -1324,8 +1259,8 @@ def plot_physical_consistency_cdf_grid(*, datasets: dict[str, pd.DataFrame]) -> 
             nmax = min(max_cases, len(df_ref))
             for i in range(loaded, nmax):
                 npz_path = str(df_ref.loc[i, "npz_path"])
-                with np.load(Path(npz_path), allow_pickle=True) as z:
-                    cont_list.append(float(_gt_cont_mse_divu(z)))
+                with np.load(Path(npz_path), allow_pickle=False) as z:
+                    cont_list.append(float(_gt_cont_mse(z)))
                     mom_list.append(float(_gt_mom_mse(z)))
                     bc_list.append(float(_gt_bc_mse(z)))
                     dp_list.append(float(_dp_rel_err_from_npz(z, use_gt=True)))

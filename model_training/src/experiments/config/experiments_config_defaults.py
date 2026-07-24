@@ -2,21 +2,22 @@
 ===============================================================================
 experiments_config_defaults.py
 ===============================================================================
-Define task and component defaults for experiment configs.
+Define generic runtime defaults around task-owned semantic contracts.
 
 Responsibilities:
-  - Define task defaults for supported problem types
-  - Map tasks to standard datasets, channels and field selections
-  - Provide model, loss, optimizer, scheduler and training defaults
+  - Provide generic run, data-loader, optimizer, scheduler, and training defaults
+  - Project task-owned datasets, losses, metrics, and objective into config defaults
+  - Return serializable defaults for strict experiment resolution
 
 Design principles:
-  - Defaults are declarative data
-  - User YAML values override defaults
-  - Resolved configs are complete enough for reproducible runs
+  - Task-fixed values come exclusively from the registered TaskSpec
+  - Runtime defaults remain independent of concrete task field names
+  - Semantic identifiers are distinct from Python implementation class names
 
 Boundaries:
-  - YAML parsing and saving belong to experiments.config.loader
-  - Training execution belongs to learning.training.loop
+  - Config parsing and strict validation belong to experiments.config.loader
+  - Model, loss, metric, and physics construction belong to their registries
+  - Dataset storage schemas and lifecycle behavior are not defined here
 ===============================================================================
 """
 
@@ -24,163 +25,119 @@ from __future__ import annotations
 
 from typing import Any
 
-# =============================================================================
-# Task defaults
-# =============================================================================
-#
-# Each task defines:
-# - input/output fields for model
-# - default train and OOD datasets
-# - task-specific metrics and preprocessing
-#
-TASK_DEFAULTS = {
-    "steady_flow": {
-        # Data handling
-        "data": {
-            "train_dataset": "lhs_var80_seed3001",
-            "ood_datasets": ["lhs_var120_seed4001"],
-            "train_ratio": 0.8,
-            "ood_fraction": 0.2,
-            "batch_size": 32,
-            "num_workers": 8,
-            "pin_memory": True,
-            "persistent_workers": True,
-        },
-        # Model channels (7 inputs: x, y, kxx, kyy, kxy, phi, p_bc; 3 outputs: p, u, v)
-        "in_channels": 7,
-        "out_channels": 3,
-        "input_fields": [
-            "x",
-            "y",
-            "kxx",
-            "kyy",
-            "kxy",
-            "phi",
-            "p_bc",
-        ],
-        "output_fields": ["p", "u", "v"],
-        # Training defaults
-        "training": {
-            "n_epochs": 600,
-            "eval_interval": 5,
-            "mixed_precision": False,
-            "save_best_metric": "eval_overall_rmse",
-        },
-        # Evaluation defaults
-        "evaluation": {
-            "losses": {
-                "h1": True,
-                "l2": True,
-                "overall_rmse": True,
-                "rmse_p_pa": True,
-                "rmse_u_ms": True,
-                "rmse_v_ms": True,
-            },
-        },
+from src import domain
+
+RUN_DEFAULTS: dict[str, Any] = {
+    "seed": 9,
+    "deterministic": True,
+    "device": "cuda",
+    "prefix": None,
+    "suffix": None,
+}
+
+DATA_RUNTIME_DEFAULTS: dict[str, Any] = {
+    "train_ratio": 0.8,
+    "ood_fraction": 0.2,
+    "batch_size": 32,
+    "num_workers": 8,
+    "pin_memory": True,
+    "persistent_workers": True,
+}
+
+PHYSICS_LOSS_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "derivatives": {
+        "kind": "spectral",
+        "extension": "reflect",
+    },
+    "interior_crop": 2,
+    "residual_weight": {
+        "target": 1.0e-4,
+        "warmup": {"kind": "linear", "epochs": 50},
+    },
+    "boundary_weight": {
+        "target": 5.0e-4,
+        "warmup": {"kind": "linear", "epochs": 50},
     },
 }
 
-
-# =============================================================================
-# Model architecture defaults
-# =============================================================================
-#
-# FNO and UNO have sensible defaults. These are used if not specified in YAML.
-#
-MODEL_DEFAULTS = {
-    "FNO": {
-        "params": {
-            "lifting_channel_ratio": 2,
-            "projection_channel_ratio": 2,
-            "fno_skip": "linear",
-            "channel_mlp_skip": "soft-gating",
-            "implementation": "factorized",
-        },
-    },
-    "PI-FNO": {
-        "params": {
-            "lifting_channel_ratio": 2,
-            "projection_channel_ratio": 2,
-            "fno_skip": "linear",
-            "channel_mlp_skip": "soft-gating",
-            "implementation": "factorized",
-        },
-    },
-    "UNO": {
-        # UNO mode schedule and scalings are architecture-dependent
-        # Set in code based on n_layers
-    },
-    "PI-UNO": {
-        # Same as UNO
-    },
-}
-
-
-# =============================================================================
-# Loss defaults
-# =============================================================================
-#
-LOSS_DEFAULTS = {
-    "supervised": {
-        "type": "supervised",
-        "data_loss": "h1",
-    },
-    "pino": {
-        "type": "pino",
-        "data_loss": "h1",
-    },
-}
-
-
-# =============================================================================
-# Optimizer defaults
-# =============================================================================
-#
-OPTIMIZER_DEFAULTS = {
+OPTIMIZER_DEFAULTS: dict[str, dict[str, Any]] = {
     "adamw": {
-        "type": "adamw",
+        "kind": "adamw",
         "betas": [0.9, 0.999],
-        "eps": 1e-6,
-    },
+        "second_moment_floor": 1.0e-6,
+    }
 }
 
-
-# =============================================================================
-# Scheduler defaults
-# =============================================================================
-#
-SCHEDULER_DEFAULTS = {
+SCHEDULER_DEFAULTS: dict[str, dict[str, Any]] = {
     "reduce_on_plateau": {
-        "type": "reduce_on_plateau",
-        "mode": "min",
+        "kind": "reduce_on_plateau",
         "factor": 0.5,
         "patience": 20,
-        "min_lr": 1e-8,
-    },
+        "min_lr": 1.0e-8,
+    }
+}
+
+TRAINING_DEFAULTS: dict[str, Any] = {
+    "epochs": 600,
+    "evaluation_interval": 5,
+    "mixed_precision": False,
+}
+
+TRACKING_DEFAULTS: dict[str, Any] = {
+    "wandb": {
+        "enabled": False,
+        "project": "grainlegumes-pino-airflow",
+        "entity": None,
+        "group": None,
+        "tags": [],
+        "mode": "online",
+    }
 }
 
 
-def get_task_defaults(task: str) -> dict[str, Any]:
+def get_task_defaults(task_id: str) -> dict[str, Any]:
     """
-    Get all defaults for a specific task.
+    Project one registered task into generic experiment defaults.
 
     Parameters
     ----------
-    task : str
-        Task name (e.g., "steady_flow")
+    task_id : str
+        Exact registered task identifier.
 
     Returns
     -------
     dict[str, Any]
-        Task defaults dictionary
+        Isolated serializable runtime defaults combined with task-owned semantics.
 
     Raises
     ------
-    KeyError
-        If task is not recognized
+    ValueError
+        If `task_id` is not registered.
 
     """
-    if task not in TASK_DEFAULTS:
-        msg = f"Unknown task: {task}. Available tasks: {list(TASK_DEFAULTS.keys())}"
-        raise KeyError(msg)
-    return TASK_DEFAULTS[task]
+    task = domain.tasks.registry.get_task(task_id)
+    return {
+        "run": RUN_DEFAULTS,
+        "data": {
+            "train_dataset": task.default_datasets.train,
+            "ood_datasets": list(task.default_datasets.ood),
+            **DATA_RUNTIME_DEFAULTS,
+        },
+        "loss": {
+            "data": {
+                "kind": task.data_losses[0],
+                "space": "normalized",
+                "weight": 1.0,
+            },
+            "physics": PHYSICS_LOSS_DEFAULTS,
+        },
+        "evaluation": {
+            "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],
+            "objective": {"id": task.default_objective.id},
+        },
+        "optimizer": OPTIMIZER_DEFAULTS["adamw"],
+        "scheduler": SCHEDULER_DEFAULTS["reduce_on_plateau"],
+        "training": TRAINING_DEFAULTS,
+        "tracking": TRACKING_DEFAULTS,
+    }

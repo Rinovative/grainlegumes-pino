@@ -1,8 +1,8 @@
 """
-Metric modules for training and evaluation.
+Task-resolved metric modules for training and evaluation.
 
 Provides:
-- metrics: NumPy metrics and PyTorch metric modules
+- metrics: semantic metric registry and explicit-space accumulators
 """
 
 from . import learning_metrics as metrics

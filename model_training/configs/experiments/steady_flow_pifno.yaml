@@ -8,35 +8,75 @@ run:
   suffix: null
 
 model:
-  architecture: PI-FNO
+  kind: fno
   params:
     n_modes: [128, 160]
     hidden_channels: 64
     n_layers: 3
 
 loss:
-  type: pino
-  data_loss: h1
-  loss_type: ps_eps
-  lambda_phys: 1.0e-4
-  lambda_p: 5.0e-4
+  data:
+    kind: relative_h1
+    space: normalized
+    weight: 1.0
+  physics:
+    enabled: true
+    derivatives:
+      kind: spectral
+      extension: reflect
+    interior_crop: 2
+    residual_weight:
+      target: 1.0e-4
+      warmup:
+        kind: linear
+        epochs: 50
+    boundary_weight:
+      target: 5.0e-4
+      warmup:
+        kind: linear
+        epochs: 50
 
-physics:
-  enabled: true
+evaluation:
+  metrics:
+    - id: normalized_relative_h1
+      kind: relative_h1
+      space: normalized
+      fields: all
+      reduction: sample_mean
+    - id: normalized_rmse
+      kind: rmse
+      space: normalized
+      fields: all
+      reduction: element_mean
+    - id: physical_rmse_p
+      kind: rmse
+      space: physical
+      field: p
+      reduction: element_mean
+    - id: physical_rmse_u
+      kind: rmse
+      space: physical
+      field: u
+      reduction: element_mean
+    - id: physical_rmse_v
+      kind: rmse
+      space: physical
+      field: v
+      reduction: element_mean
+  objective:
+    id: normalized_relative_h1
 
 optimizer:
-  type: adamw
+  kind: adamw
   lr: 3.883614530748613e-4
   weight_decay: 1.0e-4
 
 scheduler:
-  type: reduce_on_plateau
-  monitor: eval_overall_rmse
+  kind: reduce_on_plateau
   factor: 0.5
   patience: 20
 
 training:
-  n_epochs: 600
-  eval_interval: 5
+  epochs: 600
+  evaluation_interval: 5
   mixed_precision: false
-  save_best_metric: eval_overall_rmse

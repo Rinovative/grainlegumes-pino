@@ -6,7 +6,7 @@ Provides:
 - losses: supervised and PINO loss modules
 - metrics: training and evaluation metric modules
 - models: model factories and UNO helpers
-- training: training loop, hooks and optimizer helpers
+- training: checkpoint, training-loop, optimizer and scheduler helpers
 """
 
 from . import inference, losses, metrics, models, training

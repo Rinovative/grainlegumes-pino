@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 # ============================================================================
 # CHANNEL DEFINITIONS
 # ============================================================================
-CHANNELS = domain.fields.OUTPUT_FIELDS
+CHANNELS = domain.fields.ANALYSIS_FIELDS
 CHANNEL_INDICES = {name: i for i, name in enumerate(CHANNELS)}
 
 # =============================================================================
@@ -73,7 +73,7 @@ def plot_error_vs_gt_magnitude(*, datasets: dict[str, pd.DataFrame]) -> widgets.
 
     """
     n_bins = 15
-    eps = 1e-12
+    relative_denominator_floor = 1e-12
     names = list(datasets.keys())
 
     # ------------------------------------------------------------------
@@ -134,7 +134,7 @@ def plot_error_vs_gt_magnitude(*, datasets: dict[str, pd.DataFrame]) -> widgets.
                     k = CHANNEL_INDICES[ch]
                     g = np.abs(gt[k]).ravel()
 
-                    e = (np.abs(pred[k] - gt[k]) / (np.abs(gt[k]) + eps)).ravel()
+                    e = (np.abs(pred[k] - gt[k]) / (np.abs(gt[k]) + relative_denominator_floor)).ravel()
 
                     q_cut = 0.02  # 2 % quantile cut to remove extreme outliers
                     g_min = np.nanquantile(g, q_cut)
@@ -407,7 +407,7 @@ def plot_error_vs_boundary_distance(
 
         for ax, name in zip(axes, names, strict=False):
             entry = cache[name]
-            eps = 1e-12
+            ratio_denominator_floor = 1e-12
 
             # MAE pro Channel und Band (gemittelt ueber Cases)
             mae_by_ch = {ch: np.array(entry["sum"][ch], dtype=float) / max(entry["count"], 1) for ch in active_channels}
@@ -416,7 +416,7 @@ def plot_error_vs_boundary_distance(
             ref_idx = -1
 
             for i, _label in enumerate(band_labels):
-                y = [mae_by_ch[ch][i] / (mae_by_ch[ch][ref_idx] + eps) for ch in active_channels]
+                y = [mae_by_ch[ch][i] / (mae_by_ch[ch][ref_idx] + ratio_denominator_floor) for ch in active_channels]
 
                 bars = ax.bar(
                     x_pos + (i - (len(bands) - 1) / 2) * width,
@@ -457,7 +457,7 @@ def plot_error_vs_boundary_distance(
     # ------------------------------------------------------------------
     # UI COMPONENTS
     # ------------------------------------------------------------------
-    channel_selector = analysis.ui.components.ui_checkbox_channels(default_on=CHANNELS)
+    channel_selector = analysis.ui.components.ui_checkbox_channels(default_on=list(CHANNELS))
 
     # ------------------------------------------------------------------
     # CASECOUNT VIEWER

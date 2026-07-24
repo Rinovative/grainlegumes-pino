@@ -48,11 +48,11 @@ def build_optimizer(
         Model to optimize
     config : dict[str, Any]
         Optimizer config with keys:
-        - optimizer.type: optimizer type (default: "adamw")
+        - optimizer.kind: optimizer type (default: "adamw")
         - optimizer.lr: learning rate
         - optimizer.weight_decay: weight decay
         - optimizer.betas: betas for AdamW (optional)
-        - optimizer.eps: eps for AdamW (optional)
+        - optimizer.second_moment_floor: Adam second-moment denominator floor (optional)
 
     Returns
     -------
@@ -66,7 +66,7 @@ def build_optimizer(
 
     """
     opt_config = config.get("optimizer", {})
-    opt_type = opt_config.get("type", "adamw").lower()
+    opt_type = opt_config.get("kind", "adamw").lower()
 
     if opt_type != "adamw":
         msg = f"Only 'adamw' optimizer is supported, got: {opt_type}"
@@ -83,14 +83,14 @@ def build_optimizer(
         msg = f"optimizer.betas must contain exactly two numeric values, got: {betas_config!r}"
         raise ValueError(msg)
     betas = (float(betas_config[0]), float(betas_config[1]))
-    eps = opt_config.get("eps", 1e-6)
+    second_moment_floor = opt_config.get("second_moment_floor", 1e-6)
 
     return AdamW(
         model.parameters(),
         lr=float(lr),
         weight_decay=float(weight_decay),
         betas=betas,
-        eps=float(eps),
+        eps=float(second_moment_floor),
     )
 
 
@@ -107,8 +107,7 @@ def build_scheduler(
         Optimizer to schedule
     config : dict[str, Any]
         Scheduler config with keys:
-        - scheduler.type: scheduler type (default: "reduce_on_plateau")
-        - scheduler.mode: "min" or "max" (default: "min")
+        - scheduler.kind: scheduler type (default: "reduce_on_plateau")
         - scheduler.factor: LR reduction factor (default: 0.5)
         - scheduler.patience: epochs before reduction (default: 20)
         - scheduler.min_lr: minimum LR (default: 1e-8)
@@ -128,14 +127,15 @@ def build_scheduler(
     if sched_config is None:
         return None
 
-    sched_type = sched_config.get("type", "reduce_on_plateau").lower()
+    sched_type = sched_config.get("kind", "reduce_on_plateau").lower()
 
     if sched_type == "reduce_on_plateau":
-        mode = sched_config.get("mode", "min")
-        if mode not in ("min", "max"):
-            msg = f"scheduler.mode must be 'min' or 'max', got: {mode!r}"
+        direction = config["evaluation"]["objective"]["direction"]
+        mode_by_direction = {"minimize": "min", "maximize": "max"}
+        if direction not in mode_by_direction:
+            msg = f"evaluation.objective.direction must be 'minimize' or 'maximize', got: {direction!r}"
             raise ValueError(msg)
-        mode_value = cast('Literal["min", "max"]', mode)
+        mode_value = cast('Literal["min", "max"]', mode_by_direction[direction])
         factor = sched_config.get("factor", 0.5)
         patience = sched_config.get("patience", 20)
         min_lr = sched_config.get("min_lr", 1e-8)

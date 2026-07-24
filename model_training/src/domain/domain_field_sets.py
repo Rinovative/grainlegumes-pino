@@ -2,120 +2,74 @@
 ===============================================================================
 domain_field_sets.py
 ===============================================================================
-Define canonical input and output field sets for model tensors.
+Validate exact ordered field contracts.
 
 Responsibilities:
-  - Declare default 2D and 3D model input fields
-  - Declare default 2D and 3D model output fields
-  - Return canonical field lists by problem dimension
+  - Reject duplicate, missing, unexpected, or misordered fields
+  - Compare producer/consumer declarations with a task-owned sequence
 
 Design principles:
-  - Field sets are declarative and side-effect free
-  - Tensor channel order is centralized here
-  - Model architecture stays independent from field selection
+  - Validation is strict and side-effect free
+  - Task specifications are the only source of tensor channel order
 
 Boundaries:
-  - Field-name constants belong to domain.fields
-  - Permeability component mappings belong to domain.permeability
+  - Field-name primitives belong to domain.fields
+  - Complete task contracts belong to domain.tasks
 ===============================================================================
 """
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------
-# Default training inputs
-# ---------------------------------------------------------------------
-# These are INTERNAL, CANONICAL field names
-# (after domain.permeability mapping and batch dataset construction)
-# ---------------------------------------------------------------------
+from typing import TYPE_CHECKING
 
-DEFAULT_INPUTS_2D = [
-    "x",
-    "y",
-    "kxx",
-    "kyy",
-    "kxy",
-    "phi",
-    "p_bc",
-]
-
-DEFAULT_INPUTS_3D = [
-    "x",
-    "y",
-    "z",
-    "kxx",
-    "kyy",
-    "kzz",
-    "kxy",
-    "kxz",
-    "kyz",
-    "phi",
-    "p_bc",
-]
-
-# ---------------------------------------------------------------------
-# Default training outputs
-# ---------------------------------------------------------------------
-
-DEFAULT_OUTPUTS_2D = [
-    "p",
-    "u",
-    "v",
-]
-
-DEFAULT_OUTPUTS_3D = [
-    "p",
-    "u",
-    "v",
-    "w",
-]
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-def default_training_inputs(dim: int) -> list[str]:
+def validate_ordered_fields(
+    actual: Sequence[str],
+    expected: Sequence[str],
+    *,
+    label: str,
+) -> tuple[str, ...]:
     """
-    Return default input field names for the given problem dimension.
+    Validate one exact, duplicate-free ordered field declaration.
 
     Parameters
     ----------
-    dim : int
-        Problem dimension (2 or 3).
+    actual : Sequence[str]
+        Field order declared by a producer or consumer.
+    expected : Sequence[str]
+        Authoritative field order from the task contract.
+    label : str
+        Human-readable path or contract label used in errors.
 
     Returns
     -------
-    list[str]
-        Canonical input field names for training.
+    tuple[str, ...]
+        The validated `actual` declaration as an immutable tuple.
+
+    Raises
+    ------
+    ValueError
+        If fields are duplicated, missing, unexpected, or misordered.
 
     """
-    if dim == 2:  # noqa: PLR2004
-        return DEFAULT_INPUTS_2D
-    if dim == 3:  # noqa: PLR2004
-        return DEFAULT_INPUTS_3D
-    msg = f"Unsupported dimension: {dim}"
-    raise ValueError(msg)
+    actual_fields = tuple(actual)
+    expected_fields = tuple(expected)
 
+    duplicates = sorted({name for name in actual_fields if actual_fields.count(name) > 1})
+    if duplicates:
+        msg = f"{label} contains duplicate fields: {duplicates}."
+        raise ValueError(msg)
 
-def default_training_outputs(dim: int) -> list[str]:
-    """
-    Return default output field names for the given problem dimension.
+    missing = [name for name in expected_fields if name not in actual_fields]
+    unexpected = [name for name in actual_fields if name not in expected_fields]
+    if missing or unexpected:
+        msg = f"{label} does not match the task contract. Missing: {missing}; unexpected: {unexpected}; expected order: {list(expected_fields)}."
+        raise ValueError(msg)
 
-    Parameters
-    ----------
-    dim : int
-        Problem dimension (2 or 3).
-
-    Returns
-    -------
-    list[str]
-        Canonical output field names for training.
-
-    """
-    if dim == 2:  # noqa: PLR2004
-        return DEFAULT_OUTPUTS_2D
-    if dim == 3:  # noqa: PLR2004
-        return DEFAULT_OUTPUTS_3D
-    msg = f"Unsupported dimension: {dim}"
-    raise ValueError(msg)
+    if actual_fields != expected_fields:
+        msg = f"{label} has the wrong channel order. Expected: {list(expected_fields)}; got: {list(actual_fields)}."
+        raise ValueError(msg)
+    return actual_fields

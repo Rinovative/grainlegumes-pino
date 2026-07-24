@@ -5,6 +5,7 @@
 .gitignore
 .dockerignore
 .devcontainer/
+.vscode/
 __pycache__/
 *.pyc
 *.pyo
@@ -16,8 +17,10 @@ __pycache__/
 # -------------------------------
 # 🧮 NOTEBOOKS & CACHE
 # -------------------------------
-.ipynb_checkpoints
-*.ipynb_checkpoints
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 .DS_Store
 Thumbs.db
 
@@ -45,14 +48,11 @@ OneDrive*/
 # -------------------------------
 # 📊 PROJECT DATA
 # -------------------------------
-data/
-data_generation/data/
-model_training/data/
+/data/
+/data_generation/data/
+/model_training/data/
+/logs/
 
 # Temporary files
-*.pt
-*.csv
 *.zip
 *.log
-__pycache__/
-.ipynb_checkpoints/

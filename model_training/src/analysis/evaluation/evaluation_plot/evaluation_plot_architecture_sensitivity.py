@@ -12,7 +12,7 @@ Responsibilities:
 Design principles:
   - One model run maps to one architecture point
   - Evaluation DataFrames remain case-level inputs
-  - Architecture metadata comes from model.architecture and model.params
+  - Architecture metadata comes from model.kind and model.params
 
 Boundaries:
   - Per-case field viewing belongs to evaluation_plot_sample_viewer
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 # Helpers: architecture extraction
 # ======================================================================
 def _as_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
-    """Return a config section mapping or raise a current-schema error."""
+    """Return a required config section mapping."""
     if not isinstance(value, Mapping):
         msg = f"Expected {label} to be a mapping in config.yaml."
         raise TypeError(msg)
@@ -64,14 +64,13 @@ def _load_current_run_config_from_npz_path(npz_path: str | Path) -> dict[str, An
 
 
 def _current_config_sections(cfg: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
-    """Return current-schema model, model.params and loss sections."""
+    """Return the model, model.params, and loss sections."""
     model_cfg = _as_mapping(cfg.get("model"), label='config["model"]')
     params = _as_mapping(model_cfg.get("params"), label='config["model"]["params"]')
     loss_cfg = _as_mapping(cfg.get("loss"), label='config["loss"]')
 
-    # Validate these current run sections here even though this plot only needs
-    # model and loss metadata. Their presence distinguishes resolved run configs
-    # from old ad hoc metadata files.
+    # Validate all required run sections even though this plot only
+    # consumes model and loss metadata.
     _as_mapping(cfg.get("data"), label='config["data"]')
     _as_mapping(cfg.get("run"), label='config["run"]')
 
@@ -112,7 +111,7 @@ def _load_arch_from_npz_path(npz_path: str | Path) -> dict[str, Any]:
     arch["hidden_channels"] = params.get("hidden_channels")
 
     # ------------------------------------------------------------------
-    # Spectral capacity (FNO / PI-FNO / UNO unified)
+    # Spectral capacity across FNO and UNO with either loss composition
     # ------------------------------------------------------------------
     modes_mean = _mean_pair(params.get("n_modes"))
     if modes_mean is not None:
@@ -133,8 +132,12 @@ def _load_arch_from_npz_path(npz_path: str | Path) -> dict[str, Any]:
     # ------------------------------------------------------------------
     # Physics weights (PI models only, otherwise None)
     # ------------------------------------------------------------------
-    arch["lambda_phys"] = loss_cfg.get("lambda_phys")
-    arch["lambda_p"] = loss_cfg.get("lambda_p")
+    physics_cfg = loss_cfg.get("physics")
+    physics_cfg = physics_cfg if isinstance(physics_cfg, Mapping) else {}
+    residual_weight = physics_cfg.get("residual_weight")
+    boundary_weight = physics_cfg.get("boundary_weight")
+    arch["lambda_phys"] = residual_weight.get("target") if isinstance(residual_weight, Mapping) else None
+    arch["lambda_p"] = boundary_weight.get("target") if isinstance(boundary_weight, Mapping) else None
 
     return arch
 

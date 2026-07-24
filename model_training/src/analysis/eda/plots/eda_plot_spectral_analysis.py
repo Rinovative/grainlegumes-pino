@@ -488,7 +488,7 @@ def plot_spectral_cumulative(*, datasets: dict[str, pd.DataFrame]) -> widgets.VB
         datasets: dict[str, pd.DataFrame],
         dataset_selector: CheckboxGroup,
     ) -> Figure:
-        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)
+        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)  # noqa: SLF001 -- sibling plot helper
 
         sample_df = datasets[active[0]]
         field_keys = _infer_field_keys(sample_df)
@@ -634,7 +634,7 @@ def plot_spectral_cumulative_directional(*, datasets: dict[str, pd.DataFrame]) -
         datasets: dict[str, pd.DataFrame],
         dataset_selector: CheckboxGroup,
     ) -> Figure:
-        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)
+        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)  # noqa: SLF001 -- sibling plot helper
 
         sample_df = datasets[active[0]]
         field_keys = _infer_field_keys(sample_df)

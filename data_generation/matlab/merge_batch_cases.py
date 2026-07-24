@@ -1,216 +1,136 @@
 """
 ===============================================================================
- merge_batch_cases.py
+merge_batch_cases.py
 ===============================================================================
-Merges all individual case_XXXX.pt files of a simulation batch into a single
-training dataset file for PINO/FNO.
+Merge strict task cases into one training dataset.
 
-Each case file contains:
-    - input_fields:  x, y, kappa* (already transformed in build_batch_dataset)
-    - output_fields: p, u, v, U
-    - meta:          simulation metadata
+Responsibilities:
+  - Resolve the exact ordered fields from a registered TaskSpec
+  - Validate every case schema, fingerprint, identifier, dtype, and shape
+  - Save ordered tensors and deterministic merged-dataset identity
 
-This script:
-    1. Loads all case_XXXX.pt files.
-    2. Selects the desired input and output channels.
-    3. Stacks them into tensors of shape:
-           inputs:  (N, C_in,  ny, nx)
-           outputs: (N, C_out, ny, nx)
-    4. Saves a single <batch_name>.pt dataset for model_training.
-    5. Copies meta.pt into the dataset folder if available.
+Design principles:
+  - Callers cannot select or filter learned fields
+  - Stacking always follows task order, never mapping insertion order
+  - Existing merged targets are never overwritten implicitly
 ===============================================================================
 """
 
-import shutil
+from __future__ import annotations
 
-import numpy as np
+from typing import TYPE_CHECKING, Any
+
 import torch
-from src import common, domain
+from src import common, datasets, domain
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def merge_batch_cases(
     batch_name: str,
-    keep_input_fields: list[str] | None = None,
-    keep_output_fields: list[str] | None = None,
     verbose: bool = False,
-) -> dict:
+    *,
+    task_id: str = "steady_flow",
+    dataset_root: Path | str | None = None,
+) -> dict[str, Any]:
     """
-    Merge all individual case_XXXX.pt files of a batch into one dataset for PINO/FNO training.
+    Merge one directory of strict cases using a task-owned field contract.
 
     Parameters
     ----------
     batch_name : str
-        Name of the simulation batch.
-    keep_input_fields : list[str] or None
-        Input fields to keep. If None, defaults to all permeability components
-        plus x and y coordinates.
-    keep_output_fields : list[str] or None
-        Output fields to keep. If None, defaults to velocity and pressure fields.
-    verbose : bool
-        If True, prints structure information for the first case.
+        Logical dataset identifier and batch directory name.
+    verbose : bool, optional
+        Show merge progress and tensor metadata.
+    task_id : str, optional
+        Exact registered task identifier.
+    dataset_root : Path | str | None, optional
+        Explicit dataset root resolved through ``common.paths``.
 
     Returns
     -------
-    dict
-        Summary information including dataset path and shapes.
+    dict[str, Any]
+        Dataset path, verified fingerprint, sample count, and tensor shapes.
+
+    Raises
+    ------
+    FileExistsError
+        If the merged output already exists.
+    ValueError
+        If any case violates schema, fields, identity, dtype, or shape.
 
     """
-    log = []
-    # ------------------------------------------------------------------
-    # Data roots resolved through common.paths
-    # ------------------------------------------------------------------
-    DATA_RAW = common.paths.get_train_root()
-    MODEL_DATA_RAW = common.paths.get_train_root()
-
-    # ------------------------------------------------------------------
-    # Batch paths
-    # ------------------------------------------------------------------
-    src_batch = DATA_RAW / batch_name
-    cases_dir = src_batch / "cases"
-    src_meta = src_batch / "meta.pt"
-
-    dst_batch_dir = MODEL_DATA_RAW / batch_name
-    dst_batch_dir.mkdir(parents=True, exist_ok=True)
-
-    dst_data_path = dst_batch_dir / f"{batch_name}.pt"
-    dst_meta_path = dst_batch_dir / "meta.pt"
-
-    log.append(f"Merging batch: {batch_name}")
-    log.append(f"Source cases: {cases_dir}")
-    log.append(f"Destination: {dst_batch_dir}")
+    task = domain.tasks.registry.get_task(task_id)
+    batch_dir = common.paths.resolve_dataset_dir(batch_name, dataset_root=dataset_root)
+    cases_dir = batch_dir / "cases"
+    destination = common.paths.resolve_dataset_path(batch_name, dataset_root=dataset_root)
+    if destination.exists():
+        msg = f"Refusing to overwrite existing merged dataset: {destination}"
+        raise FileExistsError(msg)
 
     case_files = sorted(cases_dir.glob("case_*.pt"))
     if not case_files:
-        msg = f"No .pt case files found in {cases_dir}"
+        msg = f"No strict case files found in {cases_dir}"
         raise RuntimeError(msg)
 
-    # -------------------- preview first case structure --------------------
-    first_case_path = case_files[0]
-    first_case = torch.load(first_case_path, map_location="cpu", weights_only=False)
+    validated_cases: list[datasets.identity.ValidatedCase] = []
+    for case_path in tqdm(case_files, desc=f"Merging {batch_name}", unit="file", disable=not verbose):
+        payload = torch.load(case_path, map_location="cpu", weights_only=False)
+        validated = datasets.identity.validate_case_payload(
+            payload,
+            task=task,
+            verify_content=True,
+        )
+        if validated.case_id != case_path.stem:
+            msg = f"Case filename/sample identity mismatch: {case_path.stem!r} != {validated.case_id!r}."
+            raise ValueError(msg)
+        validated_cases.append(validated)
 
-    # ------------------------------------------------------------------
-    # Auto-detect problem dimension from internal kappa fields
-    # ------------------------------------------------------------------
-    available_inputs = set(first_case["input_fields"].keys())
+    sample_ids = [case.case_id for case in validated_cases]
+    if len(sample_ids) != len(set(sample_ids)):
+        msg = f"Duplicate case identifiers are not allowed: {sample_ids}."
+        raise ValueError(msg)
+    input_shapes = {tuple(case.inputs.shape) for case in validated_cases}
+    output_shapes = {tuple(case.outputs.shape) for case in validated_cases}
+    input_dtypes = {str(case.inputs.dtype) for case in validated_cases}
+    output_dtypes = {str(case.outputs.dtype) for case in validated_cases}
+    if len(input_shapes) != 1 or len(output_shapes) != 1:
+        msg = f"Cases have inconsistent tensor shapes: inputs={sorted(input_shapes)}, outputs={sorted(output_shapes)}."
+        raise ValueError(msg)
+    if len(input_dtypes) != 1 or len(output_dtypes) != 1:
+        msg = f"Cases have inconsistent tensor dtypes: inputs={sorted(input_dtypes)}, outputs={sorted(output_dtypes)}."
+        raise ValueError(msg)
 
-    if {"kxx", "kyy", "kzz"}.issubset(available_inputs):
-        dim = 3
-    elif {"kxx", "kyy", "kxy"}.issubset(available_inputs):
-        dim = 2
-    else:
-        msg = f"Cannot determine problem dimension from input fields: {sorted(available_inputs)}"
-        raise RuntimeError(msg)
-
-    if keep_input_fields is None:
-        keep_input_fields = domain.field_sets.default_training_inputs(dim)
-
-    if keep_output_fields is None:
-        keep_output_fields = domain.field_sets.default_training_outputs(dim)
-
-    # ------------------------------------------------------------------
-    # Determine training schema (dimension + fields)
-    # ------------------------------------------------------------------
-    input_fields_first = {k: v for k, v in first_case["input_fields"].items() if k in keep_input_fields}
-    output_fields_first = {k: v for k, v in first_case["output_fields"].items() if k in keep_output_fields}
+    inputs = torch.stack([case.inputs for case in validated_cases], dim=0)
+    outputs = torch.stack([case.outputs for case in validated_cases], dim=0)
+    merged = datasets.identity.build_merged_dataset_payload(
+        task=task,
+        dataset_id=batch_name,
+        sample_ids=sample_ids,
+        source_identities=[case.source_identity for case in validated_cases],
+        source_metadata=[case.source_metadata for case in validated_cases],
+        case_fingerprints=[case.fingerprint for case in validated_cases],
+        inputs=inputs,
+        outputs=outputs,
+    )
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    common.serialization.atomic_torch_save(merged, destination)
 
     if verbose:
-        print("\nExample structure for first case:")
-        print("--------------------------------------------------")
-        print("input_fields:")
-        for k, v in input_fields_first.items():
-            arr = np.array(v)
-            print(f"  {k:10s}  shape={arr.shape}, dtype={arr.dtype}")
-        print("output_fields:")
-        for k, v in output_fields_first.items():
-            arr = np.array(v)
-            print(f"  {k:10s}  shape={arr.shape}, dtype={arr.dtype}")
-        print("--------------------------------------------------\n")
-
-    # -------------------- main merging loop --------------------
-    inputs_list = []
-    outputs_list = []
-
-    pbar = tqdm(
-        total=len(case_files),
-        desc=f"Merging {batch_name}",
-        unit="file",
-        disable=not verbose,
-    )
-
-    for case_path in case_files:
-        data_case = torch.load(case_path, map_location="cpu", weights_only=False)
-
-        input_fields = {k: v for k, v in data_case["input_fields"].items() if k in keep_input_fields}
-        output_fields = {k: v for k, v in data_case["output_fields"].items() if k in keep_output_fields}
-
-        if input_fields:
-            input_stack = np.stack([input_fields[k] for k in input_fields], axis=0)
-            inputs_list.append(torch.tensor(input_stack, dtype=torch.float32))
-
-        if output_fields:
-            output_stack = np.stack([output_fields[k] for k in output_fields], axis=0)
-            outputs_list.append(torch.tensor(output_stack, dtype=torch.float32))
-
-        pbar.update(1)
-
-    pbar.close()
-
-    if not inputs_list or not outputs_list:
-        log.append(f"[WARNING] No valid tensors created from {cases_dir}")
-        return {
-            "batch_name": batch_name,
-            "n_cases": 0,
-            "inputs_shape": (),
-            "outputs_shape": (),
-            "dst_dir": dst_batch_dir,
-            "meta_copied": False,
-            "log": log,
-        }
-
-    inputs_tensor = torch.stack(inputs_list, dim=0)
-    outputs_tensor = torch.stack(outputs_list, dim=0)
-
-    log.append(f"Inputs shape: {tuple(inputs_tensor.shape)}")
-    log.append(f"Outputs shape: {tuple(outputs_tensor.shape)}")
-    log.append(f"Cases merged: {len(inputs_list)}")
-
-    # Save merged dataset
-    final_input_fields = [f for f in keep_input_fields if f in input_fields_first]
-    final_output_fields = [f for f in keep_output_fields if f in output_fields_first]
-
-    batch_dataset = {
-        "inputs": inputs_tensor,
-        "outputs": outputs_tensor,
-        "fields": {
-            "inputs": final_input_fields,
-            "outputs": final_output_fields,
-        },
-    }
-
-    torch.save(batch_dataset, dst_data_path)
-    log.append(f"Saved dataset: {dst_data_path}")
-
-    meta_copied = False
-    if src_meta.exists():
-        shutil.copy2(src_meta, dst_meta_path)
-        meta_copied = True
-        log.append(f"Copied meta.pt to {dst_meta_path}")
-    else:
-        log.append(f"No meta.pt found at {src_meta}")
+        print(f"Input fields: {list(task.input_names)}")
+        print(f"Output fields: {list(task.output_names)}")
+        print(f"Inputs shape: {tuple(inputs.shape)}")
+        print(f"Outputs shape: {tuple(outputs.shape)}")
+        print(f"Dataset fingerprint: {merged['dataset_fingerprint']}")
 
     return {
         "batch_name": batch_name,
-        "n_cases": len(inputs_list),
-        "inputs_shape": tuple(inputs_tensor.shape),
-        "outputs_shape": tuple(outputs_tensor.shape),
-        "dst_dir": dst_batch_dir,
-        "meta_copied": meta_copied,
-        "log": log,
+        "task": task.id,
+        "n_cases": len(validated_cases),
+        "inputs_shape": tuple(inputs.shape),
+        "outputs_shape": tuple(outputs.shape),
+        "dataset_path": destination,
+        "dataset_fingerprint": merged["dataset_fingerprint"],
     }
-
-
-if __name__ == "__main__":
-    result = merge_batch_cases("lhs_var160_seed5001", verbose=True)
-    for line in result["log"]:
-        print(line)

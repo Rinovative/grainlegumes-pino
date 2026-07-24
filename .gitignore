@@ -1,7 +1,10 @@
+# ================================
+# Project-specific files
+# ================================
 mlenv/
-model_training/data_temp/
 .claude/
 _llm_workflow/
+AGENTS.md
 # ================================
 # IDE / Editor files
 # ================================
@@ -45,14 +48,13 @@ dist/
 # ================================
 # Data folders
 # ================================
-data/
-data_generation/data/
-model_training/data/
+/data/
+/data_generation/data/
+/model_training/data/
 
 !data/.gitkeep
 !data_generation/data/.gitkeep
 !model_training/data/.gitkeep
-
 # ================================
 # Logs, temp & system files
 # ================================

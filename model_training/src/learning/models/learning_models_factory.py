@@ -7,27 +7,33 @@ Construct FNO and UNO models from resolved experiment configs.
 Responsibilities:
   - Build FNO models from channel, mode and layer settings
   - Build UNO models with configured mode schedules
-  - Dispatch architecture names from resolved configs
+  - Resolve semantic model identifiers from strict registries
 
 Design principles:
   - Neuraloperator provides the architecture implementations
   - Parameter passing stays explicit and traceable
+  - Semantic identifiers remain independent of implementation class names
   - Device placement happens only when requested by the caller
 
 Boundaries:
-  - UNO checkpoint wrapping belongs to learning.models.uno
+  - Neuraloperator owns the concrete FNO and UNO implementations
   - Training orchestration belongs to learning.training.loop
+  - Task-owned channels and axes belong to domain.tasks and config resolution
 ===============================================================================
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal, cast
+import copy
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 from neuralop.models import FNO, UNO
 
-from . import learning_models_uno as uno
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
 
 _SkipConnection = Literal["linear", "identity", "soft-gating"]
 _UNO_LAYERS_5 = 5
@@ -126,8 +132,7 @@ def build_uno(
     uno_scalings: list[list[float]] | None = None,
     channel_mlp_skip: str = "linear",
     device: torch.device | str | None = None,
-    use_checkpoint: bool = True,
-) -> UNO | uno.UNOWithCheckpoint:
+) -> UNO:
     """
     Build a U-shaped Neural Operator (UNO) model.
 
@@ -153,15 +158,17 @@ def build_uno(
         Skip connection type for channel MLP (default: "linear")
     device : torch.device | str | None, optional
         Device to place model on (default: None - caller handles)
-    use_checkpoint : bool, optional
-        If True, use UNOWithCheckpoint wrapper (default: True)
 
     Returns
     -------
-    UNO | uno.UNOWithCheckpoint
-        Initialized UNO model, optionally wrapped with checkpoint support
+    UNO
+        Initialized UNO model
 
     """
+    if n_layers not in {_UNO_LAYERS_5, _UNO_LAYERS_7}:
+        msg = f"UNO supports exactly {_UNO_LAYERS_5} or {_UNO_LAYERS_7} layers, got {n_layers}."
+        raise ValueError(msg)
+
     # Auto-compute mode schedule if not provided
     if uno_scalings is None:
         if n_layers == _UNO_LAYERS_5:
@@ -182,9 +189,6 @@ def build_uno(
                 [2.0, 2.0],
                 [2.0, 2.0],
             ]
-        else:
-            msg = f"Unsupported n_layers={n_layers}. Provide explicit uno_scalings."
-            raise ValueError(msg)
     elif len(uno_scalings) != n_layers:
         msg = f"uno_scalings length must match n_layers={n_layers}, got {len(uno_scalings)}."
         raise ValueError(msg)
@@ -212,14 +216,12 @@ def build_uno(
             [modes_x, modes_y],
         ]
     else:
-        msg = f"Unsupported n_layers={n_layers}. Provide a supported UNO layer count."
-        raise ValueError(msg)
+        msg = f"Internal UNO layer validation failed for n_layers={n_layers}."
+        raise AssertionError(msg)
 
     uno_out_channels = [hidden_channels] * n_layers
 
-    # Build UNO
-    model_class = uno.UNOWithCheckpoint if use_checkpoint else UNO
-    model = model_class(
+    model = UNO(
         in_channels=in_channels,
         out_channels=out_channels,
         hidden_channels=hidden_channels,
@@ -236,39 +238,269 @@ def build_uno(
     return model
 
 
-def build_model(config: dict[str, Any]) -> torch.nn.Module:
+@dataclass(frozen=True, slots=True)
+class ModelKindSpec:
     """
-    Build a model from configuration.
+    Describe one semantic model kind.
 
-    Parameters
+    Attributes
     ----------
-    config : dict[str, Any]
-        Configuration dictionary with keys:
-        - model.architecture: "FNO", "PI-FNO", "UNO", or "PI-UNO"
-        - model.params: architecture-specific parameters
-        - run.device: target device
+    kind : str
+        Canonical saved configuration identifier.
+    builder : Callable[..., torch.nn.Module]
+        Internal model-construction callable.
+    defaults : Mapping[str, Any]
+        Immutable implementation defaults.
+    allowed_params : frozenset[str]
+        Accepted resolved model parameter names.
+    required_params : frozenset[str]
+        Required resolved model parameter names.
+
+    """
+
+    kind: str
+    builder: Callable[..., torch.nn.Module]
+    defaults: Mapping[str, Any]
+    allowed_params: frozenset[str]
+    required_params: frozenset[str]
+
+
+_MODEL_KINDS = MappingProxyType(
+    {
+        "fno": ModelKindSpec(
+            kind="fno",
+            builder=build_fno,
+            defaults=MappingProxyType(
+                {
+                    "lifting_channel_ratio": 2,
+                    "projection_channel_ratio": 2,
+                    "fno_skip": "linear",
+                    "channel_mlp_skip": "soft-gating",
+                    "implementation": "factorized",
+                }
+            ),
+            allowed_params=frozenset(
+                {
+                    "in_channels",
+                    "out_channels",
+                    "n_modes",
+                    "hidden_channels",
+                    "n_layers",
+                    "lifting_channel_ratio",
+                    "projection_channel_ratio",
+                    "fno_skip",
+                    "channel_mlp_skip",
+                    "implementation",
+                }
+            ),
+            required_params=frozenset(
+                {
+                    "in_channels",
+                    "out_channels",
+                    "n_modes",
+                    "hidden_channels",
+                    "n_layers",
+                }
+            ),
+        ),
+        "uno": ModelKindSpec(
+            kind="uno",
+            builder=build_uno,
+            defaults=MappingProxyType({"channel_mlp_skip": "linear"}),
+            allowed_params=frozenset(
+                {
+                    "in_channels",
+                    "out_channels",
+                    "n_layers",
+                    "hidden_channels",
+                    "modes_x",
+                    "modes_y",
+                    "mode_ratio",
+                    "uno_scalings",
+                    "channel_mlp_skip",
+                }
+            ),
+            required_params=frozenset(
+                {
+                    "in_channels",
+                    "out_channels",
+                    "n_layers",
+                    "hidden_channels",
+                    "modes_x",
+                    "modes_y",
+                }
+            ),
+        ),
+    }
+)
+
+
+def available_model_kinds() -> tuple[str, ...]:
+    """
+    Return registered semantic model identifiers.
 
     Returns
     -------
-    torch.nn.Module
-        Initialized model
+    tuple[str, ...]
+        Exact model kinds accepted by the factory.
+
+    """
+    return tuple(sorted(_MODEL_KINDS))
+
+
+def resolve_model_kind(kind: str) -> ModelKindSpec:
+    """
+    Resolve an exact semantic model identifier.
+
+    Parameters
+    ----------
+    kind : str
+        Canonical model kind.
+
+    Returns
+    -------
+    ModelKindSpec
+        Immutable model schema and implementation descriptor.
 
     Raises
     ------
     ValueError
-        If architecture is unknown or required parameters are missing
+        If `kind` is not registered.
 
     """
-    arch = config["model"]["architecture"]
-    params = config["model"].get("params", {})
-    device = config["run"].get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        return _MODEL_KINDS[kind]
+    except KeyError as error:
+        available = ", ".join(available_model_kinds())
+        msg = f"Unknown model identifier {kind!r}. Available models: {available}."
+        raise ValueError(msg) from error
 
-    # Normalize architecture name for builder dispatch
-    builder_name = arch.replace("-", "").lower()
 
-    if builder_name in ("fno", "pifno"):
-        return build_fno(**params, device=device)
-    if builder_name in ("uno", "piuno"):
-        return build_uno(**params, device=device, use_checkpoint=True)
-    msg = f"Unknown model architecture: {arch}"
-    raise ValueError(msg)
+def model_defaults(kind: str) -> dict[str, Any]:
+    """
+    Return an isolated copy of defaults owned by a model kind.
+
+    Parameters
+    ----------
+    kind : str
+        Canonical model kind.
+
+    Returns
+    -------
+    dict[str, Any]
+        Mutable copy of the registered model defaults.
+
+    Raises
+    ------
+    ValueError
+        If `kind` is not registered.
+
+    """
+    return copy.deepcopy(dict(resolve_model_kind(kind).defaults))
+
+
+def validate_model_params(
+    kind: str,
+    params: Mapping[str, Any],
+    *,
+    require_channels: bool,
+    operator_dimensionality: int,
+) -> None:
+    """
+    Validate model parameters against a semantic model schema.
+
+    Parameters
+    ----------
+    kind : str
+        Canonical model kind.
+    params : Mapping[str, Any]
+        Candidate model parameter mapping.
+    require_channels : bool
+        Whether derived input/output channel parameters must already be present.
+    operator_dimensionality : int
+        Number of task-owned spatial operator axes.
+
+    Raises
+    ------
+    ValueError
+        If the model kind, parameter names, required values, or mode shape are invalid.
+
+    """
+    spec = resolve_model_kind(kind)
+    if operator_dimensionality != _FNO_MODE_DIMENSIONS:
+        msg = f"Model kind {kind!r} currently supports exactly two operator axes, got {operator_dimensionality}."
+        raise ValueError(msg)
+    unknown = sorted(set(params).difference(spec.allowed_params))
+    if unknown:
+        msg = f"model.params contains unknown key(s) for {kind!r}: {unknown}."
+        raise ValueError(msg)
+
+    required = set(spec.required_params)
+    if not require_channels:
+        required.difference_update({"in_channels", "out_channels"})
+    missing = sorted(required.difference(params))
+    if missing:
+        msg = f"model.params is missing required key(s) for {kind!r}: {missing}."
+        raise ValueError(msg)
+
+    if kind == "fno" and "n_modes" in params:
+        n_modes = params["n_modes"]
+        if not isinstance(n_modes, (list, tuple)) or len(n_modes) != operator_dimensionality:
+            msg = f"model.params.n_modes must contain exactly {operator_dimensionality} entries for this task, got: {n_modes!r}."
+            raise ValueError(msg)
+
+    if kind == "uno":
+        n_layers = params["n_layers"]
+        if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers not in (_UNO_LAYERS_5, _UNO_LAYERS_7):
+            msg = f"UNO supports exactly {_UNO_LAYERS_5} or {_UNO_LAYERS_7} layers, got {n_layers!r}."
+            raise ValueError(msg)
+
+
+def build_model(config: dict[str, Any]) -> torch.nn.Module:
+    """
+    Build a registered semantic model from a resolved configuration.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Resolved configuration containing model kind, parameters, task contract, and device.
+
+    Returns
+    -------
+    torch.nn.Module
+        Constructed FNO or UNO implementation.
+
+    Raises
+    ------
+    TypeError
+        If required resolved config sections have invalid types.
+    ValueError
+        If the semantic model identifier or parameters are invalid.
+
+    """
+    model_config = config.get("model")
+    if not isinstance(model_config, dict):
+        msg = "Resolved config must contain a model mapping."
+        raise TypeError(msg)
+    kind = model_config.get("kind")
+    if not isinstance(kind, str):
+        msg = "Resolved config must contain model.kind as a string."
+        raise TypeError(msg)
+    params = model_config.get("params")
+    if not isinstance(params, dict):
+        msg = "Resolved config must contain model.params as a mapping."
+        raise TypeError(msg)
+
+    task_contract = config.get("task_contract", {})
+    operator_dimensionality = int(task_contract.get("operator_dimensionality", _FNO_MODE_DIMENSIONS))
+    validate_model_params(
+        kind,
+        params,
+        require_channels=True,
+        operator_dimensionality=operator_dimensionality,
+    )
+    device = config.get("run", {}).get(
+        "device",
+        "cuda" if torch.cuda.is_available() else "cpu",
+    )
+    return resolve_model_kind(kind).builder(**params, device=device)

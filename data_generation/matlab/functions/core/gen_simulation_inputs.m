@@ -1,5 +1,5 @@
 % ============================================================
-% gen_material_fields.m
+% gen_simulation_inputs.m
 %
 % Wrapper generating structure, material and BC fields
 % and delegating export to gen_export_fields.
@@ -21,7 +21,18 @@ end
 if ~isfield(opts,'save'), opts.save = true; end
 
 if ~isfield(opts,'save_dir')
-    opts.save_dir = fullfile(this_dir,'..','..','..','data','raw','test');
+    generated_data_root = getenv('GENERATED_DATA_ROOT');
+    if isempty(generated_data_root)
+        generation_root = fullfile(this_dir, '..', '..', '..');
+        generation_root = char(java.io.File(generation_root).getCanonicalPath());
+        storage_root = getenv('STORAGE_ROOT');
+        if isempty(storage_root)
+            repository_root = fileparts(generation_root);
+            storage_root = fullfile(fileparts(repository_root), 'storage');
+        end
+        generated_data_root = fullfile(storage_root, 'data_generation');
+    end
+    opts.save_dir = fullfile(generated_data_root, 'raw', 'test');
 end
 
 if ~isfield(opts,'file_tag'), opts.file_tag = ""; end

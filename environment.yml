@@ -20,6 +20,7 @@ dependencies:
   - seaborn
   - tqdm
   - pyarrow
+  - pyyaml
 
   # Interactive / notebooks
   - ipykernel
@@ -29,11 +30,12 @@ dependencies:
   # Code quality / VS Code
   - ruff
   - mypy
-  - nbqa
 
-  # Pip packages
+  # Package build and pip dependencies
+  - setuptools
+  - wheel
   - pip
   - pip:
       - neuraloperator==2.0.*
-      - wandb
       - optuna
+      - wandb

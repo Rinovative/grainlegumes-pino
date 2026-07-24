@@ -23,6 +23,7 @@ Boundaries:
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
@@ -120,24 +121,104 @@ def _require_sequence(value: Any, *, label: str) -> Sequence[Any]:
     return value
 
 
+def _require_nonempty_string(value: Any, *, label: str) -> str:
+    """Return a non-empty string without coercing another scalar type."""
+    if not isinstance(value, str) or not value.strip():
+        msg = f"{label} must be a non-empty string, got: {value!r}"
+        raise TypeError(msg)
+    return value
+
+
 def _parse_kind(value: Any, *, path: str) -> SearchKind:
-    """Parse a YAML search parameter kind."""
-    kind = str(value).lower()
+    """Parse one exact YAML search parameter kind."""
+    kind = _require_nonempty_string(value, label=f"search_space.{path}.kind")
     valid_kinds = {"categorical", "float", "int", "fixed"}
     if kind not in valid_kinds:
-        msg = f"search_space.{path}.type must be one of {sorted(valid_kinds)}, got: {kind!r}"
+        msg = f"search_space.{path}.kind must be one of {sorted(valid_kinds)}, got: {kind!r}"
         raise ValueError(msg)
     return cast("SearchKind", kind)
 
 
-def _parse_numeric_bounds(spec: Mapping[str, Any], *, path: str) -> tuple[int | float, int | float]:
-    """Parse low/high bounds from a numeric search spec."""
-    if "low" not in spec or "high" not in spec:
-        msg = f"search_space.{path} numeric specs require low and high"
+def _require_finite_number(value: Any, *, label: str) -> int | float:
+    """Return one finite YAML number while rejecting booleans and strings."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"{label} must be a finite number, got: {value!r}"
+        raise TypeError(msg)
+    if isinstance(value, float) and not math.isfinite(value):
+        msg = f"{label} must be finite, got: {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _require_exact_int(value: Any, *, label: str) -> int:
+    """Return one exact integer while rejecting booleans and integral floats."""
+    if type(value) is not int:
+        msg = f"{label} must be an integer, got: {value!r}"
+        raise TypeError(msg)
+    return value
+
+
+def _parse_numeric_spec(
+    spec: Mapping[str, Any],
+    *,
+    path: str,
+    kind: Literal["float", "int"],
+) -> tuple[int | float, int | float, int | float | None, bool]:
+    """Parse and validate one exact numeric search specification."""
+    required_keys = {"name", "kind", "low", "high"}
+    optional_keys = {"step", "log"}
+    missing_keys = sorted(required_keys.difference(spec))
+    if missing_keys:
+        msg = f"search_space.{path} is missing required key(s): {missing_keys}."
         raise KeyError(msg)
-    low = cast("int | float", spec["low"])
-    high = cast("int | float", spec["high"])
-    return low, high
+    unknown_keys = sorted(set(spec).difference(required_keys | optional_keys))
+    if unknown_keys:
+        msg = f"search_space.{path} contains key(s) invalid for {kind}: {unknown_keys}."
+        raise ValueError(msg)
+
+    low: int | float
+    high: int | float
+    if kind == "int":
+        low = _require_exact_int(spec["low"], label=f"search_space.{path}.low")
+        high = _require_exact_int(spec["high"], label=f"search_space.{path}.high")
+    else:
+        low = _require_finite_number(spec["low"], label=f"search_space.{path}.low")
+        high = _require_finite_number(spec["high"], label=f"search_space.{path}.high")
+
+    if low >= high:
+        msg = f"search_space.{path} requires low < high, got low={low!r}, high={high!r}"
+        raise ValueError(msg)
+
+    log = spec.get("log", False)
+    if type(log) is not bool:
+        msg = f"search_space.{path}.log must be a boolean, got: {log!r}"
+        raise TypeError(msg)
+    if log and (low <= 0 or high <= 0):
+        msg = f"search_space.{path} log sampling requires positive bounds"
+        raise ValueError(msg)
+
+    step: int | float | None = None
+    if "step" in spec:
+        if kind == "int":
+            step = _require_exact_int(spec["step"], label=f"search_space.{path}.step")
+        else:
+            step = _require_finite_number(spec["step"], label=f"search_space.{path}.step")
+        if step <= 0:
+            msg = f"search_space.{path}.step must be positive, got: {step!r}"
+            raise ValueError(msg)
+    if log and step is not None:
+        msg = f"search_space.{path} cannot combine log sampling with step"
+        raise ValueError(msg)
+    if step is not None:
+        if kind == "int":
+            divisible = (int(high) - int(low)) % int(step) == 0
+        else:
+            step_count = (float(high) - float(low)) / float(step)
+            divisible = math.isclose(step_count, round(step_count), rel_tol=1e-9, abs_tol=1e-9)
+        if not divisible:
+            msg = f"search_space.{path}.step must divide the bound span exactly"
+            raise ValueError(msg)
+    return low, high, step, log
 
 
 def parse_search_space(raw_search_space: Any) -> tuple[SearchSpaceParameter, ...]:
@@ -168,29 +249,70 @@ def parse_search_space(raw_search_space: Any) -> tuple[SearchSpaceParameter, ...
         raise ValueError(msg)
 
     parameters: list[SearchSpaceParameter] = []
-    for path, raw_spec in mapping.items():
+    for raw_path, raw_spec in mapping.items():
+        path = _require_nonempty_string(raw_path, label="search_space parameter path")
         spec = _require_mapping(raw_spec, label=f"search_space.{path}")
-        kind = _parse_kind(spec.get("type", "categorical"), path=path)
-        name = str(spec.get("name", path))
+        if "kind" not in spec:
+            msg = f"search_space.{path}.kind is required"
+            raise KeyError(msg)
+        if "name" not in spec:
+            msg = f"search_space.{path}.name is required"
+            raise KeyError(msg)
+        kind = _parse_kind(spec["kind"], path=path)
+        name = _require_nonempty_string(spec["name"], label=f"search_space.{path}.name")
 
         if kind == "categorical":
-            values = tuple(copy.deepcopy(value) for value in _require_sequence(spec.get("values"), label=f"search_space.{path}.values"))
+            expected_keys = {"name", "kind", "values"}
+            unknown_keys = sorted(set(spec).difference(expected_keys))
+            missing_keys = sorted(expected_keys.difference(spec))
+            if unknown_keys:
+                msg = f"search_space.{path} contains key(s) invalid for categorical: {unknown_keys}."
+                raise ValueError(msg)
+            if missing_keys:
+                msg = f"search_space.{path} is missing required key(s): {missing_keys}."
+                raise KeyError(msg)
+            values = tuple(
+                copy.deepcopy(value)
+                for value in _require_sequence(
+                    spec["values"],
+                    label=f"search_space.{path}.values",
+                )
+            )
+            for value in values:
+                if value is not None and type(value) not in {bool, int, float, str}:
+                    msg = f"search_space.{path}.values must contain only supported scalar choices"
+                    raise TypeError(msg)
+                if isinstance(value, float) and not math.isfinite(value):
+                    msg = f"search_space.{path}.values must contain only finite choices"
+                    raise ValueError(msg)
+            if len(set(values)) != len(values):
+                msg = f"search_space.{path}.values must be unique"
+                raise ValueError(msg)
             parameters.append(SearchSpaceParameter(path=path, name=name, kind=kind, values=values))
             continue
 
         if kind == "fixed":
-            if "value" not in spec:
-                msg = f"search_space.{path}.value is required for fixed parameters"
+            expected_keys = {"name", "kind", "value"}
+            unknown_keys = sorted(set(spec).difference(expected_keys))
+            missing_keys = sorted(expected_keys.difference(spec))
+            if unknown_keys:
+                msg = f"search_space.{path} contains key(s) invalid for fixed: {unknown_keys}."
+                raise ValueError(msg)
+            if missing_keys:
+                msg = f"search_space.{path} is missing required key(s): {missing_keys}."
                 raise KeyError(msg)
-            parameters.append(SearchSpaceParameter(path=path, name=name, kind=kind, value=copy.deepcopy(spec["value"])))
+            parameters.append(
+                SearchSpaceParameter(
+                    path=path,
+                    name=name,
+                    kind=kind,
+                    value=copy.deepcopy(spec["value"]),
+                )
+            )
             continue
 
-        low, high = _parse_numeric_bounds(spec, path=path)
-        step = cast("int | float | None", spec.get("step"))
-        log = bool(spec.get("log", False))
-        if log and step is not None:
-            msg = f"search_space.{path} cannot combine log sampling with step"
-            raise ValueError(msg)
+        numeric_kind = cast('Literal["float", "int"]', kind)
+        low, high, step, log = _parse_numeric_spec(spec, path=path, kind=numeric_kind)
         parameters.append(
             SearchSpaceParameter(
                 path=path,
@@ -203,7 +325,40 @@ def parse_search_space(raw_search_space: Any) -> tuple[SearchSpaceParameter, ...
             )
         )
 
+    names = [parameter.name for parameter in parameters]
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        msg = f"search_space contains duplicate parameter name(s): {duplicate_names}."
+        raise ValueError(msg)
     return tuple(parameters)
+
+
+def validate_search_space_paths(
+    config: dict[str, Any],
+    search_space: Sequence[SearchSpaceParameter],
+) -> None:
+    """Validate every resolved dotted path without applying an override."""
+    for parameter in search_space:
+        tokens = parameter.path.split(".")
+        if not tokens or any(token == "" for token in tokens):
+            msg = f"Invalid override path: {parameter.path!r}"
+            raise ValueError(msg)
+        if tokens[0] in {"task", "task_contract", "paths", "evaluation"}:
+            msg = f"Search-space path {parameter.path!r} targets immutable experiment/objective identity."
+            raise ValueError(msg)
+        derived_paths = {
+            "model.params.in_channels",
+            "model.params.out_channels",
+            "run.name",
+            "run.seed",
+            "run.suffix",
+        }
+        if parameter.path in derived_paths:
+            msg = f"Search-space path {parameter.path!r} targets a derived run/task value."
+            raise ValueError(msg)
+        current: Any = config
+        for token in tokens:
+            current = _descend(current, token, full_path=parameter.path)
 
 
 def suggest_trial_overrides(trial: TrialLike, search_space: Sequence[SearchSpaceParameter]) -> dict[str, Any]:
@@ -367,7 +522,7 @@ def search_space_summary(search_space: Sequence[SearchSpaceParameter]) -> list[d
         item: dict[str, Any] = {
             "path": parameter.path,
             "name": parameter.name,
-            "type": parameter.kind,
+            "kind": parameter.kind,
         }
         if parameter.kind == "categorical":
             item["values"] = list(parameter.values)

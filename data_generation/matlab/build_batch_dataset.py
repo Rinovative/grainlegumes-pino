@@ -1,423 +1,672 @@
 """
 ===============================================================================
- build_batch_dataset.py
+build_batch_dataset.py
 ===============================================================================
-Reads raw COMSOL simulation outputs and converts them into structured PyTorch
-`.pt` case files for PINO/FNO training and evaluation.
+Build strict task-aware case payloads from generated COMSOL exports.
 
-Permeability tensors are handled via a central schema:
-  - Automatic detection of 2D vs 3D problems
-  - Canonical internal tensor representation
-  - Symmetric COMSOL components (e.g. kappaxy, kappayx) are averaged
-  - Diagonal components are stored in log10-space
-  - Off-diagonal components are stored in normalized, dimensionless form
+Responsibilities:
+  - Resolve source columns through the registered task field declarations
+  - Convert permeability fields to their declared stored representations
+  - Save exact task fields with stable source identity and case fingerprints
 
-Each case file contains:
-  - input_fields:
-      x, y,
-      kxx, kyy (, kzz),
-      kxy (, kxz, kyz),
-      eps, p_bc
-  - output_fields:
-      p, u, v, U
-  - meta:
-
-Note:
-----
-p_bc is a boundary condition exported by COMSOL as a volume field.
-Values are zero everywhere except on the prescribed boundary.
-This encoding is intentional to keep a purely field-based PINO input.
+Design principles:
+  - Learned field order comes only from TaskSpec
+  - Source column insertion order never controls tensor order
+  - Existing case targets are never overwritten implicitly
 ===============================================================================
-
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
+import math
+import re
+import shutil
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
-import torch
-from src import common, domain
+from src import common, datasets, domain
 from tqdm import tqdm
 
-# =============================================================================
-# COMSOL name prefix
-# =============================================================================
+if TYPE_CHECKING:
+    from src.domain.tasks.domain_task_spec import FieldSpec, TaskSpec
+
 COMSOL_PREFIX = "br."
+_COMSOL_UNIT_SUFFIX = re.compile(r"\s+\([^)]*\)\s*$")
+_PERMEABILITY_SYMMETRY_RTOL = 1e-6
+_SYMMETRY_EPSILON_FACTOR = 16.0
+_MIN_AXIS_POINTS = 2
+_GRID_UNIFORM_RTOL = 1e-8
+_BATCH_MANIFEST_SCHEMA_VERSION = 1
+_BATCH_MANIFEST_SCHEMA_KIND = "comsol_batch_manifest"
+_MAX_EXACT_MANIFEST_INTEGER = 2**53
+_MAX_RANDOM_SEED = 2**32 - 1
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_CASE_ID_PATTERN = re.compile(r"case_[0-9]{4,}")
+_MANIFEST_KEYS = frozenset({"schema_kind", "schema_version", "batch_name", "status", "configuration", "field_schema", "intended_case_ids", "cases"})
+_MANIFEST_CONFIGURATION_KEYS = frozenset(
+    {"method", "variation", "N", "seed", "Lx", "Ly", "res", "save_model", "sample_sha256", "template_name", "template_sha256"}
+)
+_MANIFEST_RECORD_KEYS = frozenset({"case_id", "status", "stage", "message", "files"})
+_MANIFEST_FILE_KEYS = frozenset({"raw_csv_sha256", "raw_json_sha256", "solution_csv_sha256", "solution_model_sha256"})
+_MANIFEST_FIELD_SCHEMA = {
+    "input_columns": ["x", "y", "Kxx", "Kxy", "Kyy", "eps", "p_bc"],
+    "solution_columns": ["x", "y", "kappaxx", "kappayx", "kappaxy", "kappayy", "eps", "p_bc", "p", "u", "v", "U"],
+}
+_NONCANONICAL_FIELDS = frozenset({"phi", "pbc"})
 
 
-def _prune_meta(meta: dict[str, Any]) -> dict[str, Any]:
+def _source_column(field: FieldSpec) -> str:
+    """Return the exact source column declared for a task field."""
+    return field.source_name or field.name
+
+
+def _load_case_sources(csv_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Load one COMSOL CSV and its full reproducibility metadata."""
+    with meta_path.open(encoding="utf-8") as file:
+        metadata = json.load(file)
+    if not isinstance(metadata, dict):
+        msg = f"Case metadata must contain a JSON object: {meta_path}"
+        raise TypeError(msg)
+
+    with csv_path.open(encoding="utf-8") as file:
+        comment_lines = [line for line in file if line.strip().startswith("%")]
+    if not comment_lines:
+        msg = f"COMSOL CSV has no commented header declaration: {csv_path}"
+        raise ValueError(msg)
+    header = [_COMSOL_UNIT_SUFFIX.sub("", item.strip()).removeprefix(COMSOL_PREFIX) for item in comment_lines[-1][1:].split(";")]
+    if len(header) != len(set(header)):
+        msg = f"COMSOL CSV header contains duplicate fields after unit normalization: {header}"
+        raise ValueError(msg)
+
+    dataframe = pd.read_csv(
+        csv_path,
+        comment="%",
+        sep=";",
+        names=header,
+        index_col=False,
+        skip_blank_lines=True,
+    ).copy()
+    noncanonical = sorted(_NONCANONICAL_FIELDS.intersection(dataframe.columns))
+    if noncanonical:
+        msg = f"Noncanonical learned field name(s) are invalid: {noncanonical}."
+        raise ValueError(msg)
+    return dataframe, metadata
+
+
+def _require_exact_mapping_keys(value: Any, expected: frozenset[str], *, label: str) -> dict[str, Any]:
+    """Return a mapping with one exact persisted key set."""
+    if not isinstance(value, dict):
+        msg = f"{label} must be a mapping."
+        raise TypeError(msg)
+    missing = sorted(expected.difference(value))
+    unexpected = sorted(set(value).difference(expected))
+    if missing or unexpected:
+        msg = f"{label} keys do not match: missing={missing}; unexpected={unexpected}."
+        raise ValueError(msg)
+    return value
+
+
+def _require_sha256(value: Any, *, label: str, allow_empty: bool = False) -> str:
+    """Return one lowercase SHA-256 digest, optionally allowing an empty sentinel."""
+    if allow_empty and value == "":
+        return ""
+    if not isinstance(value, str):
+        msg = f"{label} must be a lowercase hexadecimal SHA-256 string."
+        raise TypeError(msg)
+    if _SHA256_PATTERN.fullmatch(value) is None:
+        msg = f"{label} must be a 64-character lowercase hexadecimal SHA-256 digest."
+        raise ValueError(msg)
+    return value
+
+
+def _require_manifest_real(
+    configuration: dict[str, Any],
+    key: str,
+    *,
+    positive: bool,
+) -> float:
+    """Return one finite manifest real with an explicit sign domain."""
+    value = configuration[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"Batch manifest configuration.{key} must be a real number."
+        raise TypeError(msg)
+    numeric = float(value)
+    if not math.isfinite(numeric) or (numeric <= 0 if positive else numeric < 0):
+        domain = "positive" if positive else "non-negative"
+        msg = f"Batch manifest configuration.{key} must be finite and {domain}."
+        raise ValueError(msg)
+    return numeric
+
+
+def _validate_manifest_configuration(value: Any) -> dict[str, Any]:
+    """Validate the exact production batch-configuration schema."""
+    configuration = _require_exact_mapping_keys(value, _MANIFEST_CONFIGURATION_KEYS, label="Batch manifest configuration")
+    method = configuration["method"]
+    if not isinstance(method, str) or method not in {"uniform", "lhs", "sobol"}:
+        msg = "Batch manifest configuration.method must be one of 'uniform', 'lhs', or 'sobol'."
+        raise ValueError(msg)
+    count = configuration["N"]
+    seed = configuration["seed"]
+    if isinstance(count, bool) or not isinstance(count, int):
+        msg = "Batch manifest configuration.N must be an integer."
+        raise TypeError(msg)
+    if not 1 <= count <= _MAX_EXACT_MANIFEST_INTEGER:
+        msg = f"Batch manifest configuration.N must be in [1, {_MAX_EXACT_MANIFEST_INTEGER}]."
+        raise ValueError(msg)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        msg = "Batch manifest configuration.seed must be an integer."
+        raise TypeError(msg)
+    if not 0 <= seed <= _MAX_RANDOM_SEED:
+        msg = f"Batch manifest configuration.seed must be in [0, {_MAX_RANDOM_SEED}]."
+        raise ValueError(msg)
+    _require_manifest_real(configuration, "variation", positive=False)
+    length_x = _require_manifest_real(configuration, "Lx", positive=True)
+    length_y = _require_manifest_real(configuration, "Ly", positive=True)
+    resolution = _require_manifest_real(configuration, "res", positive=True)
+    if resolution > min(length_x, length_y):
+        msg = "Batch manifest configuration.res cannot exceed the shorter domain length."
+        raise ValueError(msg)
+    if not isinstance(configuration["save_model"], bool):
+        msg = "Batch manifest configuration.save_model must be boolean."
+        raise TypeError(msg)
+    _require_sha256(configuration["sample_sha256"], label="Batch manifest configuration.sample_sha256")
+    _require_sha256(configuration["template_sha256"], label="Batch manifest configuration.template_sha256")
+    template_name = configuration["template_name"]
+    if (
+        not isinstance(template_name, str)
+        or not template_name
+        or template_name != Path(template_name).name
+        or "/" in template_name
+        or "\\" in template_name
+        or not template_name.endswith(".mph")
+    ):
+        msg = "Batch manifest configuration.template_name must be one basename ending in '.mph'."
+        raise ValueError(msg)
+    return configuration
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the lowercase SHA-256 digest of one authoritative source file."""
+    hasher = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _verify_manifest_file(path: Path, expected_digest: str, *, label: str) -> None:
+    """Require one authoritative file to exist and match its manifest digest."""
+    if not path.is_file():
+        msg = f"Batch manifest file integrity failure: missing {label} at {path}."
+        raise RuntimeError(msg)
+    actual_digest = _sha256_file(path)
+    if actual_digest != expected_digest:
+        msg = f"Batch manifest file integrity failure: SHA-256 mismatch for {label} at {path}."
+        raise RuntimeError(msg)
+
+
+def _load_batch_manifest(raw_dir: Path, processed_dir: Path, *, batch_name: str) -> dict[str, Any]:
+    """Load and cryptographically validate one terminal producer manifest."""
+    path = raw_dir / "batch_manifest.json"
+    if not path.is_file():
+        msg = f"Generated batch is missing its terminal completion manifest: {path}"
+        raise FileNotFoundError(msg)
+    with path.open(encoding="utf-8") as file:
+        loaded = json.load(file)
+    manifest = _require_exact_mapping_keys(loaded, _MANIFEST_KEYS, label="Batch manifest")
+    schema_version = manifest["schema_version"]
+    if (
+        not isinstance(manifest["schema_kind"], str)
+        or manifest["schema_kind"] != _BATCH_MANIFEST_SCHEMA_KIND
+        or isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != _BATCH_MANIFEST_SCHEMA_VERSION
+    ):
+        msg = f"Unsupported batch manifest schema: {path}"
+        raise ValueError(msg)
+    if not isinstance(manifest["batch_name"], str) or manifest["batch_name"] != batch_name:
+        msg = f"Batch manifest identity {manifest['batch_name']!r} does not match {batch_name!r}."
+        raise ValueError(msg)
+    configuration = _validate_manifest_configuration(manifest["configuration"])
+    field_schema = manifest["field_schema"]
+    if not isinstance(field_schema, dict) or field_schema != _MANIFEST_FIELD_SCHEMA:
+        msg = "Batch manifest field_schema must exactly match the maintained COMSOL producer contract."
+        raise ValueError(msg)
+    if not isinstance(manifest["status"], str) or manifest["status"] != "complete":
+        msg = f"Batch manifest is not complete: status={manifest['status']!r}."
+        raise RuntimeError(msg)
+
+    intended = manifest["intended_case_ids"]
+    if not isinstance(intended, list) or not all(isinstance(case_id, str) and _CASE_ID_PATTERN.fullmatch(case_id) for case_id in intended):
+        msg = "Batch manifest intended_case_ids must be a list of canonical case identifiers."
+        raise TypeError(msg)
+    if len(intended) != len(set(intended)):
+        msg = "Batch manifest intended_case_ids must be unique."
+        raise ValueError(msg)
+    if len(intended) > configuration["N"]:
+        msg = "Batch manifest intended membership cannot exceed configuration.N."
+        raise ValueError(msg)
+    records = manifest["cases"]
+    if isinstance(records, dict):
+        records = [records]
+    if not isinstance(records, list):
+        msg = "Batch manifest cases must be a list of case-status mappings."
+        raise TypeError(msg)
+    if len(records) != len(intended):
+        msg = "Batch manifest case records must exactly match intended_case_ids."
+        raise RuntimeError(msg)
+
+    save_model = configuration["save_model"]
+    for index, (case_id, record_value) in enumerate(zip(intended, records, strict=True)):
+        record = _require_exact_mapping_keys(record_value, _MANIFEST_RECORD_KEYS, label=f"Batch manifest cases[{index}]")
+        if record["case_id"] != case_id or record["status"] != "complete" or record["stage"] != "simulation" or record["message"] != "":
+            msg = "Batch manifest complete case records must exactly match intended_case_ids and the terminal record schema."
+            raise RuntimeError(msg)
+        files = _require_exact_mapping_keys(record["files"], _MANIFEST_FILE_KEYS, label=f"Batch manifest cases[{index}].files")
+        raw_csv_digest = _require_sha256(files["raw_csv_sha256"], label=f"Batch manifest cases[{index}].files.raw_csv_sha256")
+        raw_json_digest = _require_sha256(files["raw_json_sha256"], label=f"Batch manifest cases[{index}].files.raw_json_sha256")
+        solution_csv_digest = _require_sha256(files["solution_csv_sha256"], label=f"Batch manifest cases[{index}].files.solution_csv_sha256")
+        model_digest = _require_sha256(
+            files["solution_model_sha256"],
+            label=f"Batch manifest cases[{index}].files.solution_model_sha256",
+            allow_empty=not save_model,
+        )
+        if save_model and not model_digest:
+            msg = f"Batch manifest cases[{index}] must bind the configured solved model."
+            raise ValueError(msg)
+        if not save_model and model_digest:
+            msg = f"Batch manifest cases[{index}] cannot bind a solved model when save_model is false."
+            raise ValueError(msg)
+
+        _verify_manifest_file(raw_dir / f"{case_id}.csv", raw_csv_digest, label=f"{case_id} raw CSV")
+        _verify_manifest_file(raw_dir / f"{case_id}.json", raw_json_digest, label=f"{case_id} raw JSON")
+        _verify_manifest_file(processed_dir / f"{case_id}_sol.csv", solution_csv_digest, label=f"{case_id} solution CSV")
+        model_path = processed_dir / f"{case_id}_sol.mph"
+        if save_model:
+            _verify_manifest_file(model_path, model_digest, label=f"{case_id} solved model")
+        elif model_path.exists():
+            msg = f"Batch manifest file integrity failure: unexpected solved model at {model_path}."
+            raise RuntimeError(msg)
+    return manifest
+
+
+def _validate_uniform_axis(values: np.ndarray, *, label: str) -> None:
+    """Require one finite strictly increasing uniformly spaced coordinate axis."""
+    if values.size < _MIN_AXIS_POINTS:
+        msg = f"{label}-coordinate axis must contain at least {_MIN_AXIS_POINTS} points."
+        raise ValueError(msg)
+    differences = np.diff(values)
+    if not np.isfinite(differences).all() or np.any(differences <= 0):
+        msg = f"{label}-coordinate axis must be finite and strictly increasing."
+        raise ValueError(msg)
+    mean_spacing = float(np.mean(differences))
+    absolute_tolerance = np.finfo(np.float64).eps * max(1.0, float(np.max(np.abs(values))))
+    if not np.allclose(differences, mean_spacing, rtol=_GRID_UNIFORM_RTOL, atol=absolute_tolerance):
+        msg = f"{label}-coordinate axis must be uniform within relative tolerance {_GRID_UNIFORM_RTOL}."
+        raise ValueError(msg)
+
+
+def _numeric_field(
+    dataframe: pd.DataFrame,
+    column: str,
+    *,
+    spatial_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Return one finite real numeric source field in canonical grid shape."""
+    values = dataframe[column].to_numpy()
+    if not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values):
+        msg = f"Source column {column!r} must contain real numeric values, got dtype {values.dtype}."
+        raise TypeError(msg)
+    expected_count = int(np.prod(spatial_shape))
+    if values.size != expected_count:
+        msg = f"Source column {column!r} has {values.size} values; expected {expected_count} for shape {spatial_shape}."
+        raise ValueError(msg)
+    numeric = np.asarray(values, dtype=np.float64)
+    if not np.isfinite(numeric).all():
+        msg = f"Source column {column!r} contains non-finite values."
+        raise ValueError(msg)
+    return numeric.reshape(spatial_shape)
+
+
+def _canonicalize_cartesian_grid(
+    dataframe: pd.DataFrame,
+    *,
+    spatial_shape: tuple[int, int],
+) -> pd.DataFrame:
+    """Validate a complete Cartesian grid and return deterministic y/x row order."""
+    missing = [column for column in ("x", "y") if column not in dataframe.columns]
+    if missing:
+        msg = f"COMSOL export is missing coordinate column(s): {missing}."
+        raise KeyError(msg)
+    y_count, x_count = spatial_shape
+    x_coordinates = _numeric_field(dataframe, "x", spatial_shape=spatial_shape).reshape(-1)
+    y_coordinates = _numeric_field(dataframe, "y", spatial_shape=spatial_shape).reshape(-1)
+    x_values = np.unique(x_coordinates)
+    y_values = np.unique(y_coordinates)
+    _validate_uniform_axis(x_values, label="x")
+    _validate_uniform_axis(y_values, label="y")
+    if x_values.size != x_count or y_values.size != y_count:
+        msg = f"COMSOL coordinate cardinality does not match metadata geometry: x={x_values.size}/{x_count}, y={y_values.size}/{y_count}."
+        raise ValueError(msg)
+    coordinate_pairs = np.column_stack((x_coordinates, y_coordinates))
+    if np.unique(coordinate_pairs, axis=0).shape[0] != coordinate_pairs.shape[0]:
+        msg = "COMSOL coordinate grid contains duplicate (x, y) pairs."
+        raise ValueError(msg)
+    if coordinate_pairs.shape[0] != x_values.size * y_values.size:
+        msg = "COMSOL coordinates do not form one complete Cartesian product."
+        raise ValueError(msg)
+
+    canonical = dataframe.copy()
+    canonical["x"] = x_coordinates
+    canonical["y"] = y_coordinates
+    canonical = canonical.sort_values(["y", "x"], kind="mergesort").reset_index(drop=True)
+    expected_x, expected_y = np.meshgrid(x_values, y_values, indexing="xy")
+    if not np.array_equal(canonical["x"].to_numpy(), expected_x.reshape(-1)) or not np.array_equal(
+        canonical["y"].to_numpy(),
+        expected_y.reshape(-1),
+    ):
+        msg = "COMSOL coordinates do not cover the complete Cartesian product."
+        raise ValueError(msg)
+    return canonical
+
+
+def _build_permeability_fields(
+    dataframe: pd.DataFrame,
+    *,
+    task: TaskSpec,
+    spatial_shape: tuple[int, ...],
+) -> dict[str, np.ndarray]:
+    """Build validated task-declared permeability representations."""
+    available = [column for column in dataframe.columns if column.startswith("kappa")]
+    mapping = domain.permeability.resolve_internal_to_present_sources(available)
+    expected = [field.name for field in task.inputs if field.role == "permeability"]
+    missing = [name for name in expected if name not in mapping]
+    if missing:
+        msg = f"Missing task permeability source component(s): {missing}."
+        raise ValueError(msg)
+
+    raw_fields: dict[str, np.ndarray] = {}
+    for name in expected:
+        sources = mapping[name]
+        tensors = [_numeric_field(dataframe, source, spatial_shape=spatial_shape) for source in sources]
+        reference = tensors[0]
+        for source, tensor in zip(sources[1:], tensors[1:], strict=True):
+            magnitude = max(float(np.max(np.abs(reference))), float(np.max(np.abs(tensor))), np.finfo(np.float64).tiny)
+            absolute_tolerance = _SYMMETRY_EPSILON_FACTOR * np.finfo(np.float64).eps * magnitude
+            if not np.allclose(reference, tensor, rtol=_PERMEABILITY_SYMMETRY_RTOL, atol=absolute_tolerance):
+                msg = f"Symmetric permeability sources {sources[0]!r} and {source!r} disagree for {name!r}."
+                raise ValueError(msg)
+        raw_fields[name] = np.mean(np.stack(tensors), axis=0)
+
+    diagonal_names = [name for name in expected if name[1] == name[2]]
+    for name in diagonal_names:
+        if np.any(raw_fields[name] <= 0):
+            msg = f"Permeability diagonal {name!r} must be strictly positive."
+            raise ValueError(msg)
+
+    axes = tuple(axis for axis in "xyz" if f"k{axis}{axis}" in raw_fields)
+    axis_indices = {axis: index for index, axis in enumerate(axes)}
+    permeability_tensor = np.zeros((*spatial_shape, len(axes), len(axes)), dtype=np.float64)
+    for axis, index in axis_indices.items():
+        permeability_tensor[..., index, index] = raw_fields[f"k{axis}{axis}"]
+    for name, values in raw_fields.items():
+        if name[1] == name[2]:
+            continue
+        first_axis, second_axis = name[1], name[2]
+        if first_axis not in axis_indices or second_axis not in axis_indices:
+            msg = f"Cross component {name!r} requires both task diagonal permeability components."
+            raise ValueError(msg)
+        first_index = axis_indices[first_axis]
+        second_index = axis_indices[second_axis]
+        permeability_tensor[..., first_index, second_index] = values
+        permeability_tensor[..., second_index, first_index] = values
+    if np.any(np.linalg.eigvalsh(permeability_tensor) <= 0):
+        msg = "The symmetric permeability tensor must be positive definite at every grid point."
+        raise ValueError(msg)
+
+    fields = {name: np.log10(raw_fields[name]) for name in diagonal_names}
+    for name in expected:
+        if name[1] == name[2]:
+            continue
+        first_axis, second_axis = name[1], name[2]
+        denominator = np.sqrt(raw_fields[f"k{first_axis}{first_axis}"] * raw_fields[f"k{second_axis}{second_axis}"])
+        fields[name] = raw_fields[name] / denominator
+    return fields
+
+
+def _float32_field(value: np.ndarray, *, name: str) -> np.ndarray:
+    """Convert one validated field and reject float32 overflow."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.asarray(value, dtype=np.float32).copy()
+    if not np.isfinite(converted).all():
+        msg = f"Field {name!r} is non-finite after float32 conversion."
+        raise ValueError(msg)
+    return converted
+
+
+def _build_fields(
+    dataframe: pd.DataFrame,
+    *,
+    task: TaskSpec,
+    spatial_shape: tuple[int, ...],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Build exact finite input and output mappings for one task case."""
+    input_fields: dict[str, np.ndarray] = {}
+    permeability = _build_permeability_fields(
+        dataframe,
+        task=task,
+        spatial_shape=spatial_shape,
+    )
+    for field in task.inputs:
+        if field.role == "permeability":
+            input_fields[field.name] = permeability[field.name]
+            continue
+        source = _source_column(field)
+        if source not in dataframe.columns:
+            msg = f"Missing required task input source column {source!r} for field {field.name!r}."
+            raise KeyError(msg)
+        values = _numeric_field(dataframe, source, spatial_shape=spatial_shape)
+        if field.role == "porosity" and np.any((values <= 0) | (values > 1)):
+            msg = f"Porosity field {field.name!r} must satisfy 0 < eps <= 1."
+            raise ValueError(msg)
+        input_fields[field.name] = values
+
+    output_fields: dict[str, np.ndarray] = {}
+    for field in task.outputs:
+        source = _source_column(field)
+        if source not in dataframe.columns:
+            msg = f"Missing required task output source column {source!r} for field {field.name!r}."
+            raise KeyError(msg)
+        output_fields[field.name] = _numeric_field(dataframe, source, spatial_shape=spatial_shape)
+    return (
+        {name: _float32_field(value, name=name) for name, value in input_fields.items()},
+        {name: _float32_field(value, name=name) for name, value in output_fields.items()},
+    )
+
+
+def build_batch_dataset(
+    batch_name: str,
+    verbose: bool = False,
+    *,
+    task_id: str = "steady_flow",
+    generated_data_root: Path | str | None = None,
+    dataset_root: Path | str | None = None,
+) -> dict[str, Any]:
     """
-    Prune unnecessary information from the meta dictionary.
-
-    Parameters
-    ----------
-    meta : dict[str, Any]
-        Original metadata dictionary.
-
-    Returns
-    -------
-    dict[str, Any]
-        Pruned metadata dictionary.
-
-    """
-    gen = meta.get("generator")
-    if not isinstance(gen, dict):
-        return meta
-
-    def _clean_block(block: dict[str, Any]) -> dict[str, Any]:
-        """
-        Recursively clean a block of the meta dictionary.
-
-        Parameters
-        ----------
-        block : dict[str, Any]
-            Block to clean.
-
-        Returns
-        -------
-            dict[str, Any]
-                Cleaned block.
-
-        """
-        out: dict[str, Any] = {}
-        for k, v in block.items():
-            # drop RNG / state / reproducibility info
-            if "state" in k.lower():
-                continue
-
-            if isinstance(v, dict):
-                cleaned = _clean_block(v)
-                if cleaned:
-                    out[k] = cleaned
-            # keep ONLY numeric values
-            elif isinstance(v, (int, float, np.integer, np.floating)):
-                out[k] = v
-        return out
-
-    meta["generator"] = _clean_block(gen)
-    return meta
-
-
-def build_batch_dataset(batch_name: str, verbose: bool = False) -> dict:  # noqa: C901, PLR0915
-    """
-    Build a batch dataset from raw COMSOL outputs.
+    Build strict case payloads from one complete generated COMSOL batch.
 
     Parameters
     ----------
     batch_name : str
-        Name of the batch to process (corresponds to folder names).
+        Logical batch and dataset identifier.
     verbose : bool, optional
-        If True, prints additional information, by default False.
+        Show build progress and a first-case preview.
+    task_id : str, optional
+        Exact registered task identifier.
+    generated_data_root : Path | str | None, optional
+        Independent generated-data root.
+    dataset_root : Path | str | None, optional
+        Independent destination dataset root.
 
     Returns
     -------
-    dict
-        Summary of the dataset building process.
+    dict[str, Any]
+        Task, case count, destination, and ordered field declarations.
 
     """
-    log: list[str] = []
+    task = domain.tasks.registry.get_task(task_id)
+    processed_dir = common.paths.resolve_generated_batch_dir(
+        batch_name,
+        stage="processed",
+        generated_data_root=generated_data_root,
+    )
+    raw_dir = common.paths.resolve_generated_batch_dir(
+        batch_name,
+        stage="raw",
+        generated_data_root=generated_data_root,
+    )
+    batch_dir = common.paths.resolve_dataset_dir(batch_name, dataset_root=dataset_root)
+    cases_dir = batch_dir / "cases"
+    batch_manifest = _load_batch_manifest(raw_dir, processed_dir, batch_name=batch_name)
+    intended_case_ids = batch_manifest["intended_case_ids"]
 
-    # ------------------------------------------------------------------
-    # Paths
-    # ------------------------------------------------------------------
-    DATA_GENERATION = common.paths.get_gen_root()
-    DATA_RAW = common.paths.get_train_root()
-
-    proc_dir = DATA_GENERATION / "processed" / batch_name
-    raw_dir = DATA_GENERATION / "raw" / batch_name
-    meta_dir = DATA_GENERATION / "meta"
-    out_batch = DATA_RAW / batch_name
-
-    cases_dir = out_batch / "cases"
-    cases_dir.mkdir(parents=True, exist_ok=True)
-
-    log.append(f"Processing batch: {batch_name}")
-
-    # ------------------------------------------------------------------
-    # Case discovery
-    # ------------------------------------------------------------------
+    raw_csv_files = sorted(raw_dir.glob("case_*.csv"))
     json_files = sorted(raw_dir.glob("case_*.json"))
-    csv_files = sorted(proc_dir.glob("case_*_sol.csv"))
-
-    json_names = {f.stem for f in json_files}
-    csv_names = {f.stem.replace("_sol", "") for f in csv_files}
-    common_cases = sorted(json_names.intersection(csv_names))
-
-    if not common_cases:
-        msg = f"No valid matching cases found for {batch_name}"
+    csv_files = sorted(processed_dir.glob("case_*_sol.csv"))
+    model_files = sorted(processed_dir.glob("case_*_sol.mph"))
+    raw_csv_names = {path.stem for path in raw_csv_files}
+    json_names = {path.stem for path in json_files}
+    csv_names = {path.stem.removesuffix("_sol") for path in csv_files}
+    model_names = {path.stem.removesuffix("_sol") for path in model_files}
+    intended_names = set(intended_case_ids)
+    expected_model_names = intended_names if batch_manifest["configuration"]["save_model"] else set()
+    missing_raw = sorted(intended_names.difference(raw_csv_names))
+    missing_solutions = sorted(intended_names.difference(csv_names))
+    missing_metadata = sorted(intended_names.difference(json_names))
+    missing_models = sorted(expected_model_names.difference(model_names))
+    unexpected_raw = sorted(raw_csv_names.difference(intended_names))
+    unexpected_solutions = sorted(csv_names.difference(intended_names))
+    unexpected_metadata = sorted(json_names.difference(intended_names))
+    unexpected_models = sorted(model_names.difference(expected_model_names))
+    if any(
+        (
+            missing_raw,
+            missing_solutions,
+            missing_metadata,
+            missing_models,
+            unexpected_raw,
+            unexpected_solutions,
+            unexpected_metadata,
+            unexpected_models,
+        )
+    ):
+        msg = (
+            f"Generated batch {batch_name!r} does not match its terminal manifest: "
+            f"missing raw={missing_raw}; missing solutions={missing_solutions}; "
+            f"missing metadata={missing_metadata}; missing models={missing_models}; "
+            f"unexpected raw={unexpected_raw}; unexpected solutions={unexpected_solutions}; "
+            f"unexpected metadata={unexpected_metadata}; unexpected models={unexpected_models}."
+        )
         raise RuntimeError(msg)
+    case_ids = list(intended_case_ids)
+    if not case_ids:
+        msg = f"No complete generated cases found for {batch_name!r}."
+        raise RuntimeError(msg)
+    if cases_dir.exists() or cases_dir.is_symlink():
+        msg = f"Refusing to overwrite existing strict case target: {cases_dir}"
+        raise FileExistsError(msg)
 
-    log.append(f"Found {len(common_cases)} matching cases.")
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(dir=batch_dir, prefix=".cases.", suffix=".tmp"))
+    reference_shape: tuple[int, ...] | None = None
+    fingerprints: list[str] = []
+    try:
+        for case_id in tqdm(
+            case_ids,
+            desc=f"Building {batch_name}",
+            unit="case",
+            disable=not verbose,
+        ):
+            csv_path = processed_dir / f"{case_id}_sol.csv"
+            raw_csv_path = raw_dir / f"{case_id}.csv"
+            metadata_path = raw_dir / f"{case_id}.json"
+            dataframe, metadata = _load_case_sources(csv_path, metadata_path)
+            geometry = metadata.get("geometry")
+            if not isinstance(geometry, dict):
+                msg = f"Case metadata is missing a geometry mapping: {metadata_path}"
+                raise TypeError(msg)
+            nx = geometry.get("nx")
+            ny = geometry.get("ny")
+            if isinstance(nx, bool) or not isinstance(nx, int) or isinstance(ny, bool) or not isinstance(ny, int):
+                msg = f"Case geometry nx/ny must be integers: {metadata_path}"
+                raise TypeError(msg)
+            if nx < _MIN_AXIS_POINTS or ny < _MIN_AXIS_POINTS:
+                msg = f"Case geometry nx/ny must each be at least {_MIN_AXIS_POINTS}: {metadata_path}"
+                raise ValueError(msg)
+            spatial_shape = (ny, nx)
+            dataframe = _canonicalize_cartesian_grid(
+                dataframe,
+                spatial_shape=spatial_shape,
+            )
+            if reference_shape is None:
+                reference_shape = spatial_shape
+            elif spatial_shape != reference_shape:
+                msg = f"Inconsistent case shape for {case_id!r}: {spatial_shape} != {reference_shape}."
+                raise ValueError(msg)
 
-    # ------------------------------------------------------------------
-    # IO helpers
-    # ------------------------------------------------------------------
-    def load_case(csv_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
-        """
-        Load a single case from CSV and JSON files.
-
-        Parameters
-        ----------
-        csv_path : Path
-            Path to the CSV file.
-        meta_path : Path
-            Path to the JSON metadata file.
-
-        Returns
-        -------
-        tuple[pd.DataFrame, dict[str, Any]]
-            DataFrame with case data and metadata dictionary.
-
-        """
-        with meta_path.open() as f:
-            meta = json.load(f)
-
-        meta = _prune_meta(meta)
-
-        with csv_path.open() as f:
-            lines = f.readlines()
-
-        header_line = [line for line in lines if line.strip().startswith("%")][-1]
-        sep = ";"
-        header = header_line[1:].split(";")
-
-        header = [h.strip() for h in header]
-
-        if header.count("y") > 1:
-            idx = [i for i, h in enumerate(header) if h == "y"][1]
-            header[idx] = "y (on)"
-
-        df = pd.read_csv(
-            csv_path,
-            comment="%",
-            sep=sep,
-            names=header,
-            index_col=False,
-            skip_blank_lines=True,
-        )
-        df = df.copy()
-        df.columns = [c.removeprefix(COMSOL_PREFIX) for c in df.columns]
-
-        return df, meta
-
-    def build_fields(
-        df: pd.DataFrame,
-        nx: int,
-        ny: int,
-    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-        """
-        Build input and output fields from a case DataFrame.
-
-        Parameters
-        ----------
-        df : pd.DataFrame
-            DataFrame containing case data.
-        nx : int
-            Number of grid points in x direction.
-        ny : int
-            Number of grid points in y direction.
-
-        Returns
-        -------
-        tuple[dict[str, np.ndarray], dict[str, np.ndarray]]
-            Dictionaries of input and output fields.
-
-        """
-        input_fields: dict[str, np.ndarray] = {}
-        output_fields: dict[str, np.ndarray] = {}
-
-        # --------------------------------------------------------------
-        # Coordinates
-        # --------------------------------------------------------------
-        for c in domain.fields.COORD_FIELDS:
-            if c in df.columns:
-                input_fields[c] = df[c].to_numpy().reshape(ny, nx)
-
-        # --------------------------------------------------------------
-        # Permeability tensor (schema-driven, canonical representation)
-        #
-        # The permeability tensor is constructed using the central
-        # kappa schema, which defines:
-        #   - the problem dimensionality (2D vs 3D),
-        #   - the canonical internal component order,
-        #   - and the mapping from COMSOL-exported components to
-        #     internal symmetric tensor components.
-        #
-        # Symmetric COMSOL components (e.g. kappaxy, kappayx) are
-        # averaged to enforce numerical symmetry and robustness.
-        #
-        # Diagonal components are stored in log10-space.
-        # Off-diagonal components are stored in dimensionless,
-        # normalized form using sqrt(k_ii * k_jj).
-        # --------------------------------------------------------------
-        eps_kappa = 1e-20
-        eps_det = 1e-30
-
-        # Collect all available COMSOL permeability components
-        # (strip the COMSOL_PREFIX 'br.' to match schema naming)
-        available_kappa = [c for c in df.columns if c.startswith("kappa")]
-
-        # Determine which kappa components are physically non-zero
-        KAPPA_ZERO_TOL = 1e-14
-
-        nonzero_kappa = []
-        for name in available_kappa:
-            field = df[name].to_numpy()
-            if np.any(np.abs(field) > KAPPA_ZERO_TOL):
-                nonzero_kappa.append(name)
-
-        # Let the schema decide:
-        # - dimensionality (2D vs 3D)
-        # - canonical internal component order
-        # - mapping from internal components to COMSOL sources
-        kappa_mapping = domain.permeability.resolve_internal_to_present_sources(available_kappa, nonzero_kappa)
-
-        if not kappa_mapping:
-            msg = "No permeability components found in dataset"
-            raise RuntimeError(msg)
-
-        for internal_name, source_fields in kappa_mapping.items():
-            # Load all COMSOL source fields contributing to this internal component
-            tensors = [df[src].to_numpy().reshape(ny, nx) for src in source_fields]
-
-            # Average symmetric components if multiple sources are present
-            raw = sum(tensors) / len(tensors)
-
-            if internal_name in ("kxx", "kyy", "kzz"):
-                # Diagonal components: stored in log10-space
-                input_fields[internal_name] = np.log10(raw + eps_kappa)
-            else:
-                # Off-diagonal components: dimensionless, normalized by
-                # sqrt(k_ii * k_jj) to ensure scale consistency
-                i, j = internal_name[1], internal_name[2]
-                kii_log = input_fields[f"k{i}{i}"]
-                kjj_log = input_fields[f"k{j}{j}"]
-
-                Kii = 10**kii_log
-                Kjj = 10**kjj_log
-
-                denom = np.sqrt(np.maximum(Kii * Kjj, eps_det))
-                input_fields[internal_name] = raw / denom
-
-        # --------------------------------------------------------------
-        # Scalar input fields (eps, p_bc)
-        # --------------------------------------------------------------
-        for internal, col in domain.fields.SCALAR_INPUT_FIELDS.items():
-            if col not in df.columns:
-                msg = f"Missing required input field '{col}'"
-                raise KeyError(msg)
-            input_fields[internal] = df[col].to_numpy().reshape(ny, nx)
-
-        # --------------------------------------------------------------
-        # Outputs
-        # --------------------------------------------------------------
-        for name in domain.fields.OUTPUT_FIELDS:
-            if name not in df.columns:
-                msg = f"Missing required output field '{name}'"
-                raise KeyError(msg)
-            output_fields[name] = df[name].to_numpy().reshape(ny, nx)
-
-        return input_fields, output_fields
-
-    # ------------------------------------------------------------------
-    # Drop detection (reference case)
-    # ------------------------------------------------------------------
-    df_first, meta_first = load_case(
-        proc_dir / f"{common_cases[0]}_sol.csv",
-        raw_dir / f"{common_cases[0]}.json",
-    )
-
-    nx = meta_first["geometry"]["nx"]
-    ny = meta_first["geometry"]["ny"]
-
-    if verbose:
-        print("\n[DEBUG] df_first.columns:")
-        for col in df_first.columns:
-            print(f"  - {col}")
-
-    # ------------------------------------------------------------------
-    # Preview
-    # ------------------------------------------------------------------
-    preview_in, preview_out = build_fields(df_first, nx, ny)
-
-    if verbose:
-        print("\nExample structure for first case:")
-        print("--------------------------------------------------")
-        print("input_fields:")
-        for k, v in preview_in.items():
-            print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")
-        print("output_fields:")
-        for k, v in preview_out.items():
-            print(f"  {k:10s}  shape={v.shape}, dtype={v.dtype}")
-        print("meta keys:", list(meta_first.keys()))
-        print("--------------------------------------------------\n")
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-    pbar = tqdm(
-        total=len(common_cases),
-        desc=f"Building {batch_name}",
-        unit="file",
-        disable=not verbose,
-    )
-
-    for name in common_cases:
-        df, meta = load_case(
-            proc_dir / f"{name}_sol.csv",
-            raw_dir / f"{name}.json",
-        )
-
-        nx = meta["geometry"]["nx"]
-        ny = meta["geometry"]["ny"]
-
-        input_fields, output_fields = build_fields(df, nx, ny)
-
-        torch.save(
-            {
-                "input_fields": input_fields,
-                "output_fields": output_fields,
-                "meta": meta,
-            },
-            cases_dir / f"{name}.pt",
-        )
-
-        pbar.update(1)
-
-    pbar.close()
-
-    # ------------------------------------------------------------------
-    # Batch meta
-    # ------------------------------------------------------------------
-    meta_saved = False
-    meta_json = meta_dir / f"{batch_name}.json"
-    meta_csv = meta_dir / f"{batch_name}.csv"
-
-    if meta_json.exists() and meta_csv.exists():
-        with meta_json.open() as f:
-            meta_struct = {
-                "json": json.load(f),
-                "csv": pd.read_csv(meta_csv).to_dict(orient="list"),
+            input_fields, output_fields = _build_fields(
+                dataframe,
+                task=task,
+                spatial_shape=spatial_shape,
+            )
+            identity_metadata = {key: value for key, value in metadata.items() if key not in {"paths", "timestamp"}}
+            source_identity = {
+                "raw_export": datasets.identity.source_file_identity(raw_csv_path),
+                "raw_metadata": datasets.identity.canonical_metadata_identity(
+                    identity_metadata,
+                ),
+                "solution_export": datasets.identity.source_file_identity(csv_path),
+                "batch_manifest": datasets.identity.canonical_metadata_identity(batch_manifest),
             }
-        torch.save(meta_struct, out_batch / "meta.pt")
-        meta_saved = True
-        log.append("Saved meta.pt")
-    else:
-        log.append("No meta files found.")
+            case_payload = datasets.identity.build_case_payload(
+                task=task,
+                case_id=case_id,
+                input_fields=input_fields,
+                output_fields=output_fields,
+                source_identity=source_identity,
+                source_metadata=metadata,
+            )
+            common.serialization.atomic_torch_save(
+                case_payload,
+                staging_dir / f"{case_id}.pt",
+            )
+            fingerprints.append(case_payload["dataset_fingerprint"])
+
+            if verbose and len(fingerprints) == 1:
+                print(f"Input fields: {list(task.input_names)}")
+                print(f"Output fields: {list(task.output_names)}")
+                print(f"Spatial shape: {spatial_shape}")
+                print(f"First case fingerprint: {fingerprints[0]}")
+
+        if cases_dir.exists() or cases_dir.is_symlink():
+            msg = f"Strict case target appeared during build: {cases_dir}"
+            raise FileExistsError(msg)
+        staging_dir.replace(cases_dir)
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
 
     return {
         "batch_name": batch_name,
-        "n_cases": len(common_cases),
+        "task": task.id,
+        "n_cases": len(case_ids),
         "cases_dir": cases_dir,
-        "out_batch": out_batch,
-        "meta_saved": meta_saved,
-        "log": log,
+        "input_fields": list(task.input_names),
+        "output_fields": list(task.output_names),
+        "case_fingerprints": fingerprints,
     }
-
-
-if __name__ == "__main__":
-    result = build_batch_dataset("lhs_var160_seed5001", verbose=True)
-    for line in result["log"]:
-        print(line)

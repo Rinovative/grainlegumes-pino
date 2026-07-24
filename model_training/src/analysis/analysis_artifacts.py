@@ -12,13 +12,14 @@ Responsibilities:
 
 Design principles:
   - Artifacts are reproducible and split-aware
-  - Physical units and domain field order are explicit
+  - Physical units and the caller-provided task field order are explicit
   - Heavy inference work stays out of plotting modules
   - Saved-run detection uses the current run artifact contract
 
 Boundaries:
   - Model reconstruction belongs to learning.inference.context
   - Interactive visualization belongs to analysis.evaluation and analysis.ui
+  - Saved outputs follow the strict current artifact schema and provenance contract
 
 Notes:
   Artifact contents:
@@ -34,28 +35,23 @@ Notes:
         - split_local_index : zero-based position in the saved split
         - npz_path          : path to the corresponding NPZ artifact
 
-        # Absolute field errors (physical units, full domain unless noted)
-        - l2                : absolute RMSE on [p, u, v] over the full domain
-        - h1                : absolute H1-like error on [p, u, v] over the interior (cropped by EVAL_PAD)
-
         # Relative field errors (dimensionless, channel-balanced)
         - rel_l2            : channel-balanced mean relative L2 on [p, u, v] over the full domain
         - rel_h1            : channel-balanced mean relative H1 on [p, u, v] over the interior (cropped by EVAL_PAD)
 
         # Book-friendly metrics (physical units, intuitive)
         - rmse_p            : RMSE of pressure p over the full domain
+        - rmse_u            : RMSE of x-velocity u over the full domain
+        - rmse_v            : RMSE of y-velocity v over the full domain
         - rmse_U            : RMSE of speed magnitude U=sqrt(u^2+v^2) over the full domain
 
         # Physics residual metrics (interior-cropped by EVAL_PAD)
         - mom_mse           : MSE of Brinkman momentum residual
-        - cont_mse          : MSE of continuity residual div(u) computed with SP (reflect-FFT)
-        - phys_mse          : mom_mse + cont_mse (convenience scalar)
-
+        - cont_mse          : MSE of the task-selected continuity residual computed with spectral reflect derivatives
         # Boundary condition metric (no crop, evaluated on inlet/outlet masks)
         - bc_mse            : pressure BC mismatch on inlet/outlet boundaries
 
         # Diagnostics
-        - cont_mse_divepsu  : MSE of div(eps u) on interior (cropped by EVAL_PAD), diagnostic even if cont_mse is div(u)
         - kappa_names       : list of available permeability tensor components
         - meta              : JSON-safe metadata dictionary (stored as JSON string)
 
@@ -63,24 +59,28 @@ Notes:
         - case_index   : stable one-based source case id
         - source_index : zero-based original merged-dataset index
         - split_local_index : zero-based position in the saved split
-        - pred         : (4, H, W) prediction [p, u, v, U]
-        - gt           : (4, H, W) ground truth [p, u, v, U]
-        - err          : (4, H, W) prediction error (pred - gt) for [p, u, v, U]
+        - pred         : (C_artifact, H, W) prediction aligned with artifact_fields
+        - gt           : (C_artifact, H, W) ground truth aligned with artifact_fields
+        - err          : (C_artifact, H, W) prediction error (pred - gt)
+        - artifact_fields : list[str] names aligned with pred/gt/err
+        - artifact_units  : list[str] physical units aligned with artifact_fields
 
-        - kappa_log    : (C_kappa, H, W) log10-permeability components
+        - kappa_encoded: (C_kappa, H, W) task-stored permeability representations
         - kappa        : (C_kappa, H, W) physical permeability components
         - kappa_names  : list[str], same order as kappa channels
         - p_bc         : (1, H, W) pressure boundary condition
 
-        # Raw inputs/targets for compatibility with downstream tools
+        # Declared inputs and targets retained for downstream analysis
         - x_raw        : (C_in, H, W) raw input tensor (physical units)
         - y_raw        : (C_out, H, W) raw target tensor (physical units)
         - input_fields : list[str] canonical input channel names
+        - output_fields: list[str] canonical learned-output names aligned with y_raw
+        - output_units : list[str] physical units aligned with output_fields
 
         # Physics diagnostic fields (full fields, not cropped)
         - Rx           : (H, W) x-momentum residual field
         - Ry           : (H, W) y-momentum residual field
-        - Rc           : (H, W) continuity residual field (here: div(u))
+        - Rc           : (H, W) task-selected continuity residual field
         - div_u        : (H, W) divergence field div(u)
         - div_eps_u    : (H, W) divergence field div(eps u)
 
@@ -95,17 +95,13 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
 
-from src import common, domain, learning
-
-if TYPE_CHECKING:
-    from torch.utils.data import DataLoader
-
+from src import common, domain
 
 # ============================================================================
 # Global constants
@@ -113,8 +109,8 @@ if TYPE_CHECKING:
 
 INTERNAL_KAPPA_NAMES = set(domain.permeability.INTERNAL_KAPPA_2D_ORDER) | set(domain.permeability.INTERNAL_KAPPA_3D_ORDER)
 MU_AIR = 1.8139e-5  # must be consistent with training
-ARTIFACT_SCHEMA_VERSION = 2
-ARTIFACT_PROVENANCE_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 3
+ARTIFACT_PROVENANCE_SCHEMA_VERSION = 2
 ARTIFACT_PROVENANCE_FILENAME = "artifact_provenance.json"
 
 # ----------------------------------------------------------------------------
@@ -125,20 +121,6 @@ EVAL_PAD = 2  # crop for ALL gradient-based metrics (H1 + physics)
 # =============================================================================
 # JSON / type normalisation utilities
 # =============================================================================
-
-NUMPY_INT_TYPES = (
-    np.int_,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-)
-
-NUMPY_FLOAT_TYPES = (
-    np.float16,
-    np.float32,
-    np.float64,
-)
 
 
 def meta_to_jsonable(obj: Any) -> Any:
@@ -162,10 +144,10 @@ def meta_to_jsonable(obj: Any) -> Any:
     if isinstance(obj, np.ndarray):
         return float(obj) if obj.ndim == 0 else obj.tolist()
 
-    if isinstance(obj, NUMPY_INT_TYPES):  # pyright: ignore[reportArgumentType]
+    if isinstance(obj, np.integer):
         return int(obj)
 
-    if isinstance(obj, NUMPY_FLOAT_TYPES):  # pyright: ignore[reportArgumentType]
+    if isinstance(obj, np.floating):
         return float(obj)
 
     if isinstance(obj, dict):
@@ -188,8 +170,32 @@ def artifact_provenance_path(save_root: str | Path) -> Path:
     return Path(save_root) / ARTIFACT_PROVENANCE_FILENAME
 
 
+def artifact_output_manifest(save_root: str | Path) -> dict[str, Any]:
+    """Return the exact digest manifest for one complete artifact payload."""
+    root = Path(save_root)
+    parquet_files = sorted(root.glob("*.parquet"))
+    npz_files = sorted((root / "npz").glob("*.npz"))
+    if len(parquet_files) != 1:
+        msg = f"Artifact payload must contain exactly one Parquet file, found {len(parquet_files)} in {root}."
+        raise RuntimeError(msg)
+    if not npz_files:
+        msg = f"Artifact payload contains no NPZ files: {root / 'npz'}"
+        raise RuntimeError(msg)
+
+    def entry(payload_path: Path) -> dict[str, Any]:
+        return {
+            "path": payload_path.relative_to(root).as_posix(),
+            "sha256": common.serialization.file_sha256(payload_path),
+        }
+
+    return {
+        "parquet": entry(parquet_files[0]),
+        "npz": [entry(payload_path) for payload_path in npz_files],
+    }
+
+
 def write_artifact_provenance(save_root: str | Path, provenance: Mapping[str, Any]) -> Path:
-    """Atomically write provenance after all artifact payloads are complete."""
+    """Atomically publish provenance and payload digests as the completion marker."""
     provenance_path = artifact_provenance_path(save_root)
     if provenance_path.exists():
         msg = f"Refusing to overwrite existing artifact provenance: {provenance_path}"
@@ -199,18 +205,12 @@ def write_artifact_provenance(save_root: str | Path, provenance: Mapping[str, An
     if not isinstance(payload, dict):
         msg = "Artifact provenance must normalise to a JSON object."
         raise TypeError(msg)
+    if "outputs" in payload:
+        msg = "Caller-provided artifact provenance cannot define output digests."
+        raise ValueError(msg)
+    payload["outputs"] = artifact_output_manifest(save_root)
 
-    temp_path = provenance_path.with_name(f".{provenance_path.name}.tmp")
-    if temp_path.exists():
-        msg = f"Interrupted artifact provenance write exists: {temp_path}"
-        raise FileExistsError(msg)
-
-    provenance_path.parent.mkdir(parents=True, exist_ok=True)
-    with temp_path.open("x", encoding="utf-8") as file:
-        json.dump(payload, file, indent=2, sort_keys=True)
-        file.write("\n")
-    temp_path.replace(provenance_path)
-    return provenance_path
+    return common.serialization.atomic_write_json(provenance_path, payload)
 
 
 def _require_batch_scalar_int(batch: Mapping[str, Any], key: str) -> int:
@@ -242,6 +242,16 @@ def _require_batch_scalar_int(batch: Mapping[str, Any], key: str) -> int:
         msg = f"Artifact batch {key!r} must be an integer; got {type(value).__name__}."
         raise TypeError(msg)
     return int(value)
+
+
+def _require_finite_artifact_tensor(value: torch.Tensor, *, label: str) -> None:
+    """Reject non-floating or non-finite tensors before artifact publication."""
+    if not value.is_floating_point() or value.is_complex():
+        msg = f"{label} must be a real floating-point tensor."
+        raise TypeError(msg)
+    if not torch.isfinite(value).all():
+        msg = f"{label} contains non-finite values."
+        raise FloatingPointError(msg)
 
 
 def _artifact_effective_case_count(provenance: Mapping[str, Any]) -> int:
@@ -321,7 +331,7 @@ def extract_kappa(
     kappa_names: list[str],
 ) -> dict[str, torch.Tensor]:
     """
-    Extract log-kappa and physical kappa fields from the input tensor.
+    Extract task-encoded and physical permeability fields from the input tensor.
 
     This function handles the case where no permeability channels are
     present by returning empty tensors with the correct shape.
@@ -339,39 +349,39 @@ def extract_kappa(
     -------
     dict[str, torch.Tensor]
         Dictionary with keys:
-            - "kappa_log"
+            - "kappa_encoded"
             - "kappa"
 
     """
     if not kappa_names:
         return {
-            "kappa_log": x_tensor.new_empty((x_tensor.shape[0], 0, *x_tensor.shape[2:])),
+            "kappa_encoded": x_tensor.new_empty((x_tensor.shape[0], 0, *x_tensor.shape[2:])),
             "kappa": x_tensor.new_empty((x_tensor.shape[0], 0, *x_tensor.shape[2:])),
         }
 
     index_map = {name: i for i, name in enumerate(input_fields)}
     kappa_indices = [index_map[name] for name in kappa_names]
 
-    # log-kappa (as stored in dataset)
-    kappa_log = x_tensor[:, kappa_indices, :, :]
+    # Task-encoded permeability representations as stored in the dataset.
+    kappa_encoded = x_tensor[:, kappa_indices, :, :]
 
-    # physical kappa reconstruction
-    kappa_phys = torch.zeros_like(kappa_log)
+    # Physical permeability reconstruction in square metres.
+    kappa_phys = torch.zeros_like(kappa_encoded)
     name_to_pos = {name: i for i, name in enumerate(kappa_names)}
 
     # kxx, kyy (always log10-physical)
-    kxx = torch.pow(10.0, kappa_log[:, name_to_pos["kxx"]])
-    kyy = torch.pow(10.0, kappa_log[:, name_to_pos["kyy"]])
+    kxx = torch.pow(10.0, kappa_encoded[:, name_to_pos["kxx"]])
+    kyy = torch.pow(10.0, kappa_encoded[:, name_to_pos["kyy"]])
     kappa_phys[:, name_to_pos["kxx"]] = kxx
     kappa_phys[:, name_to_pos["kyy"]] = kyy
 
-    # kxy is stored as kxy_hat (dimensionless). Keep it as is.
+    # kxy is a dimensionless ratio to sqrt(kxx * kyy).
     if "kxy" in name_to_pos:
-        kxy_hat = kappa_log[:, name_to_pos["kxy"]]
-        kappa_phys[:, name_to_pos["kxy"]] = kxy_hat
+        kxy_ratio = kappa_encoded[:, name_to_pos["kxy"]]
+        kappa_phys[:, name_to_pos["kxy"]] = kxy_ratio * torch.sqrt(kxx * kyy)
 
     return {
-        "kappa_log": kappa_log,
+        "kappa_encoded": kappa_encoded,
         "kappa": kappa_phys,
     }
 
@@ -402,10 +412,11 @@ def infer_current_run_dir(save_root: Path) -> Path:
 # =============================================================================
 
 
-def generate_artifacts(  # noqa: PLR0915
+def _generate_steady_flow_artifacts(  # noqa: PLR0915
     *,
+    task: domain.tasks.spec.TaskSpec,
     model: Any,
-    loader: DataLoader,
+    loader: Iterable[Mapping[str, Any]],
     processor: Any,
     device: torch.device,
     save_root: str | Path,
@@ -418,16 +429,18 @@ def generate_artifacts(  # noqa: PLR0915
 
     For each case:
         - perform a forward pass with the trained model
-        - compute global error metrics (l2/rel_l2 full-domain; h1 + physics terms on interior cropped by EVAL_PAD)
+        - compute channel-balanced relative L2/H1 and physical-unit per-field RMSE metrics
         - store full spatial fields in an NPZ file
         - store scalar metrics and metadata in a Parquet table
 
     Parameters
     ----------
+    task : domain.tasks.spec.TaskSpec
+        Validated task contract owning exact input channel names and order.
     model : Any
         Trained neural operator model (FNO, PINO, etc.).
-    loader : DataLoader
-        Deterministic evaluation DataLoader.
+    loader : Iterable[Mapping[str, Any]]
+        Deterministic iterable of evaluation batches.
     processor : Any
         Normalisation processor used during training.
     device : torch.device
@@ -458,7 +471,7 @@ def generate_artifacts(  # noqa: PLR0915
     # Infer run_dir from save_root for logging/metadata only.
     run_dir = infer_current_run_dir(save_root)
     run_name = run_dir.name
-    physics_variant = "divu-SP"
+    physics_variant = f"{task.physics.continuity}-spectral-reflect"
 
     print(
         "[ARTIFACTS]",
@@ -470,24 +483,14 @@ def generate_artifacts(  # noqa: PLR0915
     )
 
     # --------------------------------------------------
-    # Build exact residual calculator (same as training loss)
+    # Build domain-owned residual diagnostics
     # --------------------------------------------------
-    def _zero_data_loss(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # noqa: ARG001
-        return pred.new_zeros(())
-
-    # Canonical eval physics: spectral derivatives (reflect-FFT) + div(u), fixed interior crop
-    loss_obj = learning.losses.pino.PINOSpectralLossDiv(
-        data_loss=_zero_data_loss,
-        lambda_phys=1.0,
-        lambda_p=0.0,
-        in_normalizer=processor.in_normalizer,
-        out_normalizer=processor.out_normalizer,
-        grad_mode="fft_reflect",
-        interior_pad=EVAL_PAD,
-        log_every=10_000_000,
-    ).to(device)
-    loss_obj.eval()
-    print(f"[ARTIFACTS] Using EVAL loss_cls={loss_obj.__class__.__name__} (pad={EVAL_PAD})")
+    physics_evaluator = domain.physics.brinkman.resolve_physics_evaluator(task.physics.kind)
+    derivative_operator = domain.physics.derivatives.build_derivative_operator(
+        "spectral",
+        extension="reflect",
+    )
+    print(f"[ARTIFACTS] Using domain physics diagnostics kind={task.physics.kind} derivatives=spectral/reflect pad={EVAL_PAD}")
 
     npz_dir = save_root / "npz"
     npz_dir.mkdir(parents=True, exist_ok=True)
@@ -496,7 +499,7 @@ def generate_artifacts(  # noqa: PLR0915
     generated_source_indices: list[int] = []
 
     # Detect available kappa channels from field contracts
-    kappa_names = detect_kappa_channels_from_inputs(domain.field_sets.DEFAULT_INPUTS_2D)
+    kappa_names = detect_kappa_channels_from_inputs(list(task.input_names))
 
     for idx, batch in enumerate(loader):
         if max_cases is not None and idx >= max_cases:
@@ -514,29 +517,24 @@ def generate_artifacts(  # noqa: PLR0915
 
         x = batch["x"].to(device)
         y = batch["y"].to(device)
+        _require_finite_artifact_tensor(x, label=f"Artifact case {case_id} inputs")
+        _require_finite_artifact_tensor(y, label=f"Artifact case {case_id} targets")
 
-        # Metadata (generator-side)
+        # Preserve generator metadata in a JSON-safe form.
         source_meta = meta_to_jsonable(batch.get("meta", {}))
         meta_clean = dict(source_meta) if isinstance(source_meta, dict) else {"source_meta": source_meta}
         reserved_meta_keys = {"case_index", "source_index", "split_local_index"}.intersection(meta_clean)
         if reserved_meta_keys:
-            msg = (
-                "Source metadata contains reserved artifact identity keys and cannot be "
-                f"preserved unambiguously: {sorted(reserved_meta_keys)}."
-            )
+            msg = f"Source metadata contains reserved artifact identity keys and cannot be preserved unambiguously: {sorted(reserved_meta_keys)}."
             raise KeyError(msg)
-        meta_clean["case_index"] = case_id
-        meta_clean["source_index"] = source_index
-        meta_clean["split_local_index"] = split_local_index
-
         # Pressure boundary condition (stored for diagnostics)
-        p_bc_idx = domain.field_sets.DEFAULT_INPUTS_2D.index("p_bc")
+        p_bc_idx = task.input_names.index("p_bc")
         p_bc = x[:, p_bc_idx : p_bc_idx + 1].detach().cpu()
 
         # Permeability fields (no scalar stats here)
         kappa_info = extract_kappa(
             x,
-            input_fields=domain.field_sets.DEFAULT_INPUTS_2D,
+            input_fields=list(task.input_names),
             kappa_names=kappa_names,
         )
 
@@ -556,35 +554,49 @@ def generate_artifacts(  # noqa: PLR0915
             y_hat_norm = model(x_norm)
             y_hat = processor.out_normalizer.inverse_transform(y_hat_norm)
 
-        # --------------------------------------------------
-        # Physics diagnostics (exact training-consistent implementation)
-        # --------------------------------------------------
-        with torch.no_grad():
-            diag = loss_obj.compute_diagnostics(y_hat_norm, x=x_norm)
-
-        mom_mse = float(diag["mom_mse"].detach().cpu().item())
-        bc_mse = float(diag["bc_mse"].detach().cpu().item())
-
-        # Rc from this eval loss is div(u)
-        cont_mse_divu = float(diag["cont_mse"].detach().cpu().item())
-        phys_mse = float(mom_mse + cont_mse_divu)
-
-        Rx_np = diag["Rx"].detach().cpu().squeeze(0).squeeze(0).numpy()
-        Ry_np = diag["Ry"].detach().cpu().squeeze(0).squeeze(0).numpy()
-        Rc_np = diag["Rc"].detach().cpu().squeeze(0).squeeze(0).numpy()
-        divu_np = diag["div_u"].detach().cpu().squeeze(0).squeeze(0).numpy()
-        divepsu_np = diag["div_eps_u"].detach().cpu().squeeze(0).squeeze(0).numpy()
-
-        # diagnostic: div(eps u) MSE with same crop
-        div_eps_u_i = divepsu_np[EVAL_PAD:-EVAL_PAD, EVAL_PAD:-EVAL_PAD] if EVAL_PAD > 0 else divepsu_np
-        cont_mse_divepsu = float(np.mean(div_eps_u_i**2))
-
         if device.type == "cuda" and end_time is not None:
             end_time.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
             inference_time_ms = start_time.elapsed_time(end_time) if start_time is not None else None
         else:
             inference_time_ms = None
+
+        _require_finite_artifact_tensor(x_norm, label=f"Artifact case {case_id} normalized inputs")
+        _require_finite_artifact_tensor(y_hat_norm, label=f"Artifact case {case_id} normalized prediction")
+        _require_finite_artifact_tensor(y_hat, label=f"Artifact case {case_id} physical prediction")
+        if y_hat.shape != y.shape:
+            msg = f"Artifact prediction/target shape mismatch: {tuple(y_hat.shape)} != {tuple(y.shape)}."
+            raise RuntimeError(msg)
+
+        # --------------------------------------------------
+        # Physics diagnostics (exact training-consistent implementation)
+        # --------------------------------------------------
+        with torch.no_grad():
+            diag = physics_evaluator(
+                x,
+                y_hat,
+                input_fields=task.input_names,
+                output_fields=task.output_names,
+                derivatives=derivative_operator,
+                continuity=task.physics.continuity,
+                boundary=task.physics.boundary,
+                interior_crop=EVAL_PAD,
+            ).as_dict()
+        for diagnostic_name, diagnostic_value in diag.items():
+            _require_finite_artifact_tensor(
+                diagnostic_value,
+                label=f"Artifact case {case_id} physics diagnostic {diagnostic_name}",
+            )
+
+        mom_mse = float(diag["mom_mse"].detach().cpu().item())
+        bc_mse = float(diag["bc_mse"].detach().cpu().item())
+
+        cont_mse = float(diag["cont_mse"].detach().cpu().item())
+        Rx_np = diag["Rx"].detach().cpu().squeeze(0).squeeze(0).numpy()
+        Ry_np = diag["Ry"].detach().cpu().squeeze(0).squeeze(0).numpy()
+        Rc_np = diag["Rc"].detach().cpu().squeeze(0).squeeze(0).numpy()
+        divu_np = diag["div_u"].detach().cpu().squeeze(0).squeeze(0).numpy()
+        divepsu_np = diag["div_eps_u"].detach().cpu().squeeze(0).squeeze(0).numpy()
 
         # --------------------------------------------------
         # Outputs (de-normalised, physical units)
@@ -597,6 +609,8 @@ def generate_artifacts(  # noqa: PLR0915
 
         # Book-friendly metrics (physical units)
         rmse_p = torch.sqrt(torch.mean((p - p_gt) ** 2)).item()
+        rmse_u = torch.sqrt(torch.mean((u - u_gt) ** 2)).item()
+        rmse_v = torch.sqrt(torch.mean((v - v_gt) ** 2)).item()
         rmse_U = torch.sqrt(torch.mean((U - U_gt) ** 2)).item()
 
         # Full tensors for NPZ export / plotting (includes U)
@@ -610,32 +624,18 @@ def generate_artifacts(  # noqa: PLR0915
         err_main = y_hat_main - y_main
 
         # Grid spacing from coordinate fields (physical)
-        idx_x = domain.field_sets.DEFAULT_INPUTS_2D.index("x")
-        idx_y = domain.field_sets.DEFAULT_INPUTS_2D.index("y")
+        idx_x = task.input_names.index("x")
+        idx_y = task.input_names.index("y")
         dx = float((x[0, idx_x, 0, 1] - x[0, idx_x, 0, 0]).abs().detach().cpu().item())
         dy = float((x[0, idx_y, 1, 0] - x[0, idx_y, 0, 0]).abs().detach().cpu().item())
 
-        metric_eps = 1e-12
+        metric_denominator_floor = 1e-12
 
         # ------------------------------------------------------------------
-        # Absolute + relative L2/H1 on [p, u, v]
+        # Dimensionless relative L2/H1, normalized independently per field
         # ------------------------------------------------------------------
         rel_l2_per_channel: list[float] = []
         rel_h1_per_channel: list[float] = []
-
-        # Absolute "L2" here is RMSE over all entries of [p,u,v]
-        l2 = torch.sqrt(torch.mean(err_main.pow(2))).item()
-
-        # Absolute H1-like: RMSE of (field error + gradient error) on interior
-        derr_dy_all, derr_dx_all = torch.gradient(err_main, spacing=(dy, dx), dim=(2, 3))
-        if EVAL_PAD > 0:
-            err_i = err_main[..., EVAL_PAD:-EVAL_PAD, EVAL_PAD:-EVAL_PAD]
-            derr_dx_i = derr_dx_all[..., EVAL_PAD:-EVAL_PAD, EVAL_PAD:-EVAL_PAD]
-            derr_dy_i = derr_dy_all[..., EVAL_PAD:-EVAL_PAD, EVAL_PAD:-EVAL_PAD]
-        else:
-            err_i, derr_dx_i, derr_dy_i = err_main, derr_dx_all, derr_dy_all
-
-        h1 = torch.sqrt(torch.mean(err_i.pow(2) + derr_dx_i.pow(2) + derr_dy_i.pow(2))).item()
 
         for c in range(y_main.shape[1]):  # c in {p,u,v}
             e_c = err_main[:, c : c + 1]
@@ -644,7 +644,7 @@ def generate_artifacts(  # noqa: PLR0915
             # Relative L2 per channel (global norm ratio)
             l2_e_c = torch.linalg.norm(e_c)
             l2_r_c = torch.linalg.norm(r_c)
-            rel_l2_c = (l2_e_c / (l2_r_c + metric_eps)).item()
+            rel_l2_c = (l2_e_c / (l2_r_c + metric_denominator_floor)).item()
             rel_l2_per_channel.append(float(rel_l2_c))
 
             # Relative H1 per channel (interior, with gradients)
@@ -666,11 +666,15 @@ def generate_artifacts(  # noqa: PLR0915
             h1_e_c = torch.sqrt((e_i.pow(2) + de_dx_i.pow(2) + de_dy_i.pow(2)).mean())
             h1_r_c = torch.sqrt((r_i.pow(2) + dr_dx_i.pow(2) + dr_dy_i.pow(2)).mean())
 
-            rel_h1_c = (h1_e_c / (h1_r_c + metric_eps)).item()
+            rel_h1_c = (h1_e_c / (h1_r_c + metric_denominator_floor)).item()
             rel_h1_per_channel.append(float(rel_h1_c))
 
         rel_l2 = float(np.mean(rel_l2_per_channel))
         rel_h1 = float(np.mean(rel_h1_per_channel))
+        scalar_metrics = (rmse_p, rmse_u, rmse_v, rmse_U, rel_l2, rel_h1, mom_mse, cont_mse, bc_mse)
+        if not np.isfinite(np.asarray(scalar_metrics, dtype=float)).all():
+            msg = f"Artifact case {case_id} produced non-finite scalar metrics."
+            raise FloatingPointError(msg)
 
         # --------------------------------------------------
         # Write NPZ artifact
@@ -682,28 +686,39 @@ def generate_artifacts(  # noqa: PLR0915
         x_raw = x.squeeze(0).detach().cpu().numpy()  # (C_in,H,W)
         y_raw = y.squeeze(0).detach().cpu().numpy()  # (C_out,H,W)
 
-        np.savez_compressed(
-            npz_path,
-            case_index=np.int64(case_id),
-            source_index=np.int64(source_index),
-            split_local_index=np.int64(split_local_index),
-            pred=y_hat_ext.squeeze(0).cpu().numpy(),
-            gt=y_ext.squeeze(0).cpu().numpy(),
-            err=err_ext.squeeze(0).cpu().numpy(),
-            kappa_log=kappa_info["kappa_log"].squeeze(0).cpu().numpy(),
-            kappa=kappa_info["kappa"].squeeze(0).cpu().numpy(),
-            kappa_names=np.array(kappa_names, dtype=object),
-            p_bc=p_bc.squeeze(0).numpy(),
-            meta=json.dumps(meta_clean),
-            x_raw=x_raw,
-            y_raw=y_raw,
-            input_fields=np.array(domain.field_sets.DEFAULT_INPUTS_2D, dtype=object),
-            Rx=Rx_np,
-            Ry=Ry_np,
-            Rc=Rc_np,
-            div_u=divu_np,
-            div_eps_u=divepsu_np,
-        )
+        artifact_fields = (*task.output_names, "U")
+        artifact_units = (*(field.unit for field in task.outputs), "m/s")
+        npz_payload = {
+            "case_index": np.int64(case_id),
+            "source_index": np.int64(source_index),
+            "split_local_index": np.int64(split_local_index),
+            "pred": y_hat_ext.squeeze(0).cpu().numpy(),
+            "gt": y_ext.squeeze(0).cpu().numpy(),
+            "err": err_ext.squeeze(0).cpu().numpy(),
+            "artifact_fields": np.asarray(artifact_fields),
+            "artifact_units": np.asarray(artifact_units),
+            "kappa_encoded": kappa_info["kappa_encoded"].squeeze(0).cpu().numpy(),
+            "kappa": kappa_info["kappa"].squeeze(0).cpu().numpy(),
+            "kappa_names": np.asarray(kappa_names),
+            "p_bc": p_bc.squeeze(0).numpy(),
+            "meta": json.dumps(meta_clean),
+            "x_raw": x_raw,
+            "y_raw": y_raw,
+            "input_fields": np.asarray(task.input_names),
+            "output_fields": np.asarray(task.output_names),
+            "output_units": np.asarray(tuple(field.unit for field in task.outputs)),
+            "Rx": Rx_np,
+            "Ry": Ry_np,
+            "Rc": Rc_np,
+            "div_u": divu_np,
+            "div_eps_u": divepsu_np,
+        }
+
+        def write_npz(temp_path: Path, content: dict[str, Any] = npz_payload) -> None:
+            with temp_path.open("wb") as stream:
+                np.savez_compressed(stream, **content)
+
+        common.serialization.atomic_path_write(npz_path, write_npz)
 
         # --------------------------------------------------
         # Parquet row (scalar metrics + metadata only)
@@ -715,18 +730,16 @@ def generate_artifacts(  # noqa: PLR0915
                 "source_index": source_index,
                 "split_local_index": split_local_index,
                 "npz_path": str(npz_path),
-                "l2": l2,
-                "h1": h1,
                 "rel_l2": rel_l2,
                 "rel_h1": rel_h1,
                 "rmse_p": rmse_p,
+                "rmse_u": rmse_u,
+                "rmse_v": rmse_v,
                 "rmse_U": rmse_U,
                 "kappa_names": kappa_names,
                 "mom_mse": mom_mse,
-                "cont_mse": cont_mse_divu,
-                "phys_mse": phys_mse,
+                "cont_mse": cont_mse,
                 "bc_mse": bc_mse,
-                "cont_mse_divepsu": cont_mse_divepsu,
                 "meta": json.dumps(meta_clean),
             }
         )
@@ -738,13 +751,209 @@ def generate_artifacts(  # noqa: PLR0915
         raise RuntimeError(msg)
 
     parquet_path = save_root / f"{dataset_name}.parquet"
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    parquet_temp_path = parquet_path.with_name(f".{parquet_path.name}.tmp")
-    if parquet_temp_path.exists():
-        msg = f"Interrupted Parquet write exists: {parquet_temp_path}"
-        raise FileExistsError(msg)
-    df.to_parquet(parquet_temp_path, index=False)
-    parquet_temp_path.replace(parquet_path)
+    common.serialization.atomic_path_write(
+        parquet_path,
+        lambda temp_path: df.to_parquet(temp_path, index=False),
+    )
     write_artifact_provenance(save_root, provenance)
 
     return df, parquet_path
+
+
+def _generate_generic_artifacts(
+    *,
+    task: domain.tasks.spec.TaskSpec,
+    model: Any,
+    loader: Iterable[Mapping[str, Any]],
+    processor: Any,
+    device: torch.device,
+    save_root: str | Path,
+    dataset_name: str,
+    provenance: Mapping[str, Any],
+    max_cases: int | None = None,
+) -> tuple[pd.DataFrame, Path]:
+    """Store task-declared fields without assuming any concrete field names."""
+    root = Path(save_root)
+    expected_case_count = _artifact_effective_case_count(provenance)
+    _ensure_artifact_targets_absent(root, dataset_name)
+    model.eval()
+    npz_dir = root / "npz"
+    npz_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    generated_source_indices: list[int] = []
+
+    for iteration, batch in enumerate(loader):
+        if max_cases is not None and iteration >= max_cases:
+            break
+        split_local_index = _require_batch_scalar_int(batch, "split_local_index")
+        source_index = _require_batch_scalar_int(batch, "source_index")
+        if split_local_index != iteration:
+            msg = f"Artifact loader order does not match saved split-local identity: iteration={iteration}, split_local_index={split_local_index}."
+            raise RuntimeError(msg)
+        if source_index < 0:
+            msg = f"Artifact source_index must be non-negative, got {source_index}."
+            raise ValueError(msg)
+        case_index = source_index + 1
+        generated_source_indices.append(source_index)
+
+        source_meta = meta_to_jsonable(batch.get("meta", {}))
+        metadata = dict(source_meta) if isinstance(source_meta, dict) else {"source_meta": source_meta}
+        reserved = {"case_index", "source_index", "split_local_index"}.intersection(metadata)
+        if reserved:
+            msg = f"Source metadata contains reserved artifact identity keys: {sorted(reserved)}."
+            raise KeyError(msg)
+
+        inputs = batch["x"].to(device)
+        targets = batch["y"].to(device)
+        _require_finite_artifact_tensor(inputs, label=f"Artifact case {case_index} inputs")
+        _require_finite_artifact_tensor(targets, label=f"Artifact case {case_index} targets")
+        with torch.no_grad():
+            normalized_inputs = processor.in_normalizer.transform(inputs)
+            normalized_prediction = model(normalized_inputs)
+            prediction = processor.out_normalizer.inverse_transform(normalized_prediction)
+        _require_finite_artifact_tensor(
+            normalized_inputs,
+            label=f"Artifact case {case_index} normalized inputs",
+        )
+        _require_finite_artifact_tensor(
+            normalized_prediction,
+            label=f"Artifact case {case_index} normalized prediction",
+        )
+        _require_finite_artifact_tensor(
+            prediction,
+            label=f"Artifact case {case_index} physical prediction",
+        )
+        if prediction.shape != targets.shape:
+            msg = f"Prediction/target shape mismatch: {tuple(prediction.shape)} != {tuple(targets.shape)}."
+            raise RuntimeError(msg)
+        if prediction.shape[1] != len(task.output_names):
+            msg = f"Artifact output channel count {prediction.shape[1]} does not match task fields {list(task.output_names)}."
+            raise RuntimeError(msg)
+
+        prediction_cpu = prediction.squeeze(0).detach().cpu()
+        target_cpu = targets.squeeze(0).detach().cpu()
+        error_cpu = prediction_cpu - target_cpu
+        npz_path = npz_dir / f"case_{case_index:04d}.npz"
+        payload = {
+            "case_index": np.int64(case_index),
+            "source_index": np.int64(source_index),
+            "split_local_index": np.int64(split_local_index),
+            "pred": prediction_cpu.numpy(),
+            "gt": target_cpu.numpy(),
+            "err": error_cpu.numpy(),
+            "artifact_fields": np.asarray(task.output_names),
+            "artifact_units": np.asarray(tuple(field.unit for field in task.outputs)),
+            "x_raw": inputs.squeeze(0).detach().cpu().numpy(),
+            "y_raw": target_cpu.numpy(),
+            "input_fields": np.asarray(task.input_names),
+            "output_fields": np.asarray(task.output_names),
+            "output_units": np.asarray(tuple(field.unit for field in task.outputs)),
+            "meta": json.dumps(metadata),
+        }
+
+        def write_npz(temp_path: Path, content: dict[str, Any] = payload) -> None:
+            with temp_path.open("wb") as stream:
+                np.savez_compressed(stream, **content)
+
+        common.serialization.atomic_path_write(npz_path, write_npz)
+        row: dict[str, Any] = {
+            "inference_time_ms": None,
+            "case_index": case_index,
+            "source_index": source_index,
+            "split_local_index": split_local_index,
+            "npz_path": str(npz_path),
+            "meta": json.dumps(metadata),
+        }
+        for channel, field in enumerate(task.outputs):
+            row[f"rmse_{field.name}"] = float(torch.sqrt(torch.mean(error_cpu[channel].square())).item())
+        rows.append(row)
+
+    frame = pd.DataFrame(rows)
+    if not frame.columns.is_unique:
+        msg = "Generic artifact table contains duplicate columns."
+        raise RuntimeError(msg)
+    _validate_generated_source_indices(provenance, generated_source_indices)
+    if len(frame) != expected_case_count:
+        msg = f"Artifact generation produced {len(frame)} cases, expected {expected_case_count}."
+        raise RuntimeError(msg)
+    parquet_path = root / f"{dataset_name}.parquet"
+    common.serialization.atomic_path_write(
+        parquet_path,
+        lambda temp_path: frame.to_parquet(temp_path, index=False),
+    )
+    write_artifact_provenance(root, provenance)
+    return frame, parquet_path
+
+
+def generate_artifacts(
+    *,
+    task: domain.tasks.spec.TaskSpec,
+    model: Any,
+    loader: Iterable[Mapping[str, Any]],
+    processor: Any,
+    device: torch.device,
+    save_root: str | Path,
+    dataset_name: str,
+    provenance: Mapping[str, Any],
+    max_cases: int | None = None,
+) -> tuple[pd.DataFrame, Path]:
+    """
+    Generate artifacts through a task-extensible storage contract.
+
+    Parameters
+    ----------
+    task : domain.tasks.spec.TaskSpec
+        Validated task owning ordered input/output fields and units.
+    model : Any
+        Reconstructed best-checkpoint model.
+    loader : Iterable[Mapping[str, Any]]
+        Deterministic batch-size-one saved-split batches.
+    processor : Any
+        Restored training normalizer processor.
+    device : torch.device
+        Inference device.
+    save_root : str | Path
+        Exact artifact target directory.
+    dataset_name : str
+        Logical dataset name used for the Parquet filename.
+    provenance : Mapping[str, Any]
+        Exact cache identity published only after payload completion.
+    max_cases : int | None, optional
+        Positive effective saved-split case limit.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, Path]
+        Generated table and atomically published Parquet path.
+
+    Notes
+    -----
+    The maintained steady-flow task retains its task-specific diagnostic
+    adapter. Every other valid TaskSpec uses generic named field/unit storage,
+    so adding a future task does not require lifecycle changes.
+
+    """
+    dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
+    if task.id == domain.tasks.steady_flow.STEADY_FLOW.id:
+        return _generate_steady_flow_artifacts(
+            task=task,
+            model=model,
+            loader=loader,
+            processor=processor,
+            device=device,
+            save_root=save_root,
+            dataset_name=dataset_name,
+            provenance=provenance,
+            max_cases=max_cases,
+        )
+    return _generate_generic_artifacts(
+        task=task,
+        model=model,
+        loader=loader,
+        processor=processor,
+        device=device,
+        save_root=save_root,
+        dataset_name=dataset_name,
+        provenance=provenance,
+        max_cases=max_cases,
+    )

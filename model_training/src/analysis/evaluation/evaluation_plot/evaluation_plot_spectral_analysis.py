@@ -7,8 +7,6 @@ Plot spectral diagnostics for evaluated model predictions.
 Responsibilities:
   - Compare prediction and target power spectra
   - Plot spectral transfer ratios and error spectra
-  - Visualize learned spectral energy summaries when available
-  - Infer run metadata from current config.yaml markers
 
 Design principles:
   - Spectral analysis uses Hann-windowed 2D FFTs
@@ -18,10 +16,6 @@ Design principles:
 Boundaries:
   - Dataset-only spectral EDA belongs to eda_plot_spectral_analysis
   - Spatial error decomposition belongs to evaluation_plot_error_decomposition
-
-Notes:
-  Learned spectral energy:
-    - heatmaps are shown only when spectral_energy_aggregated.pt is available
 ===============================================================================
 
 """
@@ -35,10 +29,9 @@ import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
 from matplotlib.lines import Line2D
 
-from src import analysis, common, domain
+from src import analysis, domain
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -48,10 +41,10 @@ if TYPE_CHECKING:
 # CONSTANTS
 # =============================================================================
 
-CHANNELS = list(domain.fields.OUTPUT_FIELDS)
+CHANNELS = list(domain.fields.ANALYSIS_FIELDS)
 CHANNEL_INDICES = {name: i for i, name in enumerate(CHANNELS)}
 
-EPS = 1e-12
+SPECTRAL_NUMERICAL_FLOOR = 1e-12
 WhichSignal = Literal["gt", "pred", "err"]
 
 
@@ -86,54 +79,8 @@ class _SpectraAcc(TypedDict):
     count: dict[str, int]
 
 
-class _ErrAcc(TypedDict):
-    """
-    Accumulator for per-channel error spectra across cases.
-
-    Attributes
-    ----------
-    loaded_until : int
-        Number of cases loaded so far.
-    shape : tuple[int, int] | None
-        Spatial shape (H, W) of loaded fields, or None if not yet known.
-    k : numpy.ndarray | None
-        Radial frequency bins, or None if not yet known.
-    sum_err : dict[str, numpy.ndarray]
-        Summed error spectra per channel.
-    count : dict[str, int]
-        Number of samples per channel.
-
-    """
-
-    loaded_until: int
-    shape: tuple[int, int] | None
-    k: np.ndarray | None
-    sum_err: dict[str, np.ndarray]
-    count: dict[str, int]
-
-
-class _LearnedHeatmapAcc(TypedDict):
-    """
-    Cached learned spectral energy, radialised per layer.
-
-    Attributes
-    ----------
-    k : numpy.ndarray | None
-        Radial frequency bins.
-    layer_ids : list[int]
-        Layer indices.
-    layer_k_energy : numpy.ndarray | None
-        Spectral energy per layer and k-bin, shape [L, K].
-
-    """
-
-    k: np.ndarray | None
-    layer_ids: list[int]
-    layer_k_energy: np.ndarray | None  # [L, K]
-
-
 # =============================================================================
-# HELPERS: field contracts, geometry, npz loading, run dir
+# HELPERS: field contracts, geometry, and NPZ loading
 # =============================================================================
 
 
@@ -157,7 +104,7 @@ def _has_npz_path_col(df: pd.DataFrame) -> bool:
 
 def _to_pos_float_from_df_col(df: pd.DataFrame, col: str, default: float) -> float:
     """
-    Read a positive float from a DataFrame column (first row), else fallback.
+    Read a positive float from a DataFrame column or use the supplied default.
 
     Parameters
     ----------
@@ -166,7 +113,7 @@ def _to_pos_float_from_df_col(df: pd.DataFrame, col: str, default: float) -> flo
     col : str
         Column name.
     default : float
-        Fallback value.
+        Default value.
 
     Returns
     -------
@@ -197,7 +144,7 @@ def _get_dx_dy_from_df(df: pd.DataFrame) -> tuple[float, float]:
     Returns
     -------
     tuple[float, float]
-        (dx, dy) with sensible fallbacks.
+        ``(dx, dy)`` with explicit defaults when geometry is absent.
 
     """
     dx = _to_pos_float_from_df_col(df, "geometry_dx", 1.0)
@@ -224,48 +171,8 @@ def _safe_load_npz(path: str | Path) -> dict[str, Any] | None:
     if not p.is_file():
         return None
 
-    with np.load(str(p), allow_pickle=True) as data:
+    with np.load(str(p), allow_pickle=False) as data:
         return {k: data[k] for k in data.files}
-
-
-def _infer_run_dir_from_df(df: pd.DataFrame) -> Path:
-    """
-    Infer a run directory from an evaluation DataFrame.
-
-    Heuristic:
-    - pick a valid npz_path (first file found within a small probe window)
-    - walk upward until we find either config.yaml or spectral_energy_aggregated.pt
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Evaluation DataFrame (must contain 'npz_path').
-
-    Returns
-    -------
-    pathlib.Path
-        Inferred run directory. May be an empty Path() if unavailable.
-
-    """
-    if not _has_npz_path_col(df) or len(df) == 0:
-        return Path()
-
-    df_i = df.reset_index(drop=True)
-
-    npz_path = Path(str(df_i["npz_path"].iloc[0])).expanduser()
-    probe_n = int(min(25, len(df_i)))
-
-    for i in range(probe_n):
-        p = Path(str(df_i["npz_path"].iloc[i])).expanduser()
-        if p.is_file():
-            npz_path = p
-            break
-
-    for parent in [npz_path.parent, *npz_path.parents]:
-        if (parent / "spectral_energy_aggregated.pt").is_file() or common.paths.resolve_run_config_path(parent).is_file():
-            return parent
-
-    return npz_path.parent
 
 
 # =============================================================================
@@ -432,7 +339,7 @@ def _normalise_spectrum(spec: np.ndarray) -> np.ndarray:
     s = float(np.nansum(spec))
     if not np.isfinite(s) or s <= 0:
         return spec
-    return spec / (s + EPS)
+    return spec / (s + SPECTRAL_NUMERICAL_FLOOR)
 
 
 # =============================================================================
@@ -534,7 +441,7 @@ def _extract_field(npz: dict[str, Any], *, ch: str, which: WhichSignal) -> np.nd
 
 
 # =============================================================================
-# CACHE: init + reset + accumulate
+# Streaming spectra cache lifecycle
 # =============================================================================
 
 
@@ -587,55 +494,6 @@ def _reset_spectra_cache(cache: dict[str, _SpectraAcc]) -> None:
         entry["k"] = None
         entry["sum_gt"] = {}
         entry["sum_pred"] = {}
-        entry["sum_err"] = {}
-        entry["count"] = {}
-
-
-def _init_err_cache(names: list[str]) -> dict[str, _ErrAcc]:
-    """
-    Create an error-only cache per dataset.
-
-    Parameters
-    ----------
-    names : list[str]
-        Dataset names.
-
-    Returns
-    -------
-    dict[str, _ErrAcc]
-        Per-dataset error accumulators.
-
-    """
-    return {
-        name: {
-            "loaded_until": 0,
-            "shape": None,
-            "k": None,
-            "sum_err": {},
-            "count": {},
-        }
-        for name in names
-    }
-
-
-def _reset_err_cache(cache: dict[str, _ErrAcc]) -> None:
-    """
-    Reset error cache in-place.
-
-    Parameters
-    ----------
-    cache : dict[str, _ErrAcc]
-        Cache to reset.
-
-    Returns
-    -------
-    None
-
-    """
-    for entry in cache.values():
-        entry["loaded_until"] = 0
-        entry["shape"] = None
-        entry["k"] = None
         entry["sum_err"] = {}
         entry["count"] = {}
 
@@ -725,86 +583,6 @@ def _accumulate_spectra(
 
             entry["sum_gt"][ch] += s_gt
             entry["sum_pred"][ch] += s_pr
-            entry["sum_err"][ch] += s_er
-            entry["count"][ch] += 1
-
-    entry["loaded_until"] = max_cases_i
-
-
-def _accumulate_err_only(
-    entry: _ErrAcc,
-    df: pd.DataFrame,
-    *,
-    max_cases: int,
-    normalise: bool,
-) -> None:
-    """
-    Accumulate mean error spectra across up to max_cases.
-
-    Parameters
-    ----------
-    entry : _ErrAcc
-        Dataset accumulator.
-    df : pandas.DataFrame
-        Evaluation DataFrame with 'npz_path'.
-    max_cases : int
-        Number of cases to include.
-    normalise : bool
-        If True, each case spectrum is normalised to unit sum before accumulation.
-
-    Returns
-    -------
-    None
-
-    """
-    if not _has_npz_path_col(df):
-        entry["loaded_until"] = int(min(max_cases, len(df)))
-        return
-
-    max_cases_i = int(min(max_cases, len(df)))
-    loaded = int(entry["loaded_until"])
-    if max_cases_i <= loaded:
-        return
-
-    dx, dy = _get_dx_dy_from_df(df)
-    df_i = df.reset_index(drop=True)
-
-    for path in df_i["npz_path"].iloc[loaded:max_cases_i]:
-        npz = _safe_load_npz(path)
-        if npz is None:
-            continue
-
-        for ch in CHANNELS:
-            er_field = _extract_field(npz, ch=ch, which="err")
-            if er_field is None:
-                continue
-
-            if entry["shape"] is None:
-                entry["shape"] = (int(er_field.shape[0]), int(er_field.shape[1]))
-
-            if entry["shape"] is None:
-                continue
-
-            if er_field.shape != entry["shape"]:
-                continue
-
-            nbins = max(8, min(entry["shape"][0], entry["shape"][1]) // 2)
-
-            k, s_er = _radial_spectrum_fft2(er_field, dx=dx, dy=dy, nbins=nbins)
-
-            if entry["k"] is None:
-                entry["k"] = k
-
-            if entry["k"] is None or len(k) != len(entry["k"]):
-                continue
-
-            if normalise:
-                s_er = _normalise_spectrum(s_er)
-
-            if ch not in entry["sum_err"]:
-                entry["sum_err"][ch] = np.zeros_like(s_er, dtype=float)
-                entry["count"][ch] = 0
-
             entry["sum_err"][ch] += s_er
             entry["count"][ch] += 1
 
@@ -1122,7 +900,7 @@ def plot_spectral_transfer_ratio(*, datasets: dict[str, pd.DataFrame]) -> widget
                 if gt is None or pr is None:
                     continue
 
-                ratio = pr / (gt + EPS)
+                ratio = pr / (gt + SPECTRAL_NUMERICAL_FLOOR)
                 col = ch_colors.get(ch, "C0")
                 ax.plot(k, ratio, lw=2.2, color=col, alpha=0.95)
 
@@ -1176,343 +954,4 @@ def plot_spectral_transfer_ratio(*, datasets: dict[str, pd.DataFrame]) -> widget
         step_size=50,
         extra_widgets=[channel_selector],
         channel_selector=channel_selector,
-    )
-
-
-# =============================================================================
-# Learned layer x frequency heatmap (optional)
-# =============================================================================
-
-
-def _load_spectral_energy_aggregated(run_dir: Path) -> dict[int, np.ndarray] | None:
-    """
-    Load spectral energy tensors from a run directory.
-
-    Parameters
-    ----------
-    run_dir : pathlib.Path
-        Run directory path.
-
-    Returns
-    -------
-    dict[int, numpy.ndarray] | None
-        Mapping layer_id -> energy tensor (usually rFFT energy), or None if missing/invalid.
-
-    """
-    pt_path = run_dir / "spectral_energy_aggregated.pt"
-    if not pt_path.is_file():
-        return None
-
-    obj = torch.load(pt_path, map_location="cpu")
-    if not isinstance(obj, dict) or not obj:
-        return None
-
-    out: dict[int, np.ndarray] = {}
-    for lid, t in obj.items():
-        lid_i = int(lid)
-        arr = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
-        out[lid_i] = np.asarray(arr, dtype=float)
-
-    return out or None
-
-
-def _radialise_rfft_energy(
-    E: np.ndarray,
-    *,
-    dx: float,
-    dy: float,
-    nbins: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Radialise 2D rFFT energy E[ky, kx_rfft] into 1D spectrum over k.
-
-    Parameters
-    ----------
-    E : numpy.ndarray
-        2D array of energy in rFFT layout [Ny, Nx//2+1].
-    dx : float
-        Physical spacing in x-direction.
-    dy : float
-        Physical spacing in y-direction.
-    nbins : int | None
-        Number of radial bins.
-
-    Returns
-    -------
-    tuple[numpy.ndarray, numpy.ndarray]
-        (k_centers, radial_energy_spectrum).
-
-    """
-    if E.ndim != 2:  # noqa: PLR2004
-        return np.array([0.0]), np.array([0.0])
-
-    ny, nxh = E.shape
-    nx = (nxh - 1) * 2
-
-    if nbins is None:
-        nbins = max(8, min(ny, nx) // 2)
-
-    ky = np.fft.fftfreq(ny, d=dy)
-    kx = np.fft.rfftfreq(nx, d=dx)
-    KX, KY = np.meshgrid(kx, ky)
-    kr = np.sqrt(KX**2 + KY**2)
-
-    kr_flat = kr.ravel()
-    e_flat = np.asarray(E, dtype=float).ravel()
-
-    k_max = float(np.max(kr_flat))
-    if not np.isfinite(k_max) or k_max <= 0:
-        return np.array([0.0]), np.array([0.0])
-
-    bins = np.linspace(0.0, k_max, int(nbins) + 1)
-    idx = np.digitize(kr_flat, bins) - 1
-
-    valid = (idx >= 0) & (idx < nbins)
-    idx_v = idx[valid]
-    e_v = e_flat[valid]
-
-    sum_e = np.bincount(idx_v, weights=e_v, minlength=nbins).astype(float)
-    cnt = np.bincount(idx_v, minlength=nbins).astype(float)
-
-    spec = np.zeros(nbins, dtype=float)
-    m = cnt > 0
-    spec[m] = sum_e[m] / cnt[m]
-
-    k_centers = 0.5 * (bins[:-1] + bins[1:])
-    return k_centers.astype(float), spec.astype(float)
-
-
-def _k_edges_from_centers(k: np.ndarray) -> np.ndarray:
-    """
-    Convert bin centers into pcolormesh-compatible bin edges.
-
-    Parameters
-    ----------
-    k : numpy.ndarray
-        Bin centers.
-
-    Returns
-    -------
-    numpy.ndarray
-        Bin edges (len = len(k) + 1).
-
-    """
-    k = np.asarray(k, dtype=float)
-    if len(k) < 2:  # noqa: PLR2004
-        k0 = float(k[0]) if len(k) == 1 else 1.0
-        return np.array([max(k0 - 1.0, EPS), k0 + 1.0])
-
-    edges = np.zeros(len(k) + 1, dtype=float)
-    edges[1:-1] = 0.5 * (k[:-1] + k[1:])
-    edges[0] = max(k[0] - (edges[1] - k[0]), EPS)
-    edges[-1] = k[-1] + (k[-1] - edges[-2])
-    return np.maximum(edges, EPS)
-
-
-def plot_learned_layer_frequency_heatmap(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:  # noqa: C901
-    """
-    Learned spectral energy heatmap: layer x frequency (optional).
-
-    This plot is only available if spectral_energy_aggregated.pt can be found
-    via _infer_run_dir_from_df for each dataset.
-
-    Parameters
-    ----------
-    datasets : dict[str, pandas.DataFrame]
-        Mapping dataset_name -> evaluation DataFrame.
-
-    Returns
-    -------
-    ipywidgets.VBox
-        Interactive viewer widget (case slider is present for UI consistency,
-        but does not affect this plot).
-
-    """
-    names = list(datasets.keys())
-    if not names:
-        return widgets.VBox([widgets.HTML("<b>No datasets provided.</b>")])
-
-    learned_cache: dict[str, _LearnedHeatmapAcc] = {name: {"k": None, "layer_ids": [], "layer_k_energy": None} for name in names}
-
-    norm_layer_cb = analysis.ui.components.ui_checkbox_normalise(
-        description="Normalise per layer",
-        default=True,
-        width="220px",
-    )
-    controls = widgets.HBox([norm_layer_cb])
-
-    def _ensure_cached(name: str, df: pd.DataFrame) -> None:
-        """
-        Load and cache learned layer spectra for one dataset.
-
-        Parameters
-        ----------
-        name : str
-            Dataset name.
-        df : pandas.DataFrame
-            Evaluation DataFrame for this dataset.
-
-        Returns
-        -------
-        None
-
-        """
-        if learned_cache[name]["layer_k_energy"] is not None:
-            return
-
-        run_dir = _infer_run_dir_from_df(df)
-        spec = _load_spectral_energy_aggregated(run_dir)
-        if spec is None:
-            return
-
-        layer_ids = sorted(spec.keys())
-        if not layer_ids:
-            return
-
-        dx, dy = _get_dx_dy_from_df(df)
-
-        k_ref, s0 = _radialise_rfft_energy(spec[layer_ids[0]], dx=dx, dy=dy)
-        if len(k_ref) < 2 or len(s0) != len(k_ref):  # noqa: PLR2004
-            return
-
-        rows: list[np.ndarray] = []
-        kept: list[int] = []
-
-        for lid in layer_ids:
-            k, s = _radialise_rfft_energy(spec[lid], dx=dx, dy=dy)
-            if len(k) != len(k_ref):
-                continue
-            rows.append(s)
-            kept.append(lid)
-
-        if not rows:
-            return
-
-        learned_cache[name]["k"] = k_ref
-        learned_cache[name]["layer_ids"] = kept
-        learned_cache[name]["layer_k_energy"] = np.vstack(rows)
-
-    def _plot(
-        max_cases: int,
-        *,
-        datasets: dict[str, pd.DataFrame],
-        norm_layer_cb: widgets.Checkbox,
-    ) -> Figure:
-        """
-        Plot learned spectral energy heatmaps.
-
-        Parameters
-        ----------
-        max_cases : int
-            Not used (kept for viewer API consistency).
-        datasets : dict[str, pandas.DataFrame]
-            Mapping dataset_name -> evaluation DataFrame.
-        norm_layer_cb : ipywidgets.Checkbox
-            Normalise per layer toggle.
-
-        Returns
-        -------
-        matplotlib.figure.Figure
-            Heatmaps side by side (one per dataset).
-
-        """
-        _ = max_cases
-
-        for name, df in datasets.items():
-            if _has_npz_path_col(df):
-                _ensure_cached(name, df)
-
-        fig = plt.figure(figsize=(6.0 * len(names), 4.9))
-        gs = fig.add_gridspec(1, len(names), wspace=0.25, hspace=0.0)
-
-        all_vals: list[np.ndarray] = []
-        eps_floor = 100.0 * EPS
-
-        for name in names:
-            k = learned_cache[name]["k"]
-            M = learned_cache[name]["layer_k_energy"]
-            if k is None or M is None:
-                continue
-
-            A = np.asarray(M, dtype=float).copy()
-            if bool(norm_layer_cb.value):
-                row_sums = np.nansum(A, axis=1, keepdims=True)
-                A = A / (row_sums + EPS)
-
-            valid = np.isfinite(A) & (eps_floor < A)
-            if np.any(valid):
-                all_vals.append(np.log10(A[valid]))
-
-        if all_vals:
-            flat = np.concatenate(all_vals)
-            vmin = float(np.nanpercentile(flat, 2.0))
-            vmax = float(np.nanpercentile(flat, 99.5))
-        else:
-            vmin, vmax = -12.0, 0.0
-
-        # Wenn pro Layer normalisiert wird, gilt A <= 1 -> log10(A) <= 0
-        if bool(norm_layer_cb.value):
-            vmax = 0.0
-            vmin = max(vmin, float(np.log10(eps_floor)))
-
-        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin >= vmax):
-            vmin, vmax = (-12.0, 0.0) if bool(norm_layer_cb.value) else (-12.0, 2.0)
-
-        last_im = None
-
-        for c, name in enumerate(names):
-            ax = fig.add_subplot(gs[0, c])
-
-            k = learned_cache[name]["k"]
-            M = learned_cache[name]["layer_k_energy"]
-            layer_ids = learned_cache[name]["layer_ids"]
-
-            if k is None or M is None or not layer_ids:
-                ax.set_title(name)
-                ax.axis("off")
-                continue
-
-            A = M.copy()
-            if bool(norm_layer_cb.value):
-                row_sums = np.nansum(A, axis=1, keepdims=True)
-                A = A / (row_sums + EPS)
-
-            A_log = np.log10(A + EPS)
-
-            x_edges = _k_edges_from_centers(k)
-            y_edges = np.arange(0, A_log.shape[0] + 1, dtype=float)
-
-            last_im = ax.pcolormesh(
-                x_edges,
-                y_edges,
-                A_log,
-                shading="auto",
-                vmin=vmin,
-                vmax=vmax,
-            )
-
-            ax.set_xscale("log")
-            ax.set_xlabel("Spatial frequency k [1/length]")
-
-            if c == 0:
-                ax.set_ylabel("Layer depth index")
-
-            ax.set_title(name)
-
-        fig.suptitle("Learned spectral energy: layer x frequency (log10)", y=0.98)
-
-        if last_im is not None:
-            cb = fig.colorbar(last_im, ax=fig.axes, fraction=0.025)
-            cb.set_label("log10(energy)")
-
-        fig.subplots_adjust(top=0.86, bottom=0.16, left=0.06, right=0.98)
-        return fig
-
-    return analysis.ui.viewers.make_casecount_viewer(
-        plot_func=_plot,
-        datasets=datasets,
-        start_cases=50,
-        step_size=50,
-        extra_widgets=[controls],
-        norm_layer_cb=norm_layer_cb,
     )

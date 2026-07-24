@@ -91,9 +91,7 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
                     "2-1. Error vs architecture parameters",
                     analysis.evaluation.plots.architecture.plot_error_vs_architecture_parameters,
                 ),
-                toggle(
-                    "2-2. Capacity vs performance", analysis.evaluation.plots.architecture.plot_capacity_vs_performance
-                ),
+                toggle("2-2. Capacity vs performance", analysis.evaluation.plots.architecture.plot_capacity_vs_performance),
                 toggle("2-3. Parameter efficiency", analysis.evaluation.plots.architecture.plot_parameter_efficiency),
             ],
             "Architecture Sensitivity",
@@ -102,9 +100,7 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
         "error_decomposition": (
             [
                 toggle("3-1. Error vs |GT| magnitude", analysis.evaluation.plots.error_decomposition.plot_error_vs_gt_magnitude),
-                toggle(
-                    "3-2. Boundary vs interior error", analysis.evaluation.plots.error_decomposition.plot_error_vs_boundary_distance
-                ),
+                toggle("3-2. Boundary vs interior error", analysis.evaluation.plots.error_decomposition.plot_error_vs_boundary_distance),
             ],
             "Error Decomposition",
         ),
@@ -143,10 +139,6 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
                     "4-8. Pressure boundary consistency (p_bc)",
                     analysis.evaluation.plots.physical_consistency.plot_pressure_bc_consistency,
                 ),
-                toggle(
-                    "4-9. Porosity-weighted continuity residual map (∇·(εu))",
-                    analysis.evaluation.plots.physical_consistency.plot_div_eps_u_error_map,
-                ),
             ],
             "Physical Consistency",
         ),
@@ -160,10 +152,6 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
                 toggle(
                     "5-2. Spectral transfer ratio (Pred/GT)",
                     analysis.evaluation.plots.spectral.plot_spectral_transfer_ratio,
-                ),
-                toggle(
-                    "5-3. Learned layer x frequency heatmap",
-                    analysis.evaluation.plots.spectral.plot_learned_layer_frequency_heatmap,
                 ),
             ],
             "Spectral & Representation Analysis",
@@ -207,9 +195,7 @@ def _build_sections(toggle: Callable[[str, Callable[..., object]], widgets.Widge
                     "8-2. Worst per-channel cases (field plots)",
                     analysis.evaluation.plots.outliers.plot_outlier_cases_per_channel,
                 ),
-                toggle(
-                    "8-3. Extreme input parameters (table view)", analysis.evaluation.plots.outliers.plot_extreme_input_table
-                ),
+                toggle("8-3. Extreme input parameters (table view)", analysis.evaluation.plots.outliers.plot_extreme_input_table),
                 toggle(
                     "8-4. Extreme input parameter cases (field plots)",
                     analysis.evaluation.plots.outliers.plot_extreme_input_cases,

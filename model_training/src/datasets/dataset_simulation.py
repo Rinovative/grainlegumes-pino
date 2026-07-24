@@ -2,293 +2,211 @@
 ===============================================================================
 dataset_simulation.py
 ===============================================================================
-Load simulation-based steady-flow samples for training and evaluation.
+Load validated task-aware simulation datasets.
 
 Responsibilities:
-  - Load merged training datasets or directories of case files
-  - Delegate flow-field tensor construction to dataset modules
-  - Return x/y tensors and optional case metadata
+  - Load current merged datasets or strict directories of case payloads
+  - Validate schema, fields, shapes, ordered identity, and fingerprints
+  - Return identical model-ready x/y tensors to training and inference
 
 Design principles:
-  - Merged and case-directory layouts share one sample interface
-  - Case ordering is deterministic through sorted case paths
-  - Channel ordering is delegated to domain-aware flow modules
+  - Callers supply one resolved TaskSpec; fields are never selected ad hoc
+  - Merged and case-directory modes share the same identity validators
+  - Unsupported payloads and noncanonical aliases fail before sample exposure
 
 Boundaries:
-  - Split creation and DataLoader construction belong to datasets.base
-  - Model, loss and training orchestration belong to learning
-
-Notes:
-  Data layouts:
-    1) Merged training dataset (single `.pt` file)
-       -------------------------------------------------
-       Produced by `merge_batch_cases.py`, with structure:
-              {
-                "inputs":  Tensor [N, C_in, H, W],
-                "outputs": Tensor [N, C_out, H, W],
-                "fields": {
-                     "inputs":  list[str],  # channel names in order
-                     "outputs": list[str],
-                },
-              }
-         In this mode, the dataset behaves like a standard
-        operator-learning dataset over N samples.
-
-    2) Evaluation dataset from individual case files
-       -------------------------------------------------
-       A directory containing `case_XXXX.pt` files produced by
-       `build_batch_dataset.py`, each with structure:
-              {
-                "input_fields":  dict[str, 2D-array],
-                "output_fields": dict[str, 2D-array],
-                "meta":          dict,
-              }
-         These cases are converted on-the-fly into tensors with a
-         synthetic batch dimension of size 1, then reduced back to
-         [C_in, H, W] / [C_out, H, W] via the FlowModule.
-
-    In both modes, the FlowModule constructs model-ready tensors for
-    PINO/FNO models, and __getitem__ returns:
-        {"x": Tensor, "y": Tensor}          # merged mode
-        {"x": Tensor, "y": Tensor, "meta": dict}  # cases mode
-
+  - Schema and fingerprint algorithms belong to datasets.identity
+  - Split construction and normalization belong to datasets.base
 ===============================================================================
-
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.utils.data import Dataset
 
-from . import dataset_base as base
+from . import dataset_identity as identity
 from .dataset_modules import flow
 
 if TYPE_CHECKING:
     from torch import Tensor
 
+    from src.domain.tasks.domain_task_spec import TaskSpec
 
-class PhysicsDataset(base.BaseDataset):
-    """
-    Dataset for steady-state flow simulations with permeability fields.
 
-    Supports two data layouts:
-
-    1) Merged training dataset (single `.pt` file)
-       -------------------------------------------------
-       Produced by `merge_batch_cases.py`, with structure:
-
-           {
-               "inputs":  Tensor [N, C_in, H, W],
-               "outputs": Tensor [N, C_out, H, W],
-               "fields": {
-                   "inputs":  list[str],  # channel names in order
-                   "outputs": list[str],
-               },
-           }
-
-       In this mode, the dataset behaves like a standard
-       operator-learning dataset over N samples.
-
-    2) Evaluation dataset from individual case files
-       -------------------------------------------------
-       A directory containing `case_XXXX.pt` files produced by
-       `build_batch_dataset.py`, each with structure:
-
-           {
-               "input_fields":  dict[str, 2D-array],
-               "output_fields": dict[str, 2D-array],
-               "meta":          dict,
-           }
-
-       These cases are converted on-the-fly into tensors with a
-       synthetic batch dimension of size 1, then reduced back to
-       [C_in, H, W] / [C_out, H, W] via the FlowModule.
-
-    In both modes, the FlowModule constructs model-ready tensors for
-    PINO/FNO models, and __getitem__ returns:
-
-        {"x": Tensor, "y": Tensor}          # merged mode
-        {"x": Tensor, "y": Tensor, "meta": dict}  # cases mode
-    """
+class PhysicsDataset(Dataset[dict[str, Any]]):
+    """Expose strict task tensors from a merged file or case directory."""
 
     def __init__(
         self,
-        data_path: str,
-        include_inputs: list[str] | None = None,
-        include_outputs: list[str] | None = None,
+        data_path: str | Path,
+        *,
+        task: TaskSpec,
     ) -> None:
         """
-        Initialize dataset from either a merged `.pt` file or a case directory.
+        Initialize and validate a current task dataset.
 
         Parameters
         ----------
-        data_path : str
-            Path to a merged dataset file (`<batch_name>.pt`) or to a
-            directory containing `case_XXXX.pt` files.
-        include_inputs : list[str] | None, optional
-            Optional list of input channel names to include in x.
-            If None, all available input channels are used (default: None).
-        include_outputs : list[str] | None, optional
-            Optional list of output channel names to include in y.
-            If None, all available output channels are used (default: None).
+        data_path : str | Path
+            Merged ``.pt`` file or directory of strict case files.
+        task : TaskSpec
+            Authoritative task contract used by every producer and consumer.
 
         """
         path = Path(data_path)
-
-        self.mode: str
+        self.path = path
+        self.task = task
+        self.input_fields = list(task.input_names)
+        self.output_fields = list(task.output_names)
+        self.data: dict[str, Any] | None = None
         self.case_files: list[Path] = []
         self.flow_module: flow.FlowModule | None = None
-        self.include_inputs = include_inputs
-        self.include_outputs = include_outputs
 
-        # -----------------------------------------------------------
-        # Evaluation mode: directory of case files
-        # -----------------------------------------------------------
         if path.is_dir():
             self.mode = "cases"
-            files = sorted(path.glob("case_*.pt"))
-
-            if not files:
+            self.case_files = sorted(path.glob("case_*.pt"))
+            if not self.case_files:
                 msg = f"No case_XXXX.pt files found in directory: {path}"
                 raise RuntimeError(msg)
 
-            self.case_files = list(files)
-            # BaseDataset expects `self.data`, but we do not use it in cases mode.
-            self.data = None  # type: ignore[assignment]
+            validated_cases: list[identity.CaseIdentity] = []
+            for case_path in self.case_files:
+                payload = torch.load(case_path, map_location="cpu", weights_only=False)
+                validated = identity.validate_case_identity(
+                    payload,
+                    task=task,
+                    verify_content=True,
+                )
+                if validated.case_id != case_path.stem:
+                    msg = f"Case filename/sample identity mismatch: {case_path.stem!r} != {validated.case_id!r}."
+                    raise ValueError(msg)
+                validated_cases.append(validated)
+            dataset_id = path.parent.name if path.name == "cases" else path.name
+            self.identity = identity.case_collection_identity(
+                task=task,
+                dataset_id=dataset_id,
+                cases=validated_cases,
+            )
             return
 
-        # -----------------------------------------------------------
-        # Training mode: merged dataset
-        # -----------------------------------------------------------
+        if not path.is_file():
+            msg = f"Dataset path does not exist: {path}"
+            raise FileNotFoundError(msg)
         self.mode = "merged"
-
-        # BaseDataset.__init__ loads the serialized dict into self.data
-        super().__init__(data_path)  # self.data: dict[str, Tensor]
-
-        # FlowModule handles channel ordering and selection for merged data
-        self.flow_module = flow.FlowModule(
-            self.data,  # type: ignore[arg-type]
-            include_inputs=include_inputs,
-            include_outputs=include_outputs,
-        )
-
-    # ---------------------------------------------------------------
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            msg = f"Merged dataset must contain a dictionary payload: {path}"
+            raise TypeError(msg)
+        self.data = payload
+        self.flow_module = flow.FlowModule(payload, task=task)
+        if self.flow_module.dataset_identity is None:
+            msg = "Merged FlowModule did not expose dataset identity."
+            raise RuntimeError(msg)
+        self.identity = self.flow_module.dataset_identity
 
     def __len__(self) -> int:
         """
-        Return the number of samples in the dataset.
+        Return the number of validated ordered samples.
 
         Returns
         -------
         int
-            Number of samples:
-                - For merged mode: N (first dimension of "inputs")
-                - For cases mode:  number of `case_XXXX.pt` files
+            Dataset sample count.
 
         """
-        if self.mode == "merged":
-            return self.data["inputs"].shape[0]  # type: ignore[index]
-
-        return len(self.case_files)
-
-    # ---------------------------------------------------------------
+        return self.identity.sample_count
 
     def _load_case(self, idx: int) -> dict[str, Any]:
         """
-        Load and process a single `case_XXXX.pt` file in evaluation mode.
-
-        The raw case format is converted via FlowModule to
-
-            x: Tensor [C_in, H, W]
-            y: Tensor [C_out, H, W]
-
-        A shallow copy of the metadata is returned under "meta".
+        Load one already-admitted case and revalidate it before use.
 
         Parameters
         ----------
         idx : int
-            Case index in the sorted list of `case_XXXX.pt` files.
+            Ordered case index.
 
         Returns
         -------
         dict[str, Any]
-            Dictionary with keys:
-                - "x":    Tensor [C_in, H, W]
-                - "y":    Tensor [C_out, H, W]
-                - "meta": dict with case metadata
+            Model-ready ``x``/``y`` tensors and source metadata.
 
         """
         case_path = self.case_files[idx]
-        case_dict: dict[str, Any] = torch.load(case_path)
-
-        module = flow.FlowModule(
-            case_dict,
-            include_inputs=self.include_inputs,
-            include_outputs=self.include_outputs,
-        )
-
+        payload = torch.load(case_path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            msg = f"Case file must contain a dictionary payload: {case_path}"
+            raise TypeError(msg)
+        module = flow.FlowModule(payload, task=self.task)
         sample: dict[str, Any] = {}
-        # Single-case format has an artificial batch dimension of size 1
         module.apply(0, sample)
-
         x_tensor: Tensor = sample["x"]["input"]
         y_tensor: Tensor = sample["y"]["output"]
-        raw_meta = case_dict.get("meta", {})
+        raw_meta = payload["source_metadata"]
         if not isinstance(raw_meta, Mapping):
-            msg = f"Case metadata must be a mapping: {case_path}"
+            msg = f"Case source_metadata must be a mapping: {case_path}"
             raise TypeError(msg)
-        meta = dict(raw_meta)
-
-        return {"x": x_tensor, "y": y_tensor, "meta": meta}
-
-    # ---------------------------------------------------------------
+        return {"x": x_tensor, "y": y_tensor, "meta": deepcopy(dict(raw_meta))}
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """
-        Retrieve one dataset item.
-
-        Training (merged) mode:
-            Returns a dictionary
-                {
-                    "x": Tensor [C_in, H, W],
-                    "y": Tensor [C_out, H, W],
-                }
-
-        Evaluation (cases) mode:
-            Returns a dictionary
-                {
-                    "x":    Tensor [C_in, H, W],
-                    "y":    Tensor [C_out, H, W],
-                    "meta": dict,
-                }
+        Return one validated model-ready sample.
 
         Parameters
         ----------
         idx : int
-            Sample index (0-based).
+            Ordered sample index.
 
         Returns
         -------
         dict[str, Any]
-            Sample dictionary with model-ready tensors and optional metadata.
+            ``x`` and ``y`` tensors plus isolated per-sample source metadata.
 
         """
-        if self.mode == "merged":
-            fm = self.flow_module
-            if fm is None:
-                msg = "FlowModule is not initialised in merged mode."
-                raise RuntimeError(msg)
+        if self.mode == "cases":
+            return self._load_case(idx)
+        module = self.flow_module
+        data = self.data
+        if module is None or data is None:
+            msg = "FlowModule or merged payload is not initialized in merged mode."
+            raise RuntimeError(msg)
+        sample: dict[str, Any] = {}
+        module.apply(idx, sample)
+        raw_meta = data["source_metadata"][idx]
+        if not isinstance(raw_meta, Mapping):
+            msg = f"Merged source_metadata[{idx}] must be a mapping: {self.path}"
+            raise TypeError(msg)
+        return {
+            "x": sample["x"]["input"],
+            "y": sample["y"]["output"],
+            "meta": deepcopy(dict(raw_meta)),
+        }
 
-            sample: dict[str, Any] = {}
-            fm.apply(idx, sample)
 
-            x_tensor: Tensor = sample["x"]["input"]
-            y_tensor: Tensor = sample["y"]["output"]
+def create_task_dataset(
+    data_path: str | Path,
+    *,
+    task: TaskSpec,
+) -> PhysicsDataset:
+    """
+    Construct the shared training/inference dataset implementation.
 
-            return {"x": x_tensor, "y": y_tensor}
+    Parameters
+    ----------
+    data_path : str | Path
+        Merged dataset file or strict case directory.
+    task : TaskSpec
+        Authoritative task contract.
 
-        return self._load_case(idx)
+    Returns
+    -------
+    PhysicsDataset
+        Fully validated task-aware dataset.
+
+    """
+    return PhysicsDataset(data_path, task=task)

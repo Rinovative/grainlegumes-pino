@@ -47,7 +47,8 @@ class _CheckboxGroupProto(Protocol):
 # =============================================================================
 
 CHANNELS = ["p", "u", "v", "U"]
-EPS = 1e-12
+RELATIVE_ERROR_DENOMINATOR_FLOOR = 1e-12
+CONSTANT_SERIES_THRESHOLD = 1e-12
 DROP_PARAMETER_SUBSTRINGS = (
     "eps_max_global",
     "eps_min_global",
@@ -121,7 +122,7 @@ def _rel_l2(err: np.ndarray, gt: np.ndarray) -> float:
         Relative L2 error.
 
     """
-    return float(np.linalg.norm(err) / (np.linalg.norm(gt) + EPS))
+    return float(np.linalg.norm(err) / (np.linalg.norm(gt) + RELATIVE_ERROR_DENOMINATOR_FLOOR))
 
 
 # =============================================================================
@@ -217,7 +218,7 @@ def plot_parameter_error_heatmap(*, datasets: dict[str, pd.DataFrame]) -> widget
         # --------------------------------------------------
         par_cols = sorted(set.intersection(*[{c for c in df.columns if _is_parameter_column(c)} for df in datasets.values()]))
 
-        # rauswerfen (z.B. eps_min/max_global)
+        # Keep physical parameters and drop aggregate bounds.
         par_cols = [c for c in par_cols if not _drop_parameter_column(c)]
 
         if not par_cols:
@@ -257,7 +258,7 @@ def plot_parameter_error_heatmap(*, datasets: dict[str, pd.DataFrame]) -> widget
                 for ch in CHANNELS:
                     y = np.asarray(d["err"][ch])
 
-                    if np.std(x) < EPS or np.std(y) < EPS:
+                    if np.std(x) < CONSTANT_SERIES_THRESHOLD or np.std(y) < CONSTANT_SERIES_THRESHOLD:
                         corr.loc[p, ch] = np.nan
                     else:
                         corr.loc[p, ch] = np.corrcoef(x, y)[0, 1]
@@ -388,7 +389,7 @@ def plot_error_vs_parameter_trend(*, datasets: dict[str, pd.DataFrame]) -> widge
         if x.size < min_pairs_per_param or y.size < min_pairs_per_param:
             return float("nan")
 
-        if np.nanstd(x) < EPS or np.nanstd(y) < EPS:
+        if np.nanstd(x) < CONSTANT_SERIES_THRESHOLD or np.nanstd(y) < CONSTANT_SERIES_THRESHOLD:
             return float("nan")
 
         q = np.linspace(0.0, 1.0, n_bins + 1)

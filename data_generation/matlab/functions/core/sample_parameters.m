@@ -55,12 +55,21 @@ if nargin < 1, method = 'lhs'; end
 if nargin < 2, variation = 0.20; end
 if nargin < 3, N = 200; end
 if nargin < 4, seed = 42; end
-if nargin < 5
-    this_file  = mfilename('fullpath');
-    script_dir = fileparts(this_file);
-    project_root = fullfile(script_dir, '..', '..');
-    project_root = char(java.io.File(project_root).getCanonicalPath());
-    output_dir = fullfile(project_root, 'data', 'meta');
+if nargin < 5 || isempty(output_dir)
+    generated_data_root = getenv('GENERATED_DATA_ROOT');
+    if isempty(generated_data_root)
+        this_file = mfilename('fullpath');
+        script_dir = fileparts(this_file);
+        generation_root = fullfile(script_dir, '..', '..', '..');
+        generation_root = char(java.io.File(generation_root).getCanonicalPath());
+        storage_root = getenv('STORAGE_ROOT');
+        if isempty(storage_root)
+            repository_root = fileparts(generation_root);
+            storage_root = fullfile(fileparts(repository_root), 'storage');
+        end
+        generated_data_root = fullfile(storage_root, 'data_generation');
+    end
+    output_dir = fullfile(generated_data_root, 'meta');
 end
 
 if ~isfolder(output_dir), mkdir(output_dir); end

@@ -5,14 +5,15 @@ learning_inference.py
 Rebuild deterministic model inference contexts from saved run artifacts.
 
 Responsibilities:
-  - Reconstruct saved model architecture and weights
+  - Resolve the saved task contract and reconstruct the semantic model kind
+  - Load saved model weights
   - Load saved normalizer state into a data processor
   - Build deterministic split-aware evaluation datasets and dataloaders
   - Validate saved field contracts against model and dataset channels
 
 Design principles:
   - Inference mirrors the saved training configuration
-  - Normalizers are reloaded instead of refit
+  - The exact normalizer state admitted by completed-run validation is reconstructed without refitting
   - Saved split indices are applied before evaluation loaders are built
   - Field order checks fail fast on incompatible artifacts
 
@@ -27,12 +28,13 @@ Notes:
       config.yaml
       normalizer.pt
       best_checkpoint.pt
+      last_checkpoint.pt
       split_indices.pt
       summary.json
   - The inference pipeline:
-    1. Load config.yaml to get the resolved model architecture and parameters
+    1. Load config.yaml to get the resolved task, model kind and parameters
     2. Reconstruct the model and load model_state_dict from best_checkpoint.pt
-    3. Load normalizer state from normalizer.pt into a DefaultDataProcessor
+    3. Reconstruct a DefaultDataProcessor from the already validated normalizer state
     4. Load split_indices.pt and select an explicit train/eval/OOD role
     5. Apply saved split membership before building the DataLoader
     6. Return the model, DataLoader, processor, and device for inference
@@ -42,7 +44,7 @@ Notes:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sized
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -51,50 +53,23 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from src import datasets, experiments, learning
+from src import common, datasets, experiments, learning
 
 if TYPE_CHECKING:
+    from collections.abc import Sized
+
     from neuralop.data.transforms.data_processors import DefaultDataProcessor
 
 # ======================================================================
 # RUN CONTRACT
 # ======================================================================
 
-CONFIG_FILENAME = "config.yaml"
-NORMALIZER_FILENAME = "normalizer.pt"
-CHECKPOINT_FILENAME = "best_checkpoint.pt"
-SPLIT_INDICES_FILENAME = "split_indices.pt"
 SplitRole = Literal["train", "eval", "ood"]
 _SPLIT_INDEX_KEYS: dict[str, str] = {
     "train": "train_indices",
     "eval": "eval_indices",
     "ood": "ood_indices",
 }
-_SPLIT_DATASET_METADATA_KEYS: dict[str, str] = {
-    "train": "train_dataset",
-    "eval": "train_dataset",
-    "ood": "ood_dataset",
-}
-_SPLIT_COUNT_METADATA_KEYS: dict[str, str] = {
-    "train": "n_train",
-    "eval": "n_eval",
-    "ood": "n_ood",
-}
-_SPLIT_FULL_COUNT_METADATA_KEYS: dict[str, str] = {
-    "train": "n_train_full",
-    "eval": "n_train_full",
-    "ood": "n_ood_full",
-}
-
-
-@dataclass(frozen=True)
-class RunArtifactPaths:
-    """Paths for the current saved-run contract consumed by inference."""
-
-    config: Path
-    normalizer: Path
-    checkpoint: Path
-    split_indices: Path
 
 
 @dataclass(frozen=True)
@@ -127,11 +102,9 @@ class IndexedSubset(Dataset[dict[str, Any]]):
         normalized_indices = source_indices.to(dtype=torch.long, device="cpu").clone()
         min_index = int(normalized_indices.min().item())
         max_index = int(normalized_indices.max().item())
-        if min_index < 0 or max_index >= len(dataset):
-            msg = (
-                f"source_indices are out of bounds for dataset size {len(dataset)}; "
-                f"index range is {min_index}..{max_index}."
-            )
+        dataset_size = len(cast("Sized", dataset))
+        if min_index < 0 or max_index >= dataset_size:
+            msg = f"source_indices are out of bounds for dataset size {dataset_size}; index range is {min_index}..{max_index}."
             raise IndexError(msg)
 
         self.dataset = dataset
@@ -166,46 +139,9 @@ class IndexedSubset(Dataset[dict[str, Any]]):
         return sample
 
 
-def _require_file(path: Path, *, label: str) -> Path:
-    """Return an existing file path or raise a clear contract error."""
-    if not path.is_file():
-        msg = f"Required {label} file not found: {path}"
-        raise FileNotFoundError(msg)
-    return path
-
-
-def _run_artifact_paths(run_dir: Path) -> RunArtifactPaths:
-    """Resolve and validate the saved-run files used by inference."""
-    return RunArtifactPaths(
-        config=_require_file(run_dir / CONFIG_FILENAME, label="run config"),
-        normalizer=_require_file(run_dir / NORMALIZER_FILENAME, label="normalizer"),
-        checkpoint=_require_file(run_dir / CHECKPOINT_FILENAME, label="checkpoint"),
-        split_indices=_require_file(run_dir / SPLIT_INDICES_FILENAME, label="split indices"),
-    )
-
-
 # ======================================================================
 # CONFIG AND SPLIT LOADING
 # ======================================================================
-
-
-def _normalize_path(path: Path) -> Path:
-    """Return a comparable path without requiring the file to exist."""
-    return path.expanduser().resolve(strict=False)
-
-
-def _paths_match(left: Path, right: Path) -> bool:
-    """Return whether two saved dataset paths identify the same location."""
-    return _normalize_path(left) == _normalize_path(right)
-
-
-def _load_split_indices(split_indices_path: Path) -> Mapping[str, Any]:
-    """Load saved split indices from the current run contract."""
-    split_indices = torch.load(split_indices_path, map_location="cpu")
-    if not isinstance(split_indices, Mapping):
-        msg = f"Split indices must be a mapping: {split_indices_path}"
-        raise TypeError(msg)
-    return split_indices
 
 
 def _data_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -217,48 +153,19 @@ def _data_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     return data_cfg
 
 
-def _paths_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the resolved paths config section after validating its shape."""
-    paths_cfg = config.get("paths")
-    if not isinstance(paths_cfg, Mapping):
-        msg = "Run config must contain a mapping at paths."
-        raise TypeError(msg)
-    return paths_cfg
-
-
-def _configured_dataset_paths(config: Mapping[str, Any]) -> dict[SplitRole, Path]:
-    """Resolve the merged train/eval/OOD dataset paths from saved config.yaml."""
+def _configured_dataset_ids(config: Mapping[str, Any]) -> dict[SplitRole, str]:
+    """Return logical train/eval/OOD dataset identifiers from config.yaml."""
     data_cfg = _data_section(config)
-    paths_cfg = _paths_section(config)
-
-    train_root_raw = paths_cfg.get("train_root")
-    if not isinstance(train_root_raw, str) or not train_root_raw:
-        msg = "Run config must contain paths.train_root as a non-empty string."
-        raise TypeError(msg)
-    train_root = Path(train_root_raw)
-
-    train_dataset = data_cfg.get("train_dataset")
-    if not isinstance(train_dataset, str) or not train_dataset:
-        msg = "Run config must contain data.train_dataset as a non-empty string."
-        raise TypeError(msg)
-
+    train_dataset = common.paths.validate_logical_name(
+        data_cfg.get("train_dataset"),
+        label="data.train_dataset",
+    )
     ood_datasets = data_cfg.get("ood_datasets")
-    if not isinstance(ood_datasets, list) or not ood_datasets:
-        msg = "Run config must contain data.ood_datasets as a non-empty list."
+    if not isinstance(ood_datasets, list) or len(ood_datasets) != 1:
+        msg = "Run config data.ood_datasets must contain exactly one logical dataset id."
         raise TypeError(msg)
-    if not all(isinstance(name, str) and name for name in ood_datasets):
-        msg = "Run config data.ood_datasets must contain non-empty strings."
-        raise TypeError(msg)
-
-    train_path = train_root / train_dataset / f"{train_dataset}.pt"
-    ood_dataset = ood_datasets[0]
-    ood_path = train_root / ood_dataset / f"{ood_dataset}.pt"
-
-    return {
-        "train": train_path,
-        "eval": train_path,
-        "ood": ood_path,
-    }
+    ood_dataset = common.paths.validate_logical_name(ood_datasets[0], label="data.ood_datasets[0]")
+    return {"train": train_dataset, "eval": train_dataset, "ood": ood_dataset}
 
 
 def _split_metadata(split_indices: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -279,14 +186,42 @@ def _validate_split_role(split: str) -> SplitRole:
     return cast("SplitRole", split)
 
 
-def _metadata_dataset_path(metadata: Mapping[str, Any], *, role: SplitRole) -> Path:
-    """Return the dataset path saved for a split role in split_indices metadata."""
-    metadata_key = _SPLIT_DATASET_METADATA_KEYS[role]
-    value = metadata.get(metadata_key)
-    if not isinstance(value, str) or not value:
-        msg = f"split_indices.pt metadata missing non-empty {metadata_key!r} for split {role!r}."
-        raise RuntimeError(msg)
-    return Path(value)
+def _saved_dataset_id(split_indices: Mapping[str, Any], *, role: SplitRole) -> str:
+    """Return the logical dataset identifier bound to one saved split role."""
+    metadata = _split_metadata(split_indices)
+    datasets_meta = metadata.get("datasets")
+    if not isinstance(datasets_meta, Mapping):
+        msg = "split_indices.pt metadata.datasets must be a mapping."
+        raise TypeError(msg)
+    identity_key = "ood" if role == "ood" else "train"
+    saved_identity = datasets_meta.get(identity_key)
+    if not isinstance(saved_identity, Mapping):
+        msg = f"split_indices.pt metadata.datasets.{identity_key} must be a mapping."
+        raise TypeError(msg)
+    dataset_id = saved_identity.get("dataset_id")
+    if not isinstance(dataset_id, str) or not dataset_id:
+        msg = f"split_indices.pt metadata.datasets.{identity_key}.dataset_id must be a non-empty string."
+        raise TypeError(msg)
+    return dataset_id
+
+
+def _split_settings(config: Mapping[str, Any]) -> tuple[float, float, int]:
+    """Return required effective split settings from a saved config."""
+    data_cfg = _data_section(config)
+    run_cfg = config.get("run")
+    if not isinstance(run_cfg, Mapping):
+        msg = "Run config must contain a mapping at run."
+        raise TypeError(msg)
+    required = ((data_cfg, "train_ratio"), (data_cfg, "ood_fraction"), (run_cfg, "seed"))
+    if any(key not in section for section, key in required):
+        msg = "Run config is missing train_ratio, ood_fraction, or run.seed split settings."
+        raise KeyError(msg)
+    split_seed = experiments.run.build_seed_plan(int(run_cfg["seed"]))["split"]
+    return (
+        cast("float", data_cfg["train_ratio"]),
+        cast("float", data_cfg["ood_fraction"]),
+        split_seed,
+    )
 
 
 def _select_split(
@@ -294,50 +229,27 @@ def _select_split(
     config: Mapping[str, Any],
     split_indices: Mapping[str, Any],
     split: str,
+    dataset_root: Path,
     dataset_path: Path | None,
 ) -> SplitSelection:
-    """Select a saved split and validate its dataset identity."""
+    """Select saved membership and resolve its logical dataset under the current root."""
     role = _validate_split_role(split)
-    data_cfg = _data_section(config)
-    run_cfg = config.get("run")
-    if not isinstance(run_cfg, Mapping):
-        msg = "Run config must contain a mapping at run."
-        raise TypeError(msg)
-    required_settings = {
-        "data.train_ratio": (data_cfg, "train_ratio"),
-        "data.ood_fraction": (data_cfg, "ood_fraction"),
-        "run.seed": (run_cfg, "seed"),
-    }
-    missing_settings = [label for label, (section, key) in required_settings.items() if key not in section]
-    if missing_settings:
-        msg = f"Run config is missing saved split setting(s): {', '.join(missing_settings)}."
-        raise KeyError(msg)
-
+    train_ratio, ood_fraction, split_seed = _split_settings(config)
     validated_indices = datasets.base.validate_split_info(
         split_indices,
-        expected_train_ratio=cast("float", data_cfg["train_ratio"]),
-        expected_ood_fraction=cast("float", data_cfg["ood_fraction"]),
-        expected_split_seed=cast("int", run_cfg["seed"]),
+        expected_train_ratio=train_ratio,
+        expected_ood_fraction=ood_fraction,
+        expected_split_seed=split_seed,
     )
-    metadata = _split_metadata(split_indices)
-    configured_paths = _configured_dataset_paths(config)
-
-    metadata_path = _metadata_dataset_path(metadata, role=role)
-    configured_path = configured_paths[role]
-    if not _paths_match(metadata_path, configured_path):
-        msg = f"Saved split metadata for split {role!r} does not match config.yaml.\nmetadata path: {metadata_path}\nconfig path:   {configured_path}"
+    configured_dataset_id = _configured_dataset_ids(config)[role]
+    saved_dataset_id = _saved_dataset_id(split_indices, role=role)
+    if saved_dataset_id != configured_dataset_id:
+        msg = f"Saved split dataset id for {role!r} does not match config.yaml: {saved_dataset_id!r} != {configured_dataset_id!r}."
         raise RuntimeError(msg)
-
-    selected_path = dataset_path if dataset_path is not None else metadata_path
-    if not _paths_match(selected_path, metadata_path):
-        msg = (
-            f"Requested dataset_path is incompatible with split {role!r}.\n"
-            f"requested: {selected_path}\n"
-            f"expected:  {metadata_path}\n"
-            "Saved split indices are only valid for the merged dataset recorded in split_indices.pt."
-        )
-        raise RuntimeError(msg)
-
+    selected_path = dataset_path or common.paths.resolve_dataset_path(
+        configured_dataset_id,
+        dataset_root=dataset_root,
+    )
     return SplitSelection(
         role=role,
         dataset_path=selected_path,
@@ -349,67 +261,26 @@ def _validate_split_indices_for_dataset(
     *,
     selection: SplitSelection,
     dataset: Dataset[Any],
-    split_metadata: Mapping[str, Any],
+    split_indices: Mapping[str, Any],
+    config: Mapping[str, Any],
 ) -> None:
-    """Validate saved split indices against the selected dataset length."""
-    sized_dataset = cast("Sized", dataset)
-    dataset_size = len(sized_dataset)
-    full_count_key = _SPLIT_FULL_COUNT_METADATA_KEYS[selection.role]
-    expected_full_count = split_metadata.get(full_count_key)
-    if not isinstance(expected_full_count, int) or isinstance(expected_full_count, bool):
-        msg = f"split_indices.pt metadata {full_count_key!r} must be an integer."
+    """Bind saved membership to the loaded dataset fingerprint and ordered IDs."""
+    dataset_identity = getattr(dataset, "identity", None)
+    if not isinstance(dataset_identity, datasets.identity.DatasetIdentity):
+        msg = "Inference dataset must expose a verified DatasetIdentity."
         raise TypeError(msg)
-    if expected_full_count != dataset_size:
-        msg = (
-            f"split_indices.pt metadata {full_count_key!r}={expected_full_count!r} does not match "
-            f"the selected {selection.role!r} dataset size {dataset_size}."
-        )
+    train_ratio, ood_fraction, split_seed = _split_settings(config)
+    validated = datasets.base.validate_split_info(
+        split_indices,
+        train_identity=dataset_identity if selection.role != "ood" else None,
+        ood_identity=dataset_identity if selection.role == "ood" else None,
+        expected_train_ratio=train_ratio,
+        expected_ood_fraction=ood_fraction,
+        expected_split_seed=split_seed,
+    )
+    if not torch.equal(validated[_SPLIT_INDEX_KEYS[selection.role]], selection.indices):
+        msg = f"Validated {selection.role!r} membership changed during inference construction."
         raise RuntimeError(msg)
-
-    max_index = int(selection.indices.max().item())
-    min_index = int(selection.indices.min().item())
-    if min_index < 0 or max_index >= dataset_size:
-        msg = (
-            f"Saved indices for split {selection.role!r} are out of bounds for {selection.dataset_path}.\n"
-            f"dataset size: {dataset_size}\n"
-            f"index range:  {min_index}..{max_index}"
-        )
-        raise RuntimeError(msg)
-
-    count_key = _SPLIT_COUNT_METADATA_KEYS[selection.role]
-    expected_count = split_metadata.get(count_key)
-    if not isinstance(expected_count, int) or isinstance(expected_count, bool):
-        msg = f"split_indices.pt metadata {count_key!r} must be an integer."
-        raise TypeError(msg)
-    if expected_count != int(selection.indices.numel()):
-        msg = (
-            f"split_indices.pt metadata {count_key!r}={expected_count!r} does not match "
-            f"the {selection.role!r} index count {selection.indices.numel()}."
-        )
-        raise RuntimeError(msg)
-
-
-def _load_config(config_path: Path) -> dict[str, Any]:
-    """
-    Load the resolved YAML configuration generated during training.
-
-    Parameters
-    ----------
-    config_path : Path
-        Path to the `config.yaml` file.
-
-    Returns
-    -------
-    dict[str, Any]
-        Parsed configuration dictionary.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist.
-
-    """
-    return experiments.config.loader.load_yaml(config_path)
 
 
 # ======================================================================
@@ -421,8 +292,8 @@ def _model_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(model_cfg, Mapping):
         msg = "Run config must contain a mapping at model."
         raise TypeError(msg)
-    if "architecture" not in model_cfg:
-        msg = "Run config missing model.architecture."
+    if "kind" not in model_cfg:
+        msg = "Run config missing model.kind."
         raise KeyError(msg)
     params = model_cfg.get("params")
     if not isinstance(params, Mapping):
@@ -432,16 +303,9 @@ def _model_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _field_contract(config: Mapping[str, Any]) -> tuple[list[str], list[str]]:
-    """Return input and output field names from the resolved run config."""
-    input_fields = config.get("input_fields")
-    output_fields = config.get("output_fields")
-    if not isinstance(input_fields, list) or not all(isinstance(name, str) for name in input_fields):
-        msg = "Run config must contain input_fields as a list of strings."
-        raise TypeError(msg)
-    if not isinstance(output_fields, list) or not all(isinstance(name, str) for name in output_fields):
-        msg = "Run config must contain output_fields as a list of strings."
-        raise TypeError(msg)
-    return input_fields, output_fields
+    """Return exact fields from the validated registered task contract."""
+    task = experiments.config.loader.validate_resolved_task_contract(config)
+    return list(task.input_names), list(task.output_names)
 
 
 def _with_inference_device(config: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
@@ -477,89 +341,6 @@ def _build_model_from_config(config: dict[str, Any], *, device: torch.device) ->
     """
     _model_section(config)
     return learning.models.factory.build_model(_with_inference_device(config, device))
-
-
-def _load_model_state_dict(checkpoint_path: Path) -> Mapping[str, Any]:
-    """
-    Load model weights from the current full checkpoint.
-
-    Parameters
-    ----------
-    checkpoint_path : Path
-        Path to `best_checkpoint.pt`.
-
-    Returns
-    -------
-    Mapping[str, Any]
-        Model state dictionary stored under `model_state_dict`.
-
-    Raises
-    ------
-    TypeError
-        If the checkpoint or model state dictionary has an invalid type.
-    RuntimeError
-        If the checkpoint does not contain `model_state_dict`.
-
-    """
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    if not isinstance(checkpoint, Mapping):
-        msg = f"Checkpoint must be a mapping: {checkpoint_path}"
-        raise TypeError(msg)
-
-    if "model_state_dict" not in checkpoint:
-        msg = f"Checkpoint must contain model_state_dict: {checkpoint_path}"
-        raise RuntimeError(msg)
-
-    state_dict = checkpoint["model_state_dict"]
-    if not isinstance(state_dict, Mapping):
-        msg = f"Checkpoint model_state_dict must be a mapping: {checkpoint_path}"
-        raise TypeError(msg)
-
-    return state_dict
-
-
-# ======================================================================
-# NORMALIZER LOADING
-# ======================================================================
-def _load_normalizer(normalizer_path: Path, *, device: torch.device) -> DefaultDataProcessor:
-    """
-    Load and reconstruct the NeuralOp normalizer used during training.
-
-    The stored file contains four tensors:
-        - in_normalizer.mean
-        - in_normalizer.std
-        - out_normalizer.mean
-        - out_normalizer.std
-
-    These tensors are assigned to a fresh `DefaultDataProcessor`, ensuring
-    that the preprocessing pipeline matches the training setup exactly.
-
-    Parameters
-    ----------
-    normalizer_path : Path
-        Path to `normalizer.pt`.
-    device : torch.device
-        Target device for all tensors.
-
-    Returns
-    -------
-    DefaultDataProcessor
-        Fully reconstructed normalization processor.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist.
-    RuntimeError
-        If expected keys are missing.
-
-    """
-    if not normalizer_path.exists():
-        msg = f"Normalizer file not found: {normalizer_path}"
-        raise FileNotFoundError(msg)
-
-    state = torch.load(normalizer_path, map_location="cpu")
-    return datasets.base.data_processor_from_state(state, device=device)
 
 
 # ======================================================================
@@ -598,6 +379,7 @@ def load_inference_context(
     *,
     run_dir: str | Path,
     dataset_path: str | Path | None = None,
+    dataset_root: str | Path | None = None,
     split: SplitRole | str = "eval",
     batch_size: int = 1,
     prefer_cuda: bool = True,
@@ -617,9 +399,11 @@ def load_inference_context(
         Path to a saved run directory containing `config.yaml`,
         `normalizer.pt`, `best_checkpoint.pt`, and `split_indices.pt`.
     dataset_path : str | Path | None, optional
-        Optional path to the merged dataset file to load. If omitted, the path
-        recorded in `split_indices.pt` metadata is used. If provided, it must
-        match the saved dataset identity for the requested split.
+        Optional exact merged-dataset file. Its fingerprint and ordered sample
+        identity must match the saved split.
+    dataset_root : str | Path | None, optional
+        Current explicit dataset root used with the saved logical dataset id.
+        Defaults to the current central dataset-root resolution.
     split : {"train", "eval", "ood"}, optional
         Saved split role to load. `eval` and `train` use the saved training
         dataset membership; `ood` uses saved OOD membership against the OOD
@@ -650,22 +434,25 @@ def load_inference_context(
 
     """
     run_dir = Path(run_dir)
-    requested_dataset_path = Path(dataset_path) if dataset_path is not None else None
-    artifacts = _run_artifact_paths(run_dir)
+    requested_dataset_path = Path(dataset_path).expanduser() if dataset_path is not None else None
+    current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_dataset_root()
+    completed_run = experiments.run.validate_completed_run(run_dir)
 
     device = torch.device("cuda") if prefer_cuda and torch.cuda.is_available() else torch.device("cpu")
 
-    cfg = _load_config(artifacts.config)
+    cfg = completed_run["config"]
+    split_indices = completed_run["split_indices"]
     input_channels, output_channels = _field_contract(cfg)
-    split_indices = _load_split_indices(artifacts.split_indices)
+    seed_plan = experiments.run.configure_reproducibility(cfg)
     split_selection = _select_split(
         config=cfg,
         split_indices=split_indices,
         split=str(split),
+        dataset_root=current_dataset_root,
         dataset_path=requested_dataset_path,
     )
-    split_metadata = _split_metadata(split_indices)
 
+    experiments.run.seed_process(seed_plan["model_init"])
     model = _build_model_from_config(cfg, device=device)
     # ------------------------------
     # HARD GUARDS: field contract <-> model
@@ -678,26 +465,28 @@ def load_inference_context(
         msg = f"out_channels mismatch: model.out_channels={model.out_channels} vs field contract={len(output_channels)} ({output_channels})"
         raise RuntimeError(msg)
 
-    model.load_state_dict(_load_model_state_dict(artifacts.checkpoint))
+    best_checkpoint = completed_run["best_checkpoint"]
+    model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
     model = model.to(device)
 
-    processor = _load_normalizer(artifacts.normalizer, device=device)
+    processor = datasets.base.data_processor_from_state(completed_run["normalizer_state"], device=device)
 
-    source_dataset = datasets.simulation.PhysicsDataset(
-        str(split_selection.dataset_path),
-        include_inputs=input_channels,
-        include_outputs=output_channels,
+    task = experiments.config.loader.validate_resolved_task_contract(cfg)
+    source_dataset = datasets.simulation.create_task_dataset(
+        split_selection.dataset_path,
+        task=task,
     )
     _validate_split_indices_for_dataset(
         selection=split_selection,
         dataset=source_dataset,
-        split_metadata=split_metadata,
+        split_indices=split_indices,
+        config=cfg,
     )
     # ------------------------------
     # HARD GUARDS: field contract <-> dataset
     # ------------------------------
-    ds_in = getattr(source_dataset, "include_inputs", None) or getattr(source_dataset, "input_fields", None)
-    ds_out = getattr(source_dataset, "include_outputs", None) or getattr(source_dataset, "output_fields", None)
+    ds_in = source_dataset.input_fields
+    ds_out = source_dataset.output_fields
 
     if ds_in is not None and list(ds_in) != list(input_channels):
         msg = f"Dataset input field contract mismatch.\nExpected: {input_channels}\nGot: {list(ds_in)}"

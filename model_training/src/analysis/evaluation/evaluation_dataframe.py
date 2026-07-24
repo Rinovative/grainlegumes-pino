@@ -19,21 +19,17 @@ Boundaries:
   - Visualization belongs to analysis.evaluation.plots
 
 Notes:
-  Expected raw Parquet columns:
-    - case_index
-    - npz_path
-    - l2
-    - rel_l2
-    - kappa_names
-    - meta  (dict, JSON-safe metadata)
+  Expected raw Parquet columns include authoritative identity, artifact path,
+  dimensionless relative metrics, per-field physical RMSE values, diagnostics,
+  and ``meta`` as a JSON object string.
 ===============================================================================
 
 """
 
 from __future__ import annotations
 
-import ast
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -44,38 +40,22 @@ import pandas as pd
 # =============================================================================
 # Helpers
 # =============================================================================
-def _parse_meta(val: Any) -> Any:
-    """
-    Parse the `meta` field from various formats into a dictionary.
-
-    Parameters
-    ----------
-    val : Any
-        Input metadata value (dict, str, etc.).
-
-    Returns
-    -------
-    Any
-        Parsed metadata dictionary or original value.
-
-    """
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return {}
-        # JSON first
-        try:
-            return json.loads(s)
-        except Exception:  # noqa: BLE001, S110
-            pass
-        # fallback: python-literal
-        try:
-            return ast.literal_eval(s)
-        except Exception:  # noqa: BLE001
-            return {}
-    return val
+def _parse_meta(value: Any) -> dict[str, Any]:
+    """Return one validated JSON metadata object."""
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str):
+        message = f"Artifact meta must be a JSON object or mapping, got {type(value).__name__}."
+        raise TypeError(message)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        message = "Artifact meta must contain valid JSON."
+        raise ValueError(message) from error
+    if not isinstance(parsed, dict):
+        message = f"Artifact meta JSON must decode to an object, got {type(parsed).__name__}."
+        raise TypeError(message)
+    return parsed
 
 
 def _to_scalar(val: Any) -> Any:
@@ -212,11 +192,20 @@ def build_eval_df(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     if "meta" in df.columns:
         meta_features = df["meta"].apply(lambda m: flatten_meta_scalars(_parse_meta(m)))
-        meta_df = pd.DataFrame(meta_features.tolist())
+        meta_df = pd.DataFrame(meta_features.tolist(), index=df.index)
+        authoritative_columns = set(df.columns)
+        collisions = sorted(authoritative_columns.intersection(meta_df.columns))
+        if collisions:
+            msg = f"Artifact metadata collides with authoritative table columns: {collisions}."
+            raise ValueError(msg)
 
         df = pd.concat([df, meta_df], axis=1)
 
         # Drop raw meta to keep table lightweight and analysis-friendly
         df = df.drop(columns=["meta"], errors="ignore")
 
+    if not df.columns.is_unique:
+        duplicates = sorted(set(df.columns[df.columns.duplicated()].tolist()))
+        msg = f"Evaluation DataFrame contains duplicate columns: {duplicates}."
+        raise ValueError(msg)
     return df

@@ -1,4 +1,4 @@
-name: Quality Report
+name: Quality
 
 on:
   push:
@@ -6,13 +6,15 @@ on:
   pull_request:
 
 jobs:
-  quality-report:
+  quality:
     runs-on: ubuntu-latest
+    env:
+      CUDA_VISIBLE_DEVICES: ""
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Micromamba
+      - name: Set up CPU test environment
         uses: mamba-org/setup-micromamba@v1
         with:
           environment-file: environment-dev.yml
@@ -20,16 +22,40 @@ jobs:
           cache-downloads: true
           init-shell: bash
 
-      - name: Ruff report
+      - name: Build, install, and smoke-test wheel
         shell: bash -l {0}
         run: |
-          ruff check . || true
-          ruff format --check . --exclude "*.ipynb" || true
+          wheel_dir="${RUNNER_TEMP}/grainlegumes-pino-wheel"
+          mkdir -p "$wheel_dir"
+          python -m pip wheel --no-deps --no-build-isolation --wheel-dir "$wheel_dir" .
+          wheel_path="$(find "$wheel_dir" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          install_dir="${RUNNER_TEMP}/grainlegumes-pino-install"
+          python -m pip install --no-deps --target "$install_dir" "$wheel_path"
+          cd "$RUNNER_TEMP"
+          PACKAGE_INSTALL_ROOT="$install_dir" PYTHONPATH="$install_dir" python -c 'import os; from pathlib import Path; import src; from src import analysis, common, datasets, domain, experiments, learning; assert Path(src.__file__).resolve().is_relative_to(Path(os.environ["PACKAGE_INSTALL_ROOT"]).resolve())'
 
-      - name: Mypy report
+      - name: Lint
+        shell: bash -l {0}
+        run: ruff check model_training/src model_training/tests data_generation/matlab scripts/check_notebooks.py
+
+      - name: Check formatting
+        shell: bash -l {0}
+        run: ruff format --check model_training/src model_training/tests data_generation/matlab scripts/check_notebooks.py --exclude '*.ipynb'
+
+      - name: Validate and lint notebooks
         shell: bash -l {0}
         run: |
-          mypy . || true
+          python scripts/check_notebooks.py
+          ruff check model_training/notebooks
+
+      - name: Type-check with Mypy
+        shell: bash -l {0}
+        run: PYTHONPATH=model_training mypy model_training/src data_generation/matlab
+
+      - name: Type-check with BasedPyright
+        shell: bash -l {0}
+        run: python -m basedpyright
 
       - name: Complexity report
         shell: bash -l {0}
@@ -63,7 +89,15 @@ jobs:
           grade_sort_order = {"F": 0, "E": 1, "D": 2, "C": 3, "B": 4, "A": 5}
 
           result = subprocess.run(
-              ["radon", "cc", "-j", "."],
+              [
+                  "radon",
+                  "cc",
+                  "-j",
+                  "model_training/src",
+                  "model_training/tests",
+                  "data_generation/matlab",
+                  "scripts/check_notebooks.py",
+              ],
               capture_output=True,
               text=True,
               check=False,
@@ -145,3 +179,19 @@ jobs:
 
           print("============================================================")
           EOF
+      - name: Compile maintained Python
+        shell: bash -l {0}
+        run: python -m compileall -q model_training/src data_generation/matlab scripts/check_notebooks.py
+
+      - name: Run CPU tests
+        shell: bash -l {0}
+        run: PYTHONPATH=model_training python -m pytest -q model_training/tests
+
+      - name: Smoke-test imports and command-line interfaces
+        shell: bash -l {0}
+        run: |
+          cd model_training
+          python -c "from src import analysis, common, datasets, domain, experiments, learning"
+          python -m src.experiments.cli.cli_train --help
+          python -m src.experiments.cli.cli_optuna --help
+          python -m src.experiments.cli.cli_build_artifacts --help

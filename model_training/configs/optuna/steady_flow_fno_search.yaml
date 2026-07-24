@@ -1,16 +1,12 @@
 study:
   name: steady_flow_fno_search
-  direction: minimize
-  metric: eval_overall_rmse
   seed: 9
   n_trials: 30
-  budgets: [300, 400]
-  hard_prune_spike: true
+  report_epochs: [300, 400]
   sampler:
-    type: tpe
-    seed: 9
+    kind: tpe
   pruner:
-    type: median
+    kind: median
     n_startup_trials: 0
     n_warmup_steps: 0
     interval_steps: 1
@@ -26,60 +22,89 @@ experiment:
     suffix: null
 
   model:
-    architecture: FNO
+    kind: fno
     params:
       n_modes: [128, 160]
       hidden_channels: 64
       n_layers: 3
 
   loss:
-    type: supervised
-    data_loss: h1
+    data:
+      kind: relative_h1
+      space: normalized
+      weight: 1.0
+    physics:
+      enabled: false
 
-  physics:
-    enabled: false
+  evaluation:
+    metrics:
+      - id: normalized_relative_h1
+        kind: relative_h1
+        space: normalized
+        fields: all
+        reduction: sample_mean
+      - id: normalized_rmse
+        kind: rmse
+        space: normalized
+        fields: all
+        reduction: element_mean
+      - id: physical_rmse_p
+        kind: rmse
+        space: physical
+        field: p
+        reduction: element_mean
+      - id: physical_rmse_u
+        kind: rmse
+        space: physical
+        field: u
+        reduction: element_mean
+      - id: physical_rmse_v
+        kind: rmse
+        space: physical
+        field: v
+        reduction: element_mean
+    objective:
+      id: normalized_relative_h1
 
   optimizer:
-    type: adamw
+    kind: adamw
     lr: 3.883614530748613e-4
     weight_decay: 1.0e-4
 
   scheduler:
-    type: reduce_on_plateau
-    monitor: eval_overall_rmse
+    kind: reduce_on_plateau
     factor: 0.5
     patience: 20
 
   training:
-    n_epochs: 400
-    eval_interval: 5
+    epochs: 400
+    evaluation_interval: 5
     mixed_precision: false
-    save_best_metric: eval_overall_rmse
 
 search_space:
   model.params.n_modes.0:
     name: modes_x
-    type: categorical
+    kind: categorical
     values: [24, 32, 48, 64, 96, 128]
   model.params.n_modes.1:
     name: modes_y
-    type: categorical
+    kind: categorical
     values: [32, 48, 64, 96, 128, 160]
   model.params.hidden_channels:
     name: hidden_channels
-    type: categorical
+    kind: categorical
     values: [32, 64, 96, 128]
   model.params.n_layers:
     name: n_layers
-    type: categorical
+    kind: categorical
     values: [3, 4, 5, 6]
   optimizer.lr:
     name: lr
-    type: float
+    kind: float
     low: 1.0e-3
     high: 1.5e-2
     log: true
   data.batch_size:
     name: batch_size
-    type: categorical
+    kind: categorical
     values: [16, 32]

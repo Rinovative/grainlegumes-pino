@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 # GLOBAL OUTPUT CHANNEL CONFIGURATION (domain-derived)
 # =============================================================================
 
-CHANNELS = domain.fields.OUTPUT_FIELDS
+CHANNELS = domain.fields.ANALYSIS_FIELDS
 CHANNEL_INDICES = {name: i for i, name in enumerate(CHANNELS)}
 
 # =============================================================================
@@ -53,42 +53,31 @@ CHANNEL_INDICES = {name: i for i, name in enumerate(CHANNELS)}
 
 
 def plot_global_error_metrics(*, datasets: dict[str, pd.DataFrame]) -> Figure:
-    """
-    Comprehensive global error comparison using three complementary views.
+    """Compare dimensionless channel-balanced relative L2 and relative H1."""
+    names = list(datasets)
+    if not names:
+        msg = "At least one artifact DataFrame is required."
+        raise ValueError(msg)
 
-        1. Violinplot       - distribution shape + median
-        2. KDE curves       - comparative density across datasets
-        3. CDF curves       - dominance and cumulative behaviour
-
-    All results are shown side-by-side for:
-        • global L2
-        • relative L2
-
-    Parameters
-    ----------
-    datasets : dict[str, pandas.DataFrame]
-        Mapping label → evaluation DataFrame.
-        Must contain:
-            - l2
-            - rel_l2
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        Multi-panel figure with violinplots, KDE and CDF curves.
-
-    """
-    names = list(datasets.keys())
-    l2_vals = [datasets[n]["l2"].astype(float).to_numpy() for n in names]
-    rel_vals = [datasets[n]["rel_l2"].astype(float).to_numpy() for n in names]
+    metric_specs = (("Relative L2", "rel_l2"), ("Relative H1", "rel_h1"))
+    minimum_kde_samples = 2
+    metric_values: dict[str, list[np.ndarray]] = {}
+    for _label, column in metric_specs:
+        arrays: list[np.ndarray] = []
+        for name in names:
+            if column not in datasets[name]:
+                msg = f"Artifact DataFrame {name!r} is missing required column {column!r}."
+                raise KeyError(msg)
+            values = datasets[name][column].astype(float).to_numpy()
+            if values.size == 0 or not np.isfinite(values).all() or np.any(values < 0.0):
+                msg = f"Artifact column {column!r} for {name!r} must contain finite non-negative values."
+                raise ValueError(msg)
+            arrays.append(values)
+        metric_values[column] = arrays
 
     palette = sns.color_palette("tab10", len(names))
-
-    # ------------------------------------------------------------------
-    # SMART GRID: 3 ROWS x 3 COLUMNS, RIGHT COLUMN FOR LEGEND
-    # ------------------------------------------------------------------
     fig = plt.figure(figsize=(21, 10))
-    gs = fig.add_gridspec(
+    grid = fig.add_gridspec(
         3,
         3,
         width_ratios=[1, 1, 0.35],
@@ -97,331 +86,183 @@ def plot_global_error_metrics(*, datasets: dict[str, pd.DataFrame]) -> Figure:
         hspace=0.35,
     )
 
-    ax_vio_l2 = fig.add_subplot(gs[0, 0])
-    ax_vio_rel = fig.add_subplot(gs[0, 1])
-    ax_legend = fig.add_subplot(gs[0, 2])
+    for column_index, (label, column) in enumerate(metric_specs):
+        arrays = metric_values[column]
+        box_axis = fig.add_subplot(grid[0, column_index])
+        density_axis = fig.add_subplot(grid[1, column_index])
+        cdf_axis = fig.add_subplot(grid[2, column_index])
 
-    ax_kde_l2 = fig.add_subplot(gs[1, 0])
-    ax_kde_rel = fig.add_subplot(gs[1, 1])
+        boxplot = box_axis.boxplot(
+            arrays,
+            patch_artist=True,
+            showfliers=True,
+            medianprops={"color": "black", "linewidth": 2},
+            boxprops={"linewidth": 1.5},
+            whiskerprops={"linewidth": 1.2},
+            capprops={"linewidth": 1.2},
+        )
+        for patch, color in zip(boxplot["boxes"], palette, strict=True):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.65)
+        box_axis.set_xticks([])
+        box_axis.set_title(f"{label} - Boxplot")
+        box_axis.set_ylabel(f"{label} (dimensionless)")
+        box_axis.grid(True, which="both", linestyle="--", alpha=0.3)
 
-    ax_cdf_l2 = fig.add_subplot(gs[2, 0])
-    ax_cdf_rel = fig.add_subplot(gs[2, 1])
+        for values, name, color in zip(arrays, names, palette, strict=True):
+            if values.size < minimum_kde_samples or np.allclose(values, values[0]):
+                density_axis.axvline(values[0], color=color, label=name)
+            else:
+                density = gaussian_kde(values)
+                coordinates = np.linspace(values.min(), values.max(), 400)
+                density_axis.plot(coordinates, density(coordinates), color=color, label=name)
+        density_axis.set_title(f"{label} - KDE Density")
+        density_axis.set_xlabel(f"{label} (dimensionless)")
+        density_axis.set_ylabel("Density")
+        density_axis.grid(True, which="both", linestyle="--", alpha=0.3)
 
-    # ============================================================
-    # 1. BOXPLOTS
-    # ============================================================
-    bp = ax_vio_l2.boxplot(
-        l2_vals,
-        patch_artist=True,
-        showfliers=True,
-        medianprops={"color": "black", "linewidth": 2},
-        boxprops={"linewidth": 1.5},
-        whiskerprops={"linewidth": 1.2},
-        capprops={"linewidth": 1.2},
-    )
-    for patch, color in zip(bp["boxes"], palette, strict=False):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.65)
+        for values, name, color in zip(arrays, names, palette, strict=True):
+            ordered = np.sort(values)
+            cumulative = np.arange(1, len(ordered) + 1, dtype=float) / len(ordered)
+            cdf_axis.plot(ordered, cumulative, color=color, label=name)
+        cdf_axis.set_title(f"{label} - CDF")
+        cdf_axis.set_xlabel(f"{label} (dimensionless)")
+        cdf_axis.set_ylabel("CDF")
+        cdf_axis.grid(True, which="both", linestyle="--", alpha=0.3)
 
-    ax_vio_l2.set_xticks([])
-    ax_vio_l2.set_title("L2 - Boxplot")
-    ax_vio_l2.set_ylabel("L2")
-    ax_vio_l2.set_yscale("log")
-    ax_vio_l2.grid(True, which="both", linestyle="--", alpha=0.3)
+        if all(np.all(values > 0.0) for values in arrays):
+            box_axis.set_yscale("log")
+            density_axis.set_xscale("log")
+            cdf_axis.set_xscale("log")
 
-    bp = ax_vio_rel.boxplot(
-        rel_vals,
-        patch_artist=True,
-        showfliers=True,
-        medianprops={"color": "black", "linewidth": 2},
-        boxprops={"linewidth": 1.5},
-        whiskerprops={"linewidth": 1.2},
-        capprops={"linewidth": 1.2},
-    )
-    for patch, color in zip(bp["boxes"], palette, strict=False):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.65)
-
-    ax_vio_rel.set_xticks([])
-    ax_vio_rel.set_title("Relative L2 - Boxplot")
-    ax_vio_rel.set_ylabel("Relative L2")
-    ax_vio_rel.set_yscale("log")
-    ax_vio_rel.grid(True, which="both", linestyle="--", alpha=0.3)
-
-    # ============================================================
-    # 2. KDE CURVES
-    # ============================================================
-    for arr, name in zip(l2_vals, names, strict=False):
-        kde = gaussian_kde(arr)
-        xs = np.linspace(arr.min(), arr.max(), 400)
-        ax_kde_l2.plot(xs, kde(xs), label=name)
-    ax_kde_l2.set_xscale("log")
-    ax_kde_l2.set_title("L2 - KDE Density Comparison")
-    ax_kde_l2.set_ylabel("Density")
-    ax_kde_l2.grid(True, which="both", linestyle="--", alpha=0.3)
-
-    for arr, name in zip(rel_vals, names, strict=False):
-        kde = gaussian_kde(arr)
-        xs = np.linspace(arr.min(), arr.max(), 400)
-        ax_kde_rel.plot(xs, kde(xs), label=name)
-    ax_kde_rel.set_xscale("log")
-    ax_kde_rel.set_title("Relative L2 - KDE Density Comparison")
-    ax_kde_rel.set_ylabel("Density")
-    ax_kde_rel.grid(True, which="both", linestyle="--", alpha=0.3)
-
-    # ============================================================
-    # 3. CDF CURVES
-    # ============================================================
-    for arr, name in zip(l2_vals, names, strict=False):
-        s = np.sort(arr)
-        y = np.linspace(0, 1, len(s))
-        ax_cdf_l2.plot(s, y, label=name)
-    ax_cdf_l2.set_xscale("log")
-    ax_cdf_l2.set_title("L2 - CDF")
-    ax_cdf_l2.set_xlabel("L2")
-    ax_cdf_l2.set_ylabel("CDF")
-    ax_cdf_l2.grid(True, which="both", linestyle="--", alpha=0.3)
-
-    for arr, name in zip(rel_vals, names, strict=False):
-        s = np.sort(arr)
-        y = np.linspace(0, 1, len(s))
-        ax_cdf_rel.plot(s, y, label=name)
-    ax_cdf_rel.set_xscale("log")
-    ax_cdf_rel.set_title("Relative L2 - CDF")
-    ax_cdf_rel.set_xlabel("Relative L2")
-    ax_cdf_rel.set_ylabel("CDF")
-    ax_cdf_rel.grid(True, which="both", linestyle="--", alpha=0.3)
-
-    # ============================================================
-    # GLOBAL LEGEND (SEPARATE COLUMN)
-    # ============================================================
-    ax_legend.axis("off")
-    handles = [Line2D([0], [0], color=c, lw=8) for c in palette]
-    ax_legend.legend(handles, names, loc="upper left")
-
+    legend_axis = fig.add_subplot(grid[:, 2])
+    legend_axis.axis("off")
+    handles = [Line2D([0], [0], color=color, lw=8) for color in palette]
+    legend_axis.legend(handles, names, loc="upper left")
     return fig
 
 
 class CacheEntry(TypedDict):
-    """
-    Strongly typed cache entry for incremental loading.
-
-    Attributes
-    ----------
-    loaded_until : int
-        Number of cases loaded so far.
-    global_l2_vals : list[float]
-        Global L2 values for loaded cases.
-    local_l2 : list[np.ndarray]
-        Local L2 arrays for loaded cases.
-    local_rel : list[np.ndarray]
-        Local relative L2 arrays for loaded cases.
-
-    """
+    """Incremental dimensionless error-distribution cache."""
 
     loaded_until: int
-    global_l2_vals: list[float]
-    local_l2: list[np.ndarray]
-    local_rel: list[np.ndarray]
+    global_relative: list[float]
+    local_relative: list[np.ndarray]
 
 
 def plot_error_distribution(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
-    """
-    Interactive global error distribution analysis across datasets.
-
-    Parameters
-    ----------
-    datasets : dict[str, pandas.DataFrame]
-        Mapping label → evaluation DataFrame.
-        Must contain:
-            - 'npz_path' : str (path to .npz with 'gt' and 'err' arrays)
-            - 'l2' : float (global L2 value per case)
-
-    Returns
-    -------
-    ipywidgets.VBox
-        Interactive widget with case count slider and error distribution plots.
-
-    """
-    names = list(datasets.keys())
-    palette = sns.color_palette("tab10", len(names))
-
-    # -------------------------------------------------------------------------
-    # STRONGLY TYPED CACHE (MYPY + PYLANCE CLEAN)
-    # -------------------------------------------------------------------------
+    """Interactively compare global and local dimensionless relative errors."""
+    names = list(datasets)
     cache: dict[str, CacheEntry] = {
         name: CacheEntry(
             loaded_until=0,
-            global_l2_vals=[],
-            local_l2=[],
-            local_rel=[],
+            global_relative=[],
+            local_relative=[],
         )
         for name in names
     }
-
-    eps = 1e-8
+    palette = sns.color_palette("tab10", len(names))
+    denominator_floor = 1e-12
     max_points = 20000
     clip_percentile = 99.5
 
-    # -------------------------------------------------------------------------
-    # INTERNAL PLOT FUNCTION
-    # -------------------------------------------------------------------------
     def _plot(max_cases: int, *, datasets: dict[str, pd.DataFrame]) -> Figure:
-        """
-        Plot global and local error distributions for the first `max_cases` samples.
-
-        Parameters
-        ----------
-        max_cases : int
-            Number of cases to include from each dataset.
-        datasets : dict[str, pandas.DataFrame]
-            Mapping dataset_name → evaluation DataFrame.
-            Must contain:
-                - 'npz_path' : str (path to .npz with 'gt' and 'err' arrays)
-                - 'l2' : float (global L2 value per case)
-
-        Returns
-        -------
-        matplotlib.figure.Figure
-            Multi-panel figure with global and local error distribution plots.
-
-        """
-        for name, df in datasets.items():
+        for name, frame in datasets.items():
             entry = cache[name]
-
             loaded = entry["loaded_until"]
-            _global_l2_vals = entry["global_l2_vals"]
-            local_l2 = entry["local_l2"]
-            local_rel = entry["local_rel"]
-
-            # Load ONLY new cases
             if max_cases > loaded:
-                df_new = df.iloc[loaded:max_cases]
+                selected = frame.iloc[loaded:max_cases]
+                entry["global_relative"].extend(selected["rel_l2"].astype(float).tolist())
+                for artifact_path in selected["npz_path"]:
+                    with np.load(artifact_path, allow_pickle=False) as artifact:
+                        output_fields = artifact["output_fields"].tolist()
+                        if not isinstance(output_fields, list) or not output_fields:
+                            msg = f"Artifact output_fields must be a non-empty string vector: {artifact_path}"
+                            raise ValueError(msg)
+                        learned_channels = len(output_fields)
+                        error = np.asarray(artifact["err"][:learned_channels], dtype=float)
+                        target = np.asarray(artifact["gt"][:learned_channels], dtype=float)
+                    field_rms = np.sqrt(np.mean(target**2, axis=(1, 2), keepdims=True))
+                    local_relative = np.abs(error) / np.maximum(field_rms, denominator_floor)
+                    entry["local_relative"].append(local_relative.ravel())
+                entry["loaded_until"] = min(max_cases, len(frame))
 
-                for path in df_new["npz_path"]:
-                    data = np.load(path)
-
-                    err = data["err"]
-                    gt = data["gt"]
-
-                    e = np.linalg.norm(err, axis=0)
-                    g = np.linalg.norm(gt, axis=0)
-
-                    mask = g > eps
-                    rel = np.zeros_like(e)
-                    rel[mask] = e[mask] / g[mask]
-
-                    local_l2.append(e.ravel())
-                    local_rel.append(rel.ravel())
-
-                # update global values
-                entry["global_l2_vals"] = list(df["l2"].iloc[:max_cases])
-                entry["loaded_until"] = max_cases
-
-        # ---------------------------------------------------------------------
-        # Compute statistics
-        # ---------------------------------------------------------------------
-        global_l2_stats = {}
-        local_rel_qtiles = {}
-        local_l2_arrays: dict[str, np.ndarray] = {}
-
+        global_stats: dict[str, dict[str, float]] = {}
+        local_arrays: dict[str, np.ndarray] = {}
+        local_quantiles: dict[str, dict[str, float]] = {}
         for name in names:
             entry = cache[name]
-
-            gvals = np.array(entry["global_l2_vals"], dtype=float)
-
-            global_l2_stats[name] = {
-                "median": float(np.median(gvals)),
-                "mean": float(np.mean(gvals)),
-                "q90": float(np.quantile(gvals, 0.90)),
-                "q95": float(np.quantile(gvals, 0.95)),
+            case_count = min(max_cases, len(entry["global_relative"]))
+            global_values = np.asarray(entry["global_relative"][:case_count], dtype=float)
+            if global_values.size == 0:
+                msg = f"Artifact DataFrame {name!r} contains no selected cases."
+                raise ValueError(msg)
+            global_stats[name] = {
+                "median": float(np.median(global_values)),
+                "mean": float(np.mean(global_values)),
+                "q90": float(np.quantile(global_values, 0.90)),
+                "q95": float(np.quantile(global_values, 0.95)),
             }
 
-            arr_l2 = np.concatenate(entry["local_l2"]) if entry["local_l2"] else np.array([])
-            arr_rel = np.concatenate(entry["local_rel"]) if entry["local_rel"] else np.array([])
+            local_values = np.concatenate(entry["local_relative"][:case_count])
+            local_values = local_values[np.isfinite(local_values)]
+            if local_values.size:
+                cutoff = float(np.percentile(local_values, clip_percentile))
+                local_values = np.clip(local_values, 0.0, cutoff)
+            if local_values.size > max_points:
+                random = np.random.default_rng(0)
+                local_values = local_values[random.choice(local_values.size, max_points, replace=False)]
+            local_arrays[name] = local_values
+            local_quantiles[name] = {
+                quantile: float(np.quantile(local_values, probability)) if local_values.size else 0.0
+                for quantile, probability in (("median", 0.50), ("q75", 0.75), ("q90", 0.90), ("q95", 0.95))
+            }
 
-            arr_rel = arr_rel[~np.isnan(arr_rel)]
+        figure = plt.figure(figsize=(20, 8))
+        grid = figure.add_gridspec(2, 2, hspace=0.35, wspace=0.25)
+        global_axis = figure.add_subplot(grid[0, 0])
+        legend_axis = figure.add_subplot(grid[0, 1])
+        local_density_axis = figure.add_subplot(grid[1, 0])
+        local_quantile_axis = figure.add_subplot(grid[1, 1])
+        legend_axis.axis("off")
 
-            if arr_l2.size > 0:
-                cutoff = float(np.percentile(arr_l2, clip_percentile))
-                arr_l2 = np.clip(arr_l2, 0, cutoff)
+        statistic_names = ("median", "mean", "q90", "q95")
+        positions = np.arange(len(statistic_names))
+        for index, name in enumerate(names):
+            global_stat_values = [global_stats[name][statistic] for statistic in statistic_names]
+            global_axis.plot(positions, global_stat_values, marker="o", lw=2, color=palette[index])
+        global_axis.set_xticks(positions)
+        global_axis.set_xticklabels(statistic_names)
+        global_axis.set_yscale("log")
+        global_axis.set_title("Global Relative L2 Summary")
+        global_axis.set_ylabel("Relative L2 (dimensionless)")
+        global_axis.grid(True, which="both", axis="y", linestyle="--", alpha=0.3)
 
-            if arr_rel.size > 0:
-                cutoff = float(np.percentile(arr_rel, clip_percentile))
-                arr_rel = np.clip(arr_rel, 0, cutoff)
+        for name, color in zip(names, palette, strict=True):
+            local_values = local_arrays[name]
+            if local_values.size > 1 and not np.allclose(local_values, local_values[0]):
+                sns.kdeplot(local_values, ax=local_density_axis, lw=2, color=color, log_scale=True)
+            elif local_values.size:
+                local_density_axis.axvline(local_values[0], color=color)
+        local_density_axis.set_title("Local Field-Normalized Absolute Error")
+        local_density_axis.set_xlabel("Absolute error / field RMS (dimensionless)")
+        local_density_axis.grid(True, linestyle="--", alpha=0.3)
 
-            rng = np.random.default_rng()
+        quantile_names = ("median", "q75", "q90", "q95")
+        positions = np.arange(len(quantile_names))
+        for index, name in enumerate(names):
+            quantile_values = [local_quantiles[name][quantile] for quantile in quantile_names]
+            local_quantile_axis.plot(positions, quantile_values, marker="o", lw=2, color=palette[index])
+        local_quantile_axis.set_yscale("log")
+        local_quantile_axis.set_title("Local Field-Normalized Error Quantiles")
+        local_quantile_axis.set_ylabel("Absolute error / field RMS (dimensionless)")
+        local_quantile_axis.grid(True, axis="y", linestyle="--", alpha=0.3)
+        local_quantile_axis.set_xticks(positions)
+        local_quantile_axis.set_xticklabels(quantile_names)
 
-            if arr_l2.size > max_points:
-                arr_l2 = arr_l2[rng.choice(arr_l2.size, max_points, replace=False)]
-            if arr_rel.size > max_points:
-                arr_rel = arr_rel[rng.choice(arr_rel.size, max_points, replace=False)]
-
-            local_l2_arrays[name] = arr_l2
-
-            if arr_rel.size > 0:
-                local_rel_qtiles[name] = {
-                    "median": float(np.median(arr_rel)),
-                    "q75": float(np.quantile(arr_rel, 0.75)),
-                    "q90": float(np.quantile(arr_rel, 0.90)),
-                    "q95": float(np.quantile(arr_rel, 0.95)),
-                }
-            else:
-                local_rel_qtiles[name] = {"median": 0.0, "q75": 0.0, "q90": 0.0, "q95": 0.0}
-
-        # ---------------------------------------------------------------------
-        # PLOTS
-        # ---------------------------------------------------------------------
-        fig = plt.figure(figsize=(20, 8))
-        gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.25)
-
-        ax_global = fig.add_subplot(gs[0, 0])
-        ax_legend = fig.add_subplot(gs[0, 1])
-        ax_local_l2 = fig.add_subplot(gs[1, 0])
-        ax_local_rel = fig.add_subplot(gs[1, 1])
-        ax_legend.axis("off")
-
-        stats = ["median", "mean", "q90", "q95"]
-        xpos = np.arange(len(stats))
-
-        for idx, name in enumerate(names):
-            vals = [global_l2_stats[name][s] for s in stats]
-            ax_global.plot(xpos, vals, marker="o", lw=2, color=palette[idx])
-
-        ax_global.set_xticks(xpos)
-        ax_global.set_xticklabels(stats)
-        ax_global.set_yscale("log")
-        ax_global.set_title("Global L2 Summary")
-        ax_global.grid(True, which="both", axis="y", linestyle="--", alpha=0.3)
-
-        # KDE
-        for name, color in zip(names, palette, strict=False):
-            arr = local_l2_arrays[name]
-            if arr.size > 0:
-                sns.kdeplot(arr, ax=ax_local_l2, lw=2, color=color, log_scale=True)
-
-        ax_local_l2.set_title("Local L2 Distribution")
-        ax_local_l2.grid(True, linestyle="--", alpha=0.3)
-
-        # rel quantiles
-        qstats = ["median", "q75", "q90", "q95"]
-        xpos = np.arange(len(qstats))
-
-        for idx, name in enumerate(names):
-            vals = [local_rel_qtiles[name][s] for s in qstats]
-            ax_local_rel.plot(xpos, vals, marker="o", lw=2, color=palette[idx])
-
-        ax_local_rel.set_yscale("log")
-        ax_local_rel.set_title("Local Relative L2 Quantiles")
-        ax_local_rel.grid(True, axis="y", linestyle="--", alpha=0.3)
-        ax_local_rel.set_xticks(xpos)
-        ax_local_rel.set_xticklabels(qstats)
-        ax_local_rel.set_xlabel("Local relative L2 quantile")
-
-        handles = [Line2D([0], [0], color=c, lw=6) for c in palette]
-        ax_legend.legend(handles, names, loc="upper center")
-
-        return fig
+        handles = [Line2D([0], [0], color=color, lw=6) for color in palette]
+        legend_axis.legend(handles, names, loc="upper center")
+        return figure
 
     return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
@@ -474,9 +315,7 @@ def plot_global_gt_vs_pred(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox
 
     """
     names = list(datasets.keys())
-    # =========================================================================
-    # Strongly typed cache (mypy + pylance clean)
-    # =========================================================================
+    # Cache each dataset independently so slider updates load only new cases.
     cache: dict[str, GTCacheEntry] = {
         name: GTCacheEntry(
             loaded_until=0,
@@ -637,15 +476,10 @@ def plot_mean_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     error_selector = analysis.ui.components.ui_radio_error_mode()
 
     # -------------------------------------------------------
-    # Cache structure (clean, mypy-safe)
+    # Cached aggregation state
     # -------------------------------------------------------
-    # Each dataset gets:
-    #   - geom
-    #   - loaded_until
-    #   - count
-    #   - sum_mae[ch]
-    #   - sum_rel[ch]
-    #
+    # Each dataset records its geometry, loaded prefix, sample count, and
+    # per-channel absolute and relative error totals.
     cache: dict[str, dict[str, Any]] = {}
 
     for name in datasets:
@@ -857,7 +691,7 @@ def plot_std_error_maps(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     mask_threshold = 1e-4
 
     # -------------------------------------------------------
-    # Cache (Welford)
+    # Streaming Welford statistics
     # -------------------------------------------------------
     cache: dict[str, dict[str, Any]] = {}
 

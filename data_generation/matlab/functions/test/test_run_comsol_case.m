@@ -54,7 +54,7 @@ for i = 1:n_cases
     disp("▶ [" + i + "/" + n_cases + "] " + case_name);
 
     try
-        [model, results] = run_comsol_case(field_path, template_path, output_dir, save_model);
+        results = run_comsol_case(field_path, template_path, output_dir, save_model);
         disp("   ✅ Erfolgreich (" + sprintf('%.1f', results.time_s) + " s)");
         disp("   → Export: " + results.export_csv);
         if results.save_model

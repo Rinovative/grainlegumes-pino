@@ -20,7 +20,7 @@ Boundaries:
 
 Notes:
   Relative error handling:
-    - Relative error is defined as: rel = |pred - true| / (|true| + eps) * 100
+    - Relative error is defined as: rel = |pred - true| / (|true| + denominator floor) * 100
     - relative error is masked (set to NaN) where ground-truth magnitude is below the threshold (default: 1e-4)
     - masking avoids misleading percentages in near-zero regions
 
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 # =============================================================================
 # CHANNELS AND UNITS
 # =============================================================================
-CHANNELS = domain.fields.OUTPUT_FIELDS
+CHANNELS = domain.fields.ANALYSIS_FIELDS
 CHANNEL_INDICES = {name: i for i, name in enumerate(CHANNELS)}
 UNIT_MAP = {
     "p": "Pa",
@@ -91,7 +91,7 @@ def _load_npz(row: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
     if key in _npz_cache:
         return _npz_cache[key]
 
-    data = np.load(key, allow_pickle=True)
+    data = np.load(key, allow_pickle=False)
     pred = np.asarray(data["pred"])
     gt = np.asarray(data["gt"])
     err = np.asarray(data["err"])
@@ -142,7 +142,7 @@ def _aggregate_kappa(kappa: np.ndarray, kappa_names: list[str]) -> np.ndarray:
         return kappa[next(iter(idx.values()))]
 
     # ------------------------------------------------------------------
-    # Fallback: explicit mean over provided components
+    # Generic summary: explicit mean over provided components
     # (visualisation only, no physics implied)
     # ------------------------------------------------------------------
     return np.mean(
@@ -606,7 +606,7 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
         )
 
         # --------------------------------------------------
-        # Levels: diagonal
+        # Contour levels for diagonal permeability components
         # --------------------------------------------------
         if use_log and diag_vals.size > 0:
             lo = np.nanpercentile(diag_vals, 5.0)
@@ -619,8 +619,8 @@ def plot_sample_kappa_tensor_with_overlay(*, datasets: dict[str, pd.DataFrame]) 
             levels_diag = analysis.ui.components.compute_levels(diag_vals, n_kappa_levels)
 
         # --------------------------------------------------
-        # Levels: off-diagonal (kxy / kyx)
-        # NICHT symmetrisch, echte min/max (quantil-beschraenkt)
+        # Quantile-bounded contour levels for off-diagonal components
+        # use their observed range rather than a symmetric interval.
         # --------------------------------------------------
         if offdiag_vals.size > 0:
             vals = offdiag_vals[np.isfinite(offdiag_vals)]

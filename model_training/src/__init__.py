@@ -1,16 +1,12 @@
-"""
-Reusable project packages for data, learning, analysis and experiments.
+"""Reusable project packages with lazy top-level module access."""
 
-Provides:
-- analysis: artifact generation, EDA, evaluation and UI modules
-- common: shared path and utility modules
-- datasets: dataset abstractions, simulation datasets and dataset modules
-- domain: field contracts, permeability mappings and physics helpers
-- experiments: CLI, config loading and tuning modules
-- learning: models, losses, metrics, inference and training modules
-"""
+from __future__ import annotations
 
-from . import analysis, common, datasets, domain, experiments, learning
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from . import analysis, common, datasets, domain, experiments, learning
 
 __all__ = [
     "analysis",
@@ -20,3 +16,13 @@ __all__ = [
     "experiments",
     "learning",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Import a public package only when it is first requested."""
+    if name not in __all__:
+        message = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(message)
+    module = import_module(f"{__name__}.{name}")
+    globals()[name] = module
+    return module

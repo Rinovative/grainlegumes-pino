@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,7 +14,7 @@ authors = [{ name = "Rino M. Albertin" }]
 package-dir = { "" = "model_training" }
 
 [tool.setuptools.packages.find]
-where = ["model_training/src"]
+where = ["model_training"]
 include = ["src*"]
 
 # ============================================================
@@ -27,7 +27,6 @@ target-version = "py311"
 extend-exclude = [
   "venv",
   ".venv",
-  "mlenv",
   ".mypy_cache",
   ".ruff_cache",
   "logs",
@@ -72,12 +71,18 @@ ignore = [
   "N806", "N803",  # Allow scientific variable names
   "EXE002",  # Ignore executable-bit mismatch
   "T201",  # Allow print statements
-  "ERA001",  # Allow commented-out code during research cleanup
   "D205", # Allow multi-line docstring summary to be on a separate line
   "D400", # Allow the first line to not end with a period
   "D415" # Allow the first line to not end with a period, question mark, or exclamation point
 ]
 fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"model_training/notebooks/*.ipynb" = [
+  "ANN",  # Interactive notebook helpers do not require a fully typed API surface
+  "EM102",  # Direct contextual exception messages are clearer in notebook cells
+  "TRY003",  # Notebook validation errors are local, not reusable exception APIs
+]
 
 # ------------------------------------------------------------
 # 🧠 Code complexity
@@ -97,23 +102,35 @@ max-returns = 10
 # 🧮 Type Checking
 # ============================================================
 
+[tool.basedpyright]
+include = ["model_training/src", "model_training/tests", "data_generation"]
+exclude = ["data_generation/data", "model_training/data"]
+extraPaths = ["model_training", "model_training/tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+
 [tool.mypy]
 python_version = "3.11"
-ignore_missing_imports = true
 warn_unused_configs = true
 strict_optional = true
 
 exclude = [
-  "model_training/training/",
   "logs/",
   "data/",
   "data_generation/data/",
   "model_training/data/",
 ]
 
-# ============================================================
-# 📓 Jupyter / nbQA
-# ============================================================
-
-[tool.nbqa.config]
-ruff = ["--fix", "--exit-zero"]
+[[tool.mypy.overrides]]
+module = [
+  "ipywidgets",
+  "neuralop",
+  "neuralop.*",
+  "pandas",
+  "scipy",
+  "scipy.*",
+  "seaborn",
+  "tqdm",
+  "tqdm.auto",
+]
+ignore_missing_imports = true

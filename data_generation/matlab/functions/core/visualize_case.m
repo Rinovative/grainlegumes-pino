@@ -2,22 +2,22 @@
 % ============================================================
 % Load and visualize 2D Darcy–Brinkman COMSOL results
 % Author: Rino M. Albertin
-% Date: 2025-10-14 (Updated: tab-compatible visualization)
+% Date: 2025-10-14
 %
 % DESCRIPTION
 %   Reads a COMSOL-exported .csv file containing field data of a
 %   2D Darcy–Brinkman simulation and reconstructs the variables on
 %   a regular grid for analysis or visualization.
 %
-%   Supported fields (depending on export structure):
-%       - kxx, kyy  → permeability tensor components [m²]
-%       - u, v, |U| → velocity components and magnitude [m/s]
-%       - p         → pressure field [Pa]
+%   Supported fields (the exact run_comsol_case export contract):
+%       - kxx, kxy, kyy → permeability tensor components [m²]
+%       - eps, p_bc     → porosity and inlet pressure fields
+%       - p, u, v, |U|  → solved pressure and velocity fields
 %
 %   The function automatically:
 %       • Detects and skips header/comment lines (%)
-%       • Reconstructs a regular mesh grid (x, y)
-%       • Corrects COMSOL’s coordinate orientation
+%       • Validates a complete 12-column Cartesian-grid export
+%       • Reconstructs deterministic ascending x/y orientation
 %       • Generates a 2×3 tiled plot layout:
 %             log₁₀(kxx), log₁₀(kyy), p, |U|, v, u
 %       • Computes simple field statistics for metadata
@@ -37,7 +37,8 @@
 % OUTPUTS
 %   fields : struct
 %       Contains 2D matrices of all reconstructed physical fields.
-%         fields.kxx, fields.kyy, fields.u, fields.v, fields.Umag, fields.p
+%         fields.kxx, fields.kxy, fields.kyy, fields.eps, fields.p_bc,
+%         fields.p, fields.u, fields.v, fields.Umag
 %
 %   X, Y : double [ny × nx]
 %       Regular mesh grid coordinates [m].
@@ -64,87 +65,63 @@ if ~isfile(file_path)
     error('File not found: %s', file_path);
 end
 
-%% --- Count header lines -------------------------------------------------
+%% --- Read exact runner export contract ---------------------------------
 fid = fopen(file_path, 'r');
+if fid < 0
+    error('visualize_case:OpenFile', 'Could not open file: %s', file_path);
+end
+file_cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
 header_lines = 0;
 while true
     tline = fgetl(fid);
-    if ~ischar(tline), break; end
-    if startsWith(strtrim(tline), '%')
-        header_lines = header_lines + 1;
-    else
+    if ~ischar(tline) || ~startsWith(strtrim(tline), '%')
         break;
     end
+    header_lines = header_lines + 1;
 end
-fclose(fid);
-header_lines = header_lines + 1; % +1 for column header line
+clear file_cleanup
 
-%% --- Import data --------------------------------------------------------
-opts = detectImportOptions(file_path, ...
-    'NumHeaderLines', header_lines, ...
-    'VariableNamingRule', 'preserve');
-T = readtable(file_path, opts);
+data = readmatrix(file_path, 'Delimiter', ';', ...
+    'NumHeaderLines', header_lines);
+expected_columns = 12;
+if isempty(data) || size(data, 2) ~= expected_columns
+    error('visualize_case:ExportContract', ...
+        ['Expected 12 columns from run_comsol_case: x, y, kappaxx, kappayx, ' ...
+        'kappaxy, kappayy, eps, p_bc, p, u, v, and U.']);
+end
+if any(~isfinite(data), 'all')
+    error('visualize_case:NonfiniteData', ...
+        'COMSOL result contains non-finite values: %s', file_path);
+end
 
-%% --- Assign columns (fixed COMSOL export structure) ---------------------
-x    = T.Var1;
-y    = T.Var2;
-kxx  = T.Var5;
-kyy  = T.Var9;
-Umag = T.Var14;
-u    = T.Var15;
-v    = T.Var16;
-p    = T.Var17;
-
-%% --- Clean data ---------------------------------------------------------
-mask = ~(isnan(x) | isnan(y));
-x = x(mask); y = y(mask);
-kxx = kxx(mask); kyy = kyy(mask);
-Umag = Umag(mask); u = u(mask); v = v(mask); p = p(mask);
-
-[~, ia] = unique([x, y], 'rows', 'stable');
-x = x(ia); y = y(ia);
-kxx = kxx(ia); kyy = kyy(ia);
-Umag = Umag(ia); u = u(ia); v = v(ia); p = p(ia);
-
-%% --- Reconstruct regular grid ------------------------------------------
-x_unique = unique(x);
-y_unique = unique(y);
+%% --- Validate and reconstruct deterministic Cartesian grid -------------
+data = sortrows(data, [1, 2]);
+x = data(:, 1);
+y = data(:, 2);
+x_unique = unique(x, 'sorted');
+y_unique = unique(y, 'sorted');
 nx = numel(x_unique);
 ny = numel(y_unique);
-
-if abs(numel(x) - nx*ny) <= (nx*ny*0.1)
-    [Xg, Yg] = meshgrid(x_unique, y_unique);
-    X = Xg; Y = Yg;
-    Fkxx  = scatteredInterpolant(x, y, kxx);
-    Fkyy  = scatteredInterpolant(x, y, kyy);
-    FUmag = scatteredInterpolant(x, y, Umag);
-    Fu    = scatteredInterpolant(x, y, u);
-    Fv    = scatteredInterpolant(x, y, v);
-    Fp    = scatteredInterpolant(x, y, p);
-    fields.kxx  = Fkxx(X, Y);
-    fields.kyy  = Fkyy(X, Y);
-    fields.Umag = FUmag(X, Y);
-    fields.u    = Fu(X, Y);
-    fields.v    = Fv(X, Y);
-    fields.p    = Fp(X, Y);
-else
-    X = reshape(x, ny, nx);
-    Y = reshape(y, ny, nx);
-    fields.kxx  = reshape(kxx, ny, nx);
-    fields.kyy  = reshape(kyy, ny, nx);
-    fields.Umag = reshape(Umag, ny, nx);
-    fields.u    = reshape(u, ny, nx);
-    fields.v    = reshape(v, ny, nx);
-    fields.p    = reshape(p, ny, nx);
+[X, Y] = meshgrid(x_unique, y_unique);
+if size(unique([x, y], 'rows'), 1) ~= size(data, 1) || ...
+        size(data, 1) ~= nx * ny || ...
+        ~isequal([x, y], [X(:), Y(:)])
+    error('visualize_case:CartesianGrid', ...
+        'COMSOL coordinates must form one complete Cartesian grid without duplicates.');
 end
 
-%% --- Correct orientation (COMSOL → MATLAB) ------------------------------
-fields.kxx  = flipud(fields.kxx);
-fields.kyy  = flipud(fields.kyy);
-fields.Umag = flipud(fields.Umag);
-fields.u    = flipud(fields.u);
-fields.v    = flipud(fields.v);
-fields.p    = flipud(fields.p);
+kappa_yx = reshape(data(:, 4), ny, nx);
+kappa_xy = reshape(data(:, 5), ny, nx);
+fields = struct( ...
+    'kxx', reshape(data(:, 3), ny, nx), ...
+    'kxy', (kappa_yx + kappa_xy) / 2, ...
+    'kyy', reshape(data(:, 6), ny, nx), ...
+    'eps', reshape(data(:, 7), ny, nx), ...
+    'p_bc', reshape(data(:, 8), ny, nx), ...
+    'p', reshape(data(:, 9), ny, nx), ...
+    'u', reshape(data(:, 10), ny, nx), ...
+    'v', reshape(data(:, 11), ny, nx), ...
+    'Umag', reshape(data(:, 12), ny, nx));
 
 %% --- Metadata -----------------------------------------------------------
 info = struct();
