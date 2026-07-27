@@ -14,15 +14,15 @@ Design principles:
   - Widget construction delegates to analysis_ui_components
   - Export context is updated only around rendered figures
 
-Boundaries:
-  - Notebook section composition belongs to analysis_ui_notebook
-  - Domain-specific plot logic belongs to analysis plot modules
+This module does NOT:
+  - Compose numbered notebook sections or choose scientific control vocabularies
+  - Load artifacts directly or implement domain-specific plot mathematics
 ===============================================================================
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
@@ -32,7 +32,7 @@ from matplotlib.figure import Figure
 from . import analysis_ui_components as components
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     import pandas as pd
 
@@ -50,19 +50,25 @@ def _render_figure(
     kwargs: dict[str, Any] | None = None,
 ) -> None:
     """
-    Render a figure inside an output widget.
+    Invoke and display one plot result inside an output widget.
 
     Parameters
     ----------
-    out : widgets.Output
-        Output widget to render into.
-    plot_func : callable
-        Plotting function that returns a Figure or other displayable object.
-    args : tuple, optional
-        Positional arguments for the plot function (default: ()).
-    kwargs : dict, optional
-        Keyword arguments for the plot function (default: None).
+    out : ipywidgets.Output
+        Output area cleared immediately before invocation.
+    plot_func : Callable[..., Any]
+        Callable returning a Matplotlib figure, a tuple whose first item is a
+        figure, another displayable value, or ``None``.
+    args : tuple[Any, ...], optional
+        Positional arguments forwarded unchanged.
+    kwargs : dict[str, Any] | None, optional
+        Keyword arguments forwarded unchanged.
 
+    Notes
+    -----
+    Recognized figures update the current module export context, are displayed,
+    and are then closed to release GUI resources. Other non-``None`` results are
+    displayed without changing the export figure.
 
     """
     kwargs = kwargs or {}
@@ -107,13 +113,11 @@ def _attach_widget_rerender(
     render_func: Callable[[], None],
 ) -> None:
     """
-    Attach a re-render callback to multiple widgets.
+    Register one render callback on heterogeneous semantic controls.
 
-    Any change of a widget's value triggers the provided render function.
-
-    Supports:
-        - Widgets with a `value` trait
-        - VBox checkbox groups exposing a `.boxes` dict
+    Standard value widgets observe their ``value`` trait. Checkbox-group
+    containers are recognized through the public ``boxes`` mapping and each
+    checkbox is observed; widgets without either contract are ignored.
     """
     for w in widgets_list:
         # ---------------------------------------------
@@ -141,16 +145,22 @@ _EXPORT_CTX: dict[str, Any] = {}
 
 def set_export_context(export_state: dict | None, *, plot_name: str | None = None, title: str | None = None) -> None:
     """
-    Set the export context for the next plot rendering.
+    Replace the module-global export context used by subsequent viewer renders.
 
     Parameters
     ----------
     export_state : dict | None
-        Export state dictionary to populate (or None to disable).
+        Shared panel state to populate, or ``None`` to disable figure capture.
     plot_name : str | None, optional
-        Plot name for export (default: None).
+        Filename stem associated with the active dropdown entry.
     title : str | None, optional
-        Plot title for export (default: None).
+        User-facing title associated with the active entry.
+
+    Notes
+    -----
+    The context is process-global mutable notebook state, not thread-safe or
+    panel-isolated. Dropdown selection must set it immediately before rendering;
+    viewer callbacks then update the referenced state with their latest figure.
 
     """
     _EXPORT_CTX.clear()
@@ -161,6 +171,117 @@ def set_export_context(export_state: dict | None, *, plot_name: str | None = Non
             "title": title,
         }
     )
+
+
+# =============================================================================
+# CONTROLLED COMPARISON VIEWER
+# =============================================================================
+
+
+def make_controlled_viewer(
+    plot_func: Callable[..., Any],
+    *,
+    datasets: dict[str, pd.DataFrame],
+    controls: Mapping[str, widgets.ValueWidget] | None = None,
+    plot_kwargs: Mapping[str, Any] | None = None,
+    allow_dataset_selection: bool = True,
+) -> widgets.VBox:
+    """
+    Build a lazy renderer with model/dataset and semantic argument controls.
+
+    Parameters
+    ----------
+    plot_func : callable
+        Plot function accepting ``datasets=...`` plus keyword arguments named by
+        `controls`. It may return a Matplotlib figure or displayable table.
+    datasets : dict[str, pandas.DataFrame]
+        Labelled artifact frames available to the viewer.
+    controls : Mapping[str, ipywidgets.ValueWidget] | None, optional
+        Mapping from plot keyword to a widget whose current ``value`` is passed
+        on each render. Labels and option vocabularies remain owned by callers.
+    plot_kwargs : Mapping[str, Any] | None, optional
+        Fixed keyword arguments forwarded unchanged.
+    allow_dataset_selection : bool, optional
+        Add model/dataset checkboxes when more than one frame is available.
+
+    Returns
+    -------
+    ipywidgets.VBox
+        A non-rendering control surface. The first plot is created only after the
+        user selects ``Render / update``; subsequent control changes rerender.
+
+    Raises
+    ------
+    ValueError
+        If `datasets` is empty. An empty checkbox selection is reported inside
+        the viewer without invoking the plot function.
+
+    Notes
+    -----
+    Figure rendering flows through the shared export context, so the panel's PDF
+    action always targets the latest controlled figure.
+
+    """
+    if not datasets:
+        msg = "Controlled analysis viewers require at least one labelled dataset."
+        raise ValueError(msg)
+    semantic_controls = dict(controls or {})
+    fixed_kwargs = dict(plot_kwargs or {})
+    selector = components.ui_checkbox_datasets(dataset_names=list(datasets)) if allow_dataset_selection and len(datasets) > 1 else None
+    selector_boxes = {} if selector is None else cast("components.CheckboxGroup", selector).boxes
+    output = components.ui_output_plot()
+    render_button = widgets.Button(
+        description="Render / update",
+        button_style="primary",
+        layout=widgets.Layout(width="145px"),
+    )
+    state = {"rendered": False}
+
+    def _selected_datasets() -> dict[str, pd.DataFrame]:
+        """Return the currently enabled labelled artifact frames."""
+        if selector is None:
+            return dict(datasets)
+        return {name: datasets[name] for name, checkbox in selector_boxes.items() if checkbox.value}
+
+    def _render(_: object = None) -> None:
+        """
+        Render selected frames with current semantic control values.
+
+        An empty checkbox selection is disclosed in the output without invoking
+        scientific code; successful invocation marks the viewer as initialized.
+        """
+        selected = _selected_datasets()
+        if not selected:
+            with output:
+                output.clear_output(wait=True)
+                print("Select at least one model/dataset before rendering.")
+            return
+        kwargs = {name: widget.value for name, widget in semantic_controls.items()}
+        _render_figure(
+            out=output,
+            plot_func=plot_func,
+            kwargs={"datasets": selected, **fixed_kwargs, **kwargs},
+        )
+        state["rendered"] = True
+
+    def _rerender_after_first(_: object = None) -> None:
+        """Apply live control changes only after an explicit first render."""
+        if state["rendered"]:
+            _render()
+
+    render_button.on_click(_render)
+    for widget in semantic_controls.values():
+        widget.observe(_rerender_after_first, names="value")
+    if selector is not None:
+        for checkbox in selector_boxes.values():
+            checkbox.observe(_rerender_after_first, names="value")
+
+    controls_row = widgets.HBox([*semantic_controls.values(), render_button])
+    children: list[widgets.Widget] = [controls_row]
+    if selector is not None:
+        children.insert(0, widgets.VBox([widgets.HTML("<b>Models / datasets</b>"), selector]))
+    children.append(output)
+    return widgets.VBox(children)
 
 
 # =============================================================================
@@ -179,35 +300,35 @@ def make_interactive_case_viewer(
     **plot_kwargs: Any,
 ) -> widgets.VBox:
     """
-    Interactive viewer for case-indexed plots.
+    Build and immediately render a case-indexed notebook viewer.
 
     Parameters
     ----------
-    plot_func : callable
-        Function of the form:
-            plot_func(case_idx=N, df=df, dataset_name=name, **kwargs)
-        Must return a matplotlib Figure.
-    datasets : dict[str, DataFrame]
-        Mapping: dataset_name -> dataset DataFrame.
+    plot_func : Callable[..., Any]
+        Called as ``plot_func(case_idx, df=..., dataset_name=..., **plot_kwargs)``;
+        the internal index is zero-based although the control displays one-based.
+    datasets : dict[str, pandas.DataFrame]
+        Labelled frames available to the viewer; first insertion order is initial.
     start_idx : int, optional
-        Initial zero-based case index (default: 0).
+        Initial zero-based case position.
     enable_dataset_dropdown : bool, optional
-        Whether to show dataset dropdown (default: True).
-    extra_widgets : list[widgets.Widget] | None, optional
-        Additional widgets to include in the header.
-        These widgets trigger re-rendering on value change.
-    n_cases_fn : callable | None, optional
-        Function of the form:
-            n_cases_fn(dataset_name, df) -> int
-        to determine the number of cases in a dataset.
-        If None, defaults to len(df) (default: None).
+        Show a dataset selector when more than one frame is available.
+    extra_widgets : list[ipywidgets.Widget] | None, optional
+        Additional controls whose changes trigger rerendering.
+    n_cases_fn : Callable[[str, pandas.DataFrame], int] | None, optional
+        Per-frame case-count resolver; defaults to ``len(frame)``.
     **plot_kwargs : Any
-        Forwarded into the plot function.
+        Fixed plot arguments forwarded on every render.
 
     Returns
     -------
-    widgets.VBox
-        Complete interactive viewer.
+    ipywidgets.VBox
+        Navigation controls and output containing the initial rendered result.
+
+    Notes
+    -----
+    Dataset changes rebind the case maximum and preserve the nearest valid
+    one-based control value. Rendering participates in the shared export context.
 
     """
     dataset_names = list(datasets.keys())
@@ -240,6 +361,12 @@ def make_interactive_case_viewer(
     # Render logic
     # ------------------------------------------------------------------
     def _render() -> None:
+        """
+        Clamp and render the current dataset/case selection.
+
+        The display control is one-based; the plotting callable receives a
+        zero-based index plus the selected frame and label.
+        """
         if dataset_dropdown is not None:
             selected_name = dataset_dropdown.value
             if not isinstance(selected_name, str):
@@ -268,6 +395,7 @@ def make_interactive_case_viewer(
         )
 
     def _step(delta: int) -> None:
+        """Move the one-based case control without crossing dataset bounds."""
         case_index.value = max(
             1,
             min(case_index.max, case_index.value + delta),
@@ -283,6 +411,7 @@ def make_interactive_case_viewer(
     if dataset_dropdown is not None:
 
         def _on_dataset_change(change: dict) -> None:
+            """Rebind case bounds and rerender after a dataset selection change."""
             df_new = datasets[change["new"]]
 
             n_cases_new = n_cases_fn(change["new"], df_new) if n_cases_fn is not None else len(df_new)
@@ -331,30 +460,33 @@ def make_casecount_viewer(
     **plot_kwargs: Any,
 ) -> widgets.VBox:
     """
-    Viewer for plots that aggregate over a variable number of cases.
+    Build and immediately render a shared-prefix aggregate viewer.
 
     Parameters
     ----------
-    plot_func : callable
-        Function of the form:
-            plot_func(datasets=datasets, max_cases=N, **kwargs)
-        Must return a matplotlib Figure.
-    datasets : dict[str, DataFrame]
-        Mapping: dataset_name -> dataset DataFrame.
+    plot_func : Callable[..., Any]
+        Called with ``datasets`` and integer ``max_cases`` keyword arguments.
+    datasets : dict[str, pandas.DataFrame]
+        Labelled frames; the shortest frame defines the shared maximum prefix.
     start_cases : int, optional
-        Initial number of cases to include (default: 50).
+        Initial prefix count, capped by the shared maximum (default 100).
     step_size : int, optional
-        Step size for increasing/decreasing case count (default: 50).
-    extra_widgets : list[widgets.Widget] | None, optional
-        Additional widgets to include in the header.
-        These widgets trigger re-rendering on value change.
+        Positive navigation increment passed to the slider (default 50).
+    extra_widgets : list[ipywidgets.Widget] | None, optional
+        Additional controls whose changes trigger rerendering.
     **plot_kwargs : Any
-        Forwarded into the plot function.
+        Fixed keyword arguments forwarded on every render.
 
     Returns
     -------
-    widgets.VBox
-        Complete interactive viewer.
+    ipywidgets.VBox
+        Prefix controls and output containing the initial aggregate render.
+
+    Notes
+    -----
+    Navigation clamps button-driven changes to one through the shortest frame,
+    while the underlying slider retains its configured zero minimum. Dataset
+    selection semantics, caching, and scientific reduction belong to ``plot_func``.
 
     """
     max_cases_global = min(len(df) for df in datasets.values())
@@ -373,6 +505,12 @@ def make_casecount_viewer(
     # Render logic
     # ------------------------------------------------------------------
     def _render() -> None:
+        """
+        Render the current shared ordered-prefix count across all frames.
+
+        The viewer forwards state only; prefix interpretation and aggregation
+        remain owned by the supplied plotting callable.
+        """
         _render_figure(
             out=out,
             plot_func=plot_func,
@@ -384,6 +522,7 @@ def make_casecount_viewer(
         )
 
     def _step(delta: int) -> None:
+        """Change prefix size by one configured step within the shared bound."""
         new_val = case_count.value + delta * step_size
         case_count.value = max(1, min(max_cases_global, new_val))
 

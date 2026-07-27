@@ -1,5 +1,12 @@
-# ruff: noqa: S101
-"""Verify semantic supervised and physics-loss composition and warm-up state."""
+# ruff: noqa: EM101, PLR2004, S101, TRY003
+"""
+Protect semantic supervised/physics loss composition and deterministic warmup.
+
+Manufactured tensors cover named weighted components, selected continuity,
+disabled-physics zeros, physical inverse normalization, invalid factory settings,
+sample-weighted epoch telemetry, and monitor diagnostics. Domain equation values
+and evaluation metric reductions are verified in separate modules.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +15,29 @@ from pathlib import Path
 import pytest
 import torch
 from src import experiments, learning
+from torch.optim.sgd import SGD
+from torch.utils.data import DataLoader, Dataset
 
 _MIDPOINT_EPOCH = 2
 _CONFIG_ROOT = Path(__file__).parents[2] / "configs" / "experiments"
+
+
+class _ListMappingDataset(Dataset[dict[str, torch.Tensor]]):
+    """
+    Present caller-supplied tensor mappings to a DataLoader in their original order.
+
+    The fake owns no storage, normalization, or task semantics; tests choose batch
+    sizes over its finite samples to expose partial-batch aggregation behavior.
+    """
+
+    def __init__(self, samples: list[dict[str, torch.Tensor]]) -> None:
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        return self.samples[index]
 
 
 class IdentityNormalizer:
@@ -21,9 +48,19 @@ class IdentityNormalizer:
         return tensor
 
 
-def _physics_config() -> dict[str, object]:
-    """Return a resolved PI config with short deterministic warmups."""
-    raw = experiments.config.loader.load_yaml(_CONFIG_ROOT / "steady_flow_pifno.yaml")
+def _physics_config(
+    *,
+    filename: str = "steady_flow_pifno.yaml",
+    continuity: str = "div_eps_velocity",
+) -> dict[str, object]:
+    """
+    Resolve a PI recipe with one continuity, four-epoch linear warmups, and crop one.
+
+    Residual and boundary targets are fixed at two and three respectively, making
+    their midpoint weights observable while retaining the selected FNO or UNO recipe.
+    """
+    raw = experiments.config.loader.load_yaml(_CONFIG_ROOT / filename)
+    raw["loss"]["physics"]["continuity"] = continuity  # type: ignore[index]
     raw["loss"]["physics"]["residual_weight"] = {  # type: ignore[index]
         "target": 2.0,
         "warmup": {"kind": "linear", "epochs": 4},
@@ -37,7 +74,13 @@ def _physics_config() -> dict[str, object]:
 
 
 def _manufactured_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return normalized-as-physical task tensors with nonzero physics terms."""
+    """
+    Build one 9-by-11 steady-flow BCHW batch with identity-normalized values.
+
+    Inputs follow the seven task channels, targets are zero, and the predicted
+    ``u = 1e-5 * x`` field plus inlet pressure data makes physics components
+    observable. The manufactured tensors are not a Brinkman solution benchmark.
+    """
     height = 9
     width = 11
     y_values = torch.linspace(0.0, 1.0, height)
@@ -66,23 +109,41 @@ def _manufactured_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
 
 def test_disabled_physics_exposes_named_zero_components() -> None:
-    """Disabled physics stays present as clean named zero components."""
+    """
+    Compute a supervised loss from nonzero predictions with physics disabled.
+
+    Named physics components must remain present as exact zeros and total must
+    equal data loss, keeping telemetry schema stable without fabricating residuals.
+    """
     supervised = experiments.config.loader.load_and_resolve_config(_CONFIG_ROOT / "steady_flow_fno.yaml")
-    supervised_loss = learning.losses.factory.build_training_loss(supervised)
+    supervised_loss = learning.losses.factory.build_training_loss(supervised, device=torch.device("cpu"))
     pred = torch.ones((2, 3, 8, 8))
     target = torch.zeros_like(pred)
     components = supervised_loss.compute_components(pred, x=None, y=target)
 
-    assert tuple(components) == ("total", "data", "momentum", "continuity", "boundary")
+    assert tuple(components) == (
+        "total",
+        "data",
+        "momentum",
+        "boundary",
+        "continuity_div_eps_velocity",
+    )
+    assert tuple(components) == supervised_loss.component_names
     assert components["total"] == components["data"]
     assert components["momentum"].item() == 0.0
-    assert components["continuity"].item() == 0.0
     assert components["boundary"].item() == 0.0
+    assert components["continuity_div_eps_velocity"].item() == 0.0
+    assert supervised_loss.telemetry_state() == {}
 
 
 def test_physics_composition_weighting_and_linear_warmup() -> None:
-    """Explicit epoch state produces exact start, midpoint, and end sums."""
-    loss = learning.losses.factory.build_training_loss(_physics_config())
+    """
+    Evaluate one manufactured PI batch at warmup epochs zero, two, and four.
+
+    Applied weights and named components must scale linearly and sum exactly,
+    while explicit epoch state persists for deterministic resume.
+    """
+    loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"))
     normalizer = IdentityNormalizer()
     loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
     inputs, pred, target = _manufactured_batch()
@@ -90,20 +151,30 @@ def test_physics_composition_weighting_and_linear_warmup() -> None:
     start = loss.compute_components(pred, x=inputs, y=target, epoch=0)
     midpoint = loss.compute_components(pred, x=inputs, y=target, epoch=2)
     end = loss.compute_components(pred, x=inputs, y=target, epoch=4)
+    continuity_name = loss.continuity_component_name
 
+    assert continuity_name == "continuity_div_eps_velocity"
     assert start["momentum"].item() == 0.0
-    assert start["continuity"].item() == 0.0
     assert start["boundary"].item() == 0.0
+    assert start[continuity_name].item() == 0.0
     assert midpoint["momentum"] == pytest.approx(0.5 * end["momentum"])
-    assert midpoint["continuity"] == pytest.approx(0.5 * end["continuity"])
     assert midpoint["boundary"] == pytest.approx(0.5 * end["boundary"])
+    assert midpoint[continuity_name] == pytest.approx(0.5 * end[continuity_name])
     for components in (start, midpoint, end):
-        assert components["total"] == pytest.approx(components["data"] + components["momentum"] + components["continuity"] + components["boundary"])
+        assert components["total"] == pytest.approx(
+            components["data"] + components["momentum"] + components["boundary"] + components[continuity_name]
+        )
     assert loss.component_weights(epoch=2) == {
         "data": 1.0,
         "momentum": 1.0,
-        "continuity": 1.0,
         "boundary": 1.5,
+        continuity_name: 1.0,
+    }
+    assert loss.telemetry_state(epoch=2) == {
+        "weight_physics": 1.0,
+        "weight_boundary": 1.5,
+        "warmup_physics_fraction": 0.5,
+        "warmup_boundary_fraction": 0.5,
     }
 
     loss.set_epoch(_MIDPOINT_EPOCH)
@@ -115,14 +186,244 @@ def test_physics_composition_weighting_and_linear_warmup() -> None:
         loss.set_epoch(-1)
 
 
+@pytest.mark.parametrize(
+    ("filename", "model_kind"),
+    [
+        ("steady_flow_pifno.yaml", "fno"),
+        ("steady_flow_piuno.yaml", "uno"),
+    ],
+)
+@pytest.mark.parametrize("continuity", ["div_velocity", "div_eps_velocity"])
+def test_pi_model_families_share_formulation_selected_loss_path(
+    filename: str,
+    model_kind: str,
+    continuity: str,
+) -> None:
+    """
+    Cross both PI model families with both allowed continuity formulations.
+
+    Model kind may vary, but the semantic loss class and selected residual mapping
+    stay fixed; the opposite continuity key must never enter optimization components.
+    """
+    config = _physics_config(filename=filename, continuity=continuity)
+    loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
+    normalizer = IdentityNormalizer()
+    loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
+    inputs, pred, target = _manufactured_batch()
+
+    diagnostics = loss.compute_physics_diagnostics(pred, x=inputs)
+    components = loss.compute_components(pred, x=inputs, y=target, epoch=4)
+    continuity_name = f"continuity_{continuity}"
+    selected = diagnostics.continuity.divergence_velocity if continuity == "div_velocity" else diagnostics.continuity.divergence_porosity_velocity
+    selected_interior = selected[..., 1:-1, 1:-1]
+    expected = loss.component_weights(epoch=4)[continuity_name] * selected_interior.square().mean()
+    opposite = "continuity_div_eps_velocity" if continuity == "div_velocity" else "continuity_div_velocity"
+
+    assert config["model"]["kind"] == model_kind  # type: ignore[index]
+    assert type(loss) is learning.losses.pino.SemanticComposedLoss
+    assert loss.continuity == continuity
+    assert loss.component_names == tuple(components)
+    assert torch.allclose(diagnostics.continuity.selected, selected)
+    assert torch.allclose(components[continuity_name], expected)
+    assert opposite not in components
+
+
 def test_invalid_physics_loss_settings_fail_through_public_factory() -> None:
-    """Unknown derivative and warm-up settings fail during loss construction."""
+    """
+    Replace one valid derivative kind and one warmup kind with unsupported values.
+
+    The public loss factory must reject each semantic setting before training,
+    preventing implicit numerical or schedule fallbacks.
+    """
     derivative_config = _physics_config()
     derivative_config["loss"]["physics"]["derivatives"]["kind"] = "finite_difference"  # type: ignore[index]
     with pytest.raises(ValueError, match="Unknown derivative identifier"):
-        learning.losses.factory.build_training_loss(derivative_config)
+        learning.losses.factory.build_training_loss(derivative_config, device=torch.device("cpu"))
 
     warmup_config = _physics_config()
     warmup_config["loss"]["physics"]["residual_weight"]["warmup"]["kind"] = "cosine"  # type: ignore[index]
     with pytest.raises(ValueError, match="Unknown warmup identifier"):
-        learning.losses.factory.build_training_loss(warmup_config)
+        learning.losses.factory.build_training_loss(warmup_config, device=torch.device("cpu"))
+
+
+class _IdentityScaleModel(torch.nn.Module):
+    """
+    Expose one trainable scalar for epoch-aggregation tests.
+
+    Callers use zero learning rate so predictions reveal only batch weighting;
+    this helper is not a model-accuracy fixture.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        """Scale a synthetic batch while retaining an autograd path."""
+        return self.scale * value
+
+
+class _SyntheticComponentLoss(torch.nn.Module):
+    """Return batch-mean components whose unequal final batch is observable."""
+
+    physics_enabled = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_components: dict[str, torch.Tensor] = {}
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        y: torch.Tensor | None = None,
+        *,
+        x: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return a batch mean and expose detached total/data components."""
+        del x
+        if y is None:
+            raise ValueError("target required")
+        value = (pred - y).mean()
+        self.last_components = {"total": value.detach(), "data": value.detach()}
+        return value
+
+
+class _SyntheticPhysicsComponentLoss(_SyntheticComponentLoss):
+    """Expose exactly one continuity and fixed applied-weight telemetry."""
+
+    physics_enabled = True
+    continuity = "div_velocity"
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        y: torch.Tensor | None = None,
+        *,
+        x: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return fixed-ratio named physics components from one batch mean."""
+        del x
+        if y is None:
+            raise ValueError("target required")
+        data = (pred - y).mean()
+        momentum = 2.0 * data
+        boundary = 3.0 * data
+        continuity = 4.0 * data
+        total = data + momentum + boundary + continuity
+        self.last_components = {
+            "total": total.detach(),
+            "data": data.detach(),
+            "momentum": momentum.detach(),
+            "boundary": boundary.detach(),
+            "continuity_div_velocity": continuity.detach(),
+        }
+        return total
+
+    def telemetry_state(self) -> dict[str, float]:
+        """Return fixed applied-weight telemetry for epoch aggregation."""
+        return {
+            "weight_physics": 0.25,
+            "weight_boundary": 0.5,
+            "warmup_physics_fraction": 0.75,
+            "warmup_boundary_fraction": 1.0,
+        }
+
+
+def test_epoch_loss_components_are_weighted_by_actual_sample_count() -> None:
+    """
+    Train over a two-sample batch followed by one unequal-valued singleton.
+
+    Every named component and fixed physics telemetry must use actual sample count,
+    preventing a partial batch from receiving equal weight to a full batch.
+    """
+    samples = [{"x": torch.full((1, 1, 1), value), "y": torch.zeros((1, 1, 1))} for value in (1.0, 3.0, 9.0)]
+    loader = DataLoader(_ListMappingDataset(samples), batch_size=2, shuffle=False)
+    model = _IdentityScaleModel()
+    optimizer = SGD(model.parameters(), lr=0.0)
+
+    values = learning.training.loop.train_one_epoch(
+        model,
+        loader,
+        optimizer,
+        _SyntheticComponentLoss(),
+        torch.device("cpu"),
+    )
+
+    assert values["train/loss_total"] == pytest.approx(13.0 / 3.0)
+    assert values["train/loss_data"] == pytest.approx(13.0 / 3.0)
+    assert values["train/loss_total"] != pytest.approx((2.0 + 9.0) / 2.0)
+    assert values["optimizer_steps"] == 2.0
+    assert not any("momentum" in key or "continuity" in key for key in values)
+
+    physics_model = _IdentityScaleModel()
+    physics_values = learning.training.loop.train_one_epoch(
+        physics_model,
+        loader,
+        SGD(physics_model.parameters(), lr=0.0),
+        _SyntheticPhysicsComponentLoss(),
+        torch.device("cpu"),
+    )
+    assert set(physics_values) == {
+        "train/loss_total",
+        "train/loss_data",
+        "train/loss_momentum",
+        "train/loss_boundary",
+        "train/loss_continuity_div_velocity",
+        "train/weight_physics",
+        "train/weight_boundary",
+        "train/warmup_physics_fraction",
+        "train/warmup_boundary_fraction",
+        "optimizer_steps",
+    }
+    assert physics_values["train/weight_physics"] == 0.25
+    assert "train/loss_continuity_div_eps_velocity" not in physics_values
+
+
+class _ManufacturedMonitorModel(torch.nn.Module):
+    """Return a deterministic physical-as-normalized velocity field."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.samples_seen = 0
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Return manufactured outputs and count the bounded samples consumed."""
+        self.samples_seen += int(inputs.shape[0])
+        zeros = torch.zeros_like(inputs[:, 0])
+        return torch.stack((zeros, 1e-5 * inputs[:, 0], zeros), dim=1)
+
+
+def test_physics_monitor_is_bounded_and_reports_both_continuities() -> None:
+    """
+    Evaluate the shared domain diagnostics on only a fixed evaluation prefix.
+
+    The monitor must consume exactly the bound and report both continuity metrics
+    plus momentum/boundary values, without introducing a second physics formula.
+    """
+    config = _physics_config()
+    loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
+    normalizer = IdentityNormalizer()
+    loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
+    inputs, _pred, target = _manufactured_batch()
+    samples = [{"x": inputs[0].clone(), "y": target[0].clone()} for _ in range(3)]
+    loader = DataLoader(_ListMappingDataset(samples), batch_size=3, shuffle=False)
+    model = _ManufacturedMonitorModel()
+
+    values = learning.training.loop.evaluate_physics_monitor(
+        model,
+        loader,
+        loss,
+        torch.device("cpu"),
+        data_processor=None,
+        max_cases=2,
+    )
+
+    assert model.samples_seen == 2
+    assert set(values) == {
+        "monitor/momentum_residual_mse",
+        "monitor/div_velocity_mse",
+        "monitor/div_eps_velocity_mse",
+        "monitor/pressure_boundary_mse",
+    }
+    assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
+    assert values["monitor/div_velocity_mse"] != values["monitor/div_eps_velocity_mse"]

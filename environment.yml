@@ -24,12 +24,9 @@ dependencies:
 
   # Interactive / notebooks
   - ipykernel
+  - nbconvert
   - ipywidgets
   - ipython
-
-  # Code quality / VS Code
-  - ruff
-  - mypy
 
   # Package build and pip dependencies
   - setuptools

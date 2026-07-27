@@ -1,4 +1,12 @@
-"""Reusable project packages with lazy top-level module access."""
+"""
+Expose the six public project packages through lazy top-level access.
+
+The initializer publishes ``analysis``, ``common``, ``datasets``, ``domain``,
+``experiments``, and ``learning`` without importing their optional or expensive
+dependencies during ``import src``. Attribute access imports and caches only the
+requested package; command execution and runtime initialization remain owned by
+the package-specific services.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +27,25 @@ __all__ = [
 
 
 def __getattr__(name: str) -> object:
-    """Import a public package only when it is first requested."""
+    """
+    Import and cache one declared public package on first attribute access.
+
+    Parameters
+    ----------
+    name : str
+        Attribute requested from ``src``.
+
+    Returns
+    -------
+    object
+        Imported package object for a name listed in ``__all__``.
+
+    Raises
+    ------
+    AttributeError
+        If ``name`` is not one of the six declared public package aliases.
+
+    """
     if name not in __all__:
         message = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(message)

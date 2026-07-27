@@ -8,9 +8,14 @@ Responsibilities:
   - Parse config, resume, device, and output-root arguments
   - Return a non-zero process result for lifecycle failures
 
-Boundaries:
-  - Allocation, seeding, persistence, resume, and training belong to experiments.run
-  - The CLI package remains import-free at package import time
+Design principles:
+  - Parser and dispatch code stays thin and import-light
+  - Runtime overrides are forwarded without semantic reinterpretation
+  - Material lifecycle failures remain visible to shell and queue callers
+
+This module does NOT:
+  - Allocate, seed, persist, resume, or train runs; ``experiments.run`` owns lifecycle
+  - Eagerly import command modules through the import-free ``experiments.cli`` package
 ===============================================================================
 """
 
@@ -18,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+
+from . import cli_device
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -30,7 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicitly resume in place from last_checkpoint.pt in an existing run directory",
     )
-    parser.add_argument("--device", type=str, default=None, help="Override execution device (cuda/cpu)")
+    cli_device.add_device_argument(parser, default=None, help_prefix="Override run.device")
     parser.add_argument(
         "--output-root",
         type=str,
@@ -41,7 +48,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the delegated training entry point and return a process exit code."""
+    """
+    Execute a fresh or explicit-resume run and return its process result.
+
+    Parameters
+    ----------
+    argv : list[str] | None, optional
+        Explicit argument vector; ``None`` uses the process arguments.
+
+    Returns
+    -------
+    int
+        ``0`` after a completed run, ``1`` for a caught lifecycle failure, and
+        ``130`` when training is interrupted.
+
+    Notes
+    -----
+    The reusable run service owns allocation, persistence, device resolution,
+    training, and resume. Parser usage errors raise ``SystemExit`` directly.
+
+    """
     args = _build_parser().parse_args(argv)
     try:
         from src.experiments import experiments_run  # noqa: PLC0415

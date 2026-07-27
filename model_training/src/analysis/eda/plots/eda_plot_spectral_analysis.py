@@ -2,760 +2,509 @@
 ===============================================================================
 eda_plot_spectral_analysis.py
 ===============================================================================
-Plot frequency-domain summaries for exploratory dataset analysis.
+Compare bounded dataset spectra without loading model activations or artifacts.
 
 Responsibilities:
-  - Compute and plot 2D power spectra
-  - Compute radial energy spectra
-  - Build interactive spectral dataset viewers
+  - Compute Hann-windowed isotropic and x/y directional power spectra
+  - Show cumulative bandwidth with casewise uncertainty over ordered prefixes
+  - Resolve horizontal spectral composition as a function of physical height
+  - Enforce shared task fields, units, and internally identical Cartesian grids
 
 Design principles:
-  - Spectral summaries use Hann-windowed FFTs
-  - Wavenumber plots expose dominant spatial scales
-  - Dataset selection is shared with EDA case-statistics helpers
+  - Frequencies use coordinate-derived units of inverse metres
+  - Height-resolved power is normalized within each row before case aggregation
+  - Dataset comparisons never combine physical fields with incompatible units
 
-Boundaries:
-  - Model spectral diagnostics belong to evaluation_plot_spectral_analysis
-  - Physics residual diagnostics belong to learning.losses and analysis.evaluation
+This module does NOT:
+  - Materialize merged datasets or infer undeclared task fields
+  - Compare model predictions with references or inspect model activations
 ===============================================================================
 """
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.lines import Line2D
-
-from src import analysis
 
 if TYPE_CHECKING:
-    import ipywidgets as widgets
     import pandas as pd
+    from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
-    CheckboxGroup = analysis.ui.components.CheckboxGroup
+_DEFAULT_CASE_LIMIT = 64
+_MIN_GRID_SIZE = 2
 
 
-# ======================================================================
-# Internal DataFrame utilities
-# ======================================================================
-def _infer_field_keys(df: pd.DataFrame) -> list[str]:
+def _field_names(frame: pd.DataFrame) -> tuple[str, ...]:
     """
-    Infer 2D field keys from a DataFrame by inspecting the first row.
+    Resolve declared numeric 2D non-coordinate fields in TaskSpec order.
 
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        DataFrame containing simulation case data.
-
-    Returns
-    -------
-    list[str]
-        List of column names corresponding to 2D numeric fields.
-
+    ``field_names`` and ``field_roles`` attrs are authoritative. Missing metadata,
+    an empty frame contract, or the absence of any eligible array fails instead
+    of inferring fields from arbitrary columns.
     """
-    keys: list[str] = []
-
-    sample = df.iloc[0]
-    for col in df.columns:
-        if col in {"x", "y", "meta"}:
-            continue
-
-        arr = np.asarray(sample[col])
-        if arr.ndim == 2 and np.issubdtype(arr.dtype, np.number):  # noqa: PLR2004
-            keys.append(col)
-
-    return keys
-
-
-def _infer_ncols(n_items: int, *, max_cols: int = 4) -> int:
-    """
-    Infer a suitable number of subplot columns for a given number of items.
-
-    Parameters
-    ----------
-    n_items : int
-        Total number of items to plot.
-    max_cols : int
-        Maximum number of columns allowed.
-
-    Returns
-    -------
-    int
-        Number of columns to use for subplots.
-
-    """
-    return min(max_cols, max(1, int(np.ceil(np.sqrt(n_items)))))
-
-
-# ======================================================================
-# Internal spectral utilities
-# ======================================================================
-
-
-def _hann2d(ny: int, nx: int) -> np.ndarray:
-    """
-    Create a two-dimensional Hann window.
-
-    A separable Hann weighting is applied in both spatial directions
-    to reduce edge effects before computing the FFT.
-
-    Parameters
-    ----------
-    ny : int
-        Number of grid points in the y direction.
-    nx : int
-        Number of grid points in the x direction.
-
-    Returns
-    -------
-        np.ndarray: Hann window of shape (ny, nx).
-
-    """
-    return np.outer(np.hanning(ny), np.hanning(nx))
-
-
-def _fft2_psd(field: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute the two-dimensional FFT and power spectral density.
-
-    The input field is mean-subtracted and Hann-windowed. The result
-    is returned in centred form (fftshifted), together with the
-    corresponding wavenumber grids.
-
-    Parameters
-    ----------
-    field : np.ndarray
-        2D array representing the spatial field to analyze.
-    dx : float
-        Grid spacing in the x direction.
-    dy : float
-        Grid spacing in the y direction.
-
-    Returns
-    -------
-        tuple:
-            np.ndarray: Centred power spectral density.
-            np.ndarray: Centred wavenumber grid kx.
-            np.ndarray: Centred wavenumber grid ky.
-
-    """
-    a = field.astype(float, copy=True)
-    a -= np.mean(a)
-    a *= _hann2d(*a.shape)
-
-    F = np.fft.fft2(a)
-    PSD = np.abs(F) ** 2 / a.size
-
-    kx = np.fft.fftfreq(a.shape[1], d=dx)
-    ky = np.fft.fftfreq(a.shape[0], d=dy)
-    kx, ky = np.meshgrid(kx, ky)
-
-    return np.fft.fftshift(PSD), np.fft.fftshift(kx), np.fft.fftshift(ky)
-
-
-def _radial_spectrum(
-    PSD: np.ndarray,
-    kx: np.ndarray,
-    ky: np.ndarray,
-    n_bins: int = 200,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute the isotropic radial energy spectrum E(k).
-
-    The two-dimensional PSD is binned by radial wavenumber distance.
-    The result is the mean spectral energy in each radial band.
-
-    Parameters
-    ----------
-    PSD : np.ndarray
-        2D power spectral density.
-    kx, ky : np.ndarray
-        Wavenumber grids corresponding to the PSD.
-    n_bins : int
-        Number of radial bins to use.
-
-    Returns
-    -------
-        tuple:
-            np.ndarray: Radial wavenumber centres.
-            np.ndarray: Energy density E(k).
-
-    """
-    kr = np.sqrt(kx**2 + ky**2).ravel()
-    ps = PSD.ravel()
-
-    mask = np.isfinite(kr) & np.isfinite(ps)
-    kr, ps = kr[mask], ps[mask]
-
-    edges = np.linspace(kr.min(), kr.max(), n_bins + 1)
-    idx = np.digitize(kr, edges) - 1
-
-    sums = np.bincount(idx, weights=ps)
-    counts = np.bincount(idx)
-
-    n = min(len(sums), len(edges) - 1)
-    E = sums[:n] / np.maximum(counts[:n], 1)
-
-    k_centres = 0.5 * (edges[:-1] + edges[1:])
-    return k_centres[:n], E
-
-
-def _directional_spectrum(
-    PSD: np.ndarray,
-    kx: np.ndarray,
-    ky: np.ndarray,
-    *,
-    axis: str,
-    n_bins: int = 200,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute 1D directional energy spectrum Ex(kx) or Ey(ky).
-
-    Parameters
-    ----------
-    PSD : np.ndarray
-        2D power spectral density.
-    kx, ky : np.ndarray
-        Wavenumber grids.
-    axis : {"x", "y"}
-        Direction for spectral reduction.
-    n_bins : int
-        Number of bins.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        (k_centres, E_dir)
-
-    """
-    if axis == "x":
-        k = np.abs(kx).ravel()
-    elif axis == "y":
-        k = np.abs(ky).ravel()
-    else:
-        msg = "axis must be 'x' or 'y'"
+    raw_declared = frame.attrs.get("field_names")
+    if not isinstance(raw_declared, (list, tuple)) or not raw_declared or any(not isinstance(name, str) or not name for name in raw_declared):
+        msg = "EDA spectral analysis requires task-aware field_names metadata."
         raise ValueError(msg)
-
-    ps = PSD.ravel()
-
-    mask = np.isfinite(k) & np.isfinite(ps)
-    k, ps = k[mask], ps[mask]
-
-    edges = np.linspace(0.0, k.max(), n_bins + 1)
-    idx = np.digitize(k, edges) - 1
-
-    sums = np.bincount(idx, weights=ps)
-    counts = np.bincount(idx)
-
-    n = min(len(sums), len(edges) - 1)
-    E = sums[:n] / np.maximum(counts[:n], 1)
-
-    k_centres = 0.5 * (edges[:-1] + edges[1:])
-    return k_centres[:n], E
+    declared = tuple(raw_declared)
+    roles = frame.attrs.get("field_roles")
+    if not isinstance(roles, dict) or any(name not in roles for name in declared):
+        msg = "EDA spectral analysis requires TaskSpec field_roles metadata."
+        raise ValueError(msg)
+    sample = frame.iloc[0]
+    fields = tuple(
+        name for name in declared if roles[name] != "coordinate" and name in frame.columns and np.asarray(sample[name]).ndim == _MIN_GRID_SIZE
+    )
+    if not fields:
+        msg = "EDA spectral analysis found no declared numeric 2D fields."
+        raise ValueError(msg)
+    return fields
 
 
-# ======================================================================
-# Interactive 2D spectral overview
-# ======================================================================
-
-
-def plot_spectral_overview(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
+def _validate_datasets(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> tuple[str, ...]:
     """
-    Build an interactive viewer for 2D spectral maps (PSD).
+    Admit comparable EDA frames and a positive ordered-prefix bound.
 
-    Each case is visualised by transforming the fields listed in
-    `ALL_KEYS` into log-scaled 2D PSD maps using FFT. A separate subplot
-    is shown for each field, including an individual colourbar.
+    Every label/frame must be non-empty and expose identical task identity,
+    declared spectral fields, and complete physical-unit mappings. Dataset
+    fingerprint equality is not required because this view compares datasets.
+    """
+    if not datasets:
+        msg = "At least one EDA dataset is required."
+        raise ValueError(msg)
+    if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
+        msg = "max_cases must be a positive integer."
+        raise ValueError(msg)
+    reference_fields: tuple[str, ...] | None = None
+    reference_units: object = None
+    reference_task: object = None
+    for label, frame in datasets.items():
+        if not label or frame.empty:
+            msg = "EDA datasets require non-empty labels and frames."
+            raise ValueError(msg)
+        fields = _field_names(frame)
+        units = frame.attrs.get("field_units")
+        task = frame.attrs.get("task_id")
+        if not isinstance(units, dict) or any(field not in units for field in fields) or not isinstance(task, str):
+            msg = "EDA spectra require task_id and field_units metadata."
+            raise ValueError(msg)
+        if reference_fields is None:
+            reference_fields, reference_units, reference_task = fields, units, task
+        elif fields != reference_fields or units != reference_units or task != reference_task:
+            msg = "EDA spectral comparisons require identical task fields and physical units."
+            raise ValueError(msg)
+    if reference_fields is None:
+        msg = "EDA dataset validation did not establish field metadata."
+        raise RuntimeError(msg)
+    return reference_fields
 
-    Navigation across cases is handled by the generic analysis.ui.viewers navigator.
+
+def _spacing(row: pd.Series) -> tuple[float, float, str]:
+    """
+    Derive positive median Cartesian x/y spacing from one EDA case.
+
+    Explicit finite task inputs ``x`` and ``y`` must each contain at least two
+    increasing unique coordinates. The maintained EDA coordinate contract uses
+    metres, returned as the disclosed unit string.
+    """
+    if "x" not in row or "y" not in row:
+        msg = "EDA spectral analysis requires explicit x and y task inputs."
+        raise ValueError(msg)
+    x_values = np.unique(np.asarray(row["x"], dtype=float))
+    y_values = np.unique(np.asarray(row["y"], dtype=float))
+    if x_values.size < _MIN_GRID_SIZE or y_values.size < _MIN_GRID_SIZE:
+        msg = "EDA coordinate fields must contain at least two unique values per axis."
+        raise ValueError(msg)
+    dx = float(np.median(np.diff(x_values)))
+    dy = float(np.median(np.diff(y_values)))
+    if dx <= 0.0 or dy <= 0.0 or not np.isfinite((dx, dy)).all():
+        msg = "EDA coordinate spacing must be finite and positive."
+        raise ValueError(msg)
+    return dx, dy, "m"
+
+
+def _power_grid(field: np.ndarray, *, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute mean-centered Hann-windowed FFT power on physical frequency grids.
+
+    The input must be one finite 2D field with both axes at least length two.
+    Power is ``abs(fft2((field-mean)*window))**2 / field.size``; frequency grids
+    use the caller's positive physical ``dx`` and ``dy``.
+    """
+    values = np.asarray(field, dtype=float)
+    if values.ndim != _MIN_GRID_SIZE or min(values.shape) < _MIN_GRID_SIZE or not np.isfinite(values).all():
+        msg = "EDA spectra require finite 2D fields."
+        raise ValueError(msg)
+    window = np.outer(np.hanning(values.shape[0]), np.hanning(values.shape[1]))
+    transformed = np.fft.fft2((values - np.mean(values)) * window)
+    power = np.abs(transformed) ** 2 / values.size
+    kx = np.fft.fftfreq(values.shape[1], d=dx)
+    ky = np.fft.fftfreq(values.shape[0], d=dy)
+    return power, *np.meshgrid(kx, ky)
+
+
+def _binned_mean(coordinate: np.ndarray, power: np.ndarray, *, bins: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reduce frequency-grid power into fixed equal-width coordinate bins.
+
+    Bin centers cover zero through the observed maximum. Empty bins are retained
+    with zero mean power so spectra from identical grids stay aligned.
+    """
+    values = np.asarray(coordinate, dtype=float).ravel()
+    energy = np.asarray(power, dtype=float).ravel()
+    edges = np.linspace(0.0, float(np.max(values)), bins + 1)
+    assignments = np.clip(np.digitize(values, edges) - 1, 0, bins - 1)
+    sums = np.bincount(assignments, weights=energy, minlength=bins)
+    counts = np.bincount(assignments, minlength=bins)
+    return 0.5 * (edges[:-1] + edges[1:]), sums / np.maximum(counts, 1)
+
+
+def _spectra(field: np.ndarray, *, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return isotropic radial and absolute x/y directional mean-power spectra.
+
+    All three reductions share ``max(2, min(shape)//2)`` equal-width bins and
+    preserve physical inverse-coordinate frequencies.
+    """
+    power, kx, ky = _power_grid(field, dx=dx, dy=dy)
+    bins = max(_MIN_GRID_SIZE, min(field.shape) // _MIN_GRID_SIZE)
+    radial_k, radial = _binned_mean(np.hypot(kx, ky), power, bins=bins)
+    x_k, x_energy = _binned_mean(np.abs(kx), power, bins=bins)
+    y_k, y_energy = _binned_mean(np.abs(ky), power, bins=bins)
+    return radial_k, radial, x_k, x_energy, y_k, y_energy
+
+
+def _case_spectra(
+    frame: pd.DataFrame,
+    field: str,
+    *,
+    max_cases: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, str]:
+    """
+    Stack aligned isotropic and directional spectra for one declared field.
+
+    The first bounded saved prefix is used without reranking. Frequency grids
+    must remain identical within the frame; the result carries exact selected
+    count and coordinate unit for disclosure.
+    """
+    selected = frame.iloc[: min(max_cases, len(frame))]
+    collections: list[list[np.ndarray]] = [[], [], []]
+    coordinates: list[np.ndarray | None] = [None, None, None]
+    coordinate_unit = "m"
+    for _index, row in selected.iterrows():
+        dx, dy, coordinate_unit = _spacing(row)
+        radial_k, radial, x_k, x_energy, y_k, y_energy = _spectra(np.asarray(row[field], dtype=float), dx=dx, dy=dy)
+        for axis_index, (k_values, energy) in enumerate(((radial_k, radial), (x_k, x_energy), (y_k, y_energy))):
+            reference = coordinates[axis_index]
+            if reference is None:
+                coordinates[axis_index] = k_values
+            elif not np.allclose(reference, k_values):
+                msg = "EDA spectral aggregation requires identical grids within each dataset."
+                raise ValueError(msg)
+            collections[axis_index].append(energy)
+    radial_coordinate, x_coordinate, y_coordinate = coordinates
+    if radial_coordinate is None or x_coordinate is None or y_coordinate is None:
+        msg = "EDA spectral aggregation did not establish frequency grids."
+        raise RuntimeError(msg)
+    return (
+        radial_coordinate,
+        np.stack(collections[0]),
+        x_coordinate,
+        np.stack(collections[1]),
+        y_coordinate,
+        np.stack(collections[2]),
+        len(selected),
+        coordinate_unit,
+    )
+
+
+def _vertical_spectral_map(
+    frame: pd.DataFrame,
+    field: str,
+    *,
+    max_cases: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
+    """
+    Return median horizontal spectral fractions resolved by physical height.
+
+    Each horizontal row is mean-centered and Hann-windowed before the real FFT.
+    Power is normalized within that row, so the resulting map describes scale
+    composition rather than mixing the physical units of different task fields.
+    """
+    selected = frame.iloc[: min(max_cases, len(frame))]
+    spectra: list[np.ndarray] = []
+    reference_frequency: np.ndarray | None = None
+    reference_height: np.ndarray | None = None
+    coordinate_unit = "m"
+    for _index, row in selected.iterrows():
+        values = np.asarray(row[field], dtype=float)
+        x_grid = np.asarray(row["x"], dtype=float)
+        y_grid = np.asarray(row["y"], dtype=float)
+        if values.ndim != _MIN_GRID_SIZE or x_grid.shape != values.shape or y_grid.shape != values.shape:
+            msg = "Vertical spectral evolution requires field, x, and y arrays on the same 2D grid."
+            raise ValueError(msg)
+        if not np.isfinite(values).all() or not np.isfinite(x_grid).all() or not np.isfinite(y_grid).all():
+            msg = "Vertical spectral evolution requires finite field and coordinate arrays."
+            raise ValueError(msg)
+        x_values = np.median(x_grid, axis=0)
+        y_values = np.median(y_grid, axis=1)
+        if x_values.size < _MIN_GRID_SIZE or y_values.size < _MIN_GRID_SIZE:
+            msg = "Vertical spectral evolution requires at least two grid points per axis."
+            raise ValueError(msg)
+        dx_values = np.diff(x_values)
+        dy_values = np.diff(y_values)
+        if np.any(dx_values <= 0.0) or np.any(dy_values <= 0.0):
+            msg = "Vertical spectral evolution requires increasing rectilinear coordinates."
+            raise ValueError(msg)
+        dx = float(np.median(dx_values))
+        frequency = np.fft.rfftfreq(values.shape[1], d=dx)[1:]
+        centered = values - np.mean(values, axis=1, keepdims=True)
+        transformed = np.fft.rfft(centered * np.hanning(values.shape[1]), axis=1)[:, 1:]
+        power = np.abs(transformed) ** 2 / values.shape[1]
+        totals = np.sum(power, axis=1, keepdims=True)
+        fractions = np.divide(power, totals, out=np.zeros_like(power), where=totals > 0.0)
+        if reference_frequency is None:
+            reference_frequency = frequency
+            reference_height = y_values
+        elif not np.allclose(reference_frequency, frequency) or reference_height is None or not np.allclose(reference_height, y_values):
+            msg = "Vertical spectral aggregation requires identical grids within each dataset."
+            raise ValueError(msg)
+        spectra.append(fractions)
+    if reference_frequency is None or reference_height is None or not spectra:
+        msg = "Vertical spectral aggregation did not establish a frequency-height grid."
+        raise RuntimeError(msg)
+    return reference_frequency, reference_height, np.median(np.stack(spectra), axis=0), len(selected), coordinate_unit
+
+
+def _band(axis: Axes, k_values: np.ndarray, energy: np.ndarray, *, label: str, color: object) -> None:
+    """Plot positive median power with q10-q90 case bands."""
+    q10, median, q90 = np.quantile(energy, (0.1, 0.5, 0.9), axis=0)
+    valid = (k_values > 0.0) & (median > 0.0)
+    axis.plot(k_values[valid], median[valid], color=color, label=label)
+    band = valid & (q10 > 0.0)
+    axis.fill_between(k_values[band], q10[band], q90[band], color=color, alpha=0.18)
+
+
+def _cumulative(energy: np.ndarray) -> np.ndarray:
+    """Return casewise cumulative energy after omitting the DC bin."""
+    positive = np.maximum(energy[:, 1:], 0.0)
+    cumulative = np.cumsum(positive, axis=1)
+    totals = cumulative[:, -1:]
+    return np.divide(cumulative, totals, out=np.zeros_like(cumulative), where=totals > 0.0)
+
+
+def plot_isotropic_spectral_summary(
+    *,
+    datasets: dict[str, pd.DataFrame],
+    max_cases: int = _DEFAULT_CASE_LIMIT,
+) -> Figure:
+    """
+    Compare isotropic field spectra and cumulative bandwidth across datasets.
 
     Parameters
     ----------
     datasets : dict[str, pandas.DataFrame]
-        Mapping: dataset_name -> DataFrame
-        Each DataFrame must contain:
-        - the fields defined in ALL_KEYS
-        - spatial coordinates "x" and "y" for computing dx, dy
+        Task-compatible EDA frames with physical coordinates, fields, and units.
+    max_cases : int, optional
+        Positive bound on the stored ordered prefix aggregated per dataset.
 
     Returns
     -------
-    widgets.VBox
-        Fully interactive spectral viewer with next/previous navigation.
+    matplotlib.figure.Figure
+        Per-field radial median power with q10--q90 case bands and cumulative
+        non-DC energy fractions, each disclosing selected case counts.
 
+    Raises
+    ------
+    ValueError, RuntimeError
+        If task/field/unit contracts, finite Cartesian grids, or aligned spectral
+        bins cannot establish a comparison.
+
+    Notes
+    -----
+    Power retains squared field units; cumulative energy is dimensionless. No
+    interpolation is used when within-frame frequency grids differ.
 
     """
-    # Navigator übernimmt Auswahl → kein df oder dataset_name direkt nötig
+    fields = _validate_datasets(datasets, max_cases=max_cases)
+    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    colors = plt.get_cmap("tab10")
+    units = next(iter(datasets.values())).attrs["field_units"]
+    for field_index, field in enumerate(fields):
+        for dataset_index, (label, frame) in enumerate(datasets.items()):
+            radial_k, radial, _x_k, _x_energy, _y_k, _y_energy, count, coordinate_unit = _case_spectra(frame, field, max_cases=max_cases)
+            color = colors(dataset_index % colors.N)
+            disclosed = f"{label}, n={count}"
+            _band(axes[field_index, 0], radial_k, radial, label=disclosed, color=color)
+            cumulative = _cumulative(radial)
+            q10, median, q90 = np.quantile(cumulative, (0.1, 0.5, 0.9), axis=0)
+            axes[field_index, 1].plot(radial_k[1:], median, color=color, label=disclosed)
+            axes[field_index, 1].fill_between(radial_k[1:], q10, q90, color=color, alpha=0.18)
+        axes[field_index, 0].set_xscale("log")
+        axes[field_index, 0].set_yscale("log")
+        axes[field_index, 0].set_title(f"{field}: isotropic radial power")
+        axes[field_index, 0].set_xlabel(f"spatial frequency [1/{coordinate_unit}]")
+        axes[field_index, 0].set_ylabel(f"windowed radial mean power [{units[field]}^2]")
+        axes[field_index, 1].set_xscale("log")
+        axes[field_index, 1].set_ylim(0.0, 1.02)
+        axes[field_index, 1].set_title(f"{field}: cumulative isotropic energy")
+        axes[field_index, 1].set_xlabel(f"spatial frequency [1/{coordinate_unit}]")
+        axes[field_index, 1].set_ylabel("cumulative energy fraction [1]")
+        for axis in axes[field_index]:
+            axis.grid(alpha=0.25, which="both")
+            axis.legend(fontsize=7)
+    figure.suptitle(f"Dataset EDA: isotropic spectra and cumulative energy; first <= {max_cases} ordered cases")
+    return figure
 
-    def _plot(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
-        """Plot a multi-field 2D PSD overview for a single simulation case."""
-        row = df.iloc[idx]
 
-        field_keys = _infer_field_keys(df)
-        fields = {key: np.asarray(row.loc[key], float) for key in field_keys}
+def _directional_axis(
+    axis: Axes,
+    *,
+    datasets: dict[str, pd.DataFrame],
+    field: str,
+    direction: str,
+    max_cases: int,
+) -> None:
+    """
+    Plot directional median power and cumulative energy on explicit twin axes.
 
-        x = np.asarray(row.loc["x"])
-        y = np.asarray(row.loc["y"])
-        dx = float(np.nanmedian(np.diff(np.unique(x))))
-        dy = float(np.nanmedian(np.diff(np.unique(y))))
+    The primary axis is log-log physical mean power with q10--q90 bands; the
+    secondary linear axis shows median cumulative non-DC energy. Dataset labels
+    disclose exact prefix counts.
+    """
+    colors = plt.get_cmap("tab10")
+    cumulative_axis = axis.twinx()
+    coordinate_unit = "m"
+    for dataset_index, (label, frame) in enumerate(datasets.items()):
+        _radial_k, _radial, x_k, x_energy, y_k, y_energy, count, coordinate_unit = _case_spectra(frame, field, max_cases=max_cases)
+        k_values, energy = (x_k, x_energy) if direction == "x" else (y_k, y_energy)
+        color = colors(dataset_index % colors.N)
+        disclosed = f"{label}, n={count}"
+        _band(axis, k_values, energy, label=f"{disclosed} power", color=color)
+        cumulative = _cumulative(energy)
+        median = np.quantile(cumulative, 0.5, axis=0)
+        cumulative_axis.plot(k_values[1:], median, color=color, linestyle="--", label=f"{disclosed} cumulative")
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_xlabel(f"{direction}-direction spatial frequency [1/{coordinate_unit}]")
+    axis.set_ylabel("directional mean power")
+    cumulative_axis.set_ylim(0.0, 1.02)
+    cumulative_axis.set_ylabel("cumulative energy fraction [1]")
+    axis.grid(alpha=0.25, which="both")
+    handles, labels = axis.get_legend_handles_labels()
+    cumulative_handles, cumulative_labels = cumulative_axis.get_legend_handles_labels()
+    axis.legend((*handles, *cumulative_handles), (*labels, *cumulative_labels), fontsize=6)
 
-        n_items = len(fields)
-        ncols = _infer_ncols(n_items, max_cols=4)
-        nrows = int(np.ceil(n_items / ncols))
 
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(4.5 * ncols, 3.8 * nrows),
-            squeeze=False,
-        )
-        axes = axes.ravel()
+def plot_directional_spectral_summary(
+    *,
+    datasets: dict[str, pd.DataFrame],
+    max_cases: int = _DEFAULT_CASE_LIMIT,
+) -> Figure:
+    """
+    Compare x- and y-direction spectral bandwidth across datasets.
 
-        for ax, (label, field) in zip(axes[: len(fields)], fields.items(), strict=True):
-            PSD, kx, ky = _fft2_psd(field, dx, dy)
-            logPSD = np.log10(PSD + 1e-20)
+    Parameters
+    ----------
+    datasets : dict[str, pandas.DataFrame]
+        Task-compatible EDA frames on internally identical Cartesian grids.
+    max_cases : int, optional
+        Positive bound on the stored ordered prefix aggregated per dataset.
 
-            vmin, vmax = np.nanpercentile(logPSD, [2, 98])
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Separate x/y panels per non-coordinate field, with median directional
+        power, q10--q90 bands, cumulative energy, and disclosed case counts.
 
-            im = ax.pcolormesh(
-                kx,
-                ky,
-                logPSD,
-                cmap="inferno",
-                shading="auto",
-                vmin=vmin,
-                vmax=vmax,
+    Raises
+    ------
+    ValueError, RuntimeError
+        If task/field/unit metadata, finite grids, or aligned frequency bins fail.
+
+    Notes
+    -----
+    Directional spectra remain separate so anisotropic bandwidth is visible; no
+    scalar cross-direction score is calculated.
+
+    """
+    fields = _validate_datasets(datasets, max_cases=max_cases)
+    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    for field_index, field in enumerate(fields):
+        for axis_index, direction in enumerate(("x", "y")):
+            _directional_axis(
+                axes[field_index, axis_index],
+                datasets=datasets,
+                field=field,
+                direction=direction,
+                max_cases=max_cases,
             )
-            ax.set_title(f"{label} spectrum")
-            ax.set_xlabel(r"Wavenumber $k_x$ [$\frac{1}{m}$]")
-            ax.set_ylabel(r"Wavenumber $k_y$ [$\frac{1}{m}$]")
-            ax.set_aspect("equal")
-            fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
-
-        for ax in axes[len(fields) :]:
-            ax.axis("off")
-
-        fig.suptitle(f"2D spectral maps: {dataset_name} - Case {idx + 1}", fontsize=12, y=0.98)
-        fig.subplots_adjust(top=0.97, wspace=0.5, hspace=0.01)
-        return fig
-
-    return analysis.ui.viewers.make_interactive_case_viewer(
-        plot_func=_plot,
-        datasets=datasets,
-        start_idx=0,
-        enable_dataset_dropdown=True,
-    )
+            axes[field_index, axis_index].set_title(f"{field}: {direction}-direction power and cumulative energy")
+    figure.suptitle(f"Dataset EDA: directional spectral bandwidth; first <= {max_cases} ordered cases")
+    return figure
 
 
-# ======================================================================
-# Interactive vertical spectral evolution
-# ======================================================================
-
-
-def plot_spectral_vertical(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
+def plot_vertical_spectral_evolution(
+    *,
+    datasets: dict[str, pd.DataFrame],
+    max_cases: int = _DEFAULT_CASE_LIMIT,
+) -> Figure:
     """
-    Build an interactive viewer for vertical spectral evolution.
-
-    For each field in `ALL_KEYS`, two radial spectra are computed:
-    one from a thin slice near the bottom of the domain and one
-    from a slice near mid-height. This highlights changes in spatial
-    structure across the domain height.
-
-    Navigation across cases is handled by the generic analysis.ui.viewers navigator.
+    Plot horizontal spectral composition as a function of physical height.
 
     Parameters
     ----------
     datasets : dict[str, pandas.DataFrame]
-        Mapping: dataset_name -> DataFrame
-        Each DataFrame must contain:
-        - the fields defined in ALL_KEYS
-        - spatial coordinates "x" and "y" for computing dx, dy
+        Task-compatible EDA frames with identical declared fields/units and an
+        internally shared increasing Cartesian grid.
+    max_cases : int, optional
+        Positive bound on the stored ordered prefix aggregated per dataset.
 
     Returns
     -------
-    widgets.VBox
-        Fully interactive viewer with per-field vertical line spectra.
+    matplotlib.figure.Figure
+        One frequency-height map per dataset and non-coordinate field. Values are
+        casewise median log10 row-normalized power fractions.
+
+    Raises
+    ------
+    ValueError, RuntimeError
+        If dataset metadata, fields, coordinates, finite values, or within-frame
+        grids cannot establish the declared spectral comparison.
+
+    Notes
+    -----
+    Each horizontal row is mean-centered and Hann-windowed before the real FFT.
+    Omitting the DC bin and normalizing within a row makes the map dimensionless;
+    it describes scale composition rather than absolute field power.
 
     """
-
-    def _plot(idx: int, *, df: pd.DataFrame, dataset_name: str) -> Figure:
-        """Plot vertical (bottom/mid) radial spectra for a single case."""
-        row = df.iloc[idx]
-        field_keys = _infer_field_keys(df)
-        fields = {key: np.asarray(row.loc[key], float) for key in field_keys}
-
-        x_arr = np.asarray(row.loc["x"])
-        y_arr = np.asarray(row.loc["y"])
-        dx = float(np.nanmedian(np.diff(np.unique(x_arr))))
-        dy = float(np.nanmedian(np.diff(np.unique(y_arr))))
-
-        n_items = len(fields)
-        ncols = _infer_ncols(n_items, max_cols=4)
-        nrows = int(np.ceil(n_items / ncols))
-
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(4.2 * ncols, 3.8 * nrows),
-            squeeze=False,
-        )
-        axes = axes.ravel()
-
-        field_keys = list(fields.keys())
-        y_coords = np.linspace(0, 1, fields[field_keys[0]].shape[0])
-        y_low, y_high = 0.05, 0.70
-        win = 0.01
-
-        mask_low = (y_coords >= y_low - win) & (y_coords <= y_low + win)
-        mask_high = (y_coords >= y_high - win) & (y_coords <= y_high + win)
-
-        for ax, (label, field) in zip(axes[: len(fields)], fields.items(), strict=True):
-            seg_low = np.atleast_2d(field[mask_low].mean(axis=0))
-            seg_high = np.atleast_2d(field[mask_high].mean(axis=0))
-
-            PSD_low, kx_low, ky_low = _fft2_psd(seg_low, dx, dy)
-            PSD_high, kx_high, ky_high = _fft2_psd(seg_high, dx, dy)
-
-            k_low, E_low = _radial_spectrum(PSD_low, kx_low, ky_low)
-            k_high, E_high = _radial_spectrum(PSD_high, kx_high, ky_high)
-
-            mask_l = (k_low > 0) & (E_low > 0)
-            mask_h = (k_high > 0) & (E_high > 0)
-
-            if np.count_nonzero(mask_l) > 1:
-                ax.loglog(k_low[mask_l], E_low[mask_l], lw=1.4, label=f"y={y_low:.2f}")
-
-            if np.count_nonzero(mask_h) > 1:
-                ax.loglog(k_high[mask_h], E_high[mask_h], lw=1.4, label=f"y={y_high:.2f}")
-            ax.set_title(label)
-            ax.set_xlabel(r"Wavenumber $k$ [$\frac{1}{m}$]")
-            ax.set_ylabel(r"Spectral energy $E(k)$")
-            ax.grid(True, which="both", ls=":")
-            handles, _labels = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(fontsize=8)
-
-        for ax in axes[len(fields) :]:
-            ax.axis("off")
-
-        fig.suptitle(f"Vertical spectral profiles: {dataset_name} - Case {idx + 1}", fontsize=12, y=0.98)
-        fig.subplots_adjust(top=0.94, wspace=0.40, hspace=0.3)
-        return fig
-
-    return analysis.ui.viewers.make_interactive_case_viewer(
-        plot_func=_plot,
-        datasets=datasets,
-        start_idx=0,
-        enable_dataset_dropdown=True,
+    fields = _validate_datasets(datasets, max_cases=max_cases)
+    figure, axes = plt.subplots(
+        len(fields),
+        len(datasets),
+        figsize=(5.5 * len(datasets), 4.0 * len(fields)),
+        squeeze=False,
+        constrained_layout=True,
     )
-
-
-# ============================================================================
-# CUMULATIVE SPECTRAL ENERGY (CASECOUNT VIEWER)
-# ============================================================================
-
-
-def plot_spectral_cumulative(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
-    """
-    Plot cumulative radial spectral energy distributions.
-
-    For each field, the cumulative spectral energy E_cum(k) is computed
-    per case and aggregated across the first N cases using the median.
-    This plot is intended to guide the selection of n_modes by identifying
-    the effective spectral bandwidth of the data.
-
-    The x-axis is intentionally limited to k <= 50.
-
-    Parameters
-    ----------
-    datasets : dict[str, pd.DataFrame]
-        Dictionary of datasets to plot.
-
-    Returns
-    -------
-    widgets.VBox
-        Interactive widget for viewing cumulative spectral energy distributions.
-
-    """
-    names = list(datasets.keys())
-
-    def _plot(
-        max_cases: int,
-        *,
-        datasets: dict[str, pd.DataFrame],
-        dataset_selector: CheckboxGroup,
-    ) -> Figure:
-        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)  # noqa: SLF001 -- sibling plot helper
-
-        sample_df = datasets[active[0]]
-        field_keys = _infer_field_keys(sample_df)
-
-        n_items = len(field_keys)
-        ncols = _infer_ncols(n_items, max_cols=4)
-        nrows = math.ceil(n_items / ncols)
-
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(4.6 * ncols + 2.0, 3.6 * nrows),
-            squeeze=False,
-        )
-        axes = axes.ravel()
-
-        cmap = plt.get_cmap("tab10")
-        dataset_colors = {name: cmap(i % 10) for i, name in enumerate(active)}
-
-        for ax, field in zip(axes[:n_items], field_keys, strict=True):
-            for name in active:
-                df = datasets[name].iloc[:max_cases]
-
-                E_cum_all: list[np.ndarray] = []
-                k_ref: np.ndarray | None = None
-
-                for _, row in df.iterrows():
-                    arr = np.asarray(row.loc[field], float)
-
-                    x = np.asarray(row.loc["x"])
-                    y = np.asarray(row.loc["y"])
-                    dx = float(np.nanmedian(np.diff(np.unique(x))))
-                    dy = float(np.nanmedian(np.diff(np.unique(y))))
-
-                    PSD, kx, ky = _fft2_psd(arr, dx, dy)
-                    k, E = _radial_spectrum(PSD, kx, ky)
-
-                    mask = (k > 0) & (k <= 50) & np.isfinite(E)  # noqa: PLR2004
-                    if np.count_nonzero(mask) < 2:  # noqa: PLR2004
-                        continue
-
-                    k = k[mask]
-                    E = E[mask]
-
-                    E_cum = np.cumsum(E)
-                    E_cum /= E_cum[-1]
-
-                    if k_ref is None:
-                        k_ref = k
-                    else:
-                        E_cum = np.interp(k_ref, k, E_cum)
-
-                    E_cum_all.append(E_cum)
-
-                if not E_cum_all or k_ref is None:
-                    continue
-
-                E_cum_array = np.vstack(E_cum_all)
-
-                med = np.nanmedian(E_cum_array, axis=0)
-                q10 = np.nanpercentile(E_cum_array, 10, axis=0)
-                q90 = np.nanpercentile(E_cum_array, 90, axis=0)
-
-                color = dataset_colors[name]
-                ax.plot(k_ref, med, lw=2.0, color=color)
-                ax.fill_between(k_ref, q10, q90, color=color, alpha=0.25)
-
-            for lvl in (0.90, 0.95, 0.99):
-                ax.axhline(lvl, ls="--", lw=1.0, alpha=0.5)
-
-            ax.set_xlim(0.0, 50.0)
-            ax.set_ylim(0.0, 1.02)
-            ax.set_title(field)
-            ax.set_xlabel(r"Wavenumber $k$ [$\frac{1}{m}$]")
-            ax.set_ylabel(r"Cumulative energy $E_{\mathrm{cum}}$")
-            ax.grid(True, which="both", ls=":")
-
-        for ax in axes[n_items:]:
-            ax.axis("off")
-
-        legend_handles = [Line2D([], [], lw=4, color=dataset_colors[name], alpha=0.8) for name in active]
-
-        fig.legend(
-            legend_handles,
-            active,
-            title="Dataset",
-            loc="upper left",
-            bbox_to_anchor=(0.98, 0.97),
-        )
-
-        fig.suptitle(
-            f"Cumulative spectral energy (first {max_cases} cases)",
-            fontsize=12,
-        )
-        fig.subplots_adjust(top=0.95, right=0.85, wspace=0.35, hspace=0.35)
-
-        return fig
-
-    ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
-
-    return analysis.ui.viewers.make_casecount_viewer(
-        plot_func=_plot,
-        datasets=datasets,
-        start_cases=100,
-        step_size=50,
-        extra_widgets=[ds],
-        dataset_selector=ds,
-    )
-
-
-# ============================================================================
-# ANISOTROPIC CUMULATIVE SPECTRAL ENERGY (Ex, Ey)
-# ============================================================================
-
-
-def plot_spectral_cumulative_directional(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
-    """
-    Plot cumulative directional spectral energy Ex(kx) and Ey(ky).
-
-    For each field, cumulative energy is computed separately in x-
-    and y-direction and aggregated across the first N cases using
-    the median. This plot directly indicates anisotropic bandwidth
-    requirements for n_modes_x vs n_modes_y.
-
-    The x-axis is limited to k <= 50.
-
-    Parameters
-    ----------
-    datasets : dict[str, pandas.DataFrame]
-        Dictionary of datasets to plot.
-
-    Returns
-    -------
-    widgets.VBox
-        Interactive widget for viewing cumulative directional spectral energy.
-
-    """
-    names = list(datasets.keys())
-
-    def _plot(
-        max_cases: int,
-        *,
-        datasets: dict[str, pd.DataFrame],
-        dataset_selector: CheckboxGroup,
-    ) -> Figure:
-        active = analysis.eda.plots.case_statistics._selected_datasets(dataset_selector)  # noqa: SLF001 -- sibling plot helper
-
-        sample_df = datasets[active[0]]
-        field_keys = _infer_field_keys(sample_df)
-
-        nrows = len(field_keys)
-        ncols = 2
-
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(9.0 + 2.0, 3.4 * nrows),
-            squeeze=False,
-        )
-
-        cmap = plt.get_cmap("tab10")
-        dataset_colors = {name: cmap(i % 10) for i, name in enumerate(active)}
-
-        for i, field in enumerate(field_keys):
-            ax_x = axes[i, 0]
-            ax_y = axes[i, 1]
-
-            for name in active:
-                df = datasets[name].iloc[:max_cases]
-
-                Ex_all: list[np.ndarray] = []
-                Ey_all: list[np.ndarray] = []
-                kx_ref: np.ndarray | None = None
-                ky_ref: np.ndarray | None = None
-
-                for _, row in df.iterrows():
-                    arr = np.asarray(row.loc[field], float)
-
-                    x = np.asarray(row.loc["x"])
-                    y = np.asarray(row.loc["y"])
-                    dx = float(np.nanmedian(np.diff(np.unique(x))))
-                    dy = float(np.nanmedian(np.diff(np.unique(y))))
-
-                    PSD, kx, ky = _fft2_psd(arr, dx, dy)
-
-                    kx_v, Ex = _directional_spectrum(PSD, kx, ky, axis="x")
-                    ky_v, Ey = _directional_spectrum(PSD, kx, ky, axis="y")
-
-                    mask_x = (kx_v > 0) & (kx_v <= 50) & np.isfinite(Ex)  # noqa: PLR2004
-                    mask_y = (ky_v > 0) & (ky_v <= 50) & np.isfinite(Ey)  # noqa: PLR2004
-
-                    if np.count_nonzero(mask_x) > 2:  # noqa: PLR2004
-                        Ex = np.cumsum(Ex[mask_x])
-                        Ex /= Ex[-1]
-                        kx_v = kx_v[mask_x]
-                        Ex = Ex if kx_ref is None else np.interp(kx_ref, kx_v, Ex)
-                        kx_ref = kx_v if kx_ref is None else kx_ref
-                        Ex_all.append(Ex)
-
-                    if np.count_nonzero(mask_y) > 2:  # noqa: PLR2004
-                        Ey = np.cumsum(Ey[mask_y])
-                        Ey /= Ey[-1]
-                        ky_v = ky_v[mask_y]
-                        Ey = Ey if ky_ref is None else np.interp(ky_ref, ky_v, Ey)
-                        ky_ref = ky_v if ky_ref is None else ky_ref
-                        Ey_all.append(Ey)
-
-                color = dataset_colors[name]
-
-                if Ex_all and kx_ref is not None:
-                    Ex_arr = np.vstack(Ex_all)
-                    ax_x.plot(kx_ref, np.nanmedian(Ex_arr, axis=0), lw=2.0, color=color)
-                    ax_x.fill_between(
-                        kx_ref,
-                        np.nanpercentile(Ex_arr, 10, axis=0),
-                        np.nanpercentile(Ex_arr, 90, axis=0),
-                        color=color,
-                        alpha=0.25,
-                    )
-
-                if Ey_all and ky_ref is not None:
-                    Ey_arr = np.vstack(Ey_all)
-                    ax_y.plot(ky_ref, np.nanmedian(Ey_arr, axis=0), lw=2.0, color=color)
-                    ax_y.fill_between(
-                        ky_ref,
-                        np.nanpercentile(Ey_arr, 10, axis=0),
-                        np.nanpercentile(Ey_arr, 90, axis=0),
-                        color=color,
-                        alpha=0.25,
-                    )
-
-            for ax, title in zip((ax_x, ax_y), ("Ex(kx)", "Ey(ky)"), strict=True):
-                for lvl in (0.90, 0.95, 0.99):
-                    ax.axhline(lvl, ls="--", lw=1.0, alpha=0.5)
-
-                ax.set_xlim(0.0, 50.0)
-                ax.set_ylim(0.0, 1.02)
-                ax.set_title(f"{field} - {title}")
-                ax.set_xlabel(r"Wavenumber $k$ [$\frac{1}{m}$]")
-                ax.set_ylabel("Cumulative energy")
-                ax.grid(True, which="both", ls=":")
-
-        legend_handles = [Line2D([], [], lw=4, color=dataset_colors[name], alpha=0.8) for name in active]
-
-        fig.legend(
-            legend_handles,
-            active,
-            title="Dataset",
-            loc="upper left",
-            bbox_to_anchor=(0.98, 0.97),
-        )
-
-        fig.suptitle(
-            f"Directional cumulative spectral energy (first {max_cases} cases)",
-            fontsize=12,
-        )
-        fig.subplots_adjust(top=0.95, right=0.85, wspace=0.30, hspace=0.35)
-
-        return fig
-
-    ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
-
-    return analysis.ui.viewers.make_casecount_viewer(
-        plot_func=_plot,
-        datasets=datasets,
-        start_cases=100,
-        step_size=50,
-        extra_widgets=[ds],
-        dataset_selector=ds,
-    )
+    for field_index, field in enumerate(fields):
+        for dataset_index, (label, frame) in enumerate(datasets.items()):
+            frequency, height, fractions, count, coordinate_unit = _vertical_spectral_map(
+                frame,
+                field,
+                max_cases=max_cases,
+            )
+            log_fraction = np.log10(np.maximum(fractions, np.finfo(float).tiny))
+            axis = axes[field_index, dataset_index]
+            image = axis.pcolormesh(frequency, height, log_fraction, shading="auto", cmap="magma")
+            axis.set_xscale("log")
+            axis.set_title(f"{label}: {field}, n={count}")
+            axis.set_xlabel(f"horizontal spatial frequency [1/{coordinate_unit}]")
+            axis.set_ylabel(f"height [{coordinate_unit}]")
+            colorbar = figure.colorbar(image, ax=axis)
+            colorbar.set_label("log10 row-normalized power fraction [1]")
+    figure.suptitle(f"Dataset EDA: horizontal spectral evolution with height; first <= {max_cases} ordered cases")
+    return figure

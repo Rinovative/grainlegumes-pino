@@ -6,12 +6,18 @@ Provide reusable pressure-boundary masks, residuals, and diagnostics.
 
 Responsibilities:
   - Identify inlet and outlet cells from explicit coordinates and grid spacing
-  - Compute inlet pressure mismatch and outlet pressure-gauge residuals
-  - Expose unreduced residual values and well-defined scalar diagnostics
+  - Compute inlet pressure mismatch and zero-gauge outlet residuals
+  - Expose boundary values and cancellation-safe per-sample diagnostics
 
-Boundaries:
-  - Task field lookup belongs to task-specific physics adapters
-  - Loss weights, warmup, normalization, and logging belong to learning
+Design principles:
+  - Boundary masks use coordinate extrema within half a positive grid spacing
+  - Spatial reductions occur per sample before aggregation across the batch
+  - Tensor shape, dtype, and device follow the caller's physical fields
+
+This module does NOT:
+  - Bind task channel names or convert normalized tensors to physical units
+  - Choose boundary-loss weights, warmup schedules, or logging names
+  - Differentiate fields or evaluate interior momentum and continuity equations
 ===============================================================================
 """
 
@@ -31,7 +37,20 @@ _SPATIAL_AXIS_COUNT = 2
 
 @dataclass(frozen=True, slots=True)
 class PressureBoundaryMasks:
-    """Hold boolean inlet and outlet masks for a structured grid."""
+    """
+    Hold structured-grid inlet and outlet masks.
+
+    Both frozen boolean tensors match the coordinate field shape. ``inlet``
+    selects each sample's spatial y-min boundary and ``outlet`` selects y-max within half a
+    validated grid spacing; no batch or spatial reduction is encoded.
+
+    Attributes
+    ----------
+    inlet, outlet : torch.Tensor
+        Boolean masks with the same sample/spatial layout as the coordinate
+        field supplied to ``pressure_boundary_masks``.
+
+    """
 
     inlet: Tensor
     outlet: Tensor
@@ -39,7 +58,26 @@ class PressureBoundaryMasks:
 
 @dataclass(frozen=True, slots=True)
 class PressureBoundaryResiduals:
-    """Hold pressure boundary residual values and per-sample diagnostics."""
+    """
+    Hold unreduced pressure-boundary values and per-sample diagnostics.
+
+    ``inlet_error`` is ``p-p_bc`` flattened over selected inlet cells and
+    ``outlet_pressure`` retains flattened outlet gauge values, both in Pa.
+    Spatial inlet MSE and outlet mean are retained per sample before batch
+    aggregation so opposite outlet gauges cannot cancel each other.
+
+    Attributes
+    ----------
+    inlet_error, outlet_pressure : torch.Tensor
+        One-dimensional selected physical boundary values in Pa.
+    inlet_sample_mse : torch.Tensor
+        Spatially reduced inlet pressure MSE per leading sample, in Pa².
+    outlet_sample_mean : torch.Tensor
+        Spatially reduced outlet gauge mean per leading sample, in Pa.
+    masks : PressureBoundaryMasks
+        Full-shape boolean masks used for the reductions.
+
+    """
 
     inlet_error: Tensor
     outlet_pressure: Tensor
@@ -49,22 +87,34 @@ class PressureBoundaryResiduals:
 
     @property
     def inlet_mse(self) -> Tensor:
-        """Return the batch mean of per-sample inlet pressure MSE values."""
+        """Return the batch mean of per-sample inlet pressure MSE in Pa²."""
         return self.inlet_sample_mse.mean()
 
     @property
     def outlet_mean_square(self) -> Tensor:
-        """Return the batch mean of squared per-sample outlet gauges."""
+        """Return the batch mean of squared per-sample outlet gauges in Pa²."""
         return self.outlet_sample_mean.square().mean()
 
     @property
     def mse(self) -> Tensor:
-        """Return the complete inlet-plus-outlet boundary diagnostic."""
+        """Return the inlet-plus-outlet pressure diagnostic in Pa²."""
         return self.inlet_mse + self.outlet_mean_square
 
 
 def _normalized_axes(ndim: int, axes: SpatialAxes) -> SpatialAxes:
-    """Return valid non-negative spatial axes."""
+    """
+    Normalize exactly two distinct spatial axes for a tensor rank.
+
+    Negative axes are translated relative to ``ndim``. The returned order is
+    preserved for downstream reductions; duplicates and out-of-range axes fail
+    before any boundary mask is constructed.
+
+    Raises
+    ------
+    ValueError
+        If ``axes`` does not identify two distinct axes within the tensor rank.
+
+    """
     normalized = tuple(axis if axis >= 0 else ndim + axis for axis in axes)
     if len(set(normalized)) != _SPATIAL_AXIS_COUNT or any(axis < 0 or axis >= ndim for axis in normalized):
         msg = f"Spatial axes {axes!r} are invalid for tensor rank {ndim}."
@@ -84,16 +134,25 @@ def pressure_boundary_masks(
     Parameters
     ----------
     y_coordinate : torch.Tensor
-        Physical y-coordinate field.
+        Finite floating physical y-coordinate field, normally shaped
+        ``[batch, y, x]`` and measured in the same length unit as ``spacing_y``.
     spacing_y : float or torch.Tensor
-        Positive grid spacing along y.
+        Finite positive scalar grid spacing along y.
     spatial_axes : tuple[int, int], optional
         Axes spanning the structured spatial domain.
 
     Returns
     -------
     PressureBoundaryMasks
-        Boolean masks matching ``y_coordinate``.
+        Boolean masks matching ``y_coordinate`` in shape and device.
+
+    Raises
+    ------
+    TypeError
+        If ``y_coordinate`` is not floating point.
+    ValueError
+        If spatial axes are invalid, spacing is not one finite positive scalar,
+        or either extremal boundary mask is empty.
 
     """
     if not y_coordinate.is_floating_point():
@@ -128,9 +187,9 @@ def pressure_boundary_residuals(
     Parameters
     ----------
     pressure : torch.Tensor
-        Predicted physical pressure field.
+        Predicted physical pressure field in Pa, normally ``[batch, y, x]``.
     prescribed_pressure : torch.Tensor
-        Physical pressure boundary field with the same shape.
+        Physical inlet-pressure field in Pa with the same shape.
     y_coordinate : torch.Tensor
         Physical y-coordinate field with the same shape.
     spacing_y : float or torch.Tensor
@@ -141,7 +200,17 @@ def pressure_boundary_residuals(
     Returns
     -------
     PressureBoundaryResiduals
-        Unreduced boundary values plus scalar MSE properties.
+        Selected boundary values, per-sample reductions, and scalar batch-mean
+        properties. ``mse`` is inlet MSE plus the mean squared per-sample outlet
+        gauge; outlet means are squared before batch aggregation.
+
+    Raises
+    ------
+    TypeError
+        If the coordinate field is not floating point.
+    ValueError
+        If field shapes, axes, spacing, masks, or per-sample boundary membership
+        violate the structured-grid boundary contract.
 
     """
     if pressure.shape != prescribed_pressure.shape or pressure.shape != y_coordinate.shape:

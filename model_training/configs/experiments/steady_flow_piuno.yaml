@@ -3,7 +3,7 @@ task: steady_flow
 run:
   seed: 9
   deterministic: true
-  device: cuda
+  device: auto
   prefix: null
   suffix: null
 
@@ -23,6 +23,7 @@ loss:
     weight: 1.0
   physics:
     enabled: true
+    continuity: div_eps_velocity
     derivatives:
       kind: spectral
       extension: reflect
@@ -40,16 +41,41 @@ loss:
 
 evaluation:
   metrics:
-    - id: normalized_relative_h1
-      kind: relative_h1
+    - id: normalized_macro_rmse
+      kind: macro_rmse
       space: normalized
       fields: all
-      reduction: sample_mean
+      reduction: field_macro_element_mean
+    - id: normalized_rmse_p
+      kind: rmse
+      space: normalized
+      field: p
+      reduction: element_mean
+    - id: normalized_rmse_u
+      kind: rmse
+      space: normalized
+      field: u
+      reduction: element_mean
+    - id: normalized_rmse_v
+      kind: rmse
+      space: normalized
+      field: v
+      reduction: element_mean
     - id: normalized_rmse
       kind: rmse
       space: normalized
       fields: all
       reduction: element_mean
+    - id: normalized_relative_l2
+      kind: relative_l2
+      space: normalized
+      fields: all
+      reduction: sample_mean
+    - id: normalized_relative_h1
+      kind: relative_h1
+      space: normalized
+      fields: all
+      reduction: sample_mean
     - id: physical_rmse_p
       kind: rmse
       space: physical
@@ -66,7 +92,7 @@ evaluation:
       field: v
       reduction: element_mean
   objective:
-    id: normalized_relative_h1
+    id: normalized_macro_rmse
 
 optimizer:
   kind: adamw

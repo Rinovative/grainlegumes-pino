@@ -14,9 +14,9 @@ Design principles:
   - Factory functions avoid hidden training side effects
   - Unsupported types fail fast
 
-Boundaries:
-  - Gradient execution belongs to learning.training.loop
-  - Optimizer state persistence belongs to checkpoints
+This module does NOT:
+  - Execute gradients or epochs; ``learning.training.loop`` owns training
+  - Persist optimizer or scheduler state; checkpoint services own restoration
 ===============================================================================
 """
 

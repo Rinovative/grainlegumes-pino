@@ -9,12 +9,13 @@ Responsibilities:
   - Compare producer/consumer declarations with a task-owned sequence
 
 Design principles:
-  - Validation is strict and side-effect free
+  - Validation is strict, order-sensitive, and side-effect free
   - Task specifications are the only source of tensor channel order
 
-Boundaries:
-  - Field-name primitives belong to domain.fields
-  - Complete task contracts belong to domain.tasks
+This module does NOT:
+  - Define canonical field names or complete task contracts
+  - Reorder, deduplicate, alias, or coerce a producer declaration
+  - Inspect tensor values, shapes, storage, or normalization state
 ===============================================================================
 """
 

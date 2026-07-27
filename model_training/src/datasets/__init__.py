@@ -2,7 +2,7 @@
 Dataset abstractions and simulation dataset modules.
 
 Provides:
-- base: base dataset, splitting, normalizer and dataloader helpers
+- base: split validation, normalizer reconstruction, and dataloaders
 - identity: strict case, merged-dataset and split identity contracts
 - modules: sample-construction dataset modules
 - simulation: simulation dataset class

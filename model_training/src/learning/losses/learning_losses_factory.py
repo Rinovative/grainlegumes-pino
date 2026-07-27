@@ -10,10 +10,15 @@ Responsibilities:
   - Build one named composition interface for supervised and physics training
   - Delegate evaluation metric construction to learning.metrics
 
-Boundaries:
-  - Task contracts and physics selection belong to domain.tasks
-  - Derivatives, equations, residuals, and diagnostics belong to domain.physics
-  - Metric definitions and dataset aggregation belong to learning.metrics
+Design principles:
+  - Resolved semantic identifiers select implementations without exposing class names
+  - Construction is explicit, task-aware, and placed on the caller-selected device
+  - One composition interface serves supervised and physics-informed training
+
+This module does NOT:
+  - Define task contracts or allowed physics choices; ``domain.tasks`` owns them
+  - Implement derivatives, equations, residuals, or diagnostics; ``domain.physics`` does
+  - Define evaluation metrics or dataset aggregation; ``learning.metrics`` does
 ===============================================================================
 """
 
@@ -23,6 +28,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+import torch
 from neuralop import H1Loss, LpLoss
 from torch import Tensor, nn
 
@@ -34,7 +40,17 @@ from . import learning_losses_pino as pino
 
 @dataclass(frozen=True, slots=True)
 class DataLossKindSpec:
-    """Describe one semantic supervised loss identifier and valid spaces."""
+    """
+    Describe one immutable supervised-loss registry entry.
+
+    Attributes
+    ----------
+    kind : str
+        Canonical configuration identifier.
+    spaces : frozenset[str]
+        Explicit tensor spaces admitted for this loss.
+
+    """
 
     kind: str
     spaces: frozenset[str]
@@ -42,7 +58,17 @@ class DataLossKindSpec:
 
 @dataclass(frozen=True, slots=True)
 class PhysicsLossImplementation:
-    """Describe one task-physics identifier backed by domain diagnostics."""
+    """
+    Bind one immutable task-physics identifier to its domain evaluator.
+
+    Attributes
+    ----------
+    kind : str
+        Canonical task-owned physics identifier.
+    evaluator : domain.physics.brinkman.PhysicsEvaluator
+        Domain diagnostic callable reused by loss composition.
+
+    """
 
     kind: str
     evaluator: domain.physics.brinkman.PhysicsEvaluator
@@ -66,10 +92,35 @@ _DERIVATIVE_EXTENSIONS = frozenset({"none", "reflect"})
 
 
 class SemanticDataLoss(nn.Module):
-    """Wrap a NeuralOp relative norm with explicit sample-mean reduction."""
+    """
+    Wrap a NeuralOp relative norm with an explicit scalar semantic weight.
+
+    The configured implementation already owns its task-dimensional norm and
+    sample-mean reduction. ``forward`` applies only the validated non-negative
+    weight; normalized-versus-physical space admission remains the factory's
+    responsibility rather than being inferred from tensors.
+
+    Parameters
+    ----------
+    implementation : Any
+        Callable NeuralOp relative norm with its own dimensional reduction.
+    weight : float
+        Non-negative scalar applied to the returned norm.
+
+    Raises
+    ------
+    ValueError
+        If ``weight`` is negative.
+
+    """
 
     def __init__(self, implementation: Any, *, weight: float) -> None:
-        """Store one callable relative norm and validate its scalar weight."""
+        """
+        Validate the weight and retain the callable relative norm.
+
+        Initialization also publishes the fixed ``sample_mean`` reduction used
+        by semantic config and training telemetry.
+        """
         super().__init__()
         if weight < 0:
             msg = f"Data-loss weight must be non-negative, got {weight}."
@@ -128,7 +179,13 @@ def available_derivative_kinds() -> tuple[str, ...]:
 
 
 def resolve_derivative_kind(kind: str, *, extension: str) -> tuple[str, str]:
-    """Validate a derivative kind/extension combination without constructing it."""
+    """
+    Validate a derivative kind/extension pair without constructing an operator.
+
+    The kind must be registered, the extension must be ``none`` or ``reflect``,
+    and physical derivatives require ``none``. The unchanged canonical pair is
+    returned; unsupported semantics raise ``ValueError``.
+    """
     if kind not in available_derivative_kinds():
         available = ", ".join(available_derivative_kinds())
         msg = f"Unknown derivative identifier {kind!r}. Available derivatives: {available}."
@@ -185,7 +242,13 @@ def build_data_loss(
 
 
 def _resolved_weight(config: dict[str, Any], name: str) -> pino.LinearWarmup:
-    """Build one explicit linear warmup from resolved semantic config."""
+    """
+    Build one validated linear warmup from a resolved physics-weight node.
+
+    Missing mappings, unknown warmup kinds, and malformed scalar values fail at
+    the semantic weight name instead of silently producing a schedule. The
+    returned object owns non-negative target and epoch validation.
+    """
     weight = config.get(name)
     if not isinstance(weight, dict):
         msg = f"loss.physics.{name} must be a mapping."
@@ -203,15 +266,41 @@ def _resolved_weight(config: dict[str, Any], name: str) -> pino.LinearWarmup:
     )
 
 
-def build_training_loss(config: dict[str, Any]) -> pino.SemanticComposedLoss:
+def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino.SemanticComposedLoss:
     """
     Build the unified semantic training loss from resolved configuration.
 
     Supervised and physics-informed configurations return the same type and
-    named component interface. The task contract selects the equation,
-    continuity, and boundary formulations; YAML selects numerical derivatives,
-    explicit weights, and warmup.
+    named component interface. The task contract selects the equation, allowed
+    continuity formulations, default continuity, and boundary formulation. The
+    effective experiment config selects continuity, numerical derivatives,
+    explicit weights, and warmup. The caller supplies the already resolved
+    concrete runtime device; this factory never performs availability fallback.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Fully resolved task, loss, and physics configuration.
+    device : torch.device
+        Concrete CPU or indexed CUDA device selected by the service boundary.
+
+    Returns
+    -------
+    SemanticComposedLoss
+        Device-bound composition with a stable named-component interface.
+
+    Raises
+    ------
+    TypeError
+        If the device or required resolved mappings have invalid types.
+    ValueError
+        If task physics, continuity, derivatives, weights, or crop settings
+        contradict their registered semantic contracts.
+
     """
+    if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
+        msg = f"Loss construction requires one concrete CPU or CUDA torch.device, got {device!r}."
+        raise TypeError(msg)
     task = domain.tasks.registry.get_task(str(config["task"]))
     task_physics = domain.tasks.registry.resolve_physics(task.physics.kind)
     implementation = resolve_physics_loss_implementation(task_physics.kind)
@@ -228,6 +317,15 @@ def build_training_loss(config: dict[str, Any]) -> pino.SemanticComposedLoss:
     if not isinstance(data_config, dict) or not isinstance(physics_config, dict):
         msg = "Resolved loss config must contain data and physics mappings."
         raise TypeError(msg)
+
+    continuity = physics_config.get("continuity")
+    if not isinstance(continuity, str) or not continuity:
+        msg = "loss.physics.continuity must be a non-empty semantic identifier."
+        raise TypeError(msg)
+    if continuity not in task_physics.allowed_continuities:
+        available = ", ".join(task_physics.allowed_continuities)
+        msg = f"Unknown continuity identifier {continuity!r} at loss.physics.continuity. Available continuity formulations: {available}."
+        raise ValueError(msg)
 
     derivatives_config = physics_config.get("derivatives")
     if not isinstance(derivatives_config, dict):
@@ -247,22 +345,27 @@ def build_training_loss(config: dict[str, Any]) -> pino.SemanticComposedLoss:
         operator_dimensionality=task.operator_dimensionality,
         weight=1.0,
     )
-    return pino.SemanticComposedLoss(
+    loss = pino.SemanticComposedLoss(
         data_loss=data_loss,
         data_weight=float(data_config["weight"]),
         physics_enabled=bool(physics_config["enabled"]),
         physics_kind=task_physics.kind,
         input_fields=task.input_names,
         output_fields=task.output_names,
-        continuity=task_physics.continuity,
+        continuity=continuity,
         boundary=task_physics.boundary,
         derivatives=derivatives,
         residual_weight=_resolved_weight(physics_config, "residual_weight"),
         boundary_weight=_resolved_weight(physics_config, "boundary_weight"),
         interior_crop=int(physics_config["interior_crop"]),
     )
+    return loss.to(device)
 
 
-def build_eval_metrics(config: dict[str, Any]) -> dict[str, learning_metrics.DatasetMetric]:
-    """Delegate semantic evaluation metric construction to its owner."""
-    return learning_metrics.build_evaluation_metrics(config)
+def build_eval_metrics(
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+) -> dict[str, learning_metrics.DatasetMetric]:
+    """Delegate device-bound semantic evaluation metric construction to its owner."""
+    return learning_metrics.build_evaluation_metrics(config, device=device)

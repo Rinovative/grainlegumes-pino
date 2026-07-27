@@ -7,16 +7,17 @@ Provide reusable widget constructors and UI helpers for analysis notebooks.
 Responsibilities:
   - Define checkbox group protocols and constructors
   - Build dropdown, radio and step-control widgets
-  - Provide output containers and colorbar formatters
+  - Provide output containers and stable colorbar formatters
+  - Compute display-only contour levels, axis labels, and streamline overlays
 
 Design principles:
   - Components are small and reusable
   - Widget state is explicit in returned objects
   - Plotting helpers stay independent of analysis data models
 
-Boundaries:
-  - Notebook panel composition belongs to analysis_ui_notebook
-  - Case rendering belongs to analysis_ui_viewers
+This module does NOT:
+  - Compose complete notebook panels or manage figure-export lifecycle
+  - Load analysis data or implement domain-specific case rendering
 ===============================================================================
 """
 
@@ -41,14 +42,25 @@ if TYPE_CHECKING:
 
 class CheckboxGroup(Protocol):
     """
-    Protocol for a group of checkboxes contained in a VBox.
+    Define the structural widget contract for labelled checkbox groups.
 
     Attributes
     ----------
-    boxes : dict[str, widgets.Checkbox]
-        Mapping from checkbox label to checkbox widget.
+    boxes : dict[str, ipywidgets.Checkbox]
+        Public mapping from semantic option label to its checkbox widget.
+
+    Notes
+    -----
+    The concrete object is a private ``VBox`` subclass that owns this mapping;
+    callers depend only on this protocol and must not infer that implementation.
 
     """
+
+    boxes: dict[str, widgets.Checkbox]
+
+
+class _CheckboxGroupVBox(widgets.VBox):
+    """Own typed checkbox state while preserving the public ``VBox`` contract."""
 
     boxes: dict[str, widgets.Checkbox]
 
@@ -149,7 +161,7 @@ def _build_int_step_control(
     width: str,
     prev_label: str,
     next_label: str,
-) -> tuple[widgets.IntText | widgets.IntSlider, widgets.Button, widgets.Button]:
+) -> tuple[widgets.BoundedIntText | widgets.IntSlider, widgets.Button, widgets.Button]:
     """
     Create internal generic integer step control builder.
 
@@ -174,13 +186,13 @@ def _build_int_step_control(
 
     Returns
     -------
-    tuple[widgets.IntText | widgets.IntSlider, widgets.Button, widgets.Button]
+    tuple[widgets.BoundedIntText | widgets.IntSlider, widgets.Button, widgets.Button]
         Control widget, previous button, next button.
 
     """
     if step == 1:
         # discrete index → text input
-        control: widgets.IntText | widgets.IntSlider = widgets.BoundedIntText(
+        control: widgets.BoundedIntText | widgets.IntSlider = widgets.BoundedIntText(
             value=value,
             min=minimum,
             max=maximum,
@@ -268,7 +280,7 @@ def _build_checkbox_group(
 
     children.append(grid)
 
-    box = widgets.VBox(
+    box = _CheckboxGroupVBox(
         children,
         layout=widgets.Layout(
             margin="0px 0px 0px 25px",
@@ -541,25 +553,25 @@ def ui_checkbox_channels(
     default_on: Sequence[str] | None = None,
 ) -> widgets.VBox:
     """
-    Checkbox selector for output channels.
+    Build a checkbox group for task output channels.
 
     Parameters
     ----------
-    channels : list[str] | None, optional
-        Available channels. Defaults to ["p", "u", "v", "U"].
-    default_on : list[str] | None, optional
-        Channels enabled by default. Defaults to all channels.
+    channels : Sequence[str] | None, optional
+        Available channel labels; defaults to ``p``, ``u``, ``v``, and ``U``.
+    default_on : Sequence[str] | None, optional
+        Initially enabled labels; omitted or empty input enables every channel.
 
     Returns
     -------
-    widgets.VBox
-        Checkbox group for channel selection.
+    ipywidgets.VBox
+        Checkbox group exposing the public ``boxes`` mapping required by
+        :class:`CheckboxGroup`.
 
     Notes
     -----
-    The returned widget exposes an internal `_boxes` attribute
-    mapping channel name -> Checkbox. This is used by plot
-    functions to determine which channels are active.
+    The widget owns only selection state; field validation and plot semantics
+    remain with the consuming analysis view.
 
     """
     resolved_channels = list(channels or ["p", "u", "v", "U"])

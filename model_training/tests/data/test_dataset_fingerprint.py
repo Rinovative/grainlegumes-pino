@@ -1,5 +1,12 @@
 # ruff: noqa: S101
-"""Verify deterministic, tamper-evident dataset and split-membership identity."""
+"""
+Protect deterministic, content-bound dataset and saved-membership identity.
+
+The tests vary case order, tensors, metadata, sample IDs, and split indices to
+show that equivalent content is stable and tampering fails strict verification.
+Filesystem builder/merger transactions belong to ``test_dataset_contract``;
+large historical tensors are deliberately not loaded.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +31,12 @@ def _reordered_payload(
     order: list[int],
     task: domain.tasks.spec.TaskSpec,
 ) -> dict[str, Any]:
-    """Rebuild a payload with exact source samples in a different order."""
+    """
+    Rebuild a payload after applying one order to every sample-aligned component.
+
+    Tensors, source evidence, metadata, and case fingerprints stay paired while the
+    production builder recomputes merged identity, isolating sample order as the change.
+    """
     return datasets.identity.build_merged_dataset_payload(
         task=task,
         dataset_id=payload["dataset_id"],
@@ -38,7 +50,12 @@ def _reordered_payload(
 
 
 def _save_dataset(root: Path, payload: dict[str, Any]) -> Path:
-    """Save one strict payload under its logical dataset id."""
+    """
+    Save one strict payload below its logical dataset directory.
+
+    This test helper intentionally uses direct ``torch.save`` rather than the
+    production atomic publisher because callers exercise read-time identity only.
+    """
     dataset_id = payload["dataset_id"]
     directory = root / dataset_id
     directory.mkdir(parents=True, exist_ok=True)
@@ -51,7 +68,12 @@ def test_creation_computes_stable_content_identity(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Equivalent creation inputs produce one strict-verifiable identity."""
+    """
+    Build identical strict merged content twice, then verify one payload by content.
+
+    Both builders and strict validation must report the same fingerprint, proving
+    deterministic identity for reproducible split and cache admission.
+    """
     first = merged_payload_factory()
     second = merged_payload_factory()
 
@@ -69,7 +91,12 @@ def test_source_metadata_is_aligned_and_fingerprint_bound(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Ordered source metadata survives schema validation and participates in identity."""
+    """
+    Change and misalign ordered source metadata around an otherwise fixed payload.
+
+    Rebuilding must change the fingerprint, while post-build tampering or length
+    drift must be rejected so provenance cannot detach from sample membership.
+    """
     original = merged_payload_factory()
     changed_metadata = copy.deepcopy(original["source_metadata"])
     changed_metadata[0]["case_id"] = "changed_case"
@@ -110,7 +137,12 @@ def test_ordered_membership_changes_fingerprint(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Reordered, missing, changed, or replaced cases change identity."""
+    """
+    Vary case order, membership, source identity, and tensor dtype independently.
+
+    Every family must produce a distinct fingerprint because each changes the
+    scientific dataset consumed by a saved run.
+    """
     original = merged_payload_factory()
     reordered = _reordered_payload(
         original,
@@ -146,7 +178,12 @@ def test_strict_verification_rejects_reordered_samples_with_stale_fingerprint(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Strict verification rejects changed sample order with a stale fingerprint."""
+    """
+    Swap persisted sample IDs while retaining the original stored fingerprint.
+
+    Strict validation must reject the stale digest so ordered membership cannot
+    be altered without invalidating downstream split identity.
+    """
     payload = copy.deepcopy(merged_payload_factory())
     payload["sample_ids"][0], payload["sample_ids"][1] = (
         payload["sample_ids"][1],
@@ -165,7 +202,12 @@ def test_default_dataset_load_rejects_modified_tensor_content(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Maintained consumers reject tensor changes hidden behind stored identity."""
+    """
+    Mutate saved tensor content without recomputing its persisted fingerprint.
+
+    The default dataset loader must reject the mismatch, proving ordinary
+    consumers do not silently bypass content verification.
+    """
     payload = copy.deepcopy(merged_payload_factory())
     payload["inputs"][0, 0, 0, 0] += 1.0
     path = tmp_path / "modified.pt"
@@ -179,7 +221,12 @@ def test_duplicate_sample_id_is_rejected(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Ordered sample identity is unique by schema."""
+    """
+    Duplicate one sample identifier in an otherwise current merged payload.
+
+    Validation must reject the collision because ordered membership digests rely
+    on each logical sample having a unique identity.
+    """
     payload = copy.deepcopy(merged_payload_factory())
     payload["sample_ids"][1] = payload["sample_ids"][0]
     with pytest.raises(ValueError, match="duplicate identifiers"):
@@ -189,7 +236,12 @@ def test_duplicate_sample_id_is_rejected(
 def test_membership_digest_binds_indices_and_order(
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Exact indices and selected sample order are part of split identity."""
+    """
+    Hash fixed dataset membership while varying selected order and split role.
+
+    Both variations must change the digest, protecting exact saved membership
+    rather than only the unordered set of selected samples.
+    """
     payload = merged_payload_factory()
     direct = datasets.identity.membership_digest(
         role="train",
@@ -220,7 +272,12 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """A same-path, same-name, same-count replacement fails by fingerprint."""
+    """
+    Replace a saved training dataset with equal-name, equal-count new content.
+
+    Reusing the original split must fail by fingerprint so path and cardinality
+    cannot masquerade as the dataset identity used for training.
+    """
     train_payload = merged_payload_factory("train")
     ood_payload = merged_payload_factory("ood")
     train_path = _save_dataset(tmp_path, train_payload)
@@ -280,7 +337,12 @@ def test_saved_normalizer_state_fails_closed(
     error_type: type[Exception],
     match: str,
 ) -> None:
-    """Restored normalizers require finite real BCHW statistics and non-negative std."""
+    """
+    Vary one saved statistic across negative, non-finite, complex, and wrong-rank forms.
+
+    Each parameter family must fail with its type/domain-specific error while
+    valid BCHW keys remain fixed, protecting preprocessing reconstruction.
+    """
     state = _valid_normalizer_state()
     state[key] = replacement
 
@@ -289,7 +351,12 @@ def test_saved_normalizer_state_fails_closed(
 
 
 def test_zero_variance_normalizer_uses_a_positive_denominator_floor() -> None:
-    """Constant channels normalize finitely through the explicit epsilon floor."""
+    """
+    Restore zero standard deviations and normalize constant BCHW tensors.
+
+    Results must remain finite and zero through a positive denominator floor,
+    protecting legitimate constant channels without falsifying saved statistics.
+    """
     state = _valid_normalizer_state()
     state["in_normalizer.std"][0, 0] = 0.0
     state["out_normalizer.std"].zero_()
@@ -318,7 +385,12 @@ def test_training_loader_retains_a_partial_batch(
     steady_task: domain.tasks.spec.TaskSpec,
     merged_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """A valid train split smaller than batch_size still yields one batch."""
+    """
+    Request a batch larger than the small valid training split.
+
+    The loader must retain one partial batch; dropping it would turn a valid
+    dataset into an empty training lifecycle.
+    """
     train_path = _save_dataset(tmp_path, merged_payload_factory("partial_train"))
     ood_path = _save_dataset(tmp_path, merged_payload_factory("partial_ood"))
 

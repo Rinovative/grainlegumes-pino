@@ -14,9 +14,9 @@ Design principles:
   - Metric implementations never own or apply normalizers
   - Semantic identifiers remain independent of metric implementation classes
 
-Boundaries:
-  - Tensor-view construction belongs to evaluation orchestration
-  - Logging and persistence belong to callers
+This module does NOT:
+  - Construct normalized or physical tensor views; evaluation orchestration owns them
+  - Log or persist metric results; callers own observer and storage side effects
 ===============================================================================
 """
 
@@ -33,7 +33,7 @@ from neuralop import H1Loss
 from src import domain
 
 MetricSpace = Literal["normalized", "physical"]
-MetricReduction = Literal["sample_mean", "element_mean"]
+MetricReduction = Literal["sample_mean", "element_mean", "field_macro_element_mean"]
 MetricDirection = Literal["minimize", "maximize"]
 _MIN_METRIC_TENSOR_RANK = 3
 
@@ -80,6 +80,12 @@ _METRIC_KINDS = MappingProxyType(
             kind="rmse",
             spaces=frozenset({"normalized", "physical"}),
             reductions=frozenset({"element_mean"}),
+            direction="minimize",
+        ),
+        "macro_rmse": MetricKindSpec(
+            kind="macro_rmse",
+            spaces=frozenset({"normalized"}),
+            reductions=frozenset({"field_macro_element_mean"}),
             direction="minimize",
         ),
     }
@@ -173,7 +179,29 @@ def validate_metric_semantics(
 
 @dataclass(frozen=True, slots=True)
 class ResolvedMetric:
-    """Describe one task-resolved evaluation metric and its physical unit."""
+    """
+    Describe one task-resolved evaluation metric and its reduction contract.
+
+    Attributes
+    ----------
+    id, kind : str
+        Stable config identifier and registered implementation kind.
+    space : {"normalized", "physical"}
+        Tensor representation required by accumulation.
+    fields : tuple[str, ...]
+        Exact TaskSpec outputs included in declared order.
+    field_indices : tuple[int, ...]
+        Corresponding channel indices in the task output tensor.
+    reduction : str
+        Sample, element, or field-macro sufficient-statistic reduction.
+    direction : {"minimize", "maximize"}
+        Selection direction when used as an objective.
+    unit : str
+        Task-owned physical unit or dimensionless ``1``.
+    operator_dimensionality : int
+        Spatial dimensionality used by derivative-aware metrics.
+
+    """
 
     id: str
     kind: str
@@ -185,13 +213,59 @@ class ResolvedMetric:
     unit: str
     operator_dimensionality: int
 
+    def __post_init__(self) -> None:
+        """Reject ambiguous field declarations before tensor accumulation."""
+        if not self.fields or len(self.fields) != len(set(self.fields)):
+            msg = f"Metric {self.id!r} fields must be unique and non-empty."
+            raise ValueError(msg)
+        if len(self.field_indices) != len(self.fields):
+            msg = f"Metric {self.id!r} field names and channel indices must have equal length."
+            raise ValueError(msg)
+        if len(self.field_indices) != len(set(self.field_indices)) or any(index < 0 for index in self.field_indices):
+            msg = f"Metric {self.id!r} field indices must be unique non-negative integers."
+            raise ValueError(msg)
+
 
 class DatasetMetric:
-    """Accumulate one explicit-space dataset metric by sufficient statistics."""
+    """
+    Accumulate one explicit-space dataset metric by sufficient statistics.
 
-    def __init__(self, definition: ResolvedMetric) -> None:
-        """Store the immutable definition and clear sufficient statistics."""
+    Implementations validate tensor space, shape ``(batch, channel, *spatial)``,
+    concrete device, finiteness, and TaskSpec field selection on every update.
+    Callers must reset once, update with every evaluation batch, and compute only
+    after the complete dataset; batching must not change the final value.
+
+    Parameters
+    ----------
+    definition : ResolvedMetric
+        Immutable semantic fields, space, reduction, direction, and unit.
+    device : torch.device
+        Concrete device on which every update tensor must reside.
+
+    Raises
+    ------
+    TypeError
+        If ``device`` is not a concrete CPU or CUDA ``torch.device``.
+
+    Notes
+    -----
+    Accumulators own only sufficient statistics. They never normalize tensors,
+    transfer devices, persist values, or infer field/unit semantics.
+
+    """
+
+    def __init__(self, definition: ResolvedMetric, *, device: torch.device) -> None:
+        """
+        Validate device ownership and initialize empty sufficient statistics.
+
+        Construction performs no tensor transfer or normalization; the concrete
+        device becomes an invariant checked on every update.
+        """
+        if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
+            msg = f"Metric construction requires one concrete CPU or CUDA torch.device, got {device!r}."
+            raise TypeError(msg)
         self.definition = definition
+        self.device = device
         self.reset()
 
     @property
@@ -227,12 +301,22 @@ class DatasetMetric:
         space: str,
         batch_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Validate space, shape, finiteness, and select task fields."""
+        """
+        Validate one batch view and select the declared task channels.
+
+        Prediction and target must share shape ``(batch, channel, *spatial)``,
+        concrete device, requested tensor space, and finite values. Failures
+        include metric and batch identity; returned tensors preserve batch and
+        spatial axes while selecting fields in declaration order.
+        """
         if space != self.space:
             msg = f"Metric {self.id!r} expects {self.space!r} tensors, got {space!r}."
             raise ValueError(msg)
         if pred.shape != target.shape:
             msg = f"Metric {self.id!r} prediction/target shapes differ: {tuple(pred.shape)} != {tuple(target.shape)}."
+            raise ValueError(msg)
+        if pred.device != self.device or target.device != self.device:
+            msg = f"Metric {self.id!r} requires tensors on resolved device {self.device}, got prediction={pred.device} and target={target.device}."
             raise ValueError(msg)
         if pred.ndim < _MIN_METRIC_TENSOR_RANK:
             msg = f"Metric {self.id!r} requires batch, channel, and spatial axes."
@@ -264,7 +348,12 @@ class DatasetMetric:
 
 
 class RMSEMetric(DatasetMetric):
-    """Accumulate global squared error and take one final square root."""
+    """
+    Accumulate global squared error and take one final square root.
+
+    The metric is ``sqrt(sum((pred-target)^2) / selected_element_count)`` over
+    the complete dataset. It therefore does not average batch RMSE values.
+    """
 
     def update(
         self,
@@ -274,7 +363,12 @@ class RMSEMetric(DatasetMetric):
         space: str,
         batch_index: int,
     ) -> None:
-        """Add squared-error sum and exact selected element count."""
+        """
+        Add double-precision squared-error sum and selected element count.
+
+        Batch RMSE is never computed. Non-finite intermediate sums raise with
+        metric and batch identity before sufficient statistics are mutated.
+        """
         selected_pred, selected_target = self._validate_update(
             pred,
             target,
@@ -301,8 +395,21 @@ class RMSEMetric(DatasetMetric):
         return value
 
 
-class RelativeL2Metric(DatasetMetric):
-    """Accumulate one combined selected-field relative L2 value per sample."""
+class MacroRMSEMetric(DatasetMetric):
+    """
+    Accumulate global per-field RMSE values and take their macro mean.
+
+    Squared normalized errors and exact element counts are accumulated
+    independently for every TaskSpec output field over the complete evaluation
+    split. Finalization takes one global RMSE per field, then the unweighted
+    arithmetic mean of those field RMSEs. This differs from pooled overall RMSE,
+    whose final square root follows aggregation across fields.
+    """
+
+    def reset(self) -> None:
+        """Clear independent per-field squared-error sums and element counts."""
+        self._field_sums = [0.0] * len(self.fields)
+        self._field_counts = [0] * len(self.fields)
 
     def update(
         self,
@@ -312,7 +419,79 @@ class RelativeL2Metric(DatasetMetric):
         space: str,
         batch_index: int,
     ) -> None:
-        """Add finite per-sample relative L2 values."""
+        """
+        Add one batch to independent per-field sufficient statistics.
+
+        Each selected channel accumulates a double-precision squared-error sum
+        and exact element count; no field or batch receives an implicit weight.
+        """
+        selected_pred, selected_target = self._validate_update(
+            pred,
+            target,
+            space=space,
+            batch_index=batch_index,
+        )
+        squared_error = (selected_pred.double() - selected_target.double()).square()
+        for field_index, field in enumerate(self.fields):
+            field_error = squared_error[:, field_index]
+            batch_sum = float(field_error.sum().detach().cpu().item())
+            if not np.isfinite(batch_sum):
+                msg = f"Metric {self.id!r} produced non-finite squared error for field {field!r} in evaluation batch {batch_index}."
+                raise FloatingPointError(msg)
+            self._field_sums[field_index] += batch_sum
+            self._field_counts[field_index] += field_error.numel()
+
+    def compute(self) -> float:
+        """
+        Finalize each global field RMSE and return their unweighted macro mean.
+
+        Empty fields and non-finite field or aggregate values fail explicitly;
+        fields are not pooled before their square roots are taken.
+        """
+        field_values: list[float] = []
+        for field, squared_error_sum, element_count in zip(
+            self.fields,
+            self._field_sums,
+            self._field_counts,
+            strict=True,
+        ):
+            if element_count == 0:
+                msg = f"Metric {self.id!r} cannot finalize field {field!r} without evaluation elements."
+                raise RuntimeError(msg)
+            field_value = float(np.sqrt(squared_error_sum / element_count))
+            if not np.isfinite(field_value):
+                msg = f"Metric {self.id!r} finalized field {field!r} to a non-finite value."
+                raise FloatingPointError(msg)
+            field_values.append(field_value)
+        value = float(np.mean(field_values))
+        if not np.isfinite(value):
+            msg = f"Metric {self.id!r} finalized to a non-finite field-macro value."
+            raise FloatingPointError(msg)
+        return value
+
+
+class RelativeL2Metric(DatasetMetric):
+    """
+    Accumulate one combined selected-field relative L2 value per sample.
+
+    Each sample contributes ``||pred-target||_2 / (||target||_2 + 1e-8)`` after
+    named-channel selection; finalization takes the arithmetic sample mean.
+    """
+
+    def update(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        space: str,
+        batch_index: int,
+    ) -> None:
+        """
+        Compute and accumulate one combined selected-field relative L2 per sample.
+
+        Batch and selected channel/spatial axes are flattened separately, using
+        the maintained ``1e-8`` target-norm stabilizer before sample-mean accumulation.
+        """
         selected_pred, selected_target = self._validate_update(
             pred,
             target,
@@ -347,11 +526,17 @@ class RelativeL2Metric(DatasetMetric):
 
 
 class RelativeH1Metric(RelativeL2Metric):
-    """Accumulate NeuralOp-compatible relative H1 values per sample."""
+    """
+    Accumulate NeuralOp-compatible relative H1 values per sample.
 
-    def __init__(self, definition: ResolvedMetric) -> None:
+    The registered NeuralOp H1 implementation uses the TaskSpec operator
+    dimensionality and is evaluated independently per sample before sample-mean
+    accumulation, preserving the declared ``sample_mean`` reduction.
+    """
+
+    def __init__(self, definition: ResolvedMetric, *, device: torch.device) -> None:
         """Build the task-dimensional relative H1 implementation."""
-        super().__init__(definition)
+        super().__init__(definition, device=device)
         self._implementation = H1Loss(
             d=definition.operator_dimensionality,
             reduction="sum",
@@ -365,7 +550,12 @@ class RelativeH1Metric(RelativeL2Metric):
         space: str,
         batch_index: int,
     ) -> None:
-        """Compute and accumulate one relative H1 value per sample."""
+        """
+        Compute and accumulate one task-dimensional relative H1 value per sample.
+
+        Samples are evaluated independently with NeuralOp reduction ``sum`` so
+        final accumulation preserves the declared dataset ``sample_mean`` contract.
+        """
         selected_pred, selected_target = self._validate_update(
             pred,
             target,
@@ -390,7 +580,12 @@ def _resolved_metric_fields(
     task_fields: tuple[str, ...],
     metric_id: str,
 ) -> tuple[str, ...]:
-    """Return exact fields from an already resolved config metric."""
+    """
+    Return the exact ordered fields from an already resolved metric declaration.
+
+    ``all`` expands to TaskSpec output order. Explicit lists must be non-empty,
+    unique, and task-known; failures retain the metric ID for config diagnostics.
+    """
     if raw_fields == "all":
         return task_fields
     if not isinstance(raw_fields, list) or not raw_fields or not all(isinstance(field, str) for field in raw_fields):
@@ -407,13 +602,34 @@ def _resolved_metric_fields(
     return fields
 
 
-def build_evaluation_metrics(config: dict[str, Any]) -> dict[str, DatasetMetric]:
+def build_evaluation_metrics(config: dict[str, Any], *, device: torch.device) -> dict[str, DatasetMetric]:
     """
     Build explicit-space dataset accumulators from semantic config.
 
     Metric implementations do not receive or own normalizers. Physical units
     come from the resolved task field contract, and physical metrics select one
     field so incompatible units can never be silently combined.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Fully resolved task and evaluation configuration.
+    device : torch.device
+        Concrete device required by all accumulator updates.
+
+    Returns
+    -------
+    dict[str, DatasetMetric]
+        Metric-ID keyed fresh accumulators in declaration order.
+
+    Raises
+    ------
+    TypeError
+        If required resolved sections or metric entries have invalid types.
+    ValueError
+        If IDs, field selections, units, directions, or semantic combinations
+        contradict the registered task and metric contracts.
+
     """
     task = domain.tasks.registry.get_task(str(config["task"]))
     evaluation = config.get("evaluation")
@@ -443,6 +659,9 @@ def build_evaluation_metrics(config: dict[str, Any]) -> dict[str, DatasetMetric]
             task_fields=task.output_names,
             metric_id=metric_id,
         )
+        if kind == "macro_rmse" and fields != task.output_names:
+            msg = f"Metric {metric_id!r} with kind 'macro_rmse' must select every TaskSpec output field in declared order: {list(task.output_names)}."
+            raise ValueError(msg)
         if space == "physical" and len(fields) != 1:
             units = sorted({task.field(field).unit for field in fields})
             msg = f"Physical metric {metric_id!r} must select exactly one field; selected units are {units}."
@@ -463,11 +682,13 @@ def build_evaluation_metrics(config: dict[str, Any]) -> dict[str, DatasetMetric]
             operator_dimensionality=task.operator_dimensionality,
         )
         if kind == "rmse":
-            built[metric_id] = RMSEMetric(definition)
+            built[metric_id] = RMSEMetric(definition, device=device)
+        elif kind == "macro_rmse":
+            built[metric_id] = MacroRMSEMetric(definition, device=device)
         elif kind == "relative_l2":
-            built[metric_id] = RelativeL2Metric(definition)
+            built[metric_id] = RelativeL2Metric(definition, device=device)
         elif kind == "relative_h1":
-            built[metric_id] = RelativeH1Metric(definition)
+            built[metric_id] = RelativeH1Metric(definition, device=device)
         else:
             msg = f"No dataset accumulator exists for metric identifier {kind!r}."
             raise ValueError(msg)

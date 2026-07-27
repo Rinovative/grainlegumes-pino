@@ -1,4 +1,11 @@
-"""Provide strict synthetic task-dataset fixtures and factories."""
+"""
+Provide reusable strict task and dataset fixtures for the CPU contract suite.
+
+The factories model current TaskSpec field order, schema identity, and small
+in-memory tensors while deliberately avoiding production storage and training
+workloads. Scientific equations and lifecycle failures are exercised by their
+own focused modules; these fixtures should not be treated as benchmark data.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 from src import datasets, domain
-from support.future_task import build_future_task
+from support.synthetic_task import build_synthetic_task
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -15,21 +22,36 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def steady_task() -> domain.tasks.spec.TaskSpec:
-    """Return the authoritative steady-flow task."""
+    """
+    Return the registered immutable steady-flow contract used by production.
+
+    This fixture is appropriate when a test must exercise the exact seven-input,
+    three-output fields; genericity tests should request ``synthetic_task`` instead.
+    """
     return domain.tasks.registry.get_task("steady_flow")
 
 
 @pytest.fixture
-def future_task() -> domain.tasks.spec.TaskSpec:
-    """Return the shared future-task contract."""
-    return build_future_task()
+def synthetic_task() -> domain.tasks.spec.TaskSpec:
+    """
+    Return an unregistered task with different fields, units, and no physics.
+
+    The fixture detects steady-flow constants leaking into generic consumers and
+    must never be used as a production task or persisted default.
+    """
+    return build_synthetic_task()
 
 
 @pytest.fixture
 def case_payload_factory(
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> Callable[..., dict[str, Any]]:
-    """Return a factory for small strict case payloads."""
+    """
+    Return a factory for small content-bound steady-flow case payloads.
+
+    The factory varies identity, values, shape, dtype, and source token while
+    always using production TaskSpec ordering; it does not model COMSOL files.
+    """
 
     def factory(
         case_id: str = "case_0000",
@@ -39,6 +61,7 @@ def case_payload_factory(
         dtype: torch.dtype = torch.float32,
         source_token: str | None = None,
     ) -> dict[str, Any]:
+        """Build one strict case with deterministic per-channel constant fields."""
         input_fields = {name: torch.full(shape, value + index, dtype=dtype) for index, name in enumerate(steady_task.input_names)}
         output_fields = {name: torch.full(shape, value + 20 + index, dtype=dtype) for index, name in enumerate(steady_task.output_names)}
         return datasets.identity.build_case_payload(
@@ -58,7 +81,12 @@ def merged_payload_factory(
     steady_task: domain.tasks.spec.TaskSpec,
     case_payload_factory: Callable[..., dict[str, Any]],
 ) -> Callable[..., dict[str, Any]]:
-    """Return a factory for small strict merged payloads."""
+    """
+    Return a factory for small strict merged-dataset payloads.
+
+    Each member is validated through the production case contract before stacking,
+    so callers can vary membership and dtype without bypassing identity checks.
+    """
 
     def factory(
         dataset_id: str = "tiny",
@@ -67,6 +95,7 @@ def merged_payload_factory(
         dtype: torch.dtype = torch.float32,
         source_tokens: Sequence[str] | None = None,
     ) -> dict[str, Any]:
+        """Build one content-bound merged payload from deterministic strict cases."""
         tokens = tuple(source_tokens or sample_ids)
         cases = [
             case_payload_factory(

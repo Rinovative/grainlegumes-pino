@@ -14,6 +14,11 @@ Design principles:
   - Lock files live outside any target directory a caller may delete
   - Kernel-owned locks, rather than file existence, define lease ownership
   - Re-entrancy is limited to the owning process thread and exact lock path
+
+This module does NOT:
+  - Delete persistent lock files or infer ownership from their existence
+  - Coordinate threads through an in-memory mutex in place of a kernel lock
+  - Make a multi-file operation transactional beyond the caller-held context
 ===============================================================================
 """
 
@@ -34,7 +39,13 @@ if TYPE_CHECKING:
 
 
 class FileLockUnavailableError(RuntimeError):
-    """Raised when a nonblocking exclusive file lock is already held."""
+    """
+    Report fail-fast contention at the public file-lock boundary.
+
+    ``exclusive_file_lock(..., blocking=False)`` raises this project-specific
+    error only when another thread or process owns the advisory lock. Filesystem
+    creation, descriptor, and kernel failures remain ``OSError`` instances.
+    """
 
 
 @dataclass
@@ -68,7 +79,13 @@ def _after_fork_parent() -> None:
 
 
 def _after_fork_child() -> None:
-    """Drop every parent-owned lock descriptor in the forked child."""
+    """
+    Remove inherited parent lock ownership from the forked child process.
+
+    Every registered descriptor is closed best effort, global and thread-local
+    ownership registries are cleared, and the inherited registration guard is
+    released so the child can acquire independent locks safely.
+    """
     descriptors = tuple(_OPEN_LOCK_DESCRIPTORS)
     _OPEN_LOCK_DESCRIPTORS.clear()
     for descriptor in descriptors:
@@ -86,7 +103,13 @@ os.register_at_fork(
 
 
 def _open_lock_file(path: Path) -> int:
-    """Open one regular lock file without following a final-component symlink."""
+    """
+    Open a non-inheritable regular lock file without following a final symlink.
+
+    The descriptor is opened read/write with owner-only permissions when the
+    file is created. A non-regular target is rejected and the descriptor is
+    closed before the originating ``OSError`` reaches the lock boundary.
+    """
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -121,6 +144,16 @@ def exclusive_file_lock(
     ------
     FileLockUnavailableError
         If a nonblocking lock is held by another process or thread.
+    OSError
+        If the lock directory or regular lock file cannot be created, opened,
+        locked, unlocked, or closed.
+
+    Notes
+    -----
+    Re-entry is recognized only for the same canonical path in the owning
+    thread. The persistent lock file is not deleted on release; kernel lock
+    ownership, not file existence, is authoritative. The descriptor and lock
+    are released when the context exits, including during exception unwinding.
 
     """
     lock_path = Path(path).expanduser().resolve(strict=False)

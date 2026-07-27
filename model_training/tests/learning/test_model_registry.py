@@ -1,12 +1,28 @@
 # ruff: noqa: S101
-"""Verify semantic model, loss, metric, and physics implementation registries."""
+"""
+Protect public semantic registries for models, losses, metrics, derivatives, and physics.
+
+The tests require canonical identifiers to resolve, implementation/display aliases
+to fail, structural dimensionality/depth constraints to agree with builders, and
+CPU construction not to query CUDA. Numerical model quality and training lifecycle
+are deliberately covered elsewhere.
+"""
+
+from pathlib import Path
+from typing import Any
 
 import pytest
-from src import domain, learning
+import torch
+from src import domain, experiments, learning
 
 
 def test_semantic_model_loss_metric_and_physics_ids_resolve() -> None:
-    """Public semantic identifiers resolve to their implementation specifications."""
+    """
+    Resolve every maintained model, data-loss, metric, and physics identifier.
+
+    Each public semantic ID must reach its registered specification, protecting
+    configuration from depending on implementation class names.
+    """
     assert learning.models.factory.resolve_model_kind("fno").kind == "fno"
     assert learning.models.factory.resolve_model_kind("uno").kind == "uno"
     assert learning.losses.factory.resolve_data_loss_kind("relative_h1").kind == "relative_h1"
@@ -18,7 +34,12 @@ def test_semantic_model_loss_metric_and_physics_ids_resolve() -> None:
 
 
 def test_nonsemantic_implementation_identifiers_fail_clearly() -> None:
-    """Class, display, shorthand, and unknown names are not public identifiers."""
+    """
+    Query class names, display labels, shorthand, capitalization drift, and unknown IDs.
+
+    Every nonsemantic family must fail at its owning registry so no undocumented
+    compatibility vocabulary enters persisted configuration.
+    """
     for identifier in ("PI-FNO", "PINOLoss", "FNO"):
         with pytest.raises(ValueError, match="Unknown model identifier"):
             learning.models.factory.resolve_model_kind(identifier)
@@ -34,7 +55,12 @@ def test_nonsemantic_implementation_identifiers_fail_clearly() -> None:
 
 
 def test_model_factory_rejects_unsupported_dimensionality_and_uno_depth() -> None:
-    """Public validation and builders agree on current two-dimensional model support."""
+    """
+    Request a three-axis FNO and unsupported three-layer UNO through public boundaries.
+
+    Validation and direct UNO construction must reject the same structural limits,
+    preventing a config from validating only to fail deeper in model creation.
+    """
     fno_params = {
         "in_channels": 7,
         "out_channels": 3,
@@ -74,3 +100,32 @@ def test_model_factory_rejects_unsupported_dimensionality_and_uno_depth() -> Non
             modes_y=8,
             uno_scalings=[[1.0, 1.0]] * 3,
         )
+
+
+def test_model_factory_uses_only_the_required_concrete_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Build a tiny model on explicit CPU while making every CUDA query fail.
+
+    Construction must use only the concrete device supplied and reject string or
+    unindexed CUDA inputs, preserving device resolution as orchestration ownership.
+    """
+    config_path = Path(__file__).parents[2] / "configs/experiments/steady_flow_fno.yaml"
+    config = experiments.config.loader.load_and_resolve_config(config_path)
+    config["model"]["params"].update(
+        {"n_modes": [2, 2], "hidden_channels": 2, "n_layers": 1},
+    )
+
+    def unexpected_cuda_query(*_args: Any, **_kwargs: Any) -> Any:
+        message = "model factory queried CUDA availability"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(torch.cuda, "is_available", unexpected_cuda_query)
+    model = learning.models.factory.build_model(config, device=torch.device("cpu"))
+    assert {parameter.device for parameter in model.parameters()} == {torch.device("cpu")}
+
+    with pytest.raises(TypeError, match=r"concrete CPU or CUDA torch\.device"):
+        learning.models.factory.build_model(config, device="cpu")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="indexed CUDA device"):
+        learning.models.factory.build_model(config, device=torch.device("cuda"))

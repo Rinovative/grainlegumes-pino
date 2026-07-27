@@ -1,5 +1,12 @@
 # ruff: noqa: S101
-"""Verify manufactured Brinkman momentum, continuity, and boundary residuals."""
+"""
+Verify manufactured Darcy-Brinkman momentum, continuity, and boundary equations.
+
+Constant and linear physical fields establish analytic residual values, both
+continuity selections, per-sample outlet reduction, and name-based channel
+binding. Numerical derivative backends are tested in
+``test_physics_derivatives``; training weights and warmup belong to loss tests.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +16,12 @@ from src import domain
 
 
 def _grid(height: int = 9, width: int = 11) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return batched physical coordinate fields."""
+    """
+    Build batched float64 coordinate planes on x in [0, 2] and y in [0, 1].
+
+    Each field has shape ``(1, height, width)`` with ``ij`` indexing, making
+    the physical grid spacing explicit for analytic residual assertions.
+    """
     y_values = torch.linspace(0.0, 1.0, height, dtype=torch.float64)
     x_values = torch.linspace(0.0, 2.0, width, dtype=torch.float64)
     y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
@@ -17,7 +29,13 @@ def _grid(height: int = 9, width: int = 11) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def _steady_tensors() -> tuple[torch.Tensor, torch.Tensor, tuple[str, ...], tuple[str, ...]]:
-    """Return a zero-residual task-bound manufactured state."""
+    """
+    Build one zero-pressure, zero-velocity state in steady-flow channel order.
+
+    Inputs contain the physical grid, zero stored permeability channels, porosity
+    one-half, and a zero pressure boundary. Returned names bind the BCHW channels
+    explicitly so the manufactured baseline must produce zero residuals.
+    """
     x_grid, y_grid = _grid()
     zeros = torch.zeros_like(x_grid)
     inputs = torch.stack(
@@ -42,7 +60,12 @@ def _steady_tensors() -> tuple[torch.Tensor, torch.Tensor, tuple[str, ...], tupl
 
 
 def test_zero_velocity_constant_pressure_has_zero_residual() -> None:
-    """A zero-velocity, zero-pressure manufactured state has zero physics."""
+    """
+    Evaluate a task-bound constant state with zero pressure and velocity.
+
+    Momentum, selected continuity, and boundary reductions must all be exactly
+    zero with full-grid shapes, establishing the residual baseline.
+    """
     inputs, outputs, input_fields, output_fields = _steady_tensors()
     diagnostics = domain.physics.brinkman.evaluate_steady_2d_brinkman(
         inputs,
@@ -64,7 +87,12 @@ def test_zero_velocity_constant_pressure_has_zero_residual() -> None:
 
 
 def test_linear_state_matches_analytic_brinkman_residuals() -> None:
-    """Linear pressure and velocity fields produce exact drag residuals."""
+    """
+    Evaluate Brinkman diagnostics on linear pressure and velocity fields.
+
+    The computed momentum residuals must equal the analytic pressure-gradient,
+    viscous, and permeability-drag terms, protecting signs, units, and tensor axes.
+    """
     inputs, outputs, input_fields, output_fields = _steady_tensors()
     x_grid = inputs[:, input_fields.index("x")]
     y_grid = inputs[:, input_fields.index("y")]
@@ -92,7 +120,12 @@ def test_linear_state_matches_analytic_brinkman_residuals() -> None:
 
 
 def test_both_continuity_formulations_are_semantically_selected() -> None:
-    """Plain and conservative continuity return their distinct analytic values."""
+    """
+    Evaluate a linear velocity under constant non-unit porosity with both continuity IDs.
+
+    Plain divergence must equal one, conservative divergence must equal porosity,
+    and an unknown ID must fail so configuration selection remains scientifically explicit.
+    """
     x_grid, _ = _grid()
     zeros = torch.zeros_like(x_grid)
     porosity = torch.full_like(x_grid, 0.25)
@@ -125,7 +158,12 @@ def test_both_continuity_formulations_are_semantically_selected() -> None:
 
 
 def test_outlet_pressure_gauge_is_reduced_per_sample() -> None:
-    """Opposite outlet offsets in separate samples cannot cancel."""
+    """
+    Give two samples equal-magnitude, opposite-sign outlet pressure gauges.
+
+    Per-sample means must remain distinct and their squared reduction nonzero,
+    preventing cross-sample cancellation from hiding boundary error.
+    """
     _, y_grid = _grid()
     y_grid = y_grid.repeat(2, 1, 1)
     pressure = torch.zeros_like(y_grid)
@@ -145,7 +183,12 @@ def test_outlet_pressure_gauge_is_reduced_per_sample() -> None:
 
 
 def test_pressure_boundary_residual_and_field_map_invariance() -> None:
-    """Boundary values are exact and channel lookup follows names, not positions."""
+    """
+    Satisfy the inlet gauge, then reorder every input and output channel with its label.
+
+    Boundary error must remain zero and all residual arrays invariant, proving
+    physics binds semantic field names rather than positional conventions.
+    """
     inputs, outputs, input_fields, output_fields = _steady_tensors()
     y_grid = inputs[:, input_fields.index("y")]
     inlet = y_grid == y_grid.amin()

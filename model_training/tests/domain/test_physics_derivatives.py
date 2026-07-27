@@ -1,5 +1,12 @@
 # ruff: noqa: S101
-"""Analytic tests for reusable physical and spectral derivatives."""
+"""
+Verify reusable physical and spectral derivative operators on analytic fields.
+
+Linear and periodic manufactured solutions cover gradients, divergence, crop,
+spacing inference, extension semantics, and invalid grids/identifiers. Brinkman
+equation assembly is covered separately; these tests do not claim accuracy on
+production COMSOL fields.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +18,12 @@ from src import domain
 
 
 def test_physical_derivatives_match_linear_field_and_crop() -> None:
-    """Physical gradients are exact on a linear uniform-grid field."""
+    """
+    Differentiate a linear float64 field on a rectangular uniform physical grid.
+
+    Both analytic gradients and a valid interior crop must be exact, while an
+    overlarge crop must fail so finite-difference axes and region semantics stay fixed.
+    """
     x_values = torch.linspace(-2.0, 3.0, 17, dtype=torch.float64)
     y_values = torch.linspace(1.0, 4.0, 13, dtype=torch.float64)
     y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
@@ -31,7 +43,12 @@ def test_physical_derivatives_match_linear_field_and_crop() -> None:
 
 
 def test_spectral_derivatives_match_periodic_analytic_field() -> None:
-    """Periodic FFT gradients match trigonometric analytic derivatives."""
+    """
+    Differentiate a periodic two-mode field with the no-extension spectral operator.
+
+    Both FFT gradients must match their analytic functions, protecting physical
+    spacing and x/y frequency-axis interpretation.
+    """
     height = 32
     width = 40
     length_x = 2.0 * math.pi
@@ -54,7 +71,12 @@ def test_spectral_derivatives_match_periodic_analytic_field() -> None:
 
 
 def test_uniform_spacing_rejects_invalid_coordinate_grids() -> None:
-    """Spacing inference accepts only finite increasing uniform Cartesian grids."""
+    """
+    Infer spacing from one valid grid, then vary finiteness, order, spacing, and Cartesian form.
+
+    The valid grid must yield exact unit spacing and every malformed family must
+    fail explicitly before a derivative operator consumes it.
+    """
     y_grid, x_grid = torch.meshgrid(
         torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64),
         torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=torch.float64),
@@ -84,7 +106,12 @@ def test_uniform_spacing_rejects_invalid_coordinate_grids() -> None:
 
 
 def test_derivative_semantics_fail_clearly() -> None:
-    """Unknown and contradictory derivative identifiers fail before use."""
+    """
+    Request an unknown derivative kind and a physical operator with spectral extension.
+
+    Both semantic contradictions must fail during construction, preventing hidden
+    fallback or unused extension settings from changing scientific meaning.
+    """
     with pytest.raises(ValueError, match="Unknown derivative identifier"):
         domain.physics.derivatives.build_derivative_operator("automatic", extension="none")
     with pytest.raises(ValueError, match="require extension 'none'"):

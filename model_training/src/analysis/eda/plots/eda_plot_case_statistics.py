@@ -10,13 +10,13 @@ Responsibilities:
   - Build interactive case-statistics viewers
 
 Design principles:
-  - Statistics are aggregated per case
-  - Dataset comparisons use consistent normalized scaling
-  - Widget construction is delegated to analysis.ui
+  - Statistics are aggregated per case from an explicit ordered prefix
+  - Incremental caches extend monotonically as notebook case limits increase
+  - Dataset values remain on their stored scales and are labelled independently
 
-Boundaries:
-  - Frequency-domain EDA belongs to eda_plot_spectral_analysis
-  - Model-evaluation diagnostics belong to analysis.evaluation
+This module does NOT:
+  - Compute frequency-domain EDA or model-evaluation diagnostics
+  - Own generic case-count navigation and widget rendering
 ===============================================================================
 """
 
@@ -48,16 +48,37 @@ if TYPE_CHECKING:
 
 
 class _StatCache(TypedDict):
+    """
+    Track incrementally loaded generator-statistic scalars for one dataset.
+
+    ``loaded`` is the consumed ordered prefix length; ``cols`` retains flattened
+    numeric leaf histories keyed by metadata path.
+    """
+
     loaded: int
     cols: dict[str, list[float]]
 
 
 class _ParamCache(TypedDict):
+    """
+    Track incrementally loaded generator-parameter scalars for one dataset.
+
+    This internal notebook transport mirrors :class:`_StatCache` but keeps the
+    semantically separate generator ``parameters`` namespace.
+    """
+
     loaded: int
     cols: dict[str, list[float]]
 
 
 class _FieldCache(TypedDict):
+    """
+    Track per-field min/mean/max histories for an incrementally loaded prefix.
+
+    Values remain on each task field's stored scale and are partitioned by field
+    and statistic so extending a viewer does not recompute earlier cases.
+    """
+
     loaded: int
     data: dict[str, dict[str, list[float]]]
 
@@ -116,6 +137,7 @@ def _flatten_dict_raw(dct: dict[str, Any]) -> dict[str, float]:
     out: dict[str, float] = {}
 
     def _rec(key: str, obj: Any) -> None:
+        """Flatten nested mappings/sequences while retaining numeric leaf paths."""
         if isinstance(obj, dict):
             for k, v in obj.items():
                 _rec(f"{key}_{k}", v)
@@ -140,7 +162,8 @@ def _selected_datasets(dataset_selector: CheckboxGroup) -> list[str]:
     """
     Get list of selected dataset names from the dataset selector widget.
 
-    Parameters    ----------
+    Parameters
+    ----------
     dataset_selector : CheckboxGroup
         Dataset selector widget.
 
@@ -378,17 +401,30 @@ def _hist_grid(
 
 def plot_meta_statistics(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     """
-    Plot meta statistics distributions from datasets.
+    Build an interactive viewer for generator-statistic distributions.
 
     Parameters
     ----------
-    datasets : dict[str, pd.DataFrame]
-        Dictionary of dataset names to DataFrames.
+    datasets : dict[str, pandas.DataFrame]
+        Labelled EDA frames whose ``meta.generator.*.statistics`` mappings contain
+        numeric leaves. Frame order defines dataset display order.
 
     Returns
     -------
-        widgets.VBox
-            VBox containing the plot and controls.
+    ipywidgets.VBox
+        Case-count controls, dataset checkboxes, and incrementally cached
+        histograms for the selected dataset set.
+
+    Raises
+    ------
+    ValueError
+        If no dataset is available or the user disables every dataset.
+
+    Notes
+    -----
+    Nested mapping/sequence paths are flattened and non-numeric leaves omitted.
+    Caches grow monotonically; reducing the case control after loading a larger
+    prefix does not discard already accumulated observations.
 
     """
     names = list(datasets.keys())
@@ -468,17 +504,29 @@ def plot_meta_statistics(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
 
 def plot_meta_parameters(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     """
-    Plot meta parameters distributions from datasets.
+    Build an interactive viewer for generator-parameter distributions.
 
     Parameters
     ----------
-    datasets : dict[str, pd.DataFrame]
-        Dictionary of dataset names to DataFrames.
+    datasets : dict[str, pandas.DataFrame]
+        Labelled EDA frames whose ``meta.generator.*.parameters`` mappings contain
+        numeric leaves.
 
     Returns
     -------
-        widgets.VBox
-            VBox containing the plot and controls.
+    ipywidgets.VBox
+        Case-count controls, dataset checkboxes, and parameter histograms on the
+        original stored scales.
+
+    Raises
+    ------
+    ValueError
+        If no dataset is available or the user disables every dataset.
+
+    Notes
+    -----
+    Caches grow monotonically with the largest requested prefix. Reducing the
+    control later reuses, rather than truncates, accumulated observations.
 
     """
     names = list(datasets.keys())
@@ -558,17 +606,30 @@ def plot_meta_parameters(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
 
 def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     """
-    Plot field value distributions from datasets.
+    Build per-field distributions of case minima, means, and maxima.
 
     Parameters
     ----------
-    datasets : dict[str, pd.DataFrame]
-        Dictionary of dataset names to DataFrames.
+    datasets : dict[str, pandas.DataFrame]
+        Non-empty labelled EDA frames. Every column except ``meta``, ``x``, and
+        ``y`` in the first frame is treated as a comparable field array.
 
     Returns
     -------
-        widgets.VBox
-            VBox containing the plot and controls.
+    ipywidgets.VBox
+        Case-count controls, dataset checkboxes, and a field-by-statistic
+        histogram grid backed by monotonic ordered-prefix caches.
+
+    Raises
+    ------
+    ValueError
+        If datasets are empty or no dataset remains selected.
+
+    Notes
+    -----
+    Values are clipped to the 1st--99th percentile for display only; source
+    frames are not mutated. Previously cached observations remain when a user
+    lowers the case-count control.
 
     """
     names = list(datasets.keys())

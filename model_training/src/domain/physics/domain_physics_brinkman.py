@@ -12,8 +12,13 @@ Responsibilities:
 
 Design principles:
   - Numerical kernels accept named physical quantities, never channel indices
-  - Semantic physics and continuity identifiers fail closed
-  - Normalization, weights, warmup, and training logging remain outside domain
+  - Semantic physics, continuity, and pressure-boundary identifiers fail closed
+  - Full-grid fields remain available beside explicit interior scalar reductions
+
+This module does NOT:
+  - Normalize model tensors or choose physics-loss weights and warmup schedules
+  - Own derivative discretization, checkpointing, W&B logging, or Optuna policy
+  - Infer task channel order without explicit field-name declarations
 ===============================================================================
 """
 
@@ -31,6 +36,10 @@ from .domain_physics_boundary import PressureBoundaryResiduals, pressure_boundar
 from .domain_physics_derivatives import DerivativeOperator, SpatialAxes, crop_interior, infer_uniform_spacing
 
 AIR_DYNAMIC_VISCOSITY = 1.8139e-5
+POROSITY_FLOOR = 1e-6
+PERMEABILITY_SCALE_FLOOR = 1e-30
+PERMEABILITY_DETERMINANT_FLOOR = 1e-4
+PERMEABILITY_CROSS_RATIO_CLIP = 0.999
 ContinuityKind = Literal["div_eps_velocity", "div_velocity"]
 STEADY_BRINKMAN_KIND = "steady_2d_brinkman"
 PRESSURE_BOUNDARY_KIND = "pressure_inlet_zero_pressure_outlet"
@@ -39,7 +48,18 @@ _MIN_TASK_TENSOR_RANK = 3
 
 @dataclass(frozen=True, slots=True)
 class MomentumResiduals:
-    """Hold x- and y-momentum residual fields."""
+    """
+    Hold physical x- and y-momentum residual fields.
+
+    ``x`` and ``y`` retain the input tensor's batch/spatial shape and have units
+    of pressure gradient, Pa/m. No crop or scalar reduction is implied.
+
+    Attributes
+    ----------
+    x, y : torch.Tensor
+        Full-grid x- and y-momentum equation residuals in Pa/m.
+
+    """
 
     x: Tensor
     y: Tensor
@@ -47,7 +67,24 @@ class MomentumResiduals:
 
 @dataclass(frozen=True, slots=True)
 class ContinuityResiduals:
-    """Hold both reusable continuity formulations."""
+    """
+    Hold both continuity residual fields and the selected training formulation.
+
+    ``divergence_velocity`` is ``div(u)`` and
+    ``divergence_porosity_velocity`` is ``div(eps*u)``; both have units 1/s.
+    ``selected`` aliases exactly the field identified by ``kind`` without
+    removing the other diagnostic.
+
+    Attributes
+    ----------
+    selected : torch.Tensor
+        Exact alias of the training-selected full-grid continuity field.
+    divergence_velocity, divergence_porosity_velocity : torch.Tensor
+        Full-grid plain and conservative residuals with matching shapes.
+    kind : Literal["div_eps_velocity", "div_velocity"]
+        Identifier determining the ``selected`` alias.
+
+    """
 
     selected: Tensor
     divergence_velocity: Tensor
@@ -57,47 +94,120 @@ class ContinuityResiduals:
 
 @dataclass(frozen=True, slots=True)
 class BrinkmanDiagnostics:
-    """Hold full residual fields and well-defined scalar diagnostics."""
+    """
+    Hold full residual fields and formulation-explicit scalar diagnostics.
+
+    Momentum and both continuity fields remain full-grid. Canonical scalar MSEs
+    use the declared interior crop, parallel ``*_full_grid`` values support the
+    fixed training monitor, and pressure boundary diagnostics use full-grid
+    masks. The selected training continuity never replaces either retained
+    formulation.
+
+    Attributes
+    ----------
+    momentum, continuity, boundary
+        Full-grid residual containers and pressure-boundary diagnostics.
+    momentum_residual_mse : torch.Tensor
+        Mean of ``Rx² + Ry²`` over the cropped domain, in ``(Pa/m)²``.
+    div_velocity_mse, div_eps_velocity_mse : torch.Tensor
+        Independent cropped mean-square continuity diagnostics, in ``1/s²``.
+    momentum_residual_mse_full_grid : torch.Tensor
+        Full-grid mean of ``Rx² + Ry²``.
+    div_velocity_mse_full_grid, div_eps_velocity_mse_full_grid : torch.Tensor
+        Independent full-grid mean-square continuity diagnostics.
+    interior_crop : int
+        Cells removed from every spatial edge for canonical scalar residuals.
+
+    """
 
     momentum: MomentumResiduals
     continuity: ContinuityResiduals
     boundary: PressureBoundaryResiduals
-    momentum_mse: Tensor
-    continuity_mse: Tensor
-    momentum_mse_full: Tensor
-    continuity_mse_full: Tensor
+    momentum_residual_mse: Tensor
+    div_velocity_mse: Tensor
+    div_eps_velocity_mse: Tensor
+    momentum_residual_mse_full_grid: Tensor
+    div_velocity_mse_full_grid: Tensor
+    div_eps_velocity_mse_full_grid: Tensor
     interior_crop: int
 
     @property
+    def momentum_mse(self) -> Tensor:
+        """Return the canonical cropped training momentum MSE in ``(Pa/m)²``."""
+        return self.momentum_residual_mse
+
+    @property
+    def continuity_mse(self) -> Tensor:
+        """Return only the experiment-selected continuity value for training."""
+        if self.continuity.kind == "div_eps_velocity":
+            return self.div_eps_velocity_mse
+        return self.div_velocity_mse
+
+    @property
+    def momentum_mse_full(self) -> Tensor:
+        """Return the full-grid momentum MSE used by monitors, in ``(Pa/m)²``."""
+        return self.momentum_residual_mse_full_grid
+
+    @property
+    def continuity_mse_full(self) -> Tensor:
+        """Return the selected full-grid continuity value for training monitors."""
+        if self.continuity.kind == "div_eps_velocity":
+            return self.div_eps_velocity_mse_full_grid
+        return self.div_velocity_mse_full_grid
+
+    @property
     def boundary_mse(self) -> Tensor:
-        """Return the inlet-plus-outlet pressure boundary diagnostic."""
+        """Return the inlet-plus-outlet pressure boundary diagnostic in Pa²."""
         return self.boundary.mse
 
     def as_dict(self) -> dict[str, Tensor]:
-        """Return declared diagnostic names without exposing loss ownership."""
+        """
+        Return formulation-explicit residual arrays and scalar diagnostics.
+
+        ``Rx`` and ``Ry`` have units Pa/m; ``div_u`` and ``div_eps_u`` have
+        units 1/s. Canonical residual MSEs use ``interior_crop`` while pressure
+        boundary diagnostics use inlet/outlet masks on the full grid.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Full fields with a singleton channel axis plus formulation-explicit
+            scalar tensors. The mapping contains no selected-continuity alias or
+            loss weights, so consumers must use the declared key names.
+
+        """
         return {
             "Rx": self.momentum.x.unsqueeze(1),
             "Ry": self.momentum.y.unsqueeze(1),
-            "Rc": self.continuity.selected.unsqueeze(1),
             "div_u": self.continuity.divergence_velocity.unsqueeze(1),
             "div_eps_u": self.continuity.divergence_porosity_velocity.unsqueeze(1),
-            "mom_mse": self.momentum_mse,
-            "cont_mse": self.continuity_mse,
-            "mom_mse_full": self.momentum_mse_full,
-            "cont_mse_full": self.continuity_mse_full,
-            "bc_mse": self.boundary_mse,
-            "p_inlet_mse": self.boundary.inlet_mse,
-            "p_outlet_mse": self.boundary.outlet_mean_square,
+            "momentum_residual_mse": self.momentum_residual_mse,
+            "div_velocity_mse": self.div_velocity_mse,
+            "div_eps_velocity_mse": self.div_eps_velocity_mse,
+            "momentum_residual_mse_full_grid": self.momentum_residual_mse_full_grid,
+            "div_velocity_mse_full_grid": self.div_velocity_mse_full_grid,
+            "div_eps_velocity_mse_full_grid": self.div_eps_velocity_mse_full_grid,
+            "pressure_boundary_mse": self.boundary_mse,
+            "pressure_inlet_mse": self.boundary.inlet_mse,
+            "pressure_outlet_mean_square": self.boundary.outlet_mean_square,
         }
 
 
 def available_continuity_kinds() -> tuple[str, ...]:
     """Return supported semantic continuity formulations."""
-    return ("div_eps_velocity", "div_velocity")
+    return ("div_velocity", "div_eps_velocity")
 
 
 def validate_continuity_kind(kind: str) -> ContinuityKind:
-    """Return one exact semantic continuity identifier."""
+    """
+    Validate and return one exact continuity formulation identifier.
+
+    Raises
+    ------
+    ValueError
+        If ``kind`` is not ``"div_velocity"`` or ``"div_eps_velocity"``.
+
+    """
     if kind not in available_continuity_kinds():
         available = ", ".join(available_continuity_kinds())
         msg = f"Unknown continuity identifier {kind!r}. Available continuity formulations: {available}."
@@ -121,9 +231,10 @@ def continuity_residuals(
     Parameters
     ----------
     velocity_x, velocity_y : torch.Tensor
-        Physical velocity component fields.
+        Physical velocity component fields in m/s with matching sample/spatial
+        shapes, normally ``[batch, y, x]``.
     porosity : torch.Tensor
-        Dimensionless porosity field.
+        Dimensionless porosity field with the same shape.
     derivatives : DerivativeOperator
         Explicit numerical derivative backend.
     spacing_x, spacing_y : float or torch.Tensor
@@ -134,7 +245,16 @@ def continuity_residuals(
     Returns
     -------
     ContinuityResiduals
-        Both formulations and the semantically selected residual.
+        Full-grid ``div(u)`` and ``div(eps*u)`` fields in 1/s plus the exact
+        selected alias; no crop or scalar reduction is applied.
+
+    Raises
+    ------
+    TypeError
+        If the derivative backend rejects a field or spacing dtype.
+    ValueError
+        If field shapes differ, ``kind`` is unsupported, or the derivative
+        backend rejects spacing, axes, or field geometry.
 
     """
     if velocity_x.shape != velocity_y.shape or velocity_x.shape != porosity.shape:
@@ -171,7 +291,21 @@ def _inverse_permeability_components(
     determinant_floor: float,
     cross_ratio_clip: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Return stable physical inverse-permeability tensor components."""
+    """
+    Invert the symmetric 2D permeability representation with explicit floors.
+
+    Diagonal components are physical m² values. The stored cross channel is the
+    dimensionless ratio ``Kxy / sqrt(Kxx*Kyy)``; it is clipped before inversion.
+    The geometric scale and normalized determinant are floored independently,
+    yielding ``(K^-1_xx, K^-1_xy, K^-1_yy)`` in 1/m² without materializing a
+    matrix tensor.
+
+    Raises
+    ------
+    ValueError
+        If the three permeability component shapes differ.
+
+    """
     if permeability_xx.shape != permeability_yy.shape or permeability_xx.shape != permeability_xy_ratio.shape:
         msg = "Permeability component shapes must match."
         raise ValueError(msg)
@@ -199,10 +333,10 @@ def brinkman_momentum_residuals(
     spacing_y: float | Tensor,
     *,
     viscosity: float = AIR_DYNAMIC_VISCOSITY,
-    porosity_floor: float = 1e-6,
-    permeability_scale_floor: float = 1e-30,
-    determinant_floor: float = 1e-4,
-    cross_ratio_clip: float = 0.999,
+    porosity_floor: float = POROSITY_FLOOR,
+    permeability_scale_floor: float = PERMEABILITY_SCALE_FLOOR,
+    determinant_floor: float = PERMEABILITY_DETERMINANT_FLOOR,
+    cross_ratio_clip: float = PERMEABILITY_CROSS_RATIO_CLIP,
 ) -> MomentumResiduals:
     """
     Compute the steady two-dimensional Darcy-Brinkman momentum residual.
@@ -213,7 +347,8 @@ def brinkman_momentum_residuals(
     Parameters
     ----------
     pressure, velocity_x, velocity_y : torch.Tensor
-        Physical pressure and velocity fields.
+        Physical pressure in Pa and velocity components in m/s with identical
+        sample/spatial shapes, normally ``[batch, y, x]``.
     porosity : torch.Tensor
         Dimensionless porosity field.
     permeability_xx, permeability_yy : torch.Tensor
@@ -227,18 +362,33 @@ def brinkman_momentum_residuals(
     viscosity : float, optional
         Dynamic viscosity in Pa s.
     porosity_floor : float, optional
-        Positive numerical floor for porosity.
+        Lower clamp applied to dimensionless porosity; the canonical default is
+        positive.
     permeability_scale_floor : float, optional
-        Positive numerical floor for the permeability geometric mean.
+        Lower clamp for the permeability geometric mean in m².
     determinant_floor : float, optional
-        Positive numerical floor for normalized permeability inversion.
+        Lower clamp for the normalized permeability determinant.
     cross_ratio_clip : float, optional
-        Absolute clamp for the dimensionless cross-permeability ratio.
+        Symmetric absolute clamp for the dimensionless cross-permeability ratio.
 
     Returns
     -------
     MomentumResiduals
-        Physical x- and y-momentum residual fields.
+        Full-grid x- and y-momentum residual fields in Pa/m.
+
+    Raises
+    ------
+    TypeError
+        If the derivative backend rejects a field or spacing dtype.
+    ValueError
+        If physical field shapes differ, viscosity is not positive, or the
+        derivative backend rejects field geometry or spacing.
+
+    Notes
+    -----
+    The deviatoric stress uses the three-dimensional ``2/3 div(u)`` trace
+    removal convention on a two-dimensional flow slice. Stabilization clamps
+    affect porosity and permeability inversion only; inputs are not mutated.
 
     """
     fields = (
@@ -293,7 +443,21 @@ def _field_mapping(
     *,
     label: str,
 ) -> dict[str, Tensor]:
-    """Bind task-specific names to channel tensors outside numerical kernels."""
+    """
+    Bind required task names to channel views without reordering the source.
+
+    ``tensor`` must expose batch and channel as its first two axes. The complete
+    declared ``fields`` sequence must match the channel count and be duplicate
+    free; every required steady-flow role is returned as ``tensor[:, index]``,
+    preserving batch/spatial storage as a view.
+
+    Raises
+    ------
+    ValueError
+        If tensor rank/channel count, field uniqueness, or required membership
+        violates the task-binding contract.
+
+    """
     if tensor.ndim < _MIN_TASK_TENSOR_RANK:
         msg = f"{label} tensor must have batch, channel, and spatial axes."
         raise ValueError(msg)
@@ -329,26 +493,46 @@ def evaluate_steady_2d_brinkman(
     Parameters
     ----------
     inputs, outputs : torch.Tensor
-        Physical tensor views in caller-declared field order. Diagonal
-        permeability channels retain the task's dimensionless log10 storage
-        representation and are converted before entering the numerical kernel.
+        Task-ordered BCHW tensors. Output channels are physical ``p``/``u``/``v``
+        values. Input ``x``, ``y``, ``eps``, and ``p_bc`` retain physical/stored
+        values; diagonal permeability channels are log10 ratios to 1 m² and are
+        exponentiated, while ``kxy`` is the dimensionless geometric-mean ratio.
     input_fields, output_fields : Sequence[str]
         Exact task-owned field declarations used for name-based binding.
     derivatives : DerivativeOperator
         Explicit physical or spectral derivative backend.
     continuity : str
-        Semantic continuity formulation.
+        Training-selected continuity identifier retained for compatibility;
+        both plain and porosity-weighted formulations are always evaluated.
     boundary : str
         Semantic pressure boundary formulation.
     interior_crop : int, optional
-        Cells cropped before scalar momentum/continuity diagnostics.
+        Cells removed from every spatial edge before canonical scalar momentum
+        and continuity mean-square reductions. Full-grid diagnostics are also
+        retained.
     spatial_axes : tuple[int, int], optional
         Spatial axes after removing the channel dimension.
 
     Returns
     -------
     BrinkmanDiagnostics
-        Full residual fields and scalar full/interior diagnostics.
+        Full-grid fields, cropped and full-grid mean-square residuals, and
+        pressure-boundary diagnostics. Momentum MSE has units ``(Pa/m)²``,
+        continuity MSEs ``1/s²``, and boundary MSE ``Pa²``.
+
+    Raises
+    ------
+    TypeError
+        If tensor/coordinate dtypes violate derivative or boundary contracts.
+    ValueError
+        If semantic identifiers, channel declarations, BCHW geometry, Cartesian
+        spacing, crop, or physical field shapes violate the evaluator contract.
+
+    Notes
+    -----
+    Both continuity formulations are always computed. ``continuity`` selects
+    only compatibility properties used by training; formulation-explicit fields
+    and scalars remain available regardless of that selection.
 
     """
     if boundary != PRESSURE_BOUNDARY_KIND:
@@ -388,7 +572,7 @@ def evaluate_steady_2d_brinkman(
     continuity_residual = continuity_residuals(
         output_values["u"],
         output_values["v"],
-        input_values["eps"].clamp_min(1e-6),
+        input_values["eps"].clamp_min(POROSITY_FLOOR),
         derivatives,
         spacing_x,
         spacing_y,
@@ -403,8 +587,13 @@ def evaluate_steady_2d_brinkman(
     )
     momentum_x_interior = crop_interior(momentum.x, interior_crop, axes=spatial_axes)
     momentum_y_interior = crop_interior(momentum.y, interior_crop, axes=spatial_axes)
-    continuity_interior = crop_interior(
-        continuity_residual.selected,
+    div_velocity_interior = crop_interior(
+        continuity_residual.divergence_velocity,
+        interior_crop,
+        axes=spatial_axes,
+    )
+    div_eps_velocity_interior = crop_interior(
+        continuity_residual.divergence_porosity_velocity,
         interior_crop,
         axes=spatial_axes,
     )
@@ -412,10 +601,12 @@ def evaluate_steady_2d_brinkman(
         momentum=momentum,
         continuity=continuity_residual,
         boundary=pressure_boundary,
-        momentum_mse=(momentum_x_interior.square() + momentum_y_interior.square()).mean(),
-        continuity_mse=continuity_interior.square().mean(),
-        momentum_mse_full=(momentum.x.square() + momentum.y.square()).mean(),
-        continuity_mse_full=continuity_residual.selected.square().mean(),
+        momentum_residual_mse=(momentum_x_interior.square() + momentum_y_interior.square()).mean(),
+        div_velocity_mse=div_velocity_interior.square().mean(),
+        div_eps_velocity_mse=div_eps_velocity_interior.square().mean(),
+        momentum_residual_mse_full_grid=(momentum.x.square() + momentum.y.square()).mean(),
+        div_velocity_mse_full_grid=continuity_residual.divergence_velocity.square().mean(),
+        div_eps_velocity_mse_full_grid=continuity_residual.divergence_porosity_velocity.square().mean(),
         interior_crop=interior_crop,
     )
 
@@ -430,7 +621,25 @@ def available_physics_kinds() -> tuple[str, ...]:
 
 
 def resolve_physics_evaluator(kind: str) -> PhysicsEvaluator:
-    """Resolve a task-selected reusable physics evaluator."""
+    """
+    Resolve the exact task-selected equation-set evaluator.
+
+    Parameters
+    ----------
+    kind : str
+        Canonical domain physics identifier.
+
+    Returns
+    -------
+    PhysicsEvaluator
+        Registered evaluator callable; resolution performs no computation.
+
+    Raises
+    ------
+    ValueError
+        If ``kind`` has no registered evaluator.
+
+    """
     try:
         return _PHYSICS_EVALUATORS[kind]
     except KeyError as error:

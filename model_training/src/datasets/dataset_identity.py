@@ -10,16 +10,16 @@ Responsibilities:
   - Compute deterministic content and ordered-membership fingerprints
 
 Design principles:
-  - Saved field declarations are explicit and order-sensitive
-  - Physical paths are excluded from portable dataset identity
-  - Producer outputs are immutable and creation tools refuse overwrites
-  - Routine loads trust producer-computed content identity after structural checks
-  - Explicit strict verification recomputes exact tensor content identity
-  - Invalid names and schema versions fail closed without translation
+  - Saved field declarations and sample membership are explicit and order-sensitive
+  - Physical paths and merged dataset names are excluded from portable fingerprints
+  - Routine validation trusts stored content identity after strict structure checks
+  - Explicit verification recomputes exact metadata and tensor-byte identity
+  - Invalid keys, task digests, names, and schema versions fail without translation
 
-Boundaries:
-  - Task semantics belong to domain.tasks
-  - DataLoader construction and split selection belong to datasets.base
+This module does NOT:
+  - Resolve paths, write payload files, or enforce producer overwrite policy
+  - Define task semantics, split selection, normalizers, or DataLoader behavior
+  - Upgrade historical schemas, repair fingerprints, or accept field aliases
 ===============================================================================
 """
 
@@ -114,6 +114,13 @@ class DatasetIdentity:
     spatial_shape : tuple[int, ...]
         Spatial tensor shape after batch and channel axes.
 
+    Notes
+    -----
+    This frozen dataclass is the portable identity returned by validators; path,
+    loader, split, and normalization state are deliberately absent. Its fields
+    are not an alternative to validating a serialized payload at a public load
+    boundary.
+
     """
 
     dataset_id: str
@@ -147,7 +154,29 @@ class DatasetIdentity:
 
 @dataclass(frozen=True, slots=True)
 class CaseIdentity:
-    """Describe one structurally validated immutable case payload."""
+    """
+    Describe the portable identity and metadata of one validated case payload.
+
+    Attributes
+    ----------
+    case_id : str
+        Stable sample identifier bound to ``sample_ids``.
+    source_identity : dict[str, Any]
+        Isolated path-independent producer identity included in the fingerprint.
+    source_metadata : dict[str, Any]
+        Isolated reproducibility metadata retained outside the case fingerprint.
+    fingerprint : str
+        Stored producer-computed case content SHA-256 digest.
+    spatial_shape : tuple[int, ...]
+        Positive spatial dimensions shared by all case fields.
+
+    Notes
+    -----
+    The dataclass is frozen, while its dictionaries remain ordinary isolated
+    mappings. Callers receive it only after structural validation and optionally
+    exact tensor-byte verification.
+
+    """
 
     case_id: str
     source_identity: dict[str, Any]
@@ -176,6 +205,12 @@ class ValidatedCase:
     fingerprint : str
         Stored producer-computed case content fingerprint.
 
+    Notes
+    -----
+    Input and output channels are newly stacked CPU tensors in TaskSpec order;
+    source dictionaries are isolated JSON-compatible copies. Strict content
+    verification is controlled by the validating function, not this container.
+
     """
 
     case_id: str
@@ -193,7 +228,12 @@ class ValidatedCase:
 
 @dataclass(frozen=True, slots=True)
 class _ValidatedCaseParts:
-    """Hold no-copy validated field tensors before model materialization."""
+    """
+    Carry validated case identity and ordered field tensors before stacking.
+
+    This internal transport avoids a channel-stack allocation when a caller
+    needs identity only; materializing ``ValidatedCase`` owns the later stacks.
+    """
 
     identity: CaseIdentity
     input_tensors: tuple[Tensor, ...]
@@ -201,7 +241,18 @@ class _ValidatedCaseParts:
 
 
 def _canonical_json(value: Any, *, label: str) -> bytes:
-    """Encode a JSON-compatible value deterministically."""
+    """
+    Encode canonical identity metadata as deterministic UTF-8 JSON bytes.
+
+    Keys are sorted, separators compact, non-ASCII escaped, and NaN/infinity
+    rejected so equal semantic metadata produces equal digest input.
+
+    Raises
+    ------
+    TypeError
+        If ``value`` is not JSON-serializable without non-finite numbers.
+
+    """
     try:
         return json.dumps(
             value,
@@ -216,7 +267,12 @@ def _canonical_json(value: Any, *, label: str) -> bytes:
 
 
 def _update_hash(hasher: Any, value: bytes) -> None:
-    """Append one length-delimited byte string to a hash stream."""
+    """
+    Append one eight-byte-length-prefixed value to an incremental hash.
+
+    Length framing prevents concatenation ambiguity between metadata, labels,
+    and tensor payloads that share the same SHA-256 stream.
+    """
     hasher.update(len(value).to_bytes(8, byteorder="big", signed=False))
     hasher.update(value)
 
@@ -227,7 +283,13 @@ def _tensor_dtype(tensor: Tensor) -> str:
 
 
 def _update_raw_tensor_hash(hasher: Any, tensor: Tensor) -> None:
-    """Append exact tensor bytes without a length or one full bytes copy."""
+    """
+    Stream one tensor's exact contiguous CPU bytes into an existing hash.
+
+    The tensor is detached, moved to CPU, made contiguous only when necessary,
+    viewed as bytes, and processed in bounded chunks. Shape and dtype framing
+    belong to surrounding canonical metadata and group helpers.
+    """
     contiguous = tensor.detach().cpu()
     if not contiguous.is_contiguous():
         contiguous = contiguous.contiguous()
@@ -238,14 +300,25 @@ def _update_raw_tensor_hash(hasher: Any, tensor: Tensor) -> None:
 
 
 def _update_tensor_hash(hasher: Any, tensor: Tensor) -> None:
-    """Append length-delimited exact tensor bytes without one full bytes copy."""
+    """
+    Append a tensor byte count followed by its exact chunked content.
+
+    The explicit count frames each standalone tensor without allocating one
+    complete ``bytes`` object.
+    """
     byte_count = tensor.numel() * tensor.element_size()
     hasher.update(byte_count.to_bytes(8, byteorder="big", signed=False))
     _update_raw_tensor_hash(hasher, tensor)
 
 
 def _update_tensor_group_hash(hasher: Any, tensors: Sequence[Tensor]) -> None:
-    """Hash field tensors as one virtual contiguous channel stack."""
+    """
+    Hash ordered fields as one virtual contiguous channel stack.
+
+    A single aggregate byte count followed by each field's raw bytes is exactly
+    compatible with hashing their materialized task-order ``torch.stack`` while
+    avoiding that allocation during identity-only validation.
+    """
     byte_count = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
     hasher.update(byte_count.to_bytes(8, byteorder="big", signed=False))
     for tensor in tensors:
@@ -261,7 +334,12 @@ def _tensor_metadata(tensor: Tensor) -> dict[str, Any]:
 
 
 def _require_exact_keys(payload: Mapping[str, Any], required: frozenset[str], *, label: str) -> None:
-    """Require one exact schema key set."""
+    """
+    Require exact schema keys and report both missing and unexpected names.
+
+    Additional compatibility or producer-private keys fail closed rather than
+    being silently ignored during identity validation.
+    """
     missing = sorted(required.difference(payload))
     unexpected = sorted(set(payload).difference(required))
     if missing or unexpected:
@@ -278,7 +356,12 @@ def _require_non_empty_string(value: Any, *, label: str) -> str:
 
 
 def _require_sha256(value: Any, *, label: str) -> str:
-    """Return one lowercase hexadecimal SHA-256 digest."""
+    """
+    Parse one canonical stored SHA-256 digest.
+
+    Admission requires exactly 64 lowercase hexadecimal characters; uppercase,
+    prefixes, whitespace, and other hash formats are not normalized.
+    """
     digest = _require_non_empty_string(value, label=label)
     if len(digest) != _SHA256_HEX_LENGTH or any(character not in "0123456789abcdef" for character in digest):
         msg = f"{label} must be a 64-character lowercase hexadecimal SHA-256 digest."
@@ -287,7 +370,13 @@ def _require_sha256(value: Any, *, label: str) -> str:
 
 
 def _require_string_sequence(value: Any, *, label: str, unique: bool) -> tuple[str, ...]:
-    """Return a validated sequence of non-empty strings."""
+    """
+    Parse an ordered list/tuple of non-empty strings without coercion.
+
+    Order is preserved in the immutable return value. When ``unique`` is true,
+    duplicate identifiers are reported explicitly because order-sensitive
+    sample and field identity cannot admit repeated members.
+    """
     if not isinstance(value, (list, tuple)):
         msg = f"{label} must be a list or tuple of strings."
         raise TypeError(msg)
@@ -300,7 +389,12 @@ def _require_string_sequence(value: Any, *, label: str, unique: bool) -> tuple[s
 
 
 def _require_sha256_sequence(value: Any, *, label: str) -> tuple[str, ...]:
-    """Return a sequence containing only stored SHA-256 digests."""
+    """
+    Parse an order-preserving sequence of canonical SHA-256 digests.
+
+    Duplicate digests are not rejected by this format helper; ordered sample
+    alignment and identity are validated separately by the enclosing schema.
+    """
     values = _require_string_sequence(value, label=label, unique=False)
     return tuple(_require_sha256(item, label=f"{label}[{index}]") for index, item in enumerate(values))
 
@@ -317,7 +411,12 @@ def _require_positive_int(value: Any, *, label: str) -> int:
 
 
 def _require_spatial_shape(value: Any, *, rank: int, label: str) -> tuple[int, ...]:
-    """Return a positive spatial shape of the required rank."""
+    """
+    Parse an exact-rank spatial shape into positive integer dimensions.
+
+    Lists and tuples are accepted for serialized/in-memory symmetry; booleans,
+    zero, negative, and dimension-count mismatches are rejected.
+    """
     if not isinstance(value, (list, tuple)) or len(value) != rank:
         msg = f"{label} must contain exactly {rank} dimensions."
         raise ValueError(msg)
@@ -333,14 +432,25 @@ def _require_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
 
 
 def _json_mapping_copy(value: Any, *, label: str) -> dict[str, Any]:
-    """Return an isolated JSON-compatible mapping copy."""
+    """
+    Canonicalize a mapping through JSON and return an isolated plain dictionary.
+
+    The round trip validates nested JSON compatibility and removes references to
+    producer-owned mutable containers before identity objects are exposed.
+    """
     mapping = dict(_require_mapping(value, label=label))
     encoded = _canonical_json(mapping, label=label)
     return json.loads(encoded.decode("utf-8"))
 
 
 def _require_tensor(value: Any, *, label: str, rank: int) -> Tensor:
-    """Return a finite real floating CPU tensor without forcing contiguous storage."""
+    """
+    Admit one dense finite real tensor and expose a detached CPU view/copy.
+
+    Non-tensor array-like values are converted with ``torch.as_tensor``. Sparse
+    layouts, wrong rank, non-floating/complex dtypes, and non-finite content fail
+    before hashing or model materialization; contiguity is deferred to hashing.
+    """
     tensor = value if isinstance(value, Tensor) else torch.as_tensor(value)
     if tensor.layout != torch.strided:
         msg = f"{label} must be a dense strided tensor."
@@ -359,7 +469,13 @@ def _require_tensor(value: Any, *, label: str, rank: int) -> Tensor:
 
 
 def _validate_task_header(payload: Mapping[str, Any], task: TaskSpec, *, schema_kind: str, schema_version: int, label: str) -> None:
-    """Validate task, version, digest, fields, and tensor layout."""
+    """
+    Bind a payload header to one exact current TaskSpec and schema kind.
+
+    Version, kind, task ID, complete task-contract digest, ordered input/output
+    declarations, and tensor layout must all agree. No aliasing, field reordering,
+    or schema compatibility translation occurs.
+    """
     if payload.get("schema_version") != schema_version:
         msg = f"{label} schema_version must be the current value {schema_version}."
         raise ValueError(msg)
@@ -396,7 +512,13 @@ def _validate_field_tensors(
     spatial_rank: int,
     label: str,
 ) -> tuple[Tensor, ...]:
-    """Validate an exact field mapping without stacking or copying tensors."""
+    """
+    Validate and order a complete field mapping without channel stacking.
+
+    The declaration must match TaskSpec order exactly, mapping keys must contain
+    no missing or unexpected names, and every detached CPU field must share one
+    spatial shape and dtype. The returned tuple follows ``expected`` order.
+    """
     mapping = _require_mapping(fields, label=label)
     domain.field_sets.validate_ordered_fields(declarations, expected, label=f"{label} declaration")
     missing = [name for name in expected if name not in mapping]
@@ -425,7 +547,12 @@ def _stack_fields(
     spatial_rank: int,
     label: str,
 ) -> Tensor:
-    """Validate an exact field mapping and stack in task order."""
+    """
+    Validate exact field membership and materialize a task-order channel stack.
+
+    The leading output axis corresponds one-to-one with ``expected``; field
+    tensors have already been detached to CPU and checked for shared shape/dtype.
+    """
     tensors = _validate_field_tensors(
         fields,
         declarations=declarations,
@@ -437,7 +564,13 @@ def _stack_fields(
 
 
 def _content_fingerprint(metadata: Mapping[str, Any], tensors: Sequence[tuple[str, Tensor]]) -> str:
-    """Hash canonical metadata followed by exact contiguous tensor content."""
+    """
+    Hash framed canonical metadata and labeled exact tensor content with SHA-256.
+
+    Tensor sequence and labels are order-sensitive. Each tensor is framed by its
+    byte count; dtype and shape must therefore be present in the supplied
+    metadata when those properties belong to the identity contract.
+    """
     hasher = hashlib.sha256()
     _update_hash(hasher, _canonical_json(dict(metadata), label="Fingerprint metadata"))
     for label, tensor in tensors:
@@ -451,7 +584,13 @@ def _case_content_fingerprint(
     input_tensors: Sequence[Tensor],
     output_tensors: Sequence[Tensor],
 ) -> str:
-    """Hash case fields as virtual channel stacks without materializing them."""
+    """
+    Recompute a case fingerprint from virtual task-order channel stacks.
+
+    Canonical metadata is followed by separately labeled input and output groups.
+    Group hashing matches the producer's materialized stacks without allocating
+    them during identity-only strict verification.
+    """
     hasher = hashlib.sha256()
     _update_hash(hasher, _canonical_json(dict(metadata), label="Fingerprint metadata"))
     for label, tensors in (("inputs", input_tensors), ("outputs", output_tensors)):
@@ -472,7 +611,14 @@ def source_file_identity(path: Path | str) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        File name, byte count, and SHA-256 content digest.
+        Basename, exact byte count, and lowercase SHA-256 content digest. Parent
+        directories are excluded, so moving an unchanged same-named source does
+        not alter identity.
+
+    Raises
+    ------
+    OSError
+        If the source cannot be opened or read completely.
 
     """
     source_path = Path(path)
@@ -501,7 +647,17 @@ def canonical_metadata_identity(value: Mapping[str, Any]) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Canonical byte count and SHA-256 digest.
+        Canonical UTF-8 byte count and lowercase SHA-256 digest.
+
+    Raises
+    ------
+    TypeError
+        If nested metadata is not JSON-compatible or contains non-finite values.
+
+    Notes
+    -----
+    Callers must remove producer-specific path fields before this function; it
+    canonicalizes content but does not know which metadata keys are portable.
 
     """
     encoded = _canonical_json(dict(value), label="Source metadata identity")
@@ -541,7 +697,24 @@ def build_case_payload(
     Returns
     -------
     dict[str, Any]
-        Validated case payload with deterministic fingerprint.
+        Current-schema payload with detached CPU field tensors, exact metadata,
+        and a deterministic lowercase SHA-256 fingerprint.
+
+    Raises
+    ------
+    TypeError
+        If identifiers, source mappings, or field values violate required JSON,
+        tensor, or floating-dtype types.
+    ValueError
+        If task fields, shapes, finiteness, declarations, or metadata violate the
+        exact single-case schema.
+
+    Notes
+    -----
+    The fingerprint binds schema/task identity, case/sample identity, ordered
+    fields, tensor metadata, path-independent ``source_identity``, and exact
+    input/output bytes. ``source_metadata`` is retained for reproducibility but
+    deliberately excluded from the case content digest.
 
     """
     normalized_case_id = _require_non_empty_string(case_id, label="case_id")
@@ -611,7 +784,14 @@ def _validate_case_parts(
     task: TaskSpec,
     verify_content: bool,
 ) -> _ValidatedCaseParts:
-    """Validate one case without materializing channel stacks."""
+    """
+    Validate one current case while deferring model channel-stack allocation.
+
+    Exact schema/header, singleton sample identity, field tensors, spatial shape,
+    tensor metadata, source mappings, and stored digest are always checked.
+    ``verify_content`` additionally streams canonical identity metadata and all
+    task-order tensor bytes and rejects a digest mismatch.
+    """
     mapping = _require_mapping(payload, label="Case payload")
     _require_exact_keys(mapping, _CASE_REQUIRED_KEYS, label="Case payload")
     _validate_task_header(
@@ -731,6 +911,21 @@ def validate_case_identity(
         Structurally validated immutable case identity. Content is also
         reverified when ``verify_content=True``.
 
+    Raises
+    ------
+    TypeError
+        If container, source metadata, field tensors, or stored values have
+        incompatible runtime types.
+    ValueError
+        If exact schema, TaskSpec binding, sample/field identity, tensor metadata,
+        shapes, finiteness, or the optional content fingerprint check fails.
+
+    Notes
+    -----
+    Identity-only validation does not allocate model channel stacks. With the
+    default ``verify_content=False``, the stored producer digest is syntax-checked
+    but tensor bytes are not rehashed.
+
     """
     return _validate_case_parts(
         payload,
@@ -763,8 +958,24 @@ def validate_case_payload(
     Returns
     -------
     ValidatedCase
-        Structurally validated model tensors and stored identity. Content is
-        also reverified when ``verify_content=True``.
+        Structurally validated, task-ordered CPU model tensors and isolated
+        source mappings. Content is also reverified when
+        ``verify_content=True``.
+
+    Raises
+    ------
+    TypeError
+        If container, source metadata, field tensors, or stored values have
+        incompatible runtime types.
+    ValueError
+        If exact schema, TaskSpec binding, sample/field identity, tensor metadata,
+        shapes, finiteness, or the optional content fingerprint check fails.
+
+    Notes
+    -----
+    Materialization allocates input and output channel stacks. The default trusts
+    the syntax-checked producer fingerprint after structural validation; strict
+    verification rehashes all tensor bytes first.
 
     """
     parts = _validate_case_parts(
@@ -819,7 +1030,24 @@ def build_merged_dataset_payload(
     Returns
     -------
     dict[str, Any]
-        Validated merged payload with deterministic fingerprint.
+        Current-schema merged payload with detached CPU BCHW tensors and a
+        deterministic lowercase SHA-256 content fingerprint.
+
+    Raises
+    ------
+    TypeError
+        If identifiers, source mappings, fingerprints, or tensors violate
+        required runtime and JSON-compatible types.
+    ValueError
+        If ordered membership, source alignment, tensor rank/channel/spatial
+        shape, finiteness, or exact TaskSpec declarations disagree.
+
+    Notes
+    -----
+    The portable fingerprint excludes ``dataset_id`` but binds ordered sample
+    IDs, task/schema metadata, source identities and metadata, case fingerprints,
+    tensor metadata, and exact input/output bytes. The function returns data but
+    performs no filesystem publication or overwrite check.
 
     """
     normalized_dataset_id = _require_non_empty_string(dataset_id, label="dataset_id")
@@ -921,6 +1149,22 @@ def validate_merged_dataset_payload(
     DatasetIdentity
         Structurally validated portable ordered dataset identity. Content is
         also reverified when ``verify_content=True``.
+
+    Raises
+    ------
+    TypeError
+        If containers, source metadata, fingerprints, or tensors have
+        incompatible runtime types.
+    ValueError
+        If exact schema/TaskSpec binding, ordered membership, aligned source
+        metadata, tensor geometry/metadata, or optional content verification
+        fails.
+
+    Notes
+    -----
+    Routine validation checks the stored digest format and complete structure but
+    does not rehash tensors. Strict verification canonicalizes normalized source
+    mappings and recomputes the portable metadata-and-content fingerprint.
 
     """
     mapping = _require_mapping(payload, label="Merged dataset")
@@ -1043,7 +1287,23 @@ def membership_digest(
     Returns
     -------
     str
-        Lowercase hexadecimal SHA-256 membership digest.
+        Lowercase SHA-256 digest binding split role, source fingerprint, exact
+        ordered indices, and the corresponding ordered sample IDs.
+
+    Raises
+    ------
+    TypeError
+        If role/fingerprint/sample identifiers or indices have invalid types.
+    ValueError
+        If identifiers are empty/duplicated or selected indices repeat.
+    IndexError
+        If a selected index is negative or outside ``sample_ids``.
+
+    Notes
+    -----
+    Membership order is significant. The function does not sort indices or
+    inspect dataset tensors; the supplied dataset fingerprint carries content
+    identity into the split digest.
 
     """
     normalized_role = _require_non_empty_string(role, label="role")
@@ -1091,7 +1351,22 @@ def case_collection_identity(
     Returns
     -------
     DatasetIdentity
-        Portable identity for the ordered case collection.
+        Portable identity for the ordered case collection, derived without
+        loading or stacking case tensors.
+
+    Raises
+    ------
+    TypeError
+        If ``dataset_id`` is not a non-empty string.
+    ValueError
+        If the collection is empty, sample IDs repeat, or spatial shapes differ.
+
+    Notes
+    -----
+    The collection fingerprint binds task/schema metadata, task field order,
+    ordered case IDs and case fingerprints, and the shared spatial shape. Source
+    paths and materialized tensor bytes are represented transitively by each
+    already-validated case fingerprint.
 
     """
     normalized_dataset_id = _require_non_empty_string(dataset_id, label="dataset_id")

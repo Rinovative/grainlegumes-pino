@@ -14,9 +14,9 @@ Design principles:
   - Search spaces live in YAML files
   - Runtime overrides are explicit command-line options
 
-Boundaries:
-  - Study orchestration belongs to experiments.tuning.optuna
-  - Trial search-space parsing belongs to experiments.tuning.search_space
+This module does NOT:
+  - Create, reopen, or optimize studies; ``experiments.tuning.optuna`` owns lifecycle
+  - Parse trial search schemas; ``experiments.tuning.search_space`` owns admission
 ===============================================================================
 """
 
@@ -26,10 +26,14 @@ import argparse
 import json
 import sys
 
+from . import cli_device
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the Optuna CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Run an Optuna study from a YAML config")
+    parser = argparse.ArgumentParser(
+        description=("Run additional fresh Optuna trials with held-out objective reports at every actual completed epoch")
+    )
     parser.add_argument(
         "config_path",
         type=str,
@@ -38,25 +42,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Load and validate the Optuna YAML without starting training",
+        help=("Validate config, search policy, pruning cadence, device policy, and semantic signature without creating files or importing Optuna"),
     )
     parser.add_argument(
         "--n-trials",
         type=int,
         default=None,
-        help="Override study.n_trials",
+        help="Number of additional fresh trials to run (existing trial history is never resumed)",
     )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Override experiment run.device for all trials",
-    )
+    cli_device.add_device_argument(parser, default=None, help_prefix="Override experiment run.device for all trials")
     parser.add_argument(
         "--output-root",
         type=str,
         default=None,
-        help="Override only the study and trial run/output root",
+        help="Invocation-only study database and fresh trial output root (excluded from the signature)",
     )
     parser.add_argument(
         "--show-progress-bar",
@@ -67,21 +66,43 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the delegated Optuna entry point and return a process exit code."""
+    """
+    Validate or execute an Optuna study and return its process result.
+
+    Parameters
+    ----------
+    argv : list[str] | None, optional
+        Explicit argument vector; ``None`` uses the process arguments.
+
+    Returns
+    -------
+    int
+        ``0`` for a successful dry run or study invocation, ``1`` for a caught
+        study failure, and ``130`` for an interrupted study.
+
+    Notes
+    -----
+    Dry-run validation creates no study files and imports no Optuna SDK. Parser
+    usage errors still raise ``SystemExit`` through ``argparse``.
+
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
         from src.experiments.tuning import experiments_tuning_optuna as optuna  # noqa: PLC0415
 
         study_config = optuna.load_optuna_study_config(args.config_path)
+        study_config = optuna.with_runtime_overrides(
+            study_config,
+            device=args.device,
+            output_root=args.output_root,
+        )
         if args.dry_run:
             print(json.dumps(optuna.describe_optuna_study_config(study_config), indent=2))
             return 0
         study = optuna.run_optuna_study(
             study_config,
             n_trials=args.n_trials,
-            device=args.device,
-            output_root=args.output_root,
             show_progress_bar=args.show_progress_bar,
         )
     except KeyboardInterrupt:

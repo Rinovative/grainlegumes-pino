@@ -15,10 +15,10 @@ Design principles:
   - Task-fixed semantics come only from domain.tasks
   - Saved configuration identifiers never depend on Python class names
 
-Boundaries:
-  - Dataset construction enforces the declared task schema and fingerprint
-  - Physics equations and metric mathematics remain outside config resolution
-  - Checkpoint, resume, run-directory, and artifact lifecycle belong elsewhere
+This module does NOT:
+  - Define dataset storage or fingerprints; dataset objects enforce those contracts
+  - Implement physics equations or metric mathematics; domain and learning modules do
+  - Own checkpoint, resume, run-directory, or artifact lifecycle
 ===============================================================================
 """
 
@@ -37,7 +37,13 @@ from . import experiments_config_defaults as config_defaults
 
 
 class ConfigError(ValueError):
-    """Raised when a semantic config violates a path-specific contract."""
+    """
+    Represent a path-qualified semantic configuration violation.
+
+    This error is raised at raw-schema and resolved-config boundaries. Registry
+    errors are wrapped as ``ConfigError`` when their meaning belongs to a YAML
+    path, while unknown standalone registry lookups may still raise ``ValueError``.
+    """
 
 
 class _YamlModule(Protocol):
@@ -125,8 +131,15 @@ def _reject_unknown(mapping: Mapping[str, Any], allowed: frozenset[str], *, path
         raise ConfigError(msg)
 
 
-def _validate_input_schema(user_config: Mapping[str, Any]) -> None:
-    """Reject noncanonical task-fixed overrides and unknown nested keys."""
+def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C901, PLR0912
+    """
+    Reject noncanonical task-fixed overrides and unknown nested keys.
+
+    Validation walks every user-addressable schema node before defaults are
+    merged. It admits only semantic selectors, rejects derived task contracts
+    and channel counts, and reports the exact dotted path of an unsupported key.
+    The supplied mapping is inspected without mutation.
+    """
     fixed = sorted(set(user_config).intersection(_TASK_FIXED_KEYS))
     if fixed:
         msg = f"Task-fixed config key(s) cannot be overridden: {fixed}. Select a registered task instead."
@@ -158,6 +171,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:
                 frozenset(
                     {
                         "enabled",
+                        "continuity",
                         "derivatives",
                         "interior_crop",
                         "residual_weight",
@@ -196,9 +210,51 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:
             wandb = _as_mapping(tracking["wandb"], path="tracking.wandb")
             _reject_unknown(
                 wandb,
-                frozenset({"enabled", "project", "entity", "group", "tags", "mode"}),
+                frozenset(
+                    {
+                        "enabled",
+                        "project",
+                        "entity",
+                        "group",
+                        "tags",
+                        "mode",
+                        "monitor",
+                        "training_images",
+                        "upload",
+                    }
+                ),
                 path="tracking.wandb",
             )
+            for key in ("monitor", "training_images"):
+                if key not in wandb:
+                    continue
+                settings = _as_mapping(
+                    wandb[key],
+                    path=f"tracking.wandb.{key}",
+                )
+                allowed = frozenset({"enabled", "interval", "max_cases"}) if key == "monitor" else frozenset({"enabled", "interval", "max_snapshots"})
+                _reject_unknown(
+                    settings,
+                    allowed,
+                    path=f"tracking.wandb.{key}",
+                )
+            if "upload" in wandb:
+                upload = _as_mapping(
+                    wandb["upload"],
+                    path="tracking.wandb.upload",
+                )
+                _reject_unknown(
+                    upload,
+                    frozenset(
+                        {
+                            "config",
+                            "summary",
+                            "provenance",
+                            "best_checkpoint",
+                        }
+                    ),
+                    path="tracking.wandb.upload",
+                )
 
     if "evaluation" in user_config:
         evaluation = _as_mapping(user_config["evaluation"], path="evaluation")
@@ -271,6 +327,11 @@ def save_yaml(config: dict[str, Any], path: Path | str) -> None:
     path : Path or str
         Destination YAML path.
 
+    Notes
+    -----
+    Serialization is assembled in memory and published through atomic text
+    replacement; callers never observe a partially written config.
+
     """
     destination = Path(path)
     stream = StringIO()
@@ -313,7 +374,14 @@ def _semantic_modules() -> tuple[Any, Any, Any]:
 
 
 def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) -> None:
-    """Resolve semantic loss and task-selected physics identifiers."""
+    """
+    Resolve loss semantics against the registered task contract in place.
+
+    The helper validates supervised space/weight, continuity formulation,
+    derivative/extension compatibility, crop size, and both linear warmup
+    schedules. Canonical numeric values are written back into ``config`` only
+    after their path-qualified constraints have been checked.
+    """
     _, loss_factory, _ = _semantic_modules()
     loss = _as_mapping(config["loss"], path="loss")
     data_loss = _as_mapping(loss["data"], path="loss.data")
@@ -340,6 +408,23 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
     if selected_physics != task.physics:
         msg = f"Task {task.id!r} physics registry entry does not match its task contract."
         raise ConfigError(msg)
+    continuity = physics.get("continuity")
+    if not isinstance(continuity, str) or not continuity:
+        msg = "loss.physics.continuity must be a non-empty semantic identifier."
+        raise ConfigError(msg)
+    if continuity not in selected_physics.allowed_continuities:
+        available = ", ".join(selected_physics.allowed_continuities)
+        msg = (
+            f"Unknown continuity identifier {continuity!r} at loss.physics.continuity "
+            f"for task {task.id!r}. Available continuity formulations: {available}."
+        )
+        raise ConfigError(msg)
+    try:
+        domain.physics.brinkman.validate_continuity_kind(continuity)
+    except ValueError as error:
+        msg = f"loss.physics.continuity: {error}"
+        raise ConfigError(msg) from error
+    physics["continuity"] = continuity
     derivatives = _as_mapping(physics["derivatives"], path="loss.physics.derivatives")
     try:
         loss_factory.resolve_derivative_kind(
@@ -385,7 +470,13 @@ def _metric_fields(
     task: domain.tasks.spec.TaskSpec,
     path: str,
 ) -> tuple[str, ...]:
-    """Validate and normalize one output-field selection."""
+    """
+    Validate and canonicalize one metric's output-field selection.
+
+    The legacy singular ``field`` spelling is consumed into an ordered
+    ``fields`` list, ``all`` expands in exact TaskSpec output order, and empty,
+    duplicate, or unknown fields raise ``ConfigError`` at ``path``.
+    """
     raw_field = metric.pop("field", None)
     raw_fields = metric.get("fields", "all")
     if raw_field is not None:
@@ -414,7 +505,12 @@ def _metric_fields(
 
 
 def _validate_resolved_metric_keys(config: Mapping[str, Any]) -> None:
-    """Require every resolved metric to use the exact canonical schema."""
+    """
+    Require every resolved metric to use the exact six-field canonical schema.
+
+    This fail-closed pass prevents raw-only aliases or omitted direction from
+    entering saved configs before metric/objective revalidation.
+    """
     evaluation = _as_mapping(config.get("evaluation"), path="evaluation")
     metrics = evaluation.get("metrics")
     if not isinstance(metrics, list):
@@ -429,7 +525,14 @@ def _validate_resolved_metric_keys(config: Mapping[str, Any]) -> None:
 
 
 def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) -> None:
-    """Resolve semantic metrics and materialize one complete objective."""
+    """
+    Resolve metric declarations and materialize one complete objective in place.
+
+    Each metric is bound to an exact tensor space, ordered field set, reduction,
+    direction, and unit-compatible task contract. The selected objective becomes
+    a full copy of exactly one declared metric; partial or contradictory resolved
+    objective mappings fail closed.
+    """
     _, _, metric_registry = _semantic_modules()
     evaluation = _as_mapping(config["evaluation"], path="evaluation")
     raw_metrics = evaluation["metrics"]
@@ -462,6 +565,9 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
             msg = f"{path}: {error}"
             raise ConfigError(msg) from error
         fields = _metric_fields(metric, task=task, path=path)
+        if kind == "macro_rmse" and fields != task.output_names:
+            msg = f"{path} macro_rmse must select every TaskSpec output field in declared order: {list(task.output_names)}."
+            raise ConfigError(msg)
         if space == "physical" and len(fields) != 1:
             units = {task.field(field).unit for field in fields}
             if len(units) > 1:
@@ -506,7 +612,26 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
 
 
 def get_resolved_objective(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Return and validate the complete canonical objective from a resolved config."""
+    """
+    Return the complete canonical objective from a resolved experiment config.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Candidate resolved config containing ``evaluation.objective`` and the
+        corresponding metric declaration.
+
+    Returns
+    -------
+    dict[str, Any]
+        Isolated id, kind, space, ordered fields, reduction, and direction.
+
+    Raises
+    ------
+    ConfigError
+        If the objective is partial, unsupported, or inconsistent with metrics.
+
+    """
     evaluation = _as_mapping(config.get("evaluation"), path="evaluation")
     objective = _as_mapping(evaluation.get("objective"), path="evaluation.objective")
     expected_keys = {"id", "kind", "space", "fields", "reduction", "direction"}
@@ -557,13 +682,32 @@ def _single_ood_dataset(data: Mapping[str, Any], *, path: str) -> str:
 
 
 def _validate_tracking(config: dict[str, Any]) -> None:
-    """Validate the strict optional W&B configuration without credential access."""
+    """
+    Validate and canonicalize optional W&B policy without credential access.
+
+    The complete observer schema, monitor/image cadence, upload allowlist, mode,
+    tags, and identifiers are checked using exact types. This helper performs no
+    SDK import, authentication, network access, directory creation, or run
+    initialization.
+    """
     tracking = _as_mapping(config["tracking"], path="tracking")
     _reject_unknown(tracking, frozenset({"wandb"}), path="tracking")
     wandb = _as_mapping(tracking.get("wandb"), path="tracking.wandb")
     _reject_unknown(
         wandb,
-        frozenset({"enabled", "project", "entity", "group", "tags", "mode"}),
+        frozenset(
+            {
+                "enabled",
+                "project",
+                "entity",
+                "group",
+                "tags",
+                "mode",
+                "monitor",
+                "training_images",
+                "upload",
+            }
+        ),
         path="tracking.wandb",
     )
     enabled = wandb.get("enabled")
@@ -590,12 +734,76 @@ def _validate_tracking(config: dict[str, Any]) -> None:
     if mode not in {"online", "offline"}:
         msg = "tracking.wandb.mode must be 'online' or 'offline'."
         raise ConfigError(msg)
+    monitor = _as_mapping(
+        wandb.get("monitor"),
+        path="tracking.wandb.monitor",
+    )
+    _reject_unknown(
+        monitor,
+        frozenset({"enabled", "interval", "max_cases"}),
+        path="tracking.wandb.monitor",
+    )
+    if type(monitor.get("enabled")) is not bool:
+        msg = "tracking.wandb.monitor.enabled must be boolean."
+        raise ConfigError(msg)
+    for key in ("interval", "max_cases"):
+        value = monitor.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            msg = f"tracking.wandb.monitor.{key} must be a positive integer."
+            raise ConfigError(msg)
+    training_images = _as_mapping(
+        wandb.get("training_images"),
+        path="tracking.wandb.training_images",
+    )
+    _reject_unknown(
+        training_images,
+        frozenset({"enabled", "interval", "max_snapshots"}),
+        path="tracking.wandb.training_images",
+    )
+    if type(training_images.get("enabled")) is not bool:
+        msg = "tracking.wandb.training_images.enabled must be boolean."
+        raise ConfigError(msg)
+    for key in ("interval", "max_snapshots"):
+        value = training_images.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            msg = f"tracking.wandb.training_images.{key} must be a positive integer."
+            raise ConfigError(msg)
+    upload = _as_mapping(
+        wandb.get("upload"),
+        path="tracking.wandb.upload",
+    )
+    _reject_unknown(
+        upload,
+        frozenset(
+            {
+                "config",
+                "summary",
+                "provenance",
+                "best_checkpoint",
+            }
+        ),
+        path="tracking.wandb.upload",
+    )
+    for key, value in upload.items():
+        if type(value) is not bool:
+            msg = f"tracking.wandb.upload.{key} must be boolean."
+            raise ConfigError(msg)
+    wandb["monitor"] = monitor
+    wandb["training_images"] = training_images
+    wandb["upload"] = upload
     tracking["wandb"] = wandb
     config["tracking"] = tracking
 
 
 def _validate_runtime_sections(config: dict[str, Any]) -> None:
-    """Validate generic optimizer, scheduler, training, data, run, and tracking settings."""
+    """
+    Validate all generic runtime sections after semantic resolution.
+
+    This final pass checks optimizer/scheduler identifiers, positive duration,
+    mixed-precision type, logical dataset names, optional tracking policy, and
+    the exact requested device vocabulary. It validates policy only: concrete
+    device resolution remains a top-level execution-service responsibility.
+    """
     optimizer = _as_mapping(config["optimizer"], path="optimizer")
     if optimizer["kind"] != "adamw":
         msg = f"Unknown optimizer identifier {optimizer['kind']!r}. Available optimizers: adamw."
@@ -616,6 +824,9 @@ def _validate_runtime_sections(config: dict[str, Any]) -> None:
             raise ConfigError(msg)
 
     training = _as_mapping(config["training"], path="training")
+    if type(training["mixed_precision"]) is not bool:
+        msg = f"training.mixed_precision must be boolean, got {training['mixed_precision']!r}."
+        raise ConfigError(msg)
     if int(training["epochs"]) <= 0:
         msg = "training.epochs must be positive."
         raise ConfigError(msg)
@@ -632,6 +843,14 @@ def _validate_runtime_sections(config: dict[str, Any]) -> None:
     _validate_tracking(config)
 
     run = _as_mapping(config["run"], path="run")
+    device_module = importlib.import_module("src.learning.learning_device")
+    try:
+        run["device"] = device_module.validate_device_policy(
+            run.get("device"),
+            path="run.device",
+        )
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     for key in ("prefix", "suffix", "name"):
         value = run.get(key)
         if value is None:
@@ -773,6 +992,7 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     effective["paths"] = {
         "project_root": str(common.paths.get_project_root()),
         "storage_root": str(common.paths.get_storage_root()),
+        "data_root": str(common.paths.get_data_root()),
         "dataset_root": str(common.paths.get_dataset_root()),
         "generated_data_root": str(common.paths.get_generated_data_root()),
         "output_root": str(common.paths.get_output_root()),
@@ -830,7 +1050,31 @@ def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.s
 
 
 def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate and return an isolated canonical resolved experiment config."""
+    """
+    Validate and return an isolated canonical resolved experiment config.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Fully resolved candidate, commonly loaded from a saved ``config.yaml``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Deep-copied canonical config whose task contract, paths, model, loss,
+        metrics, objective, runtime sections, and tracking policy all agree.
+
+    Raises
+    ------
+    ConfigError
+        If required derived values are absent or any semantic section drifts.
+
+    Notes
+    -----
+    Validation is read-only: it allocates no run, dataset loader, tracker, or
+    device and never rewrites the supplied mapping.
+
+    """
     if not isinstance(config, Mapping):
         msg = "Resolved experiment config must be a mapping."
         raise ConfigError(msg)
@@ -927,7 +1171,10 @@ def create_dataloaders_from_config(
 
     Notes
     -----
-    The shared task dataset factory validates schema and fingerprint before splitting.
+    The shared task dataset factory validates schema and fingerprint before
+    splitting. Loader construction may read dataset files, fit preprocessing
+    state for a fresh run, or reuse caller-supplied split and processor state;
+    persistence remains the run lifecycle's responsibility.
 
     """
     task = validate_resolved_task_contract(config)

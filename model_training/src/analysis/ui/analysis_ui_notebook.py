@@ -14,9 +14,9 @@ Design principles:
   - Export state is passed explicitly between callbacks
   - Display helpers handle figures, widgets and rich objects uniformly
 
-Boundaries:
-  - Primitive widgets belong to analysis_ui_components
-  - Case-level renderers belong to analysis_ui_viewers
+This module does NOT:
+  - Define primitive widgets or domain-specific scientific controls
+  - Load artifact cases or implement case-level plot mathematics
 ===============================================================================
 """
 
@@ -34,43 +34,21 @@ from matplotlib.figure import Figure
 
 def _sanitize_name(name: str) -> str:
     """
-    Normalize a plot name into a filename-safe format.
+    Convert a display label to the module's minimal export filename stem.
 
-    Converts to lowercase, replaces spaces and various dashes,
-    and removes invalid path characters.
-
-    Parameters
-    ----------
-    name: str
-        The original name to sanitize.
-
-    Returns
-    -------
-        str: Sanitized name suitable for filenames.
-
+    Text is lowercased; spaces become underscores; Unicode dashes become ASCII
+    hyphens; and forward slashes become underscores. No broader path-policy
+    validation is performed here.
     """
     return name.lower().replace(" ", "_").replace("–", "-").replace("—", "-").replace("/", "_")  # noqa: RUF001
 
 
 def _show_anything(result: Any) -> None:
     """
-    Display an arbitrary result object in a Jupyter notebook.
+    Display one supported result in the active notebook output context.
 
-    Supports:
-    - Matplotlib figures
-    - Plotly or other objects with .show() method
-    - Strings
-    - Generic displayable objects (e.g. DataFrames, widgets)
-
-    Parameters
-    ----------
-    result: Any
-        The object to display.
-
-    Returns
-    -------
-        None
-
+    Matplotlib figures are displayed and closed, objects with ``show`` invoke it,
+    strings are printed, and other non-``None`` values use IPython display.
     """
     if isinstance(result, Figure):
         display(result)
@@ -85,36 +63,54 @@ def _show_anything(result: Any) -> None:
 
 def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> Any:
     """
-    Create an interactive dropdown section for multiple plots.
+    Build one lazy dropdown whose entries render notebook views on selection.
 
     Parameters
     ----------
-    plots: list
-        A list of tuples in the form (title, plot_function, plot_name).
-        - title: str - Display name for the dropdown option.
-        - plot_function: Callable - A function that generates the plot when called.
-        - plot_name: str - A sanitized name used for export context.
-    export_state: dict, optional
-        A dictionary to store export information (e.g., current figure, plot name).
-        This allows the export button in the panel to access the current plot for PDF export.
+    plots : list
+        Ordered ``(title, zero-argument callable, export_name)`` entries. Index
+        ``-1`` is reserved for the initial non-rendering prompt.
+    export_state : dict | None, optional
+        Shared mutable state receiving the current title/name and direct or
+        viewer-rendered Matplotlib figure for later PDF export.
 
     Returns
     -------
-        widgets.VBox: A widget container suitable for direct notebook display.
+    ipywidgets.VBox
+        Dropdown and output area. A plot callable runs only when its entry is
+        selected for the first time after a different selection.
+
+    Notes
+    -----
+    Selecting the prompt clears output. Before rendering, the prior export figure
+    is cleared; non-figure widgets may populate it later through viewer callbacks.
 
     """
     dropdown = widgets.Dropdown(
-        options=[(title, i) for i, (title, _, _) in enumerate(plots)],
+        options=[("Choose a view…", -1), *((title, i) for i, (title, _, _) in enumerate(plots))],
+        value=-1,
+        description="View:",
         style={"description_width": "initial"},
-        layout=widgets.Layout(width="230px"),
+        layout=widgets.Layout(width="360px"),
     )
     output = widgets.Output()
-    last_idx = {"idx": None}
+    last_idx: dict[str, int | None] = {"idx": None}
 
     def on_plot_change(change: dict) -> None:
-        """Render the selected plot and update export state."""
+        """
+        Render a newly selected entry and synchronize shared export state.
+
+        Repeated selection is ignored, the prompt clears output, and direct
+        figures replace the export target while viewer widgets may update it
+        later through the shared viewer context.
+        """
         idx = change["new"]
         if last_idx["idx"] == idx:
+            return
+        if idx == -1:
+            with output:
+                output.clear_output(wait=True)
+            last_idx["idx"] = idx
             return
 
         title, plot_func, plot_name = plots[idx]
@@ -127,6 +123,7 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
             if export_state is not None:
                 from . import analysis_ui_viewers as _viewers  # local import to avoid circular import  # noqa: PLC0415
 
+                export_state["fig"] = None
                 _viewers.set_export_context(export_state, plot_name=plot_name, title=title)
 
             result = plot_func()
@@ -138,8 +135,8 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
                 export_state["title"] = title
                 export_state["plot_name"] = plot_name
 
-                # WICHTIG: NICHT auf None ueberschreiben, wenn ein Viewer-Widget zurueckkommt.
-                # In dem Fall setzt analysis_ui_viewers._render_figure die Figure bereits in export_state.
+                # Viewer callbacks may already have stored their rendered Figure
+                # through the shared export context; preserve it for non-Figure widgets.
                 if isinstance(result, Figure):
                     export_state["fig"] = result
 
@@ -152,7 +149,6 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
         last_idx["idx"] = idx
 
     dropdown.observe(on_plot_change, names="value")
-    on_plot_change({"type": "change", "name": "value", "new": 0})
 
     return widgets.VBox([dropdown, output])
 
@@ -161,26 +157,25 @@ def make_toggle_shortcut(
     dfs: dict[str, pd.DataFrame] | list[pd.DataFrame],
 ) -> Callable:
     """
-    Create a toggle shortcut that injects one or multiple datasets into interactive viewer functions.
-
-    Viewer functions that support multi-dataset viewing must include a
-    parameter named 'datasets'. In this case, toggle() will inject a
-    dictionary:
-
-        datasets = { dataset_name: DataFrame, ... }
-
-    If dfs is provided as a list, dataset names are autogenerated as:
-        "df0", "df1", ...
+    Create a dropdown-entry factory that injects labelled datasets into viewers.
 
     Parameters
     ----------
-    dfs : dict[str, pd.DataFrame] or list[pd.DataFrame]
-        One or several datasets to be passed to viewer functions.
+    dfs : dict[str, pandas.DataFrame] | list[pandas.DataFrame]
+        Dataset mapping, or an ordered list assigned stable ``df0``, ``df1``, ...
+        labels within this factory.
 
     Returns
     -------
     Callable
-        A function that generates toggle entries for dropdown sections.
+        Factory returning ``(title, zero-argument callable, export_name)``. A
+        ``datasets`` keyword is injected only when the target callable declares
+        that parameter; caller-supplied keyword arguments otherwise pass through.
+
+    Notes
+    -----
+    Missing export names are generated monotonically. Supplied names use the
+    module's minimal filename-stem sanitizer.
 
     """
     counter = {"i": 0}
@@ -189,7 +184,12 @@ def make_toggle_shortcut(
     dataset_map = dfs if isinstance(dfs, dict) else {f"df{i}": df for i, df in enumerate(dfs)}
 
     def toggle(title: str, func: Callable[..., Any], plot_name: str | None = None, **kwargs: Any) -> tuple[str, Callable[[], Any], str]:
-        """Return one dropdown entry with dataset injection applied."""
+        """
+        Bind one target callable and its export identity into a lazy entry.
+
+        The normalized dataset mapping is injected only for callables declaring a
+        ``datasets`` local/parameter name; invocation remains deferred.
+        """
         # auto-generate plot name
         if plot_name is None:
             plot_name = f"plot_{counter['i']:03d}"
@@ -219,32 +219,36 @@ def make_lazy_panel_with_tabs(
     export_btn_text: str = "Export PDF",
 ) -> widgets.Output:
     """
-    Create a collapsible widget panel containing multiple tabs.
-
-    The panel can be opened and closed using buttons, and each tab may contain
-    arbitrary widgets (e.g., dropdown sections, plots, layouts).
+    Build a collapsible tab panel with optional current-figure PDF export.
 
     Parameters
     ----------
-    sections: Sequence[widgets.Widget]
-        A sequence of widget containers to be placed in individual tabs.
-    tab_titles: Sequence[str], optional
-        Titles for each tab. If not provided, tabs will be titled "Tab 1", "Tab 2", etc.
-    open_btn_text: str, optional
-        Text for the button that opens the panel. Default is "Open section".
-    close_btn_text: str, optional
-        Text for the button that closes the panel. Default is "Close".
-    export_state: dict, optional
-        A dictionary to store export information (e.g., current figure, plot name).
-        This allows the export button in the panel to access the current plot for PDF export.
-    export_dir: str, optional
-        Directory where exported PDF files will be saved. Default is "exports".
-    export_btn_text: str, optional
-        Text for the button that triggers PDF export. Default is "Export PDF".
+    sections : Sequence[ipywidgets.Widget]
+        Already constructed tab contents; scientific views inside them may remain
+        lazy according to their own dropdown/viewer contract.
+    tab_titles : Sequence[str] | None, optional
+        Tab labels, or generated ``Tab N`` names when omitted.
+    open_btn_text, close_btn_text : str, optional
+        Labels for panel visibility controls.
+    export_state : dict | None, optional
+        Shared mutable mapping expected to contain ``fig`` and optional
+        ``plot_name`` for the current Matplotlib export target.
+    export_dir : str, optional
+        Directory created on export; an empty string resolves to the process
+        working directory.
+    export_btn_text : str, optional
+        PDF-export button label.
 
     Returns
     -------
-        widgets.Output: A widget container suitable for direct notebook display.
+    ipywidgets.Output
+        Output initially displaying only the open button.
+
+    Notes
+    -----
+    Opening/closing replaces notebook output but preserves tab/widget state.
+    Export is user-triggered, creates the directory, and writes a UTC-timestamped
+    PDF from the current figure; missing state is reported without writing.
 
     """
     main_out = widgets.Output()
@@ -268,7 +272,12 @@ def make_lazy_panel_with_tabs(
     )
 
     def do_export(_: None = None) -> None:
-        """Export the current Matplotlib figure to PDF."""
+        """
+        Write the current export figure to a UTC-timestamped PDF on button click.
+
+        Directory creation and file publication occur only when shared state holds
+        a figure; otherwise the callback reports status without filesystem writes.
+        """
         with status_out:
             status_out.clear_output(wait=True)
 

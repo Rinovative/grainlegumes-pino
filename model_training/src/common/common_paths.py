@@ -5,27 +5,23 @@ common_paths.py
 Resolve project, storage, dataset, generated-data, run, and artifact paths.
 
 Responsibilities:
-  - Read independent dataset, generated-data, and output roots
-  - Provide stable logical dataset and run-directory resolvers
+  - Map established case, dataset, generated-data, and output storage stages
+  - Provide stable logical case, merged-dataset, and run-directory resolvers
   - Resolve split-index, normalizer, checkpoint and artifact paths
   - Identify current saved-run directories by their required artifact files
 
 Design principles:
   - Environment variables are the canonical path source
-  - Dataset inputs never derive from a run/output override
-  - Defaults keep local notebook and Docker execution usable
-  - Callers pass logical names instead of hardcoded storage paths
-  - The current run contract is explicit and centralized
+  - Case preparation, merged datasets, and outputs have independent roots
+  - Missing overrides resolve from the repository and shared storage roots
+  - Logical names are validated as single path components before composition
+  - The current saved-run file contract is explicit and centralized
 
-Boundaries:
-  - Dataset membership belongs to datasets and training code
-  - Experiment semantics belong to experiments.config
-
-Notes:
-  Default paths:
-    - missing environment variables resolve relative to the repository and storage roots
+This module does NOT:
+  - Create datasets, runs, checkpoints, summaries, or analysis artifacts
+  - Decide dataset membership, experiment semantics, or resume eligibility
+  - Validate artifact contents beyond the shallow completed-run predicate
 ===============================================================================
-
 """
 
 import json
@@ -89,6 +85,24 @@ def get_storage_root() -> Path:
     return get_project_root().parent / "storage"
 
 
+def get_data_root() -> Path:
+    """
+    Return the shared case-preparation data root.
+
+    Returns
+    -------
+    Path
+        Root selected by ``DATA_ROOT`` or ``<STORAGE_ROOT>/data``. Strict
+        per-case payloads live below its ``raw`` stage; merged model inputs and
+        run outputs deliberately do not.
+
+    """
+    root = os.environ.get("DATA_ROOT")
+    if root:
+        return Path(root).expanduser()
+    return get_storage_root() / "data"
+
+
 def get_dataset_root() -> Path:
     """
     Return the root containing immutable task datasets.
@@ -96,13 +110,14 @@ def get_dataset_root() -> Path:
     Returns
     -------
     Path
-        Root selected by ``DATASET_ROOT`` or the repository storage default.
+        Root selected by ``DATASET_ROOT`` or
+        ``<STORAGE_ROOT>/data_training/raw``.
 
     """
     root = os.environ.get("DATASET_ROOT")
     if root:
         return Path(root).expanduser()
-    return get_storage_root() / "data_training"
+    return get_storage_root() / "data_training" / "raw"
 
 
 def get_generated_data_root() -> Path:
@@ -128,17 +143,39 @@ def get_output_root() -> Path:
     Returns
     -------
     Path
-        Root selected by ``OUTPUT_ROOT`` or the storage default.
+        Root selected by ``OUTPUT_ROOT`` or
+        ``<STORAGE_ROOT>/data_training/processed``.
 
     """
     root = os.environ.get("OUTPUT_ROOT")
     if root:
         return Path(root).expanduser()
-    return get_storage_root() / "model_outputs"
+    return get_storage_root() / "data_training" / "processed"
 
 
 def validate_logical_name(value: object, *, label: str) -> str:
-    """Return one safe non-empty logical path component."""
+    """
+    Validate one logical identifier for safe use as a path component.
+
+    Parameters
+    ----------
+    value : object
+        Candidate identifier. It must be a non-empty, already-trimmed string
+        containing no separator, NUL, absolute path, ``.`` or ``..`` value.
+    label : str
+        Contract name included in validation errors.
+
+    Returns
+    -------
+    str
+        The unchanged validated component.
+
+    Raises
+    ------
+    ValueError
+        If ``value`` is not exactly one safe logical component.
+
+    """
     if not isinstance(value, str) or not value or value.strip() != value:
         msg = f"{label} must be a single non-empty path component, got {value!r}."
         raise ValueError(msg)
@@ -146,6 +183,38 @@ def validate_logical_name(value: object, *, label: str) -> str:
         msg = f"{label} must be a single non-empty path component, got {value!r}."
         raise ValueError(msg)
     return value
+
+
+def resolve_case_dataset_dir(
+    dataset_id: str,
+    *,
+    data_root: Path | str | None = None,
+) -> Path:
+    """
+    Resolve the strict per-case directory for one generated batch.
+
+    Parameters
+    ----------
+    dataset_id : str
+        Non-empty logical batch and dataset identifier.
+    data_root : Path | str | None, optional
+        Explicit shared case-preparation root.
+
+    Returns
+    -------
+    Path
+        ``<data_root>/raw/<dataset_id>``. This established stage is separate
+        from the merged dataset root used by training.
+
+    Raises
+    ------
+    ValueError
+        If ``dataset_id`` is not one safe logical path component.
+
+    """
+    dataset_id = validate_logical_name(dataset_id, label="dataset_id")
+    root = Path(data_root).expanduser() if data_root is not None else get_data_root()
+    return root / "raw" / dataset_id
 
 
 def resolve_dataset_dir(dataset_id: str, *, dataset_root: Path | str | None = None) -> Path:
@@ -163,6 +232,11 @@ def resolve_dataset_dir(dataset_id: str, *, dataset_root: Path | str | None = No
     -------
     Path
         ``<dataset_root>/<dataset_id>``.
+
+    Raises
+    ------
+    ValueError
+        If ``dataset_id`` is not one safe logical path component.
 
     """
     dataset_id = validate_logical_name(dataset_id, label="dataset_id")
@@ -185,6 +259,11 @@ def resolve_dataset_path(dataset_id: str, *, dataset_root: Path | str | None = N
     -------
     Path
         ``<dataset_root>/<dataset_id>/<dataset_id>.pt``.
+
+    Raises
+    ------
+    ValueError
+        If ``dataset_id`` is not one safe logical path component.
 
     """
     return resolve_dataset_dir(dataset_id, dataset_root=dataset_root) / f"{dataset_id}.pt"
@@ -212,6 +291,12 @@ def resolve_generated_batch_dir(
     -------
     Path
         ``<generated_data_root>/<stage>/<dataset_id>``.
+
+    Raises
+    ------
+    ValueError
+        If ``dataset_id`` is unsafe or ``stage`` is not exactly ``"raw"`` or
+        ``"processed"``.
 
     """
     dataset_id = validate_logical_name(dataset_id, label="dataset_id")
@@ -244,6 +329,11 @@ def resolve_run_output_dir(
     -------
     Path
         ``<output_root>/<task>/runs/<run_name>``.
+
+    Raises
+    ------
+    ValueError
+        If ``task`` or ``run_name`` is not one safe logical path component.
 
     """
     task = validate_logical_name(task, label="task")
@@ -278,6 +368,12 @@ def resolve_optuna_trial_dir(
     Path
         ``<output_root>/<task>/optuna/<study>/trials/trial_<number>``.
 
+    Raises
+    ------
+    ValueError
+        If task/study identifiers are unsafe or ``trial_number`` is a boolean,
+        non-integer, or negative value.
+
     """
     task = validate_logical_name(task, label="task")
     study_name = validate_logical_name(study_name, label="study_name")
@@ -302,7 +398,12 @@ def resolve_runs_root(task: str, *, output_root: Path | str | None = None) -> Pa
     Returns
     -------
     Path
-        Directory containing run output directories.
+        ``<output_root>/<task>/runs``.
+
+    Raises
+    ------
+    ValueError
+        If ``task`` is not one safe logical path component.
 
     """
     task = validate_logical_name(task, label="task")
@@ -441,8 +542,18 @@ def missing_resume_run_files(run_dir: Path | str) -> tuple[Path, ...]:
     """
     Return files required before an explicit resume can inspect a run.
 
-    A best checkpoint is deliberately not required because an interrupted run
-    may have completed epochs before its first evaluation.
+    Parameters
+    ----------
+    run_dir : Path | str
+        Existing or prospective run output directory.
+
+    Returns
+    -------
+    tuple[pathlib.Path, ...]
+        Missing config, split, normalizer, last-checkpoint, and summary paths in
+        contract order. A best checkpoint is deliberately not required because
+        an interrupted run may precede its first evaluation.
+
     """
     run_dir = Path(run_dir)
     return tuple(run_dir / filename for filename in RESUME_RUN_REQUIRED_FILES if not (run_dir / filename).is_file())
@@ -482,7 +593,8 @@ def is_current_run_dir(run_dir: Path | str) -> bool:
     Returns
     -------
     bool
-        True if the directory contains the required current run files.
+        ``True`` only when every required current-run file exists and the JSON
+        summary has schema version 1 with status ``"completed"``.
 
     """
     run_dir = Path(run_dir)
@@ -547,7 +659,12 @@ def resolve_ood_analysis_dir(run_dir: Path | str, dataset_name: str) -> Path:
     Returns
     -------
     Path
-        Path to analysis/ood/<dataset_name>.
+        Path to ``analysis/ood/<dataset_name>``.
+
+    Raises
+    ------
+    ValueError
+        If ``dataset_name`` is not one safe logical path component.
 
     """
     dataset_name = validate_logical_name(dataset_name, label="dataset_name")

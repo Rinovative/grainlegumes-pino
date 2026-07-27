@@ -67,8 +67,9 @@ ignore = [
   # 🔬 Scientific / research code conventions
   "ANN401",  # Allow Any
   "FBT001", "FBT002", "FBT003",  # Allow boolean arguments
-  "PLR0913",  # Allow many function arguments
+  "PLR0913", "PLR0917",  # Allow many function arguments, including positional scientific APIs
   "N806", "N803",  # Allow scientific variable names
+  "CPY001",  # Keep the Apache copyright notice at repository level
   "EXE002",  # Ignore executable-bit mismatch
   "T201",  # Allow print statements
   "D205", # Allow multi-line docstring summary to be on a separate line
@@ -129,7 +130,6 @@ module = [
   "pandas",
   "scipy",
   "scipy.*",
-  "seaborn",
   "tqdm",
   "tqdm.auto",
 ]

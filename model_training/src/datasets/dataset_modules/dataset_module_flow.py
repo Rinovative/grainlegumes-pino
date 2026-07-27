@@ -11,12 +11,13 @@ Responsibilities:
 
 Design principles:
   - No field filtering, aliasing, reordering, or schema coercion is allowed
-  - Case and merged inputs use the same task contract and validator
-  - Tensor construction is independent of any concrete task field names
+  - Case and merged inputs use the same strict content validators
+  - Tensor construction depends on TaskSpec order, not concrete field names
 
-Boundaries:
-  - Dataset identity algorithms belong to datasets.identity
-  - Splitting and normalization belong to datasets.base
+This module does NOT:
+  - Load files, split membership, fit normalizers, or mutate persistent storage
+  - Define case/merged schemas, fingerprints, or task field semantics
+  - Translate historical payloads or accept partially verified content
 ===============================================================================
 """
 
@@ -31,7 +32,48 @@ if TYPE_CHECKING:
 
 
 class FlowModule:
-    """Expose strict task tensors from a merged or single-case payload."""
+    """
+    Bind one strict task payload to batched model-ready tensors.
+
+    Parameters
+    ----------
+    data : dict[str, Any]
+        Current merged-dataset or single-case payload. The raw mapping is retained
+        by reference; validated tensors are not normalized.
+    task : TaskSpec
+        Authoritative task contract for schema, channel order, and identity.
+
+    Attributes
+    ----------
+    raw_data : dict[str, Any]
+        Original payload mapping retained by reference.
+    task : TaskSpec
+        Authoritative immutable task contract used for validation.
+    mode : str
+        ``"merged"`` or ``"single"`` according to ``schema_kind``.
+    inputs, outputs
+        Batched task-order tensors. A case payload gains a leading batch axis of
+        length one; merged tensors retain their existing batch axis.
+    dataset_identity : DatasetIdentity | None
+        Verified merged identity, or ``None`` for a single case.
+    fields : dict[str, list[str]]
+        Isolated input/output name lists in TaskSpec order.
+
+    Raises
+    ------
+    TypeError
+        If payload containers, metadata, or tensors violate the current schema.
+    ValueError
+        If schema fields, shapes, identities, or recomputed content fingerprints
+        disagree with the TaskSpec, or ``schema_kind`` is unsupported.
+
+    Notes
+    -----
+    Construction always enables strict tensor-byte verification. It performs no
+    file I/O, split selection, normalization, persistent mutation, or historical
+    schema translation.
+
+    """
 
     def __init__(
         self,
@@ -39,23 +81,7 @@ class FlowModule:
         *,
         task: TaskSpec,
     ) -> None:
-        """
-        Validate and materialize a current dataset payload.
-
-        Parameters
-        ----------
-        data : dict[str, Any]
-            Current merged-dataset or single-case payload.
-        task : TaskSpec
-            Authoritative task contract used for exact schema validation.
-
-        Raises
-        ------
-        ValueError
-            If schema, fields, shapes, sample identity, or stored fingerprint
-            are invalid, or strict content verification finds a mismatch.
-
-        """
+        """Strictly verify content and materialize batched tensor bindings."""
         self.raw_data = data
         self.task = task
         schema_kind = data.get("schema_kind")
@@ -99,9 +125,24 @@ class FlowModule:
         Parameters
         ----------
         idx : int
-            Source sample index. Single-case payloads accept only zero.
+            Standard leading-axis tensor index. For single-case payloads, ``0``
+            and Python's equivalent negative index ``-1`` address the sole row.
         sample : dict[str, Any]
-            Mutable sample populated under ``x.input`` and ``y.output``.
+            Mutable sample populated under ``sample["x"]["input"]`` and
+            ``sample["y"]["output"]``; existing nested mappings are reused.
+
+        Raises
+        ------
+        IndexError
+            If ``idx`` is outside the batched tensor bounds.
+        TypeError
+            If an existing ``sample["x"]`` or ``sample["y"]`` value does not
+            support keyed assignment.
+
+        Notes
+        -----
+        Tensor rows are assigned as views; the source tensors and payload are not
+        copied or mutated.
 
         """
         x = sample.setdefault("x", {})

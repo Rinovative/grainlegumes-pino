@@ -1,5 +1,12 @@
 # ruff: noqa: S101, PLR2004
-"""Verify the immutable semantic task and ordered field contract."""
+"""
+Protect the immutable registered task, ordered fields, units, and derived semantics.
+
+The tests establish the exact steady-flow contract, stable serialization/digest,
+registry immutability, ordered declaration rejection, and public domain exports.
+Dataset content identity and experiment-default projection are covered by the
+data and config suites rather than duplicated here.
+"""
 
 from dataclasses import FrozenInstanceError, replace
 
@@ -8,7 +15,12 @@ from src import domain
 
 
 def test_steady_flow_contract_is_exact_and_task_owned() -> None:
-    """The sole registered task owns every fixed tensor/config semantic."""
+    """
+    Resolve the sole registered task and assert its complete steady-flow contract.
+
+    Fields, units, layout, datasets, losses, metrics, physics, objective, and digest
+    must remain task-owned so downstream components share one semantic authority.
+    """
     task = domain.tasks.registry.get_task("steady_flow")
 
     assert domain.tasks.registry.available_tasks() == ("steady_flow",)
@@ -24,14 +36,27 @@ def test_steady_flow_contract_is_exact_and_task_owned() -> None:
     assert task.default_datasets.ood == ("lhs_var120_seed4001",)
     assert task.preprocessing.fit_split == "train"
     assert task.data_losses == ("relative_h1", "relative_l2")
+    assert task.schema_version == 1
     assert task.physics.kind == "steady_2d_brinkman"
+    assert task.physics.continuity == "div_eps_velocity"
+    assert task.physics.allowed_continuities == ("div_velocity", "div_eps_velocity")
     assert [metric.id for metric in task.default_metrics] == [
-        "normalized_relative_h1",
+        "normalized_macro_rmse",
+        "normalized_rmse_p",
+        "normalized_rmse_u",
+        "normalized_rmse_v",
         "normalized_rmse",
+        "normalized_relative_l2",
+        "normalized_relative_h1",
         "physical_rmse_p",
         "physical_rmse_u",
         "physical_rmse_v",
     ]
+    assert task.default_objective.kind == "macro_rmse"
+    assert task.default_objective.space == "normalized"
+    assert task.default_objective.fields == task.output_names
+    assert task.default_objective.reduction == "field_macro_element_mean"
+    assert task.default_objective.direction == "minimize"
     assert {field.name: field.unit for field in (*task.inputs, *task.outputs)} == {
         "x": "m",
         "y": "m",
@@ -47,11 +72,24 @@ def test_steady_flow_contract_is_exact_and_task_owned() -> None:
     assert task.field("kxx").representation == "dimensionless_log10_ratio_to_1_m2"
     assert task.field("kxy").representation == "dimensionless_cross_component_ratio_to_geometric_mean"
     assert len(task.contract_digest) == 64
-    assert task.resolved_contract()["digest"] == task.contract_digest
+    resolved = task.resolved_contract()
+    physics = resolved["physics"]
+    assert isinstance(physics, dict)
+    assert resolved["digest"] == task.contract_digest
+    assert physics["continuity"] == "div_eps_velocity"
+    assert physics["allowed_continuities"] == [
+        "div_velocity",
+        "div_eps_velocity",
+    ]
 
 
 def test_task_contract_is_immutable() -> None:
-    """Registry callers cannot mutate the authoritative descriptor."""
+    """
+    Attempt scalar and tuple-item mutation on the registered frozen task.
+
+    Both mutations must fail and a new lookup must remain unchanged, protecting
+    the process-wide registry from caller-owned state drift.
+    """
     task = domain.tasks.registry.get_task("steady_flow")
     with pytest.raises(FrozenInstanceError):
         task.id = "changed"  # type: ignore[misc]
@@ -70,30 +108,45 @@ def test_task_contract_is_immutable() -> None:
     ids=("swapped-kxy-kyy", "missing-p-bc", "duplicate-kxy"),
 )
 def test_ordered_contract_validator_rejects_drift(actual: tuple[str, ...]) -> None:
-    """Swaps, missing fields, and duplicates fail before tensor use."""
+    """
+    Vary an expected declaration by swapping, omitting, or duplicating one field.
+
+    Every family must fail ordered-field validation while the canonical target
+    remains fixed, protecting channel meaning before tensor use.
+    """
     expected = domain.tasks.registry.get_task("steady_flow").input_names
     with pytest.raises(ValueError, match=r"duplicate|does not match|wrong channel order"):
         domain.field_sets.validate_ordered_fields(actual, expected, label="inputs")
 
 
 def test_public_domain_exports_resolve_and_noncanonical_fields_fail() -> None:
-    """Public imports resolve while noncanonical field names fail."""
+    """
+    Resolve the intended domain exports and query retired task/field spellings.
+
+    Public aliases must reach their canonical objects while noncanonical names
+    fail explicitly, preventing an accidental compatibility API.
+    """
     assert domain.tasks.spec.TaskSpec
     assert domain.tasks.registry.get_task
     assert domain.tasks.steady_flow.STEADY_FLOW.id == "steady_flow"
     assert domain.fields.require_known_field("eps") == "eps"
     with pytest.raises(ValueError, match="Unknown task"):
-        domain.tasks.registry.get_task("transient_heat_moisture")
+        domain.tasks.registry.get_task("unregistered_task")
     with pytest.raises(ValueError, match="Unknown field"):
-        domain.fields.require_known_field("phi")
+        domain.fields.require_known_field("unknown_field")
     with pytest.raises(ValueError, match="Unknown field"):
         domain.fields.require_known_field("pbc")
 
 
 def test_task_declarations_fail_closed_on_runtime_literals_and_layout(
-    future_task: domain.tasks.spec.TaskSpec,
+    synthetic_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """Static Literal hints and current 2D tensor support are enforced at runtime."""
+    """
+    Construct invalid field roles, metric directions, layouts, and operator axes.
+
+    Each runtime value outside the typed/current 2D contract must fail explicitly,
+    because persisted configuration cannot rely on static type checking alone.
+    """
     spec = domain.tasks.spec
     with pytest.raises(ValueError, match="unsupported role"):
         spec.FieldSpec("bad", "unsupported", "1", "identity")  # type: ignore[arg-type]
@@ -102,11 +155,11 @@ def test_task_declarations_fail_closed_on_runtime_literals_and_layout(
             id="bad_direction",
             kind="rmse",
             space="physical",
-            fields=("temperature",),
+            fields=("response_b",),
             reduction="element_mean",
             direction="sideways",  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError, match="current 2D layout"):
-        replace(future_task, tensor_layout=("channel", "batch", "y", "x"))
+        replace(synthetic_task, tensor_layout=("channel", "batch", "y", "x"))
     with pytest.raises(ValueError, match="current 2D operator/normalizer support"):
-        replace(future_task, operator_axes=(1, 2))
+        replace(synthetic_task, operator_axes=(1, 2))

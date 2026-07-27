@@ -1,5 +1,12 @@
 # ruff: noqa: S101
-"""Verify normalized and physical metric spaces, units, and field selection."""
+"""
+Protect named field selection, normalized/physical tensor routing, and metric units.
+
+Synthetic processors show physical RMSE uses inverse-transformed channels and
+TaskSpec units while incompatible mixed-unit aggregates are rejected. Exact
+macro sufficient-statistic algebra is covered by ``test_metric_reduction``;
+these fixtures do not model training normalization quality.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +21,17 @@ _CONFIG = Path(__file__).parents[2] / "configs" / "experiments" / "steady_flow_f
 
 
 class AffineNormalizer:
-    """Apply an affine normalization for observable metric-space checks."""
+    """
+    Apply a scalar affine transform for observable metric-space checks.
+
+    Parameters
+    ----------
+    mean : float
+        Shared physical offset for every synthetic output channel.
+    standard_deviation : float
+        Shared scale; tests use a positive value and do not model fitted statistics.
+
+    """
 
     def __init__(self, mean: float, standard_deviation: float) -> None:
         """Store affine normalization statistics."""
@@ -31,7 +48,12 @@ class AffineNormalizer:
 
 
 class SyntheticProcessor:
-    """Provide the minimal evaluation data-processor surface."""
+    """
+    Provide the minimal evaluation data-processor surface.
+
+    The helper preserves physical targets and exposes only an output normalizer;
+    it is not a production preprocessor and owns no learned or serialized state.
+    """
 
     def __init__(self, normalizer: AffineNormalizer) -> None:
         """Store the synthetic output normalizer."""
@@ -41,8 +63,8 @@ class SyntheticProcessor:
         """Enter evaluation mode."""
 
     def preprocess(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Normalize only the synthetic output target."""
-        return {"x": batch["x"], "y": self.out_normalizer.transform(batch["y"])}
+        """Preserve the physical target in evaluation mode."""
+        return {"x": batch["x"], "y": batch["y"]}
 
 
 class UnitErrorModel(torch.nn.Module):
@@ -58,12 +80,18 @@ def _metrics(*metric_ids: str) -> dict[str, learning.metrics.metrics.DatasetMetr
     config = experiments.config.loader.load_and_resolve_config(_CONFIG)
     selected = [metric for metric in config["evaluation"]["metrics"] if metric["id"] in metric_ids]
     config["evaluation"]["metrics"] = selected
-    return learning.metrics.metrics.build_evaluation_metrics(config)
+    return learning.metrics.metrics.build_evaluation_metrics(config, device=torch.device("cpu"))
 
 
 def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
-    """A normalized error of one maps to physical error two, never four."""
+    """
+    Evaluate unit normalized error through a processor with physical scale two.
+
+    Normalized metrics must remain one and each physical field RMSE must become
+    two exactly once, protecting against missing or duplicate inverse transforms.
+    """
     metrics = _metrics(
+        "normalized_macro_rmse",
         "normalized_rmse",
         "physical_rmse_p",
         "physical_rmse_u",
@@ -83,6 +111,7 @@ def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
         processor,
     )
 
+    assert values["normalized_macro_rmse"] == pytest.approx(1.0)
     assert values["normalized_rmse"] == pytest.approx(1.0)
     assert values["physical_rmse_p"] == pytest.approx(2.0)
     assert values["physical_rmse_u"] == pytest.approx(2.0)
@@ -90,7 +119,12 @@ def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
 
 
 def test_physical_units_and_named_channel_selection() -> None:
-    """Physical metrics follow task field names, units, and channel indices."""
+    """
+    Give pressure and velocity channels distinct constant physical errors.
+
+    Each named metric must select the matching channel and TaskSpec unit, while
+    a normalized-space update must fail instead of mixing tensor spaces.
+    """
     metrics = _metrics("physical_rmse_p", "physical_rmse_u", "physical_rmse_v")
     target = torch.zeros((1, 3, 2, 2))
     pred = torch.stack(
@@ -115,9 +149,14 @@ def test_physical_units_and_named_channel_selection() -> None:
 
 
 def test_incompatible_physical_aggregate_is_rejected() -> None:
-    """Pressure and velocity cannot form a misleading physical overall RMSE."""
+    """
+    Resolve one physical aggregate spanning pressure and both velocity fields.
+
+    Configuration must reject the mixed-unit reduction before runtime so a single
+    scalar cannot falsely imply a coherent physical unit.
+    """
     raw = experiments.config.loader.load_yaml(_CONFIG)
-    aggregate = copy.deepcopy(raw["evaluation"]["metrics"][2])
+    aggregate = copy.deepcopy(next(metric for metric in raw["evaluation"]["metrics"] if metric["id"] == "physical_rmse_p"))
     aggregate.pop("field")
     aggregate["id"] = "physical_rmse_all"
     aggregate["fields"] = ["p", "u", "v"]

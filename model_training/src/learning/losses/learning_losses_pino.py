@@ -10,10 +10,15 @@ Responsibilities:
   - Construct physical tensor views once for domain-owned physics evaluators
   - Expose current named components and reusable domain diagnostics
 
-Boundaries:
-  - Equations, derivatives, residuals, and boundary calculations live in domain
-  - Semantic config parsing and implementation selection live in losses.factory
-  - Dataset metric definitions and aggregation live in learning.metrics
+Design principles:
+  - Named loss components remain stable across supervised and physics-enabled runs
+  - Normalized predictions are converted to physical views explicitly and once
+  - Warmup is deterministic at completed-epoch boundaries
+
+This module does NOT:
+  - Define equations, derivatives, residuals, or boundaries; ``domain`` owns them
+  - Parse semantic config or select implementations; ``losses.factory`` owns selection
+  - Define or aggregate dataset metrics; ``learning.metrics`` owns evaluation
 ===============================================================================
 """
 
@@ -38,7 +43,22 @@ class TensorNormalizer(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class LinearWarmup:
-    """Define a deterministic zero-to-target epoch schedule."""
+    """
+    Define an immutable deterministic zero-to-target epoch schedule.
+
+    Parameters
+    ----------
+    target : float
+        Non-negative terminal component weight.
+    epochs : int
+        Non-negative number of zero-based epoch positions needed to reach it.
+
+    Raises
+    ------
+    ValueError
+        If either schedule value is negative.
+
+    """
 
     target: float
     epochs: int
@@ -52,6 +72,21 @@ class LinearWarmup:
             msg = f"Warmup epochs must be non-negative, got {self.epochs}."
             raise ValueError(msg)
 
+    def fraction(self, epoch: int) -> float:
+        """
+        Return the applied zero-to-one fraction at a zero-based epoch position.
+
+        A zero-length schedule returns ``1.0`` immediately; active schedules
+        start at zero and clamp at one. Negative epoch positions raise
+        ``ValueError``.
+        """
+        if epoch < 0:
+            msg = f"Warmup epoch must be non-negative, got {epoch}."
+            raise ValueError(msg)
+        if self.epochs == 0:
+            return 1.0
+        return min(float(epoch) / float(self.epochs), 1.0)
+
     def value(self, epoch: int) -> float:
         """
         Return the scheduled weight for a zero-based epoch position.
@@ -60,13 +95,7 @@ class LinearWarmup:
         and later use the complete target. A zero-length warmup uses the target
         immediately.
         """
-        if epoch < 0:
-            msg = f"Warmup epoch must be non-negative, got {epoch}."
-            raise ValueError(msg)
-        if self.epochs == 0:
-            return self.target
-        fraction = min(float(epoch) / float(self.epochs), 1.0)
-        return self.target * fraction
+        return self.target * self.fraction(epoch)
 
 
 class SemanticComposedLoss(nn.Module):
@@ -74,7 +103,8 @@ class SemanticComposedLoss(nn.Module):
     Compose one supervised or physics-informed semantic training objective.
 
     Named returned contributions are already weighted, so ``total`` is exactly
-    ``data + momentum + continuity + boundary``. Disabled physics components
+    the sum of ``data``, ``momentum``, ``boundary``, and the selected
+    formulation-qualified continuity component. Disabled physics components
     remain present as scalar zeros, giving supervised and physics-informed
     training one stable interface.
 
@@ -90,8 +120,10 @@ class SemanticComposedLoss(nn.Module):
         Task-owned domain physics identifier.
     input_fields, output_fields : tuple[str, ...]
         Exact task field declarations used for name-based domain binding.
-    continuity, boundary : str
-        Task-owned physics formulation identifiers.
+    continuity : str
+        Experiment-selected task-allowed continuity formulation.
+    boundary : str
+        Task-owned boundary formulation identifier.
     derivatives : domain.physics.derivatives.DerivativeOperator
         Explicit numerical derivative backend.
     residual_weight, boundary_weight : LinearWarmup
@@ -100,8 +132,6 @@ class SemanticComposedLoss(nn.Module):
         Interior crop applied by the domain diagnostic evaluator.
 
     """
-
-    component_names = ("total", "data", "momentum", "continuity", "boundary")
 
     def __init__(
         self,
@@ -119,7 +149,12 @@ class SemanticComposedLoss(nn.Module):
         boundary_weight: LinearWarmup,
         interior_crop: int,
     ) -> None:
-        """Initialize the semantic composition and resolve domain physics."""
+        """
+        Validate composition inputs, resolve physics, and register epoch state.
+
+        The zero-based warmup position becomes persistent module state, whereas
+        fitted normalizers and latest detached components remain runtime-only.
+        """
         super().__init__()
         if data_weight < 0:
             msg = f"data_weight must be non-negative, got {data_weight}."
@@ -148,6 +183,38 @@ class SemanticComposedLoss(nn.Module):
         self.register_buffer("current_epoch", torch.zeros((), dtype=torch.long), persistent=True)
         self._last_components: dict[str, Tensor] = {}
 
+    @property
+    def continuity_component_name(self) -> str:
+        """
+        Return the selected formulation-qualified continuity component name.
+
+        Returns
+        -------
+        str
+            Stable selected continuity contribution identifier.
+
+        """
+        return f"continuity_{self.continuity}"
+
+    @property
+    def component_names(self) -> tuple[str, ...]:
+        """
+        Return the exact ordered named loss-component interface.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Total, data, momentum, boundary, and selected continuity names.
+
+        """
+        return (
+            "total",
+            "data",
+            "momentum",
+            "boundary",
+            self.continuity_component_name,
+        )
+
     def set_normalizers(
         self,
         *,
@@ -167,20 +234,47 @@ class SemanticComposedLoss(nn.Module):
         self.out_normalizer = out_normalizer
 
     def set_epoch(self, epoch: int) -> None:
-        """Set the zero-based deterministic warmup position."""
+        """
+        Mutate the persistent zero-based warmup position.
+
+        The scalar buffer is checkpointed with the loss module. Booleans and
+        negative or non-integer positions raise ``ValueError``.
+        """
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             msg = f"epoch must be a non-negative integer, got {epoch!r}."
             raise ValueError(msg)
         self.current_epoch.fill_(epoch)
 
     def component_weights(self, *, epoch: int | None = None) -> dict[str, float]:
-        """Return explicit weights for every named non-total component."""
+        """
+        Return explicit weights for every named non-total component.
+
+        ``epoch`` overrides the checkpointed warmup position for this query.
+        Disabled physics keeps its stable component keys with zero weights.
+        """
         position = int(self.current_epoch.item()) if epoch is None else epoch
         return {
             "data": self.data_weight,
             "momentum": self.residual_weight.value(position) if self.physics_enabled else 0.0,
-            "continuity": self.residual_weight.value(position) if self.physics_enabled else 0.0,
             "boundary": self.boundary_weight.value(position) if self.physics_enabled else 0.0,
+            self.continuity_component_name: (self.residual_weight.value(position) if self.physics_enabled else 0.0),
+        }
+
+    def telemetry_state(self, *, epoch: int | None = None) -> dict[str, float]:
+        """
+        Return applied physics weights and warmup fractions for one epoch.
+
+        Supervised configurations return no synthetic physics telemetry. The
+        selected continuity contribution shares the declared residual weight.
+        """
+        if not self.physics_enabled:
+            return {}
+        position = int(self.current_epoch.item()) if epoch is None else epoch
+        return {
+            "weight_physics": self.residual_weight.value(position),
+            "weight_boundary": self.boundary_weight.value(position),
+            "warmup_physics_fraction": self.residual_weight.fraction(position),
+            "warmup_boundary_fraction": self.boundary_weight.fraction(position),
         }
 
     def compute_physics_diagnostics(
@@ -205,11 +299,8 @@ class SemanticComposedLoss(nn.Module):
             Reusable full-field and scalar physical diagnostics.
 
         """
-        if not self.physics_enabled:
-            msg = "Physics diagnostics are unavailable when loss.physics.enabled is false."
-            raise RuntimeError(msg)
         if self.in_normalizer is None or self.out_normalizer is None:
-            msg = "Physics-informed loss requires fitted input and output normalizers."
+            msg = "Physics diagnostics require fitted input and output normalizers."
             raise RuntimeError(msg)
         inputs_physical = self.in_normalizer.inverse_transform(x)
         outputs_physical = self.out_normalizer.inverse_transform(pred)
@@ -254,34 +345,35 @@ class SemanticComposedLoss(nn.Module):
         Returns
         -------
         dict[str, torch.Tensor]
-            Scalar ``total``, ``data``, ``momentum``, ``continuity``, and
-            ``boundary`` contributions.
+            Scalar ``total``, ``data``, ``momentum``, ``boundary``, and selected
+            formulation-qualified continuity contributions.
 
         """
         if pred.shape != y.shape:
             msg = f"Prediction and target shapes must match, got {tuple(pred.shape)} and {tuple(y.shape)}."
             raise ValueError(msg)
         weights = self.component_weights(epoch=epoch)
+        continuity_name = self.continuity_component_name
         data = weights["data"] * self.data_loss(pred, y)
         zero = pred.new_zeros(())
         momentum = zero
-        continuity = zero
         boundary = zero
+        continuity = zero
         if self.physics_enabled:
             if x is None:
                 msg = "Physics-informed loss requires the normalized input tensor x."
                 raise ValueError(msg)
             diagnostics = self.compute_physics_diagnostics(pred, x=x)
             momentum = weights["momentum"] * diagnostics.momentum_mse
-            continuity = weights["continuity"] * diagnostics.continuity_mse
             boundary = weights["boundary"] * diagnostics.boundary_mse
-        total = data + momentum + continuity + boundary
+            continuity = weights[continuity_name] * diagnostics.continuity_mse
+        total = data + momentum + boundary + continuity
         return {
             "total": total,
             "data": data,
             "momentum": momentum,
-            "continuity": continuity,
             "boundary": boundary,
+            continuity_name: continuity,
         }
 
     @property
@@ -298,7 +390,13 @@ class SemanticComposedLoss(nn.Module):
         epoch: int | None = None,
         **_kwargs: Any,
     ) -> Tensor:
-        """Return the scalar total semantic loss."""
+        """
+        Return the scalar total while caching detached named components.
+
+        ``y`` is mandatory; physics-enabled compositions additionally require
+        ``x`` through :meth:`compute_components`. Extra keyword arguments are
+        ignored for compatibility with generic training-loop loss calls.
+        """
         if y is None:
             msg = "SemanticComposedLoss requires a target tensor y."
             raise ValueError(msg)

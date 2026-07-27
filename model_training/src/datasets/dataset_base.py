@@ -10,14 +10,15 @@ Responsibilities:
   - Return split indices for persistence by callers
 
 Design principles:
-  - Split creation uses explicit seeds and ordered membership digests
-  - Reused splits validate task and train/OOD fingerprints
-  - Normalizers are fit from training data only
-  - DataLoader settings are controlled by config values
+  - Split creation uses explicit membership, loader, and worker seeds
+  - Reused splits validate task, ordered membership, and dataset fingerprints
+  - Per-channel normalizers are fit from training membership only
+  - Returned split metadata is complete but remains caller-owned for persistence
 
-Boundaries:
-  - Split persistence belongs to experiments and training orchestration
-  - Simulation-specific sample construction belongs to datasets.simulation
+This module does NOT:
+  - Save split indices, normalizer state, checkpoints, or run metadata
+  - Construct simulation samples or define dataset fingerprint algorithms
+  - Resolve dataset paths, devices, tasks, or experiment configuration defaults
 ===============================================================================
 """
 
@@ -61,7 +62,12 @@ _NORMALIZER_DENOMINATOR_FLOOR = 1e-7
 
 
 def _required_metadata_count(metadata: Mapping[str, Any], key: str) -> int:
-    """Return a required positive integer count from split metadata."""
+    """
+    Parse one required positive count from persisted split metadata.
+
+    Booleans are rejected even though they are integer subclasses, preserving an
+    unambiguous schema for sample counts and spatial dimensions.
+    """
     value = metadata.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
         msg = f"split_indices.pt metadata {key!r} must be an integer."
@@ -73,7 +79,12 @@ def _required_metadata_count(metadata: Mapping[str, Any], key: str) -> int:
 
 
 def _normalized_fraction(value: Any, *, label: str, allow_one: bool) -> float:
-    """Return a finite split fraction in the supported interval."""
+    """
+    Normalize a finite non-boolean split fraction to the supported interval.
+
+    The lower bound is always open. ``allow_one`` selects ``(0, 1]`` for OOD
+    selection or ``(0, 1)`` when a non-empty complementary split is required.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         msg = f"{label} must be numeric."
         raise TypeError(msg)
@@ -95,7 +106,13 @@ def _normalized_seed(value: Any, *, label: str) -> int:
 
 
 def _validated_index_tensor(split_info: Mapping[str, Any], key: str) -> Tensor:
-    """Return one non-empty, unique, one-dimensional integer index tensor."""
+    """
+    Isolate one persisted membership tensor in canonical CPU ``long`` form.
+
+    Admission requires a non-empty, one-dimensional, unique integer tensor;
+    booleans, floating/complex values, and duplicate membership are rejected.
+    The returned clone cannot mutate the loaded persistence payload.
+    """
     value = split_info.get(key)
     if not isinstance(value, Tensor):
         msg = f"split_indices.pt key {key!r} must be a torch.Tensor."
@@ -125,7 +142,12 @@ def _validate_index_bounds(indices: Tensor, *, key: str, full_count: int) -> Non
 
 
 def _validate_train_eval_partition(train_indices: Tensor, eval_indices: Tensor, *, n_train_full: int) -> None:
-    """Require train/eval to be disjoint and cover the full training dataset."""
+    """
+    Require an exact disjoint partition of every ordered training source index.
+
+    Validation is independent of index order: concatenated membership must sort
+    to ``range(n_train_full)`` exactly once, with no train/eval overlap.
+    """
     overlap = train_indices[torch.isin(train_indices, eval_indices)]
     if overlap.numel():
         msg = f"Saved train/eval indices must be disjoint; overlapping indices include {overlap[:10].tolist()}."
@@ -139,7 +161,13 @@ def _validate_train_eval_partition(train_indices: Tensor, eval_indices: Tensor, 
 
 
 def _identity_from_mapping(value: Any, *, label: str) -> identity.DatasetIdentity:
-    """Return one strict persisted dataset identity."""
+    """
+    Reconstruct one exact persisted dataset identity without compatibility keys.
+
+    The mapping must contain only logical identity, task/digest, fingerprint,
+    ordered unique sample IDs, count, and positive spatial shape. String and
+    count validation fails before the immutable ``DatasetIdentity`` is returned.
+    """
     if not isinstance(value, Mapping):
         msg = f"{label} must be a mapping."
         raise TypeError(msg)
@@ -190,7 +218,13 @@ def _validate_expected_identity(
     *,
     label: str,
 ) -> None:
-    """Reject any logical, ordered, or fingerprint identity mismatch."""
+    """
+    Bind a saved split to the complete currently loaded dataset identity.
+
+    When an expected identity is supplied, dataclass equality compares the
+    logical ID, task digest, content fingerprint, ordered sample IDs, count, and
+    spatial shape; no partial or path-based match is accepted.
+    """
     if expected is not None and saved != expected:
         msg = f"split_indices.pt {label} dataset identity does not match the loaded dataset. Saved: {saved.as_dict()}; loaded: {expected.as_dict()}."
         raise ValueError(msg)
@@ -226,7 +260,24 @@ def validate_split_info(
     Returns
     -------
     dict[str, Tensor]
-        Validated exact train, eval, and OOD index tensors.
+        Isolated CPU ``long`` train, eval, and OOD membership tensors in their
+        persisted order.
+
+    Raises
+    ------
+    TypeError
+        If the payload, nested metadata, identities, settings, or membership
+        tensors have incompatible runtime types.
+    ValueError
+        If schema keys/version, task binding, counts, fractions, seeds, index
+        partition, dataset identity, or ordered membership digests disagree.
+
+    Notes
+    -----
+    Train and eval must partition the full training dataset exactly once. OOD is
+    a non-empty subset of its source dataset. Optional expected settings and
+    identities bind an existing split to the effective run configuration without
+    mutating the supplied mapping.
 
     """
     if not isinstance(split_info, Mapping):
@@ -360,14 +411,26 @@ def data_processor_from_state(
     Parameters
     ----------
     state : Mapping[str, Any]
-        Current normalizer state mapping.
+        Exact four-key normalizer state. Means and standard deviations must be
+        finite real tensors shaped ``[1, channels, 1, 1]``; standard deviations
+        may be zero because the processor applies its denominator floor.
     device : torch.device | str, optional
-        Target processor device.
+        Target processor device for isolated state tensors.
 
     Returns
     -------
     DefaultDataProcessor
-        Processor containing isolated saved normalization tensors.
+        Processor containing detached, cloned input/output normalization state
+        on ``device`` with normalization axes ``[0, 2, 3]``.
+
+    Raises
+    ------
+    TypeError
+        If the state/key tensors have incompatible container, dtype, or layout
+        types.
+    ValueError
+        If keys, shapes, finiteness, mean/std pairing, or non-negative standard
+        deviations violate the persisted normalizer contract.
 
     """
     if not isinstance(state, Mapping):
@@ -489,9 +552,11 @@ def create_dataloaders(
     batch_size : int, optional
         Batch size for all loaders.
     train_ratio : float, optional
-        Fraction of the training dataset used for training.
+        Fraction in ``(0, 1)`` assigned to training; the remainder is evaluation.
+        Counts use ``int(train_ratio * full_count)``.
     ood_fraction : float, optional
-        Fraction of the OOD dataset selected for evaluation.
+        Fraction in ``(0, 1]`` selected from the OOD dataset, also rounded down
+        with ``int``.
     num_workers : int, optional
         Training DataLoader worker count.
     pin_memory : bool, optional
@@ -499,20 +564,42 @@ def create_dataloaders(
     persistent_workers : bool, optional
         Whether nonzero training workers persist across epochs.
     split_seed : int, optional
-        Deterministic split-membership seed.
+        Deterministic train/eval and OOD membership seed.
     loader_seed : int | None, optional
-        Explicit shuffled-loader generator seed. Defaults to ``split_seed``.
+        Shuffled training-loader generator seed. Defaults to ``split_seed`` but
+        does not change membership.
     worker_seed : int | None, optional
-        Explicit worker-pool seed. Defaults to ``loader_seed``.
+        Base Python/NumPy/PyTorch worker seed. Worker ``i`` receives
+        ``worker_seed + i``; the default is ``loader_seed``.
     split_indices : Mapping[str, Any] | None, optional
-        Saved exact membership to validate and reuse.
+        Saved exact membership to validate against datasets, settings, and
+        membership digests. Omission creates deterministic new membership.
     data_processor : DefaultDataProcessor | None, optional
-        Restored processor; omitted processors are fit on the train split.
+        Restored processor. When omitted, input/output normalizers are fit only
+        on the selected training subset over TaskSpec normalization axes.
 
     Returns
     -------
-    tuple
-        Train loader, eval/OOD loaders, processor, and current split contract.
+    tuple[DataLoader, dict[str, DataLoader], DefaultDataProcessor, dict[str, Any]]
+        Shuffled train loader; non-shuffled ``eval`` and ``ood`` loaders; fitted
+        or supplied processor; and the complete current split contract. This
+        function does not persist the contract or processor.
+
+    Raises
+    ------
+    TypeError
+        If seeds/settings, restored split state, or factory datasets violate
+        required types or fail to expose verified ``DatasetIdentity`` objects.
+    ValueError
+        If ratios select an empty split, logical IDs disagree with payloads, or
+        saved membership/settings/identity fail strict validation.
+
+    Notes
+    -----
+    ``num_workers=0`` forces ``persistent_workers=False``. Evaluation and OOD
+    loaders always use the main process without pinned memory. Fitting a new
+    processor materializes the complete selected training tensors in memory;
+    caller-supplied processors are reused without refitting.
 
     """
     train_ratio = _normalized_fraction(train_ratio, label="train_ratio", allow_one=False)

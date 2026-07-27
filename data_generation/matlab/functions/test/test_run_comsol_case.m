@@ -2,7 +2,7 @@
 clear; clc;
 
 %% --- COMSOL LiveLink Pfad hinzufügen ---
-addpath('C:\Program Files\COMSOL63\mli');
+addpath('C:\Program Files\COMSOL64\mli');
 
 % Verbindung prüfen / starten
 try
@@ -55,7 +55,16 @@ for i = 1:n_cases
 
     try
         results = run_comsol_case(field_path, template_path, output_dir, save_model);
+        assert(isnumeric(results.comsol_solve_s) && ...
+            isscalar(results.comsol_solve_s) && ...
+            isfinite(results.comsol_solve_s) && ...
+            results.comsol_solve_s > 0, ...
+            'COMSOL solve timing must be a finite positive scalar.');
+        assert(results.time_s >= results.comsol_solve_s, ...
+            'Complete COMSOL case time cannot be below solve time.');
         disp("   ✅ Erfolgreich (" + sprintf('%.1f', results.time_s) + " s)");
+        disp("   → Solver: " + sprintf('%.6f', ...
+            results.comsol_solve_s) + " s");
         disp("   → Export: " + results.export_csv);
         if results.save_model
             disp("   → Model saved (.mph)");

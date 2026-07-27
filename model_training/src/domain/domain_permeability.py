@@ -12,12 +12,13 @@ Responsibilities:
 
 Design principles:
   - Permeability contracts are declarative and deterministic
-  - Numeric tensor conversion is left to dataset modules
-  - Dimension detection is based only on field names
+  - Dimension detection depends only on the presence of source field names
+  - Source preference order remains explicit for symmetric component pairs
 
-Boundaries:
-  - Model input field sets belong to domain.field_sets
-  - Physics residual calculations belong to learning.losses
+This module does NOT:
+  - Convert, average, normalize, or validate numerical tensor values
+  - Choose learned model input fields or task channel order
+  - Evaluate permeability-dependent physics residuals
 ===============================================================================
 """
 
@@ -106,7 +107,10 @@ def resolve_internal_to_present_sources(
     Returns
     -------
     dict[str, list[str]]
-        Internal component names mapped to their present source fields.
+        Present internal components in canonical 2D or 3D order, each mapped to
+        present source names in declared preference order. Any z-component
+        selects the 3D candidate order; absent components are omitted rather
+        than synthesized or averaged.
 
     """
     available = set(available_fields)

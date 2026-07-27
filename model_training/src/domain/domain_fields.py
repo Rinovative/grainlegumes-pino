@@ -10,20 +10,15 @@ Responsibilities:
   - Validate exact canonical names without aliases
 
 Design principles:
-  - Field names are declarative constants
-  - Semantic groups avoid duplicated string lists
-  - Naming stays independent of model architecture
+  - Field names are declarative constants independent of model architecture
+  - Semantic groups provide reusable vocabulary, not learned channel order
+  - Registered TaskSpec objects remain authoritative for learned ordering
 
-Boundaries:
-  - Task-specific tensor field order belongs to domain.tasks
-  - Permeability tensor representation belongs to domain.permeability
-
-Notes:
-  - These groups are reusable vocabulary, not a learned tensor contract
-  - The only authoritative learned ordering belongs to a registered TaskSpec
-
+This module does NOT:
+  - Define task-specific tensor layouts or model input/output membership
+  - Define permeability storage conversion or source-field mapping
+  - Accept aliases for canonical field identifiers
 ===============================================================================
-
 """
 
 from __future__ import annotations

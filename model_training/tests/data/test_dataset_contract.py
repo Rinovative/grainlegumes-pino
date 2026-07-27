@@ -1,5 +1,12 @@
 # ruff: noqa: S101
-"""Verify strict case, merged-dataset, builder, and merger schemas."""
+"""
+Protect strict case, merged-dataset, builder, and merger publication contracts.
+
+Synthetic COMSOL-like files exercise TaskSpec ordering, shapes/dtypes, manifest
+and source digests, staging cleanup, overwrite refusal, and separate case versus
+merged roots. Dataset fingerprint algebra is covered in
+``test_dataset_fingerprint``; MATLAB/COMSOL production is never invoked.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +30,12 @@ if TYPE_CHECKING:
 def test_valid_seven_input_three_output_case_is_canonical(
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """Mapping insertion order cannot alter exact task tensor order."""
+    """
+    Build a valid case from reverse-ordered input and output mappings.
+
+    Persisted declarations and stacked tensors must still follow TaskSpec order,
+    preventing caller mapping order from changing channel semantics.
+    """
     reverse_inputs = OrderedDict(
         (
             name,
@@ -70,7 +82,12 @@ def test_missing_and_noncanonical_input_fields_fail(
     missing: str,
     noncanonical: str | None,
 ) -> None:
-    """Missing required fields and noncanonical spellings fail closed."""
+    """
+    Vary each required alias pair between omission and its retired spelling.
+
+    Every family must be rejected while the remaining task fields stay fixed,
+    proving case creation accepts only the exact canonical field set.
+    """
     inputs = {name: torch.zeros((2, 3)) for name in steady_task.input_names if name != missing}
     if noncanonical is not None:
         inputs[noncanonical] = torch.zeros((2, 3))
@@ -91,7 +108,12 @@ def test_duplicate_and_wrong_order_declarations_fail(
     steady_task: domain.tasks.spec.TaskSpec,
     case_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Persisted declarations cannot duplicate or reorder task fields."""
+    """
+    Corrupt one current payload with a duplicate and then a swapped declaration.
+
+    Validation must distinguish both failures before tensor use because labels
+    are the authoritative interpretation of persisted channels.
+    """
     duplicate = case_payload_factory()
     duplicate["fields"]["inputs"][4] = "kxy"
     with pytest.raises(ValueError, match="duplicate"):
@@ -107,7 +129,12 @@ def test_duplicate_and_wrong_order_declarations_fail(
 def test_inconsistent_case_field_shapes_fail(
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """A case cannot stack fields with inconsistent spatial shapes."""
+    """
+    Give one required input a spatial shape different from every peer field.
+
+    Case construction must reject the mismatch before stacking so a malformed
+    grid cannot acquire an apparently valid content fingerprint.
+    """
     inputs = {name: torch.zeros((2, 3)) for name in steady_task.input_names}
     inputs["eps"] = torch.zeros((3, 3))
     outputs = {name: torch.zeros((2, 3)) for name in steady_task.output_names}
@@ -126,7 +153,12 @@ def test_extra_output_and_wrong_tensor_counts_fail(
     steady_task: domain.tasks.spec.TaskSpec,
     case_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Unexpected learned outputs and channel/label disagreement fail."""
+    """
+    Add an undeclared output, then build merged tensors with too few input channels.
+
+    Both creation boundaries must reject semantic drift so field declarations
+    and tensor channel counts remain inseparable.
+    """
     case = case_payload_factory()
     inputs = dict(case["input_fields"])
     outputs = dict(case["output_fields"])
@@ -170,7 +202,12 @@ def _sha256(path: Path) -> str:
 
 
 def _write_raw_export(raw_dir: Path, case_id: str, rows: list[list[Any]]) -> None:
-    """Write the seven-column authoritative input export for one synthetic case."""
+    """
+    Write the seven-column authoritative input export for one synthetic case.
+
+    The helper projects solution rows to the producer's raw-input columns and is
+    intentionally limited to tiny local files used by builder contract tests.
+    """
     raw_rows = [[row[index] for index in (0, 1, 2, 4, 5, 6, 7)] for row in rows]
     content = "\n".join(";".join(map(str, row)) for row in raw_rows) + "\n"
     (raw_dir / f"{case_id}.csv").write_text(content, encoding="utf-8")
@@ -184,7 +221,12 @@ def _write_batch_manifest(
     status: str = "complete",
     save_model: bool = False,
 ) -> None:
-    """Publish the exact terminal synthetic producer contract and file hashes."""
+    """
+    Publish the exact terminal synthetic producer contract and current file hashes.
+
+    The helper models the maintained manifest schema and ordered case membership;
+    it is not a substitute for MATLAB/COMSOL generation or atomic producer writes.
+    """
     case_ids = sorted(path.stem for path in raw_dir.glob("case_*.json"))
     records = []
     for case_id in case_ids:
@@ -238,7 +280,12 @@ def _write_synthetic_comsol_case(
     *,
     include_pressure: bool = True,
 ) -> None:
-    """Write one small unit-bearing COMSOL export and matching metadata."""
+    """
+    Write one small unit-bearing COMSOL solution, raw export, and metadata record.
+
+    Values are deterministic and scientifically minimal; ``include_pressure``
+    deliberately creates a missing-output failure rather than a production case.
+    """
     case_id = f"case_{case_index:04d}"
     (raw_dir / f"{case_id}.json").write_text(
         json.dumps({"geometry": {"nx": 2, "ny": 2}}),
@@ -266,7 +313,12 @@ def test_synthetic_comsol_case_builder_emits_strict_schema(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """The real CSV/JSON builder and merger emit the exact task payloads."""
+    """
+    Feed two synthetic COMSOL cases through the real builder, merger, and loader.
+
+    Published field order, shapes, values, metadata, and sample membership must
+    agree end to end, protecting the case-root versus merged-root handoff.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "synthetic"
     processed_dir = generated_root / "processed" / "synthetic"
@@ -274,12 +326,15 @@ def test_synthetic_comsol_case_builder_emits_strict_schema(
     processed_dir.mkdir(parents=True)
     for case_index in range(2):
         _write_synthetic_comsol_case(raw_dir, processed_dir, case_index)
+    timing_path = processed_dir / "comsol_solve_timing.json"
+    timing_path.write_text(json.dumps({"schema_kind": "comsol_solve_timing"}), encoding="utf-8")
+    assert not (raw_dir / timing_path.name).exists()
 
     result = build_batch_dataset(
         "synthetic",
         task_id=steady_task.id,
         generated_data_root=generated_root,
-        dataset_root=tmp_path / "datasets",
+        data_root=tmp_path / "datasets",
     )
     payload = torch.load(
         result["cases_dir"] / "case_0000.pt",
@@ -290,7 +345,8 @@ def test_synthetic_comsol_case_builder_emits_strict_schema(
     merged_result = merge_batch_cases(
         "synthetic",
         task_id=steady_task.id,
-        dataset_root=tmp_path / "datasets",
+        data_root=tmp_path / "datasets",
+        dataset_root=tmp_path / "merged_datasets",
     )
     merged = torch.load(
         merged_result["dataset_path"],
@@ -316,6 +372,12 @@ def test_synthetic_comsol_case_builder_emits_strict_schema(
     assert merged_identity.sample_ids == ("case_0000", "case_0001")
     assert merged["source_metadata"] == [payload["source_metadata"], payload["source_metadata"]]
     assert loaded[0]["meta"] == payload["source_metadata"]
+    assert set(payload["source_identity"]) == {
+        "raw_export",
+        "raw_metadata",
+        "solution_export",
+        "batch_manifest",
+    }
     assert merged["inputs"].shape == (2, 7, 2, 2)
     assert merged["outputs"].shape == (2, 3, 2, 2)
     assert torch.equal(merged["inputs"][0], validated.inputs)
@@ -328,7 +390,12 @@ def test_builder_rejects_incomplete_generated_batches(
     steady_task: domain.tasks.spec.TaskSpec,
     missing_side: str,
 ) -> None:
-    """Metadata and solution membership must match before publication."""
+    """
+    Remove either metadata or the solution export from a manifest-bound case.
+
+    Both parameter families must fail file-integrity validation and leave no
+    authoritative case directory, protecting complete producer membership.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "incomplete"
     processed_dir = generated_root / "processed" / "incomplete"
@@ -346,16 +413,21 @@ def test_builder_rejects_incomplete_generated_batches(
             "incomplete",
             task_id=steady_task.id,
             generated_data_root=generated_root,
-            dataset_root=dataset_root,
+            data_root=dataset_root,
         )
-    assert not (dataset_root / "incomplete" / "cases").exists()
+    assert not (dataset_root / "raw" / "incomplete" / "cases").exists()
 
 
 def test_builder_failure_does_not_publish_partial_cases(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """A later invalid source case leaves no authoritative case directory."""
+    """
+    Make the second source case invalid after a valid first case can be staged.
+
+    The batch must fail and remove all staging state, proving partial work never
+    becomes an authoritative ``cases`` directory.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "invalid"
     processed_dir = generated_root / "processed" / "invalid"
@@ -375,9 +447,9 @@ def test_builder_failure_does_not_publish_partial_cases(
             "invalid",
             task_id=steady_task.id,
             generated_data_root=generated_root,
-            dataset_root=dataset_root,
+            data_root=dataset_root,
         )
-    batch_dir = dataset_root / "invalid"
+    batch_dir = dataset_root / "raw" / "invalid"
     assert not (batch_dir / "cases").exists()
     assert not list(batch_dir.glob(".cases.*"))
 
@@ -386,7 +458,12 @@ def test_builder_sorts_a_shuffled_non_square_cartesian_grid(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """CSV row order cannot change canonical y/x tensor orientation."""
+    """
+    Shuffle a complete non-square Cartesian export before case construction.
+
+    The builder must restore stable ``(y, x)`` order and field values, protecting
+    tensor orientation from arbitrary COMSOL row ordering.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "shuffled"
     processed_dir = generated_root / "processed" / "shuffled"
@@ -409,7 +486,7 @@ def test_builder_sorts_a_shuffled_non_square_cartesian_grid(
         "shuffled",
         task_id=steady_task.id,
         generated_data_root=generated_root,
-        dataset_root=tmp_path / "datasets",
+        data_root=tmp_path / "datasets",
     )
     payload = torch.load(result["cases_dir"] / f"{case_id}.pt", map_location="cpu", weights_only=False)
     validated = datasets.identity.validate_case_payload(payload, task=steady_task)
@@ -424,7 +501,12 @@ def test_builder_rejects_nonuniform_grid_and_invalid_physical_fields(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """Uniform-grid, SPD permeability, porosity, and finite-state domains fail closed."""
+    """
+    Vary grid spacing and one physical field across four invalid scientific domains.
+
+    Non-uniform coordinates, non-SPD permeability, invalid porosity, and non-finite
+    outputs must each fail before case publication while the task contract stays fixed.
+    """
     nonuniform_root = tmp_path / "nonuniform" / "generated"
     nonuniform_raw = nonuniform_root / "raw" / "nonuniform"
     nonuniform_processed = nonuniform_root / "processed" / "nonuniform"
@@ -443,7 +525,7 @@ def test_builder_rejects_nonuniform_grid_and_invalid_physical_fields(
             "nonuniform",
             task_id=steady_task.id,
             generated_data_root=nonuniform_root,
-            dataset_root=tmp_path / "nonuniform" / "datasets",
+            data_root=tmp_path / "nonuniform" / "datasets",
         )
 
     mutations = {
@@ -473,7 +555,7 @@ def test_builder_rejects_nonuniform_grid_and_invalid_physical_fields(
                 batch_name,
                 task_id=steady_task.id,
                 generated_data_root=generated_root,
-                dataset_root=tmp_path / batch_name / "datasets",
+                data_root=tmp_path / batch_name / "datasets",
             )
 
 
@@ -481,7 +563,12 @@ def test_builder_requires_a_complete_terminal_manifest(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """Missing or failed producer manifests cannot authorize dataset publication."""
+    """
+    Exercise both an absent terminal manifest and one declaring failed status.
+
+    Neither producer state may authorize case publication, preserving the manifest
+    as the required completion boundary rather than treating files as sufficient.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "manifest"
     processed_dir = generated_root / "processed" / "manifest"
@@ -494,7 +581,7 @@ def test_builder_requires_a_complete_terminal_manifest(
             "manifest",
             task_id=steady_task.id,
             generated_data_root=generated_root,
-            dataset_root=tmp_path / "datasets_missing",
+            data_root=tmp_path / "datasets_missing",
         )
 
     _write_batch_manifest(raw_dir, processed_dir, "manifest", status="failed")
@@ -503,7 +590,7 @@ def test_builder_requires_a_complete_terminal_manifest(
             "manifest",
             task_id=steady_task.id,
             generated_data_root=generated_root,
-            dataset_root=tmp_path / "datasets_failed",
+            data_root=tmp_path / "datasets_failed",
         )
 
 
@@ -521,7 +608,12 @@ def test_builder_rejects_malformed_complete_manifest_contract(
     variant: str,
     message: str,
 ) -> None:
-    """A complete status never bypasses exact field-schema or case-record checks."""
+    """
+    Corrupt a complete manifest's field schema, terminal stage, or record key set.
+
+    Each parametrized variant must fail exact-schema validation, proving the
+    ``complete`` label cannot bless structurally incompatible producer evidence.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "strict_manifest"
     processed_dir = generated_root / "processed" / "strict_manifest"
@@ -545,7 +637,7 @@ def test_builder_rejects_malformed_complete_manifest_contract(
             "strict_manifest",
             task_id=steady_task.id,
             generated_data_root=generated_root,
-            dataset_root=tmp_path / "datasets",
+            data_root=tmp_path / "datasets",
         )
 
 
@@ -569,7 +661,12 @@ def test_builder_enforces_production_manifest_configuration(
     value: Any,
     message: str,
 ) -> None:
-    """Manifest configuration has required keys, exact JSON types, ranges, and SHA syntax."""
+    """
+    Delete, add, or replace one producer-configuration field across schema domains.
+
+    Every parametrized key/type/range/digest violation must fail before source use,
+    while the surrounding manifest remains valid to isolate the declared invariant.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "bad_configuration"
     processed_dir = generated_root / "processed" / "bad_configuration"
@@ -590,7 +687,7 @@ def test_builder_enforces_production_manifest_configuration(
             "bad_configuration",
             task_id=steady_task.id,
             generated_data_root=generated_root,
-            dataset_root=tmp_path / "datasets",
+            data_root=tmp_path / "datasets",
         )
 
 
@@ -609,7 +706,12 @@ def test_builder_rejects_authoritative_file_tampering(
     target: str,
     save_model: bool,
 ) -> None:
-    """Every authoritative raw or solution artifact is bound by its SHA-256 digest."""
+    """
+    Tamper with each raw, metadata, solution, and optional-model file after hashing.
+
+    Every target family must fail digest verification, proving the terminal
+    manifest binds bytes rather than merely expected filenames.
+    """
     generated_root = tmp_path / "generated"
     raw_dir = generated_root / "raw" / "tamper"
     processed_dir = generated_root / "processed" / "tamper"
@@ -634,14 +736,19 @@ def test_builder_rejects_authoritative_file_tampering(
             "tamper",
             task_id=steady_task.id,
             generated_data_root=generated_root,
-            dataset_root=tmp_path / "datasets",
+            data_root=tmp_path / "datasets",
         )
 
 
 def test_unversioned_merged_payload_is_rejected(
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """A payload without the required schema declaration is unsupported."""
+    """
+    Present legacy-shaped tensors without the required merged schema marker.
+
+    The flow module must reject them instead of inferring compatibility, keeping
+    maintained dataset loading fail-closed at the persistence boundary.
+    """
     unversioned = {
         "inputs": torch.zeros((1, 7, 2, 3)),
         "outputs": torch.zeros((1, 3, 2, 3)),
@@ -659,8 +766,13 @@ def test_merger_strictly_rejects_modified_case_content(
     steady_task: domain.tasks.spec.TaskSpec,
     case_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Dataset construction rejects replacement content with a stale case hash."""
-    cases_dir = tmp_path / "modified_case" / "cases"
+    """
+    Mutate one saved case tensor while retaining its original case fingerprint.
+
+    The merger must reject the stale content before dataset publication so case
+    files cannot be replaced beneath a trusted logical identity.
+    """
+    cases_dir = tmp_path / "raw" / "modified_case" / "cases"
     cases_dir.mkdir(parents=True)
     payload = case_payload_factory("case_0000")
     payload["input_fields"][steady_task.input_names[0]][0, 0] += 1.0
@@ -670,7 +782,8 @@ def test_merger_strictly_rejects_modified_case_content(
         merge_batch_cases(
             "modified_case",
             task_id=steady_task.id,
-            dataset_root=tmp_path,
+            data_root=tmp_path,
+            dataset_root=tmp_path / "merged",
         )
 
 
@@ -679,8 +792,13 @@ def test_merger_rejects_inconsistent_case_shapes(
     steady_task: domain.tasks.spec.TaskSpec,
     case_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """A batch with individually valid but differently shaped cases fails."""
-    cases_dir = tmp_path / "bad_shapes" / "cases"
+    """
+    Save two independently valid cases with different spatial shapes.
+
+    The merger must reject the batch before stacking or publication because one
+    merged tensor cannot truthfully represent inconsistent grids.
+    """
+    cases_dir = tmp_path / "raw" / "bad_shapes" / "cases"
     cases_dir.mkdir(parents=True)
     torch.save(case_payload_factory("case_0000", shape=(2, 3)), cases_dir / "case_0000.pt")
     torch.save(case_payload_factory("case_0001", shape=(3, 3)), cases_dir / "case_0001.pt")
@@ -689,5 +807,6 @@ def test_merger_rejects_inconsistent_case_shapes(
         merge_batch_cases(
             "bad_shapes",
             task_id=steady_task.id,
-            dataset_root=tmp_path,
+            data_root=tmp_path,
+            dataset_root=tmp_path / "merged",
         )

@@ -1,9 +1,24 @@
 """
-Build task-aware exploratory-analysis DataFrames from strict datasets.
+===============================================================================
+eda_dataframe.py
+===============================================================================
+Materialize bounded task-aware EDA frames from immutable merged datasets.
 
-The loader resolves immutable merged datasets under ``DATASET_ROOT`` and
-delegates all schema, field, shape, identity, and fingerprint validation to the
-shared simulation dataset API.
+Responsibilities:
+  - Resolve logical dataset identifiers only below ``DATASET_ROOT``
+  - Reuse strict dataset schema, content-identity, and fingerprint validation
+  - Preserve TaskSpec field order, units, roles, sample IDs, and source metadata
+  - Load an explicit ordered prefix without mutating the stored dataset
+
+Design principles:
+  - Input is a current merged dataset paired with its authoritative TaskSpec
+  - Output arrays retain stored physical representations and declared field order
+  - Prefix selection preserves dataset identity and never mutates stored samples
+
+This module does NOT:
+  - Reimplement dataset schema, fingerprint, or content-identity validation
+  - Compute statistical or spectral visualizations
+===============================================================================
 """
 
 from __future__ import annotations
@@ -44,26 +59,38 @@ def generate_eda_dataframe(
     max_cases: int | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Load one strict task dataset into an exploratory-analysis DataFrame.
+    Materialize one ordered prefix of a strict task dataset for EDA.
 
     Parameters
     ----------
     dataset_name : str
-        Logical dataset identifier under ``DATASET_ROOT``.
+        Logical dataset identifier resolved below ``DATASET_ROOT``.
     task : TaskSpec
-        Authoritative task defining ordered input and output fields.
-    dataset_root : str | Path | None, optional
-        Explicit dataset root. When omitted, resolve ``DATASET_ROOT`` through
+        Authoritative task defining ordered input/output fields, units, and roles.
+    dataset_root : str | pathlib.Path | None, optional
+        Explicit independent root. When omitted, resolve ``DATASET_ROOT`` through
         :mod:`common.paths`.
     show_progress : bool, optional
-        Display a progress bar while materializing samples.
+        Display a local progress bar while materializing samples.
     max_cases : int | None, optional
-        Positive maximum number of ordered samples to load.
+        Positive maximum number of samples from stored identity order.
 
     Returns
     -------
     tuple[pandas.DataFrame, list[str]]
-        Task-field arrays and isolated source metadata, plus loading messages.
+        Physical/stored task-field arrays plus isolated source metadata, and
+        human-readable loading messages. Frame attrs retain task contract,
+        field units/roles, dataset identity, and loaded/available case counts.
+
+    Raises
+    ------
+    FileNotFoundError, TypeError, ValueError, RuntimeError
+        If path resolution, dataset schema/identity, requested count, or sample
+        tensor contracts are invalid.
+
+    Notes
+    -----
+    Loading is read-only and never changes dataset order or stored samples.
 
     """
     dataset_path = common.paths.resolve_dataset_path(
@@ -106,6 +133,14 @@ def generate_eda_dataframe(
         rows,
         index=pd.Index(sample_ids, name="sample_id"),
     )
+    frame.attrs["task_id"] = task.id
+    frame.attrs["task_contract_digest"] = task.contract_digest
+    frame.attrs["field_names"] = (*task.input_names, *task.output_names)
+    frame.attrs["field_units"] = {field.name: field.unit for field in (*task.inputs, *task.outputs)}
+    frame.attrs["field_roles"] = {field.name: field.role for field in (*task.inputs, *task.outputs)}
+    frame.attrs["dataset_identity"] = dataset.identity.as_dict()
+    frame.attrs["loaded_case_count"] = case_count
+    frame.attrs["available_case_count"] = available
     shapes = {column: getattr(frame[column].iloc[0], "shape", None) for column in frame.columns}
     logs.extend(
         (

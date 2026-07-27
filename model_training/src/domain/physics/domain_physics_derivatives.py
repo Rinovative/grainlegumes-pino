@@ -10,9 +10,14 @@ Responsibilities:
   - Apply explicit spectral extension, spatial-axis, and crop semantics
 
 Design principles:
-  - Operators are independent of task fields, normalizers, losses, and logging
   - Grid spacing and spatial axes are explicit at every numerical boundary
-  - Caller dtype and device are preserved after stable internal FFT work
+  - Cartesian-grid admission fails closed before an equation is evaluated
+  - Caller shape, dtype, and device are restored after internal FFT work
+
+This module does NOT:
+  - Bind task field names, transform normalized data, or select loss weights
+  - Impose equation-specific interior crops or scalar residual reductions
+  - Infer nonuniform, curvilinear, or unstructured-grid derivatives
 ===============================================================================
 """
 
@@ -36,7 +41,14 @@ _RECTILINEAR_EPSILON_FACTOR = 32.0
 
 
 class DerivativeOperator(Protocol):
-    """Define the reusable gradient/divergence interface used by equations."""
+    """
+    Define the reusable physical-field derivative interface used by equations.
+
+    Implementations accept real floating tensors with explicit ``(y, x)`` axes
+    and positive physical spacing. ``gradient`` returns ``(d/dx, d/dy)``;
+    ``divergence`` returns ``d(field_x)/dx + d(field_y)/dy`` without cropping or
+    scalar reduction.
+    """
 
     @property
     def kind(self) -> DerivativeKind:
@@ -74,7 +86,19 @@ class DerivativeOperator(Protocol):
 
 
 def _normalized_axes(ndim: int, axes: SpatialAxes) -> SpatialAxes:
-    """Return distinct non-negative spatial axes for a tensor rank."""
+    """
+    Normalize the declared ``(y, x)`` axes for a tensor rank.
+
+    Negative indices are translated relative to ``ndim`` while order is
+    preserved. Duplicate or out-of-range axes are rejected before tensor
+    movement, differentiation, or cropping.
+
+    Raises
+    ------
+    ValueError
+        If the declaration does not resolve to two distinct in-range axes.
+
+    """
     normalized = tuple(axis if axis >= 0 else ndim + axis for axis in axes)
     if len(set(normalized)) != _SPATIAL_AXIS_COUNT or any(axis < 0 or axis >= ndim for axis in normalized):
         msg = f"Spatial axes {axes!r} are invalid for tensor rank {ndim}."
@@ -83,7 +107,21 @@ def _normalized_axes(ndim: int, axes: SpatialAxes) -> SpatialAxes:
 
 
 def _validate_field(field: Tensor, axes: SpatialAxes) -> SpatialAxes:
-    """Validate a real floating field and its two spatial axes."""
+    """
+    Validate a differentiable real field and return normalized spatial axes.
+
+    The function does not copy data. Each declared spatial dimension must have
+    at least two points, which is the minimum shared by the physical stencil and
+    reflected FFT extension.
+
+    Raises
+    ------
+    TypeError
+        If ``field`` is not a floating-point ``torch.Tensor``.
+    ValueError
+        If the axes are invalid or either spatial dimension is shorter than two.
+
+    """
     if not isinstance(field, Tensor):
         msg = f"Derivative fields must be torch.Tensor instances, got {type(field).__name__}."
         raise TypeError(msg)
@@ -98,7 +136,16 @@ def _validate_field(field: Tensor, axes: SpatialAxes) -> SpatialAxes:
 
 
 def _spacing_tensor(spacing: float | Tensor, *, reference: Tensor, label: str) -> Tensor:
-    """Return one positive finite scalar spacing on the reference device."""
+    """
+    Convert one physical spacing to a scalar on the reference dtype and device.
+
+    Raises
+    ------
+    ValueError
+        If conversion does not produce exactly one finite, strictly positive
+        value.
+
+    """
     value = torch.as_tensor(spacing, dtype=reference.dtype, device=reference.device)
     if value.numel() != 1:
         msg = f"{label} must be scalar, got shape {tuple(value.shape)}."
@@ -110,7 +157,12 @@ def _spacing_tensor(spacing: float | Tensor, *, reference: Tensor, label: str) -
 
 
 def _spacing_float(spacing: float | Tensor, *, reference: Tensor, label: str) -> float:
-    """Return one validated spacing as a Python float for ``torch.fft``."""
+    """
+    Return validated physical spacing as the host scalar required by FFT grids.
+
+    Validation and dtype conversion first follow ``reference``; transferring the
+    scalar to the host does not move or copy the differentiated field.
+    """
     value = _spacing_tensor(spacing, reference=reference, label=label)
     return float(value.detach().cpu().item())
 
@@ -137,7 +189,23 @@ def infer_uniform_spacing(
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor]
-        Scalar ``(dx, dy)`` tensors on the coordinate device.
+        Mean scalar ``(dx, dy)`` tensors on the corresponding coordinate dtype
+        and device.
+
+    Raises
+    ------
+    TypeError
+        If coordinates are not floating tensors or the tolerance is not a real
+        non-boolean number.
+    ValueError
+        If shapes/axes differ, values are non-finite, the grid is not increasing
+        rectilinear Cartesian data, or spacing exceeds ``uniform_tolerance``.
+
+    Notes
+    -----
+    Cross-axis coordinate variation is admitted only at a small dtype-scaled
+    roundoff tolerance. Uniformity is then measured as maximum relative
+    deviation from mean positive spacing independently along x and y.
 
     """
     y_axis, x_axis = _validate_field(x_coordinate, axes)
@@ -202,7 +270,15 @@ def crop_interior(field: Tensor, crop: int, *, axes: SpatialAxes = (-2, -1)) -> 
     Returns
     -------
     torch.Tensor
-        A view of the requested interior.
+        A view of the requested interior; ``crop=0`` returns ``field`` itself.
+
+    Raises
+    ------
+    TypeError
+        If ``crop`` is not an integer or is a boolean.
+    ValueError
+        If ``crop`` is negative, axes are invalid, or cropping would remove a
+        complete spatial dimension.
 
     """
     if isinstance(crop, bool) or not isinstance(crop, int):
@@ -225,7 +301,29 @@ def crop_interior(field: Tensor, crop: int, *, axes: SpatialAxes = (-2, -1)) -> 
 
 @dataclass(frozen=True, slots=True)
 class PhysicalDerivatives:
-    """Compute physical-space derivatives with ``torch.gradient``."""
+    """
+    Compute finite-difference physical-space derivatives with ``torch.gradient``.
+
+    The frozen operator preserves input shape, dtype, and device, uses explicit
+    x/y spacing, and supports no boundary extension. Grid admission and interior
+    cropping remain caller responsibilities.
+
+    Attributes
+    ----------
+    axes : tuple[int, int]
+        Declared ``(y, x)`` axes, normalized and validated when an operation runs.
+    kind : Literal["physical", "spectral"]
+        Semantic metadata identifier; the canonical factory value is
+        ``"physical"``.
+    extension : Literal["none", "reflect"]
+        Must be ``"none"`` for this implementation.
+
+    Raises
+    ------
+    ValueError
+        If constructed with an extension other than ``"none"``.
+
+    """
 
     axes: SpatialAxes = (-2, -1)
     kind: DerivativeKind = "physical"
@@ -243,7 +341,37 @@ class PhysicalDerivatives:
         spacing_x: float | Tensor,
         spacing_y: float | Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Return the physical-space x/y gradient of ``field``."""
+        """
+        Return the physical-space gradient in ``(d/dx, d/dy)`` order.
+
+        Parameters
+        ----------
+        field : torch.Tensor
+            Real floating scalar field with at least two points on each declared
+            spatial axis and arbitrary leading dimensions.
+        spacing_x, spacing_y : float or torch.Tensor
+            Finite positive scalar physical spacings.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            ``(d(field)/dx, d(field)/dy)`` with the input shape, dtype, and
+            device. Derivative units are field units per spacing unit.
+
+        Raises
+        ------
+        TypeError
+            If ``field`` is not a real floating tensor.
+        ValueError
+            If axes, spatial lengths, or either spacing violate the operator
+            contract.
+
+        Notes
+        -----
+        ``torch.gradient`` supplies centered interior differences and its
+        supported one-sided edge stencil; no boundary cells are cropped.
+
+        """
         y_axis, x_axis = _validate_field(field, self.axes)
         dx = _spacing_tensor(spacing_x, reference=field, label="spacing_x")
         dy = _spacing_tensor(spacing_y, reference=field, label="spacing_y")
@@ -258,7 +386,31 @@ class PhysicalDerivatives:
         spacing_x: float | Tensor,
         spacing_y: float | Tensor,
     ) -> Tensor:
-        """Return the physical-space divergence of a vector field."""
+        """
+        Return the physical divergence ``d(field_x)/dx + d(field_y)/dy``.
+
+        Parameters
+        ----------
+        field_x, field_y : torch.Tensor
+            Real floating vector components with identical shapes and arbitrary
+            leading dimensions.
+        spacing_x, spacing_y : float or torch.Tensor
+            Finite positive scalar physical spacings shared by both components.
+
+        Returns
+        -------
+        torch.Tensor
+            Divergence with the component shape, dtype, and device; units are
+            component units per spacing unit when both components share units.
+
+        Raises
+        ------
+        TypeError
+            If either component is not a real floating tensor.
+        ValueError
+            If component shapes, axes, spatial lengths, or spacings are invalid.
+
+        """
         if field_x.shape != field_y.shape:
             msg = f"Vector component shapes must match, got {tuple(field_x.shape)} and {tuple(field_y.shape)}."
             raise ValueError(msg)
@@ -269,7 +421,29 @@ class PhysicalDerivatives:
 
 @dataclass(frozen=True, slots=True)
 class SpectralDerivatives:
-    """Compute FFT derivatives with explicit periodic or reflected extension."""
+    """
+    Compute FFT derivatives with explicit periodic or reflected extension.
+
+    Frequencies are scaled by physical spacing. Reflected extension mirrors both
+    spatial axes before differentiation and crops back to the original domain;
+    stable internal FFT precision is cast back to the caller dtype/device.
+
+    Attributes
+    ----------
+    extension : Literal["none", "reflect"]
+        ``"none"`` assumes periodic input; ``"reflect"`` mirrors both axes.
+    axes : tuple[int, int]
+        Declared ``(y, x)`` axes, normalized and validated per operation.
+    kind : Literal["physical", "spectral"]
+        Semantic metadata identifier; the canonical factory value is
+        ``"spectral"``.
+
+    Raises
+    ------
+    ValueError
+        If ``extension`` is not ``"none"`` or ``"reflect"``.
+
+    """
 
     extension: SpectralExtension = "reflect"
     axes: SpatialAxes = (-2, -1)
@@ -283,7 +457,27 @@ class SpectralDerivatives:
 
     @staticmethod
     def _gradient_last_axes(field: Tensor, dx: float, dy: float) -> tuple[Tensor, Tensor]:
-        """Return a periodic FFT gradient for fields with trailing y/x axes."""
+        """
+        Differentiate trailing periodic y/x axes with physically scaled FFT modes.
+
+        Parameters
+        ----------
+        field : torch.Tensor
+            Validated real field whose last two axes are y and x.
+        dx, dy : float
+            Positive physical spacings used to build angular wavenumbers.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            Periodic ``(d/dx, d/dy)`` fields with the original shape and dtype.
+
+        Notes
+        -----
+        Half and bfloat inputs use float32 FFT work arrays. Multiplication by
+        ``1j*k`` occurs in frequency space and ``irfft2`` restores real fields.
+
+        """
         height, width = field.shape[-2:]
         work_dtype = torch.float32 if field.dtype in {torch.float16, torch.bfloat16} else field.dtype
         work = field.to(work_dtype)
@@ -302,7 +496,36 @@ class SpectralDerivatives:
         spacing_x: float | Tensor,
         spacing_y: float | Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Return the spectral x/y gradient of ``field``."""
+        """
+        Return the spectral gradient in ``(d/dx, d/dy)`` order.
+
+        Parameters
+        ----------
+        field : torch.Tensor
+            Real floating scalar field with arbitrary leading dimensions.
+        spacing_x, spacing_y : float or torch.Tensor
+            Finite positive scalar physical spacings.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            Physically scaled derivatives with the input shape, dtype, and device.
+
+        Raises
+        ------
+        TypeError
+            If ``field`` is not a real floating tensor.
+        ValueError
+            If axes, spatial lengths, or either spacing violate the spectral
+            operator contract.
+
+        Notes
+        -----
+        Arbitrary spatial axes move to trailing y/x positions internally and are
+        restored on return. ``extension="none"`` assumes periodic data;
+        ``"reflect"`` mirrors both axes and crops back to the original domain.
+
+        """
         normalized_axes = _validate_field(field, self.axes)
         dx = _spacing_float(spacing_x, reference=field, label="spacing_x")
         dy = _spacing_float(spacing_y, reference=field, label="spacing_y")
@@ -331,7 +554,29 @@ class SpectralDerivatives:
         spacing_x: float | Tensor,
         spacing_y: float | Tensor,
     ) -> Tensor:
-        """Return the spectral divergence of a vector field."""
+        """
+        Return the FFT divergence ``d(field_x)/dx + d(field_y)/dy``.
+
+        Parameters
+        ----------
+        field_x, field_y : torch.Tensor
+            Real floating vector components with identical shapes.
+        spacing_x, spacing_y : float or torch.Tensor
+            Finite positive scalar physical spacings shared by both components.
+
+        Returns
+        -------
+        torch.Tensor
+            Divergence with the component shape, dtype, and device.
+
+        Raises
+        ------
+        TypeError
+            If either component is not a real floating tensor.
+        ValueError
+            If component shapes, axes, spatial lengths, or spacings are invalid.
+
+        """
         if field_x.shape != field_y.shape:
             msg = f"Vector component shapes must match, got {tuple(field_x.shape)} and {tuple(field_y.shape)}."
             raise ValueError(msg)
@@ -366,7 +611,13 @@ def build_derivative_operator(
     Returns
     -------
     DerivativeOperator
-        Validated reusable derivative backend.
+        Frozen reusable derivative backend with the requested canonical policy.
+
+    Raises
+    ------
+    ValueError
+        If ``kind`` or ``extension`` is unsupported, including reflected
+        extension requested for physical differences.
 
     """
     if kind == "physical":

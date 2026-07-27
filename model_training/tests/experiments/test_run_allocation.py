@@ -1,11 +1,20 @@
 # ruff: noqa: BLE001, S101, EM101, PLR2004, TC003, TRY003
-"""Verify collision-safe run allocation, resume, and lifecycle status."""
+"""
+Protect collision-safe run allocation, writer leases, resume, and status transitions.
+
+Temporary roots cover fresh-leaf refusal, atomic initialization failure, study
+qualified paths, concurrent leases, immutable scientific config, and duration-only
+resume extension. Checkpoint tensor/RNG restoration is covered by
+``test_checkpoint_resume``; no model training is performed here.
+"""
 
 from __future__ import annotations
 
+import copy
 import multiprocessing as mp
 import queue
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +45,12 @@ def _minimal_config(output_root: Path) -> dict[str, Any]:
 
 
 def test_fresh_collision_rejects_before_any_run_write(tmp_path: Path) -> None:
-    """An existing run leaf and marker remain byte-identical on collision."""
+    """
+    Prepare a fresh run at an existing leaf containing an authoritative marker.
+
+    Collision must fail before config/summary writes and preserve every byte,
+    requiring callers to choose explicit resume rather than implicit overwrite.
+    """
     run_dir = tmp_path / "outputs" / "synthetic_task" / "runs" / "run"
     run_dir.mkdir(parents=True)
     marker = run_dir / "marker.bin"
@@ -56,10 +70,16 @@ def test_initialization_failure_never_looks_loadable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A post-allocation initialization failure records failed, never completed."""
+    """
+    Inject config-save failure immediately after run-directory allocation.
+
+    The leaf must retain a failed status and remain non-loadable, preventing partial
+    initialization from appearing complete merely because a directory exists.
+    """
     run_dir = tmp_path / "run"
 
     def fail_save(*_args: Any, **_kwargs: Any) -> None:
+        """Fail exactly where fresh-run initialization persists config."""
         raise OSError("injected config failure")
 
     monkeypatch.setattr(experiments.run.config_loader, "save_yaml", fail_save)
@@ -72,7 +92,12 @@ def test_initialization_failure_never_looks_loadable(
 
 
 def test_optuna_trial_paths_are_study_and_trial_qualified(tmp_path: Path) -> None:
-    """Study identity and trial number independently qualify each leaf."""
+    """
+    Resolve equal trial numbers across studies and unequal trials within one study.
+
+    All leaves must be distinct and exact reallocation must fail, protecting Optuna
+    output ownership from study/trial collisions.
+    """
     first = common.paths.resolve_optuna_trial_dir("task", "study-a", 3, output_root=tmp_path)
     other_study = common.paths.resolve_optuna_trial_dir("task", "study-b", 3, output_root=tmp_path)
     other_trial = common.paths.resolve_optuna_trial_dir("task", "study-a", 4, output_root=tmp_path)
@@ -84,7 +109,12 @@ def test_optuna_trial_paths_are_study_and_trial_qualified(tmp_path: Path) -> Non
 
 
 def test_run_status_transitions_are_atomic_and_explicit(tmp_path: Path) -> None:
-    """Initializing, running, interrupted, resumed, and completed are retained."""
+    """
+    Drive one run through initialization, interruption, resume, and completion.
+
+    Atomic history must retain every state in order and reject a terminal transition,
+    preserving an auditable lifecycle rather than only the latest label.
+    """
     run_dir = experiments.run.allocate_run_directory(tmp_path / "run")
     experiments.run.transition_run_status(run_dir, "initializing")
     experiments.run.transition_run_status(run_dir, "running")
@@ -104,6 +134,117 @@ def test_run_status_transitions_are_atomic_and_explicit(tmp_path: Path) -> None:
         experiments.run.transition_run_status(run_dir, "failed")
 
 
+def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Start with ``auto`` resolved to CPU, interrupt, then resume under explicit CPU.
+
+    The second session must append requested/resolved facts without rewriting the
+    first, preserving runtime history across portable resume.
+    """
+    run_dir = experiments.run.allocate_run_directory(tmp_path / "run-sessions")
+    experiments.run.transition_run_status(run_dir, "initializing")
+    monkeypatch.setattr(experiments.run.learning.device.torch.cuda, "is_available", lambda: False)
+    first_resolution = experiments.run.learning.device.resolve_device("auto")
+    first_started = datetime(2025, 1, 2, 3, 4, tzinfo=UTC)
+    experiments.run.transition_run_status(
+        run_dir,
+        "running",
+        updates=experiments.run.runtime_session_updates(
+            run_dir,
+            first_resolution,
+            started_at=first_started,
+        ),
+    )
+    first_session = experiments.run.read_run_summary(run_dir)["runtime_sessions"][0].copy()
+
+    experiments.run.transition_run_status(run_dir, "interrupted")
+    second_resolution = experiments.run.learning.device.resolve_device("cpu")
+    second_started = datetime(2025, 1, 2, 5, 6, tzinfo=UTC)
+    summary = experiments.run.transition_run_status(
+        run_dir,
+        "running",
+        updates=experiments.run.runtime_session_updates(
+            run_dir,
+            second_resolution,
+            started_at=second_started,
+        ),
+    )
+
+    assert summary["runtime_sessions"][0] == first_session
+    assert summary["runtime_sessions"][0]["requested_policy"] == "auto"
+    assert summary["runtime_sessions"][0]["resolved_device"] == "cpu"
+    assert summary["runtime_sessions"][1]["requested_policy"] == "cpu"
+    assert summary["runtime_sessions"][1]["resolved_device"] == "cpu"
+    assert summary["runtime_sessions"][1]["started_at"] == second_started.isoformat()
+    assert summary["runtime_device"] == second_resolution.as_dict()
+
+
+def test_tracking_runtime_updates_are_atomic_and_session_scoped(
+    tmp_path: Path,
+) -> None:
+    """
+    Update tracking state inside one running session, then append a resume session.
+
+    Atomic session mutation must preserve status history and earlier tracking facts,
+    keeping observer state scoped to the runtime session that produced it.
+    """
+    run_dir = experiments.run.allocate_run_directory(tmp_path / "tracking-sessions")
+    experiments.run.transition_run_status(run_dir, "initializing")
+    resolution = experiments.run.learning.device.resolve_device("cpu")
+    first_started = datetime(2025, 1, 2, 3, 4, tzinfo=UTC)
+    experiments.run.transition_run_status(
+        run_dir,
+        "running",
+        updates=experiments.run.runtime_session_updates(
+            run_dir,
+            resolution,
+            started_at=first_started,
+            session_id="first-session",
+            tracking_state={
+                "enabled": True,
+                "requested_mode": "online",
+                "status": "active",
+            },
+        ),
+    )
+    updated = experiments.run.update_runtime_session(
+        run_dir,
+        "first-session",
+        {
+            "wandb_run_id": "opaque-run-id",
+            "last_logged_epoch": 2,
+            "status": "degraded",
+        },
+    )
+    first_session = copy.deepcopy(updated["runtime_sessions"][0])
+    history = copy.deepcopy(updated["status_history"])
+
+    appended = experiments.run.append_runtime_session(
+        run_dir,
+        resolution,
+        started_at=datetime(2025, 1, 2, 5, 6, tzinfo=UTC),
+        session_id="resume-session",
+        tracking_state={
+            "enabled": True,
+            "requested_mode": "online",
+            "wandb_run_id": "opaque-run-id",
+            "session_kind": "resume",
+            "status": "active",
+        },
+    )
+
+    assert appended["status"] == "running"
+    assert appended["status_history"] == history
+    assert appended["runtime_sessions"][0] == first_session
+    assert first_session["tracking"]["enabled"] is True
+    assert first_session["tracking"]["wandb_run_id"] == "opaque-run-id"
+    assert first_session["tracking"]["status"] == "degraded"
+    assert appended["runtime_sessions"][1]["tracking"]["session_kind"] == "resume"
+
+
 def _resume_config(*, epochs: int = 4) -> dict[str, Any]:
     """Return fixed semantic sections used by resume identity tests."""
     return {
@@ -121,7 +262,12 @@ def _resume_config(*, epochs: int = 4) -> dict[str, Any]:
 
 
 def test_resume_allows_only_duration_increase_and_runtime_location_changes() -> None:
-    """Terminal duration may increase while device/output location remain runtime-only."""
+    """
+    Increase terminal epochs while changing only device and output-root location.
+
+    Resume must accept retained/increased duration and operational relocation but
+    reject shortening, protecting completed progress from rollback.
+    """
     saved = _resume_config(epochs=4)
     requested = _resume_config(epochs=7)
     requested["run"]["device"] = "cuda"
@@ -145,7 +291,12 @@ def test_resume_allows_only_duration_increase_and_runtime_location_changes() -> 
     ],
 )
 def test_resume_rejects_semantic_changes(section: str, replacement: Any) -> None:
-    """Task/data/model/loss/optimizer/scheduler semantics remain immutable."""
+    """
+    Replace each scientific continuation section while increasing allowed duration.
+
+    Every parametrized section must fail resume compatibility, proving operational
+    allowances cannot conceal task, data, model, loss, or optimization drift.
+    """
     saved = _resume_config()
     requested = _resume_config(epochs=6)
     requested[section] = replacement
@@ -155,7 +306,12 @@ def test_resume_rejects_semantic_changes(section: str, replacement: Any) -> None
 
 
 def _attempt_file_lock(lock_path: Path, outcomes: Any) -> None:
-    """Try one fail-fast lock acquisition in a forked process."""
+    """
+    Attempt one nonblocking lock acquisition in a forked worker.
+
+    Only a string outcome crosses the process boundary, allowing the parent to
+    distinguish inherited ownership from correctly blocked acquisition.
+    """
     try:
         with common.locking.exclusive_file_lock(lock_path, blocking=False):
             outcomes.put("acquired")
@@ -169,7 +325,12 @@ def _hold_run_writer_lease(
     release: Any,
     outcomes: Any,
 ) -> None:
-    """Hold one run lease until the parent releases the worker."""
+    """
+    Hold one run-writer lease while the parent probes resume admission.
+
+    Events make lease acquisition and release deterministic; the outcome queue
+    reports timeout, release, or an unexpected worker exception.
+    """
     try:
         with experiments.run.run_writer_lease(run_dir):
             acquired.set()
@@ -182,11 +343,17 @@ def _hold_run_writer_lease(
 
 
 def test_file_lock_blocks_another_thread_in_the_same_process(tmp_path: Path) -> None:
-    """Separate descriptors in sibling threads cannot bypass exclusivity."""
+    """
+    Contend for one nonblocking file lock from a sibling thread in the same process.
+
+    The second descriptor must be blocked, protecting process-local re-entrancy from
+    being mistaken for ownership by arbitrary threads.
+    """
     lock_path = tmp_path / "thread.lock"
     outcomes: queue.Queue[str] = queue.Queue()
 
     def contend() -> None:
+        """Attempt sibling-thread acquisition and report its boundary result."""
         try:
             with common.locking.exclusive_file_lock(lock_path, blocking=False):
                 outcomes.put("acquired")
@@ -203,7 +370,12 @@ def test_file_lock_blocks_another_thread_in_the_same_process(tmp_path: Path) -> 
 
 
 def test_forked_child_does_not_inherit_parent_lock_ownership(tmp_path: Path) -> None:
-    """A forked child cannot inherit the parent thread's re-entrant ownership."""
+    """
+    Fork a child while the parent owns one nonblocking file lock.
+
+    The child must report blocked rather than inherit the parent's ownership token,
+    preserving mutual exclusion across forked worker processes.
+    """
     if "fork" not in mp.get_all_start_methods():
         pytest.skip("POSIX fork context is required for descriptor-inheritance coverage")
     context = mp.get_context("fork")
@@ -225,7 +397,12 @@ def test_resume_prevalidation_rejects_a_second_process_writer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The run lease is acquired before any resume artifact prevalidation."""
+    """
+    Hold a run-writer lease in one process while a second process attempts resume.
+
+    Resume must fail on the active writer before config or artifact admission,
+    preventing concurrent mutation during prevalidation.
+    """
     if "fork" not in mp.get_all_start_methods():
         pytest.skip("POSIX fork context is required for process lease coverage")
     context = mp.get_context("fork")
@@ -241,7 +418,12 @@ def test_resume_prevalidation_rejects_a_second_process_writer(
     holder.start()
     try:
         assert acquired.wait(timeout=5)
-        monkeypatch.setattr(experiments.run.config_loader, "load_and_resolve_config", lambda _path: {})
+        monkeypatch.setattr(
+            experiments.run.config_loader,
+            "load_yaml",
+            lambda _path: {"run": {"device": "cpu"}, "training": {"mixed_precision": False}},
+        )
+        monkeypatch.setattr(experiments.run.config_loader, "resolve_config", lambda raw: raw)
         with pytest.raises(experiments.run.RunLifecycleError, match="active writer lease"):
             experiments.run.run_experiment("unused.yaml", resume=run_dir)
     finally:

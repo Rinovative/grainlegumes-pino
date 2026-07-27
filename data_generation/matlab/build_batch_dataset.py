@@ -2,17 +2,23 @@
 ===============================================================================
 build_batch_dataset.py
 ===============================================================================
-Build strict task-aware case payloads from generated COMSOL exports.
+Build strict task-aware case payloads from a completed COMSOL batch.
 
 Responsibilities:
-  - Resolve source columns through the registered task field declarations
-  - Convert permeability fields to their declared stored representations
-  - Save exact task fields with stable source identity and case fingerprints
+  - Verify the terminal producer manifest and every bound source-file digest
+  - Canonicalize uniform Cartesian exports in task-declared field order
+  - Convert permeability components to stored representations and validate physics
+  - Publish fingerprinted case payloads atomically beneath the case-data root
 
 Design principles:
-  - Learned field order comes only from TaskSpec
-  - Source column insertion order never controls tensor order
-  - Existing case targets are never overwritten implicitly
+  - TaskSpec alone owns learned field names, channel order, and source mappings
+  - Source identity includes authoritative exports, metadata, and the batch manifest
+  - A complete case directory appears only after every intended case validates
+
+This module does NOT:
+  - Run COMSOL, repair incomplete producer batches, or merge cases for training
+  - Consume processed COMSOL solve timing, which is operational rather than scientific provenance
+  - Overwrite an existing case target or choose fields from mapping insertion order
 ===============================================================================
 """
 
@@ -66,7 +72,20 @@ def _source_column(field: FieldSpec) -> str:
 
 
 def _load_case_sources(csv_path: Path, meta_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Load one COMSOL CSV and its full reproducibility metadata."""
+    """
+    Load one COMSOL solution table and its reproducibility metadata.
+
+    The final commented CSV header is authoritative. Unit suffixes and the COMSOL
+    prefix are removed before rejecting duplicate or retired field spellings.
+
+    Raises
+    ------
+    TypeError
+        If the metadata JSON is not an object.
+    ValueError
+        If the CSV has no commented header or normalization creates duplicates.
+
+    """
     with meta_path.open(encoding="utf-8") as file:
         metadata = json.load(file)
     if not isinstance(metadata, dict):
@@ -99,7 +118,17 @@ def _load_case_sources(csv_path: Path, meta_path: Path) -> tuple[pd.DataFrame, d
 
 
 def _require_exact_mapping_keys(value: Any, expected: frozenset[str], *, label: str) -> dict[str, Any]:
-    """Return a mapping with one exact persisted key set."""
+    """
+    Return a persisted mapping only when its key set is exact.
+
+    Raises
+    ------
+    TypeError
+        If ``value`` is not a dictionary.
+    ValueError
+        If required keys are missing or undeclared keys are present.
+
+    """
     if not isinstance(value, dict):
         msg = f"{label} must be a mapping."
         raise TypeError(msg)
@@ -112,7 +141,20 @@ def _require_exact_mapping_keys(value: Any, expected: frozenset[str], *, label: 
 
 
 def _require_sha256(value: Any, *, label: str, allow_empty: bool = False) -> str:
-    """Return one lowercase SHA-256 digest, optionally allowing an empty sentinel."""
+    """
+    Return one validated lowercase SHA-256 digest.
+
+    An empty string is admitted only when ``allow_empty`` explicitly represents
+    an artifact that the producer was configured not to save.
+
+    Raises
+    ------
+    TypeError
+        If the value is not a string.
+    ValueError
+        If a non-empty value is not exactly 64 lowercase hexadecimal characters.
+
+    """
     if allow_empty and value == "":
         return ""
     if not isinstance(value, str):
@@ -130,7 +172,20 @@ def _require_manifest_real(
     *,
     positive: bool,
 ) -> float:
-    """Return one finite manifest real with an explicit sign domain."""
+    """
+    Return one finite manifest real in its declared sign domain.
+
+    Boolean values are rejected even though ``bool`` is an ``int`` subclass.
+    ``positive`` selects a strictly positive rather than non-negative domain.
+
+    Raises
+    ------
+    TypeError
+        If the field is boolean or not a real scalar.
+    ValueError
+        If the value is non-finite or outside the selected sign domain.
+
+    """
     value = configuration[key]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         msg = f"Batch manifest configuration.{key} must be a real number."
@@ -144,7 +199,21 @@ def _require_manifest_real(
 
 
 def _validate_manifest_configuration(value: Any) -> dict[str, Any]:
-    """Validate the exact production batch-configuration schema."""
+    """
+    Validate and return the exact production batch-configuration mapping.
+
+    The contract binds sampling method and count, seed range, domain geometry,
+    grid resolution, optional model publication, and producer/template digests.
+    No coercion or compatibility keys are accepted.
+
+    Raises
+    ------
+    TypeError
+        If a field has the wrong exact JSON type.
+    ValueError
+        If keys, ranges, digests, or the template basename violate the schema.
+
+    """
     configuration = _require_exact_mapping_keys(value, _MANIFEST_CONFIGURATION_KEYS, label="Batch manifest configuration")
     method = configuration["method"]
     if not isinstance(method, str) or method not in {"uniform", "lhs", "sobol"}:
@@ -200,7 +269,15 @@ def _sha256_file(path: Path) -> str:
 
 
 def _verify_manifest_file(path: Path, expected_digest: str, *, label: str) -> None:
-    """Require one authoritative file to exist and match its manifest digest."""
+    """
+    Require one authoritative producer file to match its manifest digest.
+
+    Raises
+    ------
+    RuntimeError
+        If the file is absent or its current bytes do not match ``expected_digest``.
+
+    """
     if not path.is_file():
         msg = f"Batch manifest file integrity failure: missing {label} at {path}."
         raise RuntimeError(msg)
@@ -211,7 +288,40 @@ def _verify_manifest_file(path: Path, expected_digest: str, *, label: str) -> No
 
 
 def _load_batch_manifest(raw_dir: Path, processed_dir: Path, *, batch_name: str) -> dict[str, Any]:
-    """Load and cryptographically validate one terminal producer manifest."""
+    """
+    Load and cryptographically validate one terminal producer manifest.
+
+    Validation is fail-closed: the schema, batch identity, configuration, ordered
+    intended membership, terminal case records, and every required file digest
+    must agree. Solved-model presence follows the manifest's ``save_model`` flag.
+
+    Parameters
+    ----------
+    raw_dir : pathlib.Path
+        Directory containing the manifest, raw exports, and metadata.
+    processed_dir : pathlib.Path
+        Directory containing solved exports, optional solved models, and the
+        operational solve-timing sidecar excluded from scientific source identity.
+    batch_name : str
+        Logical batch identity that the manifest must declare exactly.
+
+    Returns
+    -------
+    dict[str, Any]
+        The validated manifest, preserving its declared case order.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the terminal manifest is absent.
+    TypeError
+        If a persisted field has the wrong JSON container or scalar type.
+    ValueError
+        If the schema, identity, configuration, membership, or digest syntax is invalid.
+    RuntimeError
+        If the manifest is non-terminal or an authoritative file is absent or changed.
+
+    """
     path = raw_dir / "batch_manifest.json"
     if not path.is_file():
         msg = f"Generated batch is missing its terminal completion manifest: {path}"
@@ -296,7 +406,19 @@ def _load_batch_manifest(raw_dir: Path, processed_dir: Path, *, batch_name: str)
 
 
 def _validate_uniform_axis(values: np.ndarray, *, label: str) -> None:
-    """Require one finite strictly increasing uniformly spaced coordinate axis."""
+    """
+    Require a finite, strictly increasing, uniformly spaced coordinate axis.
+
+    Uniformity uses a relative tolerance of ``_GRID_UNIFORM_RTOL`` plus a
+    machine-precision absolute floor scaled to the coordinate magnitude.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two points are present, ordering is not strict, or spacing
+        is non-finite or non-uniform.
+
+    """
     if values.size < _MIN_AXIS_POINTS:
         msg = f"{label}-coordinate axis must contain at least {_MIN_AXIS_POINTS} points."
         raise ValueError(msg)
@@ -317,7 +439,20 @@ def _numeric_field(
     *,
     spatial_shape: tuple[int, ...],
 ) -> np.ndarray:
-    """Return one finite real numeric source field in canonical grid shape."""
+    """
+    Return one finite real source column in canonical grid shape.
+
+    Values are converted to float64 for validation and scientific transforms;
+    their element count must exactly match ``spatial_shape``.
+
+    Raises
+    ------
+    TypeError
+        If the source dtype is non-numeric or complex.
+    ValueError
+        If the size is wrong or any value is non-finite.
+
+    """
     values = dataframe[column].to_numpy()
     if not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values):
         msg = f"Source column {column!r} must contain real numeric values, got dtype {values.dtype}."
@@ -338,7 +473,23 @@ def _canonicalize_cartesian_grid(
     *,
     spatial_shape: tuple[int, int],
 ) -> pd.DataFrame:
-    """Validate a complete Cartesian grid and return deterministic y/x row order."""
+    """
+    Validate a complete Cartesian grid and return deterministic y/x row order.
+
+    ``spatial_shape`` is ``(ny, nx)``. Duplicate coordinates, missing Cartesian
+    products, non-uniform axes, or cardinalities inconsistent with metadata fail
+    before any field tensor is built. Sorting is stable by y and then x.
+
+    Raises
+    ------
+    KeyError
+        If either coordinate column is absent.
+    TypeError
+        If coordinates are non-real or non-numeric.
+    ValueError
+        If coordinate values, spacing, uniqueness, or shape are invalid.
+
+    """
     missing = [column for column in ("x", "y") if column not in dataframe.columns]
     if missing:
         msg = f"COMSOL export is missing coordinate column(s): {missing}."
@@ -381,7 +532,26 @@ def _build_permeability_fields(
     task: TaskSpec,
     spatial_shape: tuple[int, ...],
 ) -> dict[str, np.ndarray]:
-    """Build validated task-declared permeability representations."""
+    """
+    Build validated task-declared permeability representations.
+
+    Symmetric off-diagonal COMSOL sources are averaged only after tolerance
+    agreement. Every pointwise permeability tensor must be positive definite.
+    Diagonal components are stored as ``log10(k_ii)``; cross components are
+    stored as ``k_ij / sqrt(k_ii * k_jj)`` in task-declared field order.
+
+    Returns
+    -------
+    dict[str, numpy.ndarray]
+        Float64 stored-representation fields with ``spatial_shape``.
+
+    Raises
+    ------
+    ValueError
+        If sources are missing, symmetric exports disagree, a diagonal is not
+        positive, or a pointwise tensor is not positive definite.
+
+    """
     available = [column for column in dataframe.columns if column.startswith("kappa")]
     mapping = domain.permeability.resolve_internal_to_present_sources(available)
     expected = [field.name for field in task.inputs if field.role == "permeability"]
@@ -440,7 +610,15 @@ def _build_permeability_fields(
 
 
 def _float32_field(value: np.ndarray, *, name: str) -> np.ndarray:
-    """Convert one validated field and reject float32 overflow."""
+    """
+    Convert one validated field to owned float32 storage.
+
+    Raises
+    ------
+    ValueError
+        If conversion overflows or otherwise produces a non-finite value.
+
+    """
     with np.errstate(over="ignore", invalid="ignore"):
         converted = np.asarray(value, dtype=np.float32).copy()
     if not np.isfinite(converted).all():
@@ -455,7 +633,26 @@ def _build_fields(
     task: TaskSpec,
     spatial_shape: tuple[int, ...],
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """Build exact finite input and output mappings for one task case."""
+    """
+    Build exact finite input and output mappings for one task case.
+
+    Field names, source mappings, and order come only from ``task``. Porosity is
+    constrained to ``0 < eps <= 1``; permeability uses its declared stored
+    representation; all returned arrays are finite owned float32 values.
+
+    Returns
+    -------
+    tuple[dict[str, numpy.ndarray], dict[str, numpy.ndarray]]
+        Ordered input and output mappings in the task contract's field order.
+
+    Raises
+    ------
+    KeyError
+        If a declared non-permeability source column is absent.
+    ValueError
+        If permeability, porosity, shape, finiteness, or float32 conversion fails.
+
+    """
     input_fields: dict[str, np.ndarray] = {}
     permeability = _build_permeability_fields(
         dataframe,
@@ -495,7 +692,7 @@ def build_batch_dataset(
     *,
     task_id: str = "steady_flow",
     generated_data_root: Path | str | None = None,
-    dataset_root: Path | str | None = None,
+    data_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """
     Build strict case payloads from one complete generated COMSOL batch.
@@ -510,13 +707,37 @@ def build_batch_dataset(
         Exact registered task identifier.
     generated_data_root : Path | str | None, optional
         Independent generated-data root.
-    dataset_root : Path | str | None, optional
-        Independent destination dataset root.
+    data_root : Path | str | None, optional
+        Independent case-preparation root. Cases are published below its
+        established ``raw`` stage.
 
     Returns
     -------
     dict[str, Any]
-        Task, case count, destination, and ordered field declarations.
+        Task identity, case count, published destination, ordered fields, and
+        content fingerprints in manifest order.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the terminal producer manifest is absent.
+    FileExistsError
+        If the authoritative ``cases`` target already exists or appears while
+        publication is in progress.
+    KeyError
+        If a task-declared source column is absent.
+    TypeError
+        If persisted metadata, manifest fields, or source columns have invalid types.
+    ValueError
+        If the manifest, Cartesian grid, scientific fields, or case schema is invalid.
+    RuntimeError
+        If producer membership/files are incomplete, changed, or non-terminal.
+
+    Notes
+    -----
+    Cases are written beneath a private staging directory and the directory is
+    renamed to ``cases`` only after every intended case succeeds. On failure the
+    staging directory is removed; an existing authoritative target is never replaced.
 
     """
     task = domain.tasks.registry.get_task(task_id)
@@ -530,7 +751,7 @@ def build_batch_dataset(
         stage="raw",
         generated_data_root=generated_data_root,
     )
-    batch_dir = common.paths.resolve_dataset_dir(batch_name, dataset_root=dataset_root)
+    batch_dir = common.paths.resolve_case_dataset_dir(batch_name, data_root=data_root)
     cases_dir = batch_dir / "cases"
     batch_manifest = _load_batch_manifest(raw_dir, processed_dir, batch_name=batch_name)
     intended_case_ids = batch_manifest["intended_case_ids"]

@@ -12,8 +12,13 @@ Responsibilities:
 
 Design principles:
   - A failed publication never damages the previously published destination
+  - Same-directory temporary files keep replacement on one filesystem
   - Callers decide whether replacement is permitted by their lifecycle contract
-  - Serialization helpers do not own experiment, checkpoint, or artifact schemas
+
+This module does NOT:
+  - Enforce checkpoint, experiment, dataset, or artifact schemas
+  - Refuse overwrite of an existing destination on the caller's behalf
+  - Turn several independently published files into one transaction
 ===============================================================================
 """
 
@@ -34,13 +39,25 @@ PathWriter = Callable[[Path], None]
 
 
 def _fsync_file(path: Path) -> None:
-    """Flush one completed temporary file to stable storage where supported."""
+    """
+    Flush one completed temporary file before it becomes authoritative.
+
+    Flush failures propagate so publication cannot silently replace the
+    destination with content whose file data was not synchronized.
+    """
     with path.open("rb") as stream:
         os.fsync(stream.fileno())
 
 
 def _fsync_parent(path: Path) -> None:
-    """Flush a parent directory after replacement where supported."""
+    """
+    Best-effort flush a parent directory after atomic replacement.
+
+    Some supported filesystems cannot open or synchronize directory
+    descriptors. Those platform limitations are ignored after ``os.replace``;
+    content atomicity still holds, but crash durability of the directory entry
+    is then filesystem-dependent.
+    """
     flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
     try:
         descriptor = os.open(path, flags)
@@ -81,8 +98,11 @@ def atomic_path_write(destination: Path | str, writer: PathWriter) -> Path:
 
     Notes
     -----
-    Replacement is atomic only when the destination filesystem supports
-    ``os.replace``. The temporary file is always allocated in the same parent.
+    An existing destination is replaced; this helper owns no overwrite guard.
+    Replacement is atomic when the destination filesystem honors ``os.replace``.
+    The temporary file is always allocated in the same parent, flushed before
+    publication, and removed on handled failure. Parent-directory flushing is
+    best effort on filesystems that do not support directory descriptors.
 
     """
     final_path = Path(destination)
@@ -125,6 +145,11 @@ def atomic_write_bytes(destination: Path | str, payload: bytes) -> Path:
     Path
         Published destination.
 
+    Notes
+    -----
+    An existing destination is replaced through ``atomic_path_write``. Write,
+    flush, and replacement failures propagate after temporary-file cleanup.
+
     """
 
     def write_bytes(temp_path: Path) -> None:
@@ -155,6 +180,11 @@ def atomic_write_text(
     -------
     Path
         Published destination.
+
+    Notes
+    -----
+    An existing destination is replaced through ``atomic_path_write``. Encoding,
+    write, flush, and replacement failures propagate after temporary cleanup.
 
     """
 
@@ -187,6 +217,17 @@ def atomic_write_json(
     Path
         Published destination.
 
+    Raises
+    ------
+    TypeError, ValueError
+        If ``payload`` cannot be serialized by ``json.dumps``.
+
+    Notes
+    -----
+    Keys are sorted, non-ASCII is escaped, and one final newline is appended.
+    An existing destination is replaced atomically; serialization and filesystem
+    failures propagate without damaging the previous published file.
+
     """
     serialized = json.dumps(
         dict(payload),
@@ -213,6 +254,12 @@ def atomic_torch_save(payload: Any, destination: Path | str) -> Path:
     Path
         Published destination.
 
+    Notes
+    -----
+    An existing destination is replaced through ``atomic_path_write``. PyTorch
+    serialization, flush, and filesystem failures propagate after cleanup; this
+    helper does not define or validate checkpoint/artifact schema.
+
     """
 
     def write_torch(temp_path: Path) -> None:
@@ -237,6 +284,18 @@ def canonical_json_sha256(payload: Any) -> str:
     -------
     str
         Lowercase hexadecimal SHA-256 digest.
+
+    Raises
+    ------
+    TypeError, ValueError
+        If ``payload`` cannot be encoded by ``json.dumps``.
+
+    Notes
+    -----
+    Keys are sorted with compact separators and non-ASCII escaping. This helper
+    follows Python JSON encoding semantics, including its default handling of
+    non-finite floating values; callers needing a stricter persistence schema
+    must validate it before hashing.
 
     """
     canonical = json.dumps(
@@ -263,6 +322,13 @@ def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
     -------
     str
         Lowercase hexadecimal SHA-256 digest.
+
+    Raises
+    ------
+    ValueError
+        If ``chunk_size`` is not positive.
+    OSError
+        If the file cannot be opened or read.
 
     """
     if chunk_size <= 0:

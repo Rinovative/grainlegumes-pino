@@ -1,6 +1,6 @@
 %% batch_run.m
 % Start COMSOL server manually via:
-%   "C:\Program Files\COMSOL63\bin\win64\comsolmphserver.exe"
+%   "C:\Program Files\COMSOL64\bin\win64\comsolmphserver.exe"
 %
 % ============================================================
 % Full batch pipeline: parameter sampling → κ(x,y) generation → COMSOL simulation
@@ -14,8 +14,8 @@
 %     3. Run Darcy–Brinkman COMSOL simulations (run_comsol_case.m)
 %
 %   Output structure:
-%       <GENERATED_DATA_ROOT>/raw/<batch_name>/       → generated κ(x,y) fields
-%       <GENERATED_DATA_ROOT>/processed/<batch_name>/ → exported COMSOL results
+%       <GENERATED_DATA_ROOT>/raw/<batch_name>/       → fields and batch manifest
+%       <GENERATED_DATA_ROOT>/processed/<batch_name>/ → COMSOL results and solve timing
 %
 % REQUIREMENTS
 %   • COMSOL Multiphysics with LiveLink for MATLAB
@@ -41,24 +41,18 @@ project_root = fullfile(script_dir, '..');
 project_root = char(java.io.File(project_root).getCanonicalPath());
 addpath(genpath(fullfile(project_root, 'matlab', 'functions')));
 
-generated_data_root = getenv('GENERATED_DATA_ROOT');
-if isempty(generated_data_root)
-    storage_root = getenv('STORAGE_ROOT');
-    if isempty(storage_root)
-        repository_root = fileparts(project_root);
-        storage_root = fullfile(fileparts(repository_root), 'storage');
-    end
-    generated_data_root = fullfile(storage_root, 'data_generation');
-end
+generated_data_root = fullfile(project_root, 'data');
+generated_data_root = char( ...
+    java.io.File(generated_data_root).getCanonicalPath());
 
 % === SAVE COMSOL WITH SOLUTION ===
 save_model = false;
 
 % === SAMPLING PARAMETERS ===
-method     = 'sobol';       % 'uniform', 'lhs', or 'sobol'
+method     = 'lhs';       % 'uniform', 'lhs', or 'sobol'
 variation  = 0.8;         % relative parameter variation
 N          = 1000;        % number of samples
-seed       = 13001;        % reproducibility seed
+seed       = 3001;        % reproducibility seed
 
 batch_name = sprintf('%s_var%.0f_seed%.0f', ...
     method, variation*100, seed);
@@ -89,7 +83,7 @@ end
 validate_sample_identity(sample_csv, sample_json, method, variation, N, seed);
 
 %% --- COMSOL Connection -------------------------------------------------
-addpath('C:\Program Files\COMSOL63\mli');
+addpath('C:\Program Files\COMSOL64\mli');
 try
     v = mphversion;
     disp("✅ Connected to COMSOL Server: " + v);
@@ -126,7 +120,10 @@ Lx = 1.2;
 Ly = 0.75;
 res = 0.003;
 
+% Scientific provenance stays with raw inputs; operational solve timing stays
+% with the processed COMSOL results it measures.
 manifest_path = fullfile(raw_dir, 'batch_manifest.json');
+solve_timing_path = fullfile(processed_dir, 'comsol_solve_timing.json');
 manifest_configuration = struct( ...
     'method', method, ...
     'variation', variation, ...
@@ -144,6 +141,18 @@ validate_manifest_configuration(manifest_configuration);
 prior_manifest_complete = validate_existing_manifest_identity( ...
     manifest_path, batch_name, manifest_configuration, ...
     manifest_field_schema, intended_case_ids, raw_dir, processed_dir);
+try
+    [prior_solve_timings, prior_timing_runtime] = ...
+        load_existing_solve_timings( ...
+        solve_timing_path, manifest_path, batch_name, ...
+        prior_manifest_complete);
+catch timing_error
+    warning('batch_run:TimingIdentity', ...
+        ['Ignoring incompatible operational timing; scientific ' ...
+        'outputs remain authoritative: %s'], timing_error.message);
+    prior_solve_timings = repmat(empty_solve_timing(), 0, 1);
+    prior_timing_runtime = [];
+end
 if isfile(manifest_path)
     delete(manifest_path);
 end
@@ -160,6 +169,12 @@ case_records = repmat(struct( ...
     'files', empty_file_hashes), numel(intended_rows), 1);
 for record_index = 1:numel(intended_rows)
     case_records(record_index).case_id = string(intended_case_ids{record_index});
+end
+solve_timings = repmat(empty_solve_timing(), 0, 1);
+if isempty(prior_timing_runtime)
+    timing_runtime = build_timing_runtime(v);
+else
+    timing_runtime = prior_timing_runtime;
 end
 
 %% --- Start total timer -------------------------------------------------
@@ -188,9 +203,11 @@ for i = 1:n_cases
     working_model_file = fullfile(processed_dir, sprintf('%s.mph', case_tag));
     raw_field_file = fullfile(raw_dir, sprintf('%s.csv', case_tag));
     raw_metadata_file = fullfile(raw_dir, sprintf('%s.json', case_tag));
-    outputs_complete = prior_manifest_complete && ...
-        isfile(raw_field_file) && isfile(raw_metadata_file) && ...
-        isfile(sol_file) && (~save_model || isfile(solved_model_file));
+    outputs_complete = ...
+        isfile(raw_field_file) && ...
+        isfile(raw_metadata_file) && ...
+        isfile(sol_file) && ...
+        (~save_model || isfile(solved_model_file));
     if outputs_complete
         fprintf('[%4d/%4d] ⏩ Skip: configured outputs already exist (%s)\n', ...
             i, n_cases, case_tag);
@@ -198,6 +215,11 @@ for i = 1:n_cases
         case_records(record_index).stage = "simulation";
         case_records(record_index).files = case_file_hashes( ...
             case_tag, raw_dir, processed_dir, save_model);
+        retained_timing = find_solve_timing(prior_solve_timings, case_tag);
+        if ~isempty(retained_timing)
+            solve_timings = upsert_solve_timing( ...
+                solve_timings, retained_timing);
+        end
         continue;
     end
     if isfile(sol_file), delete(sol_file); end
@@ -290,14 +312,9 @@ for i = 1:n_cases
             fprintf('  → Fields exported: %s\n', info.export.paths.csv);
         end
     catch ME
-        fprintf('[%4d/%4d] ❌ Error in gen_simulation_inputs: %s\n', ...
-            i, n_cases, ME.message);
-        failures(end + 1, 1) = sprintf('%s generation: %s', ...
-            case_tag, ME.message);
-        case_records(record_index).status = "failed";
-        case_records(record_index).stage = "generation";
-        case_records(record_index).message = string(ME.message);
-        continue;
+        fprintf(2, '[%4d/%4d] ❌ Fatal error in gen_simulation_inputs:\n%s\n', ...
+            i, n_cases, getReport(ME, 'extended', 'hyperlinks', 'off'));
+        rethrow(ME);
     end
 
     %% --- Step 2: Run COMSOL simulation --------------------------------
@@ -313,6 +330,20 @@ for i = 1:n_cases
         case_records(record_index).stage = "simulation";
         case_records(record_index).files = case_file_hashes( ...
             case_tag, raw_dir, processed_dir, save_model);
+        measured_timing = struct( ...
+            'case_id', string(case_tag), ...
+            'comsol_solve_s', results.comsol_solve_s);
+        solve_timings = upsert_solve_timing( ...
+            solve_timings, measured_timing);
+        try
+            comsol_solve_timing( ...
+                batch_name, solve_timings, timing_runtime, "", ...
+                solve_timing_path);
+        catch timing_error
+            warning('batch_run:TimingPersistence', ...
+                'Could not persist COMSOL solve timing: %s', ...
+                timing_error.message);
+        end
         fprintf('[%4d/%4d] ✅ COMSOL completed: %s (%.1f s)\n', ...
             i, n_cases, opts.file_tag, results.time_s);
     catch ME
@@ -348,6 +379,15 @@ manifest = struct( ...
     'intended_case_ids', {intended_case_ids}, ...
     'cases', case_records);
 write_json_atomic(manifest_path, manifest);
+try
+    comsol_solve_timing( ...
+        batch_name, solve_timings, timing_runtime, ...
+        sha256_file(manifest_path), solve_timing_path);
+catch timing_error
+    warning('batch_run:TimingPersistence', ...
+        'Could not finalize COMSOL solve timing: %s', ...
+        timing_error.message);
+end
 
 if isempty(failures)
     fprintf("🏁 Batch completed successfully.\n");
@@ -368,6 +408,91 @@ if ~isempty(failures)
     error('batch_run:CaseFailures', ...
         '%d case(s) failed; the generated batch is incomplete.', ...
         numel(failures));
+end
+
+function record = empty_solve_timing()
+record = struct('case_id', "", 'comsol_solve_s', []);
+end
+
+function cases = upsert_solve_timing(cases, record)
+if ~isstruct(record) || ~isscalar(record) || ...
+        ~isequal(sort(fieldnames(record)), ...
+        sort({'case_id'; 'comsol_solve_s'}))
+    error('batch_run:TimingRecord', ...
+        'COMSOL solve timing records must have exact fields.');
+end
+case_ids = string({cases.case_id});
+match = find(case_ids == string(record.case_id), 1);
+if isempty(match)
+    cases(end + 1, 1) = record;
+else
+    cases(match) = record;
+end
+end
+
+function record = find_solve_timing(cases, case_id)
+record = repmat(empty_solve_timing(), 0, 1);
+if isempty(cases)
+    return;
+end
+match = find(string({cases.case_id}) == string(case_id), 1);
+if ~isempty(match)
+    record = cases(match);
+end
+end
+
+function [cases, runtime] = load_existing_solve_timings( ...
+        path, manifest_path, batch_name, prior_manifest_complete)
+cases = repmat(empty_solve_timing(), 0, 1);
+runtime = [];
+if ~prior_manifest_complete || ~isfile(path)
+    return;
+end
+payload = jsondecode(fileread(path));
+require_exact_struct_fields(payload, { ...
+    'schema_kind', 'schema_version', 'batch_name', ...
+    'batch_manifest_sha256', 'runtime', 'cases', 'aggregates'}, ...
+    'batch_run:TimingIdentity', 'COMSOL solve timing sidecar');
+validated = comsol_solve_timing( ...
+    payload.batch_name, payload.cases, payload.runtime, ...
+    payload.batch_manifest_sha256);
+if ~strcmp(require_text_scalar(payload.schema_kind, ...
+        'batch_run:TimingIdentity', 'schema_kind'), ...
+        'comsol_solve_timing') || ...
+        ~is_real_numeric_scalar(payload.schema_version) || ...
+        payload.schema_version ~= 1 || ...
+        ~strcmp(char(validated.batch_name), batch_name) || ...
+        isempty(char(validated.batch_manifest_sha256)) || ...
+        ~strcmp(char(validated.batch_manifest_sha256), ...
+        sha256_file(manifest_path)) || ...
+        ~isequaln(payload.aggregates, validated.aggregates)
+    error('batch_run:TimingIdentity', ...
+        ['Existing COMSOL solve timing does not bind the current ' ...
+        'complete batch manifest.']);
+end
+cases = validated.cases;
+runtime = validated.runtime;
+end
+
+function runtime = build_timing_runtime(comsol_version)
+hostname = "unknown";
+try
+    host = java.net.InetAddress.getLocalHost;
+    hostname = string(char(host.getHostName));
+catch
+    % Missing host metadata does not affect scientific outputs.
+end
+processor = string(getenv('PROCESSOR_IDENTIFIER'));
+if strlength(processor) == 0
+    processor = "unknown";
+end
+runtime = struct( ...
+    'matlab_version', string(version), ...
+    'comsol_version', string(comsol_version), ...
+    'os', string(system_dependent('getos')), ...
+    'hostname', hostname, ...
+    'processor', processor, ...
+    'case_execution', "sequential");
 end
 
 function validate_sample_identity(sample_csv, sample_json, method, variation, N, seed)

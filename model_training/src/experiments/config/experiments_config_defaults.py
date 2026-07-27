@@ -14,10 +14,10 @@ Design principles:
   - Runtime defaults remain independent of concrete task field names
   - Semantic identifiers are distinct from Python implementation class names
 
-Boundaries:
-  - Config parsing and strict validation belong to experiments.config.loader
-  - Model, loss, metric, and physics construction belong to their registries
-  - Dataset storage schemas and lifecycle behavior are not defined here
+This module does NOT:
+  - Parse or strictly validate user config; ``experiments.config.loader`` owns admission
+  - Construct models, losses, metrics, or physics; their registries own construction
+  - Define dataset storage schemas or lifecycle behavior
 ===============================================================================
 """
 
@@ -30,7 +30,7 @@ from src import domain
 RUN_DEFAULTS: dict[str, Any] = {
     "seed": 9,
     "deterministic": True,
-    "device": "cuda",
+    "device": "auto",
     "prefix": None,
     "suffix": None,
 }
@@ -92,6 +92,22 @@ TRACKING_DEFAULTS: dict[str, Any] = {
         "group": None,
         "tags": [],
         "mode": "online",
+        "monitor": {
+            "enabled": True,
+            "interval": 50,
+            "max_cases": 4,
+        },
+        "training_images": {
+            "enabled": False,
+            "interval": 50,
+            "max_snapshots": 4,
+        },
+        "upload": {
+            "config": True,
+            "summary": True,
+            "provenance": True,
+            "best_checkpoint": False,
+        },
     }
 }
 
@@ -108,7 +124,7 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Isolated serializable runtime defaults combined with task-owned semantics.
+        Serializable runtime defaults projected together with task-owned semantics.
 
     Raises
     ------
@@ -130,7 +146,10 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
                 "space": "normalized",
                 "weight": 1.0,
             },
-            "physics": PHYSICS_LOSS_DEFAULTS,
+            "physics": {
+                **PHYSICS_LOSS_DEFAULTS,
+                "continuity": task.physics.continuity,
+            },
         },
         "evaluation": {
             "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],

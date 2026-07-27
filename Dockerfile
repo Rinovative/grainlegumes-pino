@@ -60,6 +60,10 @@ RUN micromamba run -n ${ENV_NAME} pip install -e /workspace/repo
 ENV PATH=/opt/micromamba/envs/${ENV_NAME}/bin:$PATH
 ENV PROJECT_ROOT=/workspace/repo
 ENV STORAGE_ROOT=/workspace/storage
+ENV DATA_ROOT=/workspace/storage/data
+ENV DATASET_ROOT=/workspace/storage/data_training/raw
+ENV GENERATED_DATA_ROOT=/workspace/storage/data_generation
+ENV OUTPUT_ROOT=/workspace/storage/data_training/processed
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash"]

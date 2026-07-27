@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if (( $# < 3 )); then
-  echo "Usage: $0 <gpu-id> <train|optuna|artifacts> <log-basename> [command arguments...]" >&2
+  echo "Usage: $0 <gpu-id> <train|optuna|artifacts> <log-basename> [semantic CLI arguments...]" >&2
   exit 2
 fi
 
@@ -10,12 +10,13 @@ GPU_ID="$1"
 JOB_TYPE="$2"
 LOG_BASENAME="$3"
 shift 3
+SEMANTIC_ARGS=("$@")
 
-if [[ ! "${GPU_ID}" =~ ^[0-9]+$ ]]; then
+if [[ ! "${GPU_ID}" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "GPU ID must be a non-negative integer, got: ${GPU_ID@Q}" >&2
   exit 2
 fi
-if [ -z "${LOG_BASENAME}" ] || [[ "${LOG_BASENAME}" == */* ]] || [[ "${LOG_BASENAME}" == "." || "${LOG_BASENAME}" == ".." ]]; then
+if [[ -z "${LOG_BASENAME}" || "${LOG_BASENAME}" == */* || "${LOG_BASENAME}" == "." || "${LOG_BASENAME}" == ".." ]]; then
   echo "Log name must be one non-empty basename, got: ${LOG_BASENAME@Q}" >&2
   exit 2
 fi
@@ -36,57 +37,112 @@ case "${JOB_TYPE}" in
     ;;
 esac
 
+# Normalize the worker boundary to exactly one strict semantic CUDA request.
+CLI_ARGS=()
+DEVICE_COUNT=0
+INDEX=0
+while (( INDEX < ${#SEMANTIC_ARGS[@]} )); do
+  ARGUMENT="${SEMANTIC_ARGS[INDEX]}"
+  case "${ARGUMENT}" in
+    --queue-gpu|--queue-gpu=*)
+      echo "--queue-gpu is wrapper-only and must not reach the queue worker." >&2
+      exit 2
+      ;;
+    --cpu|--cpu=*)
+      echo "Obsolete --cpu is unsupported; queued jobs always use --device cuda." >&2
+      exit 2
+      ;;
+    --device)
+      if (( INDEX + 1 >= ${#SEMANTIC_ARGS[@]} )); then
+        echo "--device requires one of auto, cuda, or cpu." >&2
+        exit 2
+      fi
+      DEVICE_COUNT=$((DEVICE_COUNT + 1))
+      DEVICE_VALUE="${SEMANTIC_ARGS[INDEX + 1]}"
+      INDEX=$((INDEX + 2))
+      ;;
+    --device=*)
+      DEVICE_COUNT=$((DEVICE_COUNT + 1))
+      DEVICE_VALUE="${ARGUMENT#--device=}"
+      INDEX=$((INDEX + 1))
+      ;;
+    *)
+      CLI_ARGS+=("${ARGUMENT}")
+      INDEX=$((INDEX + 1))
+      continue
+      ;;
+  esac
+  if (( DEVICE_COUNT > 1 )); then
+    echo "Duplicate or conflicting --device options are not allowed for queued jobs." >&2
+    exit 2
+  fi
+  if [[ "${DEVICE_VALUE}" != "cuda" ]]; then
+    echo "Queued jobs require strict --device cuda; received --device ${DEVICE_VALUE@Q}." >&2
+    exit 2
+  fi
+done
+CLI_ARGS+=("--device" "cuda")
+
 IMAGE_NAME="grainlegumes-pino-airflow"
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 mkdir -p "${PROJECT_DIR}/logs" "${HOST_STORAGE_ROOT}"
-STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd)"
+STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
 DOCKER_HOME="${STORAGE_DIR}/.docker_home"
 LOG_FILE="${PROJECT_DIR}/logs/${LOG_BASENAME}"
 mkdir -p "${DOCKER_HOME}"
 
-# ----------------------------------------------------------------------
-# Create runtime user mapping for container
-# ----------------------------------------------------------------------
+# Capture both streams and the final Docker status in the unique host-visible log.
+exec > "${LOG_FILE}" 2>&1
+printf 'Queue worker job: %s\n' "${JOB_TYPE}"
+printf 'Scheduler GPU: %s\n' "${GPU_ID}"
+printf 'Host log: %s\n' "${LOG_FILE}"
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required by the queue worker but was not found on PATH."
+  echo "Docker exit status: 127"
+  exit 127
+fi
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+# Create runtime user mapping for the non-root container process.
 cat > "${DOCKER_HOME}/passwd" <<EOF
 root:x:0:0:root:/root:/bin/bash
 rino:x:$(id -u):$(id -g):Rino Albertin:/workspace/storage/.docker_home:/bin/bash
 EOF
-
 cat > "${DOCKER_HOME}/group" <<EOF
 root:x:0:
 rino:x:$(id -g):
 EOF
-
 chmod 644 "${DOCKER_HOME}/passwd" "${DOCKER_HOME}/group"
 
-# ----------------------------------------------------------------------
-# Resolve optional W&B authentication for standard Docker env pass-through
-# ----------------------------------------------------------------------
+# Resolve optional W&B authentication without printing or embedding the value.
 WANDB_ENV_ARGS=()
-if [ -z "${WANDB_API_KEY:-}" ] && [ -r "${HOME}/wandb_key.txt" ]; then
-  WANDB_API_KEY="$(< "${HOME}/wandb_key.txt")"
-  if [ -n "${WANDB_API_KEY}" ]; then
+if [[ -z "${WANDB_API_KEY:-}" && -r "${HOME}/wandb_key.txt" ]]; then
+  FILE_WANDB_KEY="$(trim_whitespace "$(< "${HOME}/wandb_key.txt")")"
+  if [[ -n "${FILE_WANDB_KEY}" ]]; then
+    WANDB_API_KEY="${FILE_WANDB_KEY}"
     export WANDB_API_KEY
   else
     unset WANDB_API_KEY
   fi
 fi
-if [ -n "${WANDB_API_KEY:-}" ]; then
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
   WANDB_ENV_ARGS=(-e WANDB_API_KEY)
 fi
 
-# ----------------------------------------------------------------------
-# Optional SSH mount for Git operations
-# ----------------------------------------------------------------------
 SSH_ARGS=()
-if [ -d "${HOME}/.ssh" ]; then
+if [[ -d "${HOME}/.ssh" ]]; then
   SSH_ARGS=(-v "${HOME}/.ssh:/workspace/storage/.docker_home/.ssh:ro")
 fi
 
-# ----------------------------------------------------------------------
-# Run the selected semantic CLI inside Docker and preserve its exit code
-# ----------------------------------------------------------------------
+set +e
 docker run --rm \
   --gpus "device=${GPU_ID}" \
   --user "$(id -u):$(id -g)" \
@@ -94,6 +150,10 @@ docker run --rm \
   --workdir /workspace/repo/model_training \
   -e HOME=/workspace/storage/.docker_home \
   -e STORAGE_ROOT=/workspace/storage \
+  -e DATA_ROOT=/workspace/storage/data \
+  -e DATASET_ROOT=/workspace/storage/data_training/raw \
+  -e GENERATED_DATA_ROOT=/workspace/storage/data_generation \
+  -e OUTPUT_ROOT=/workspace/storage/data_training/processed \
   "${WANDB_ENV_ARGS[@]}" \
   -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   -v "${DOCKER_HOME}/passwd:/etc/passwd:ro" \
@@ -102,4 +162,9 @@ docker run --rm \
   -v "${STORAGE_DIR}:/workspace/storage:rw" \
   "${SSH_ARGS[@]}" \
   "${IMAGE_NAME}" \
-  python -m "${MODULE}" "$@" > "${LOG_FILE}" 2>&1
+  python -m "${MODULE}" "${CLI_ARGS[@]}"
+DOCKER_STATUS=$?
+set -e
+
+printf 'Docker exit status: %s\n' "${DOCKER_STATUS}"
+exit "${DOCKER_STATUS}"

@@ -14,10 +14,12 @@ dependencies:
   - tqdm
   - pyarrow
   - pyyaml
+  - ipykernel
+  - nbconvert
   - ipywidgets
   - ipython
   - pytest
-  - ruff
+  - ruff=0.15.11
   - mypy
   - radon
   - setuptools

@@ -17,10 +17,10 @@ Design principles:
   - Saved split indices are applied before evaluation loaders are built
   - Field order checks fail fast on incompatible artifacts
 
-Boundaries:
-  - Training and optimization belong to learning.training
-  - Artifact generation belongs to analysis.artifacts
-  - Run-directory creation belongs to experiments.cli
+This module does NOT:
+  - Train or optimize models; ``learning.training`` owns execution
+  - Generate analysis artifacts; ``analysis.artifacts`` owns publication
+  - Allocate or transition run directories; ``experiments.run`` owns lifecycle state
 
 Notes:
   - This module assumes the current saved-run contract:
@@ -74,7 +74,19 @@ _SPLIT_INDEX_KEYS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class SplitSelection:
-    """Validated split role, dataset path and saved member indices."""
+    """
+    Carry one immutable saved-split selection into dataset reconstruction.
+
+    Attributes
+    ----------
+    role : {"train", "eval", "ood"}
+        Semantic saved membership being reconstructed.
+    dataset_path : pathlib.Path
+        Current dataset file resolved for the saved logical dataset identity.
+    indices : torch.Tensor
+        Ordered saved source indices for ``role``.
+
+    """
 
     role: SplitRole
     dataset_path: Path
@@ -82,10 +94,39 @@ class SplitSelection:
 
 
 class IndexedSubset(Dataset[dict[str, Any]]):
-    """Select saved source indices while retaining explicit sample identity."""
+    """
+    Present an ordered saved-split view without losing source-case identity.
+
+    Construction copies a unique, non-empty, in-bounds integer index vector to
+    CPU. Each returned mapping preserves the underlying sample and adds its
+    immutable ``source_index`` plus contiguous ``split_local_index``; callers can
+    therefore distinguish dataset identity from evaluation order.
+
+    Parameters
+    ----------
+    dataset : torch.utils.data.Dataset
+        Source dataset already admitted against its saved fingerprint.
+    source_indices : torch.Tensor
+        Unique non-empty one-dimensional integer membership in desired order.
+
+    Raises
+    ------
+    TypeError
+        If indices are not integral or source samples are not mappings.
+    ValueError
+        If membership is empty, multidimensional, or contains duplicates.
+    IndexError
+        If any source index lies outside the dataset.
+
+    """
 
     def __init__(self, dataset: Dataset[Any], source_indices: torch.Tensor) -> None:
-        """Store a validated, ordered copy of the selected source indices."""
+        """
+        Validate and copy membership before exposing the subset.
+
+        The stored index vector is an owned CPU ``long`` clone, so later caller
+        mutation cannot change saved-split membership or evaluation order.
+        """
         if source_indices.ndim != 1:
             msg = f"source_indices must be one-dimensional, got shape {tuple(source_indices.shape)}."
             raise ValueError(msg)
@@ -115,7 +156,12 @@ class IndexedSubset(Dataset[dict[str, Any]]):
         return int(self.source_indices.numel())
 
     def __getitem__(self, split_local_index: int) -> dict[str, Any]:
-        """Return a source sample with stable split-local and source indices."""
+        """
+        Return one source mapping with both evaluation and dataset identity.
+
+        Type/bounds, mapping shape, and reserved-key ownership are checked before
+        a copied sample receives ``split_local_index`` and ``source_index``.
+        """
         if not isinstance(split_local_index, int) or isinstance(split_local_index, bool):
             msg = f"split_local_index must be an integer, got {type(split_local_index).__name__}."
             raise TypeError(msg)
@@ -154,7 +200,13 @@ def _data_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _configured_dataset_ids(config: Mapping[str, Any]) -> dict[SplitRole, str]:
-    """Return logical train/eval/OOD dataset identifiers from config.yaml."""
+    """
+    Resolve logical train, evaluation, and OOD dataset IDs from ``config.yaml``.
+
+    Train and evaluation intentionally share the saved training dataset; OOD
+    requires the sole current-contract logical ID. All names pass central path
+    validation before they can participate in filesystem resolution.
+    """
     data_cfg = _data_section(config)
     train_dataset = common.paths.validate_logical_name(
         data_cfg.get("train_dataset"),
@@ -187,7 +239,12 @@ def _validate_split_role(split: str) -> SplitRole:
 
 
 def _saved_dataset_id(split_indices: Mapping[str, Any], *, role: SplitRole) -> str:
-    """Return the logical dataset identifier bound to one saved split role."""
+    """
+    Recover the logical dataset ID persisted for one saved split role.
+
+    Train/eval use ``metadata.datasets.train`` and OOD uses its distinct identity.
+    Missing or malformed nested identity fields fail before current-root lookup.
+    """
     metadata = _split_metadata(split_indices)
     datasets_meta = metadata.get("datasets")
     if not isinstance(datasets_meta, Mapping):
@@ -206,7 +263,12 @@ def _saved_dataset_id(split_indices: Mapping[str, Any], *, role: SplitRole) -> s
 
 
 def _split_settings(config: Mapping[str, Any]) -> tuple[float, float, int]:
-    """Return required effective split settings from a saved config."""
+    """
+    Recover the exact saved split ratios and stable split subseed.
+
+    The subseed is re-derived from ``run.seed`` through the maintained seed plan;
+    missing run/data mappings or split settings fail instead of defaulting.
+    """
     data_cfg = _data_section(config)
     run_cfg = config.get("run")
     if not isinstance(run_cfg, Mapping):
@@ -232,7 +294,13 @@ def _select_split(
     dataset_root: Path,
     dataset_path: Path | None,
 ) -> SplitSelection:
-    """Select saved membership and resolve its logical dataset under the current root."""
+    """
+    Bind one requested split role to saved membership and a current dataset path.
+
+    Saved split ratios, subseed, and logical dataset identity must agree with
+    ``config.yaml``. An explicit ``dataset_path`` changes location only; later
+    fingerprint validation still prevents it from substituting different data.
+    """
     role = _validate_split_role(split)
     train_ratio, ood_fraction, split_seed = _split_settings(config)
     validated_indices = datasets.base.validate_split_info(
@@ -264,7 +332,13 @@ def _validate_split_indices_for_dataset(
     split_indices: Mapping[str, Any],
     config: Mapping[str, Any],
 ) -> None:
-    """Bind saved membership to the loaded dataset fingerprint and ordered IDs."""
+    """
+    Bind saved membership to the loaded dataset fingerprint and ordered IDs.
+
+    The dataset must expose a verified ``DatasetIdentity``. Validation replays
+    the saved split contract against that identity and rejects any membership
+    change before an ``IndexedSubset`` or loader is constructed.
+    """
     dataset_identity = getattr(dataset, "identity", None)
     if not isinstance(dataset_identity, datasets.identity.DatasetIdentity):
         msg = "Inference dataset must expose a verified DatasetIdentity."
@@ -287,7 +361,12 @@ def _validate_split_indices_for_dataset(
 # MODEL RECONSTRUCTION
 # ======================================================================
 def _model_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the resolved model config section after validating its shape."""
+    """
+    Return the resolved model section after validating its required shape.
+
+    ``model.kind`` and a mapping-valued ``model.params`` must already exist;
+    reconstruction never supplies architecture defaults for a saved run.
+    """
     model_cfg = config.get("model")
     if not isinstance(model_cfg, Mapping):
         msg = "Run config must contain a mapping at model."
@@ -306,15 +385,6 @@ def _field_contract(config: Mapping[str, Any]) -> tuple[list[str], list[str]]:
     """Return exact fields from the validated registered task contract."""
     task = experiments.config.loader.validate_resolved_task_contract(config)
     return list(task.input_names), list(task.output_names)
-
-
-def _with_inference_device(config: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
-    """Return a shallow config copy with run.device set for this inference process."""
-    config_for_device = dict(config)
-    run_cfg = dict(config.get("run", {}))
-    run_cfg["device"] = str(device)
-    config_for_device["run"] = run_cfg
-    return config_for_device
 
 
 def _build_model_from_config(config: dict[str, Any], *, device: torch.device) -> nn.Module:
@@ -340,7 +410,7 @@ def _build_model_from_config(config: dict[str, Any], *, device: torch.device) ->
 
     """
     _model_section(config)
-    return learning.models.factory.build_model(_with_inference_device(config, device))
+    return learning.models.factory.build_model(config, device=device)
 
 
 # ======================================================================
@@ -375,20 +445,20 @@ def _build_eval_loader(dataset: Dataset[Any], batch_size: int) -> DataLoader:
 # ======================================================================
 # PUBLIC INFERENCE ENTRY POINT
 # ======================================================================
-def load_inference_context(
+def load_inference_context_with_resolution(
     *,
     run_dir: str | Path,
+    device_resolution: learning.device.DeviceResolution,
     dataset_path: str | Path | None = None,
     dataset_root: str | Path | None = None,
     split: SplitRole | str = "eval",
     batch_size: int = 1,
-    prefer_cuda: bool = True,
 ) -> tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]:
     """
-    Rebuild the complete split-aware inference context for a saved run.
+    Rebuild a split-aware inference context on one service-resolved device.
 
-    This function reconstructs the model from `config.yaml`, loads weights from
-    `best_checkpoint.pt`, restores the saved `normalizer.pt` data processor
+    This lower-level service reconstructs the model from ``config.yaml``, loads
+    weights from ``best_checkpoint.pt``, restores the saved ``normalizer.pt`` data processor
     state, loads `split_indices.pt`, and builds a deterministic loader for the
     requested saved split. It never refits preprocessing statistics during
     inference.
@@ -398,6 +468,8 @@ def load_inference_context(
     run_dir : str | Path
         Path to a saved run directory containing `config.yaml`,
         `normalizer.pt`, `best_checkpoint.pt`, and `split_indices.pt`.
+    device_resolution : learning.device.DeviceResolution
+        Immutable runtime decision resolved by the inference or artifact boundary.
     dataset_path : str | Path | None, optional
         Optional exact merged-dataset file. Its fingerprint and ordered sample
         identity must match the saved split.
@@ -410,8 +482,6 @@ def load_inference_context(
         merged dataset recorded by training. Default is `eval`.
     batch_size : int, optional
         Evaluation batch size. Default is 1.
-    prefer_cuda : bool, optional
-        Use CUDA if available. Default is True.
 
     Returns
     -------
@@ -428,22 +498,28 @@ def load_inference_context(
     Raises
     ------
     RuntimeError
-        If saved split metadata is missing, incompatible, or out of bounds.
+        If saved run, field, dataset, or split identities are incompatible.
+    TypeError
+        If the supplied resolution or saved artifact shapes have invalid types.
     ValueError
-        If the requested split role is unknown or has empty indices.
+        If the requested split role is unknown or has invalid membership.
+    FileNotFoundError
+        If a required completed-run or dataset artifact is absent.
 
     """
+    if not isinstance(device_resolution, learning.device.DeviceResolution):
+        msg = f"Inference requires one DeviceResolution, got {device_resolution!r}."
+        raise TypeError(msg)
+    device = device_resolution.device
     run_dir = Path(run_dir)
     requested_dataset_path = Path(dataset_path).expanduser() if dataset_path is not None else None
     current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_dataset_root()
     completed_run = experiments.run.validate_completed_run(run_dir)
 
-    device = torch.device("cuda") if prefer_cuda and torch.cuda.is_available() else torch.device("cpu")
-
     cfg = completed_run["config"]
     split_indices = completed_run["split_indices"]
     input_channels, output_channels = _field_contract(cfg)
-    seed_plan = experiments.run.configure_reproducibility(cfg)
+    seed_plan = experiments.run.configure_reproducibility(cfg, device=device)
     split_selection = _select_split(
         config=cfg,
         split_indices=split_indices,
@@ -452,7 +528,7 @@ def load_inference_context(
         dataset_path=requested_dataset_path,
     )
 
-    experiments.run.seed_process(seed_plan["model_init"])
+    experiments.run.seed_process(seed_plan["model_init"], device=device)
     model = _build_model_from_config(cfg, device=device)
     # ------------------------------
     # HARD GUARDS: field contract <-> model
@@ -500,3 +576,51 @@ def load_inference_context(
     loader = _build_eval_loader(selected_dataset, batch_size=batch_size)
 
     return model, loader, processor, device
+
+
+def load_inference_context(
+    *,
+    run_dir: str | Path,
+    dataset_path: str | Path | None = None,
+    dataset_root: str | Path | None = None,
+    split: SplitRole | str = "eval",
+    batch_size: int = 1,
+    device_policy: str = "auto",
+) -> tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]:
+    """
+    Resolve a device once and rebuild a complete saved-run inference context.
+
+    Parameters
+    ----------
+    run_dir : str | Path
+        Completed saved run directory.
+    dataset_path : str | Path | None, optional
+        Optional exact dataset file bound to saved identity.
+    dataset_root : str | Path | None, optional
+        Current independent dataset root.
+    split : {"train", "eval", "ood"}, optional
+        Saved split role.
+    batch_size : int, optional
+        Deterministic inference batch size.
+    device_policy : {"auto", "cuda", "cpu"}, optional
+        Runtime policy. Auto selects usable CUDA then CPU; CUDA is strict; CPU
+        avoids CUDA queries.
+
+    Returns
+    -------
+    tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]
+        Loaded model, deterministic loader, saved processor, and concrete device.
+
+    """
+    resolution = learning.device.resolve_device(
+        device_policy,
+        path="device_policy",
+    )
+    return load_inference_context_with_resolution(
+        run_dir=run_dir,
+        device_resolution=resolution,
+        dataset_path=dataset_path,
+        dataset_root=dataset_root,
+        split=split,
+        batch_size=batch_size,
+    )

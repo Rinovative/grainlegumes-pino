@@ -15,10 +15,10 @@ Design principles:
   - Semantic identifiers remain independent of implementation class names
   - Device placement happens only when requested by the caller
 
-Boundaries:
-  - Neuraloperator owns the concrete FNO and UNO implementations
-  - Training orchestration belongs to learning.training.loop
-  - Task-owned channels and axes belong to domain.tasks and config resolution
+This module does NOT:
+  - Implement FNO or UNO architectures; ``neuraloperator`` supplies them
+  - Orchestrate training; ``learning.training.loop`` owns execution
+  - Derive task channels or axes; task contracts and config resolution own them
 ===============================================================================
 """
 
@@ -456,14 +456,16 @@ def validate_model_params(
             raise ValueError(msg)
 
 
-def build_model(config: dict[str, Any]) -> torch.nn.Module:
+def build_model(config: dict[str, Any], *, device: torch.device) -> torch.nn.Module:
     """
     Build a registered semantic model from a resolved configuration.
 
     Parameters
     ----------
     config : dict[str, Any]
-        Resolved configuration containing model kind, parameters, task contract, and device.
+        Resolved configuration containing model kind, parameters, and task contract.
+    device : torch.device
+        Concrete device resolved by the top-level runtime service.
 
     Returns
     -------
@@ -499,8 +501,10 @@ def build_model(config: dict[str, Any]) -> torch.nn.Module:
         require_channels=True,
         operator_dimensionality=operator_dimensionality,
     )
-    device = config.get("run", {}).get(
-        "device",
-        "cuda" if torch.cuda.is_available() else "cpu",
-    )
+    if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
+        msg = f"Model construction requires one concrete CPU or CUDA torch.device, got {device!r}."
+        raise TypeError(msg)
+    if device.type == "cuda" and device.index is None:
+        msg = "Model construction requires an indexed CUDA device resolved by the runtime boundary."
+        raise ValueError(msg)
     return resolve_model_kind(kind).builder(**params, device=device)

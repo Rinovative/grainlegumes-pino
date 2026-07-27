@@ -14,10 +14,10 @@ Design principles:
   - Error messages enumerate the available semantic identifiers
   - Registration does not depend on model or training implementations
 
-Boundaries:
-  - Task structure belongs to domain.tasks.spec
-  - Concrete steady-flow declarations belong to domain.tasks.steady_flow
-  - Physics equations and loss mathematics remain deferred to their owners
+This module does NOT:
+  - Define task structure or concrete steady-flow field declarations
+  - Translate aliases, import plugins, or mutate registrations at runtime
+  - Implement physics equations, losses, models, or training behavior
 ===============================================================================
 """
 

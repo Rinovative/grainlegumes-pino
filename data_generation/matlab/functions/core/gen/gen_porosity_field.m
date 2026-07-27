@@ -151,7 +151,7 @@ t = t ./ max(rms(t(:)), eps);
 k_mean = opts.k_mean;
 A_mat  = opts.A_rel * k_mean;
 
-kc_fun = @(eps) A_mat * (eps.^3) ./ max((1 - eps).^2, eps);
+kc_fun = @(porosity) A_mat * (porosity.^3) ./ max((1 - porosity).^2, eps);
 
 lo = eps_min + 1e-6;
 hi = eps_max - 1e-6;
@@ -173,18 +173,18 @@ call_hook('eps_level', struct( ...
     'A_mat',   A_mat ));
 
 %% === Final porosity field ===================================
-eps = eps_ref + opts.texture_amp * t;
-eps = min(max(eps, eps_min), eps_max);
+porosity = eps_ref + opts.texture_amp * t;
+porosity = min(max(porosity, eps_min), eps_max);
 
-fields.material.eps = eps;
+fields.material.eps = porosity;
 
-call_hook('eps_final', struct('eps', eps));
+call_hook('eps_final', struct('eps', porosity));
 
 %% === Statistics =============================================
-info.statistics.eps.mean = mean(eps(:));
-info.statistics.eps.std  = std(eps(:));
-info.statistics.eps.min  = min(eps(:));
-info.statistics.eps.max  = max(eps(:));
+info.statistics.eps.mean = mean(porosity(:));
+info.statistics.eps.std  = std(porosity(:));
+info.statistics.eps.min  = min(porosity(:));
+info.statistics.eps.max  = max(porosity(:));
 
 %% === Metadata ===============================================
 info.parameters = struct( ...

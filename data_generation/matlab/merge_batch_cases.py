@@ -2,17 +2,21 @@
 ===============================================================================
 merge_batch_cases.py
 ===============================================================================
-Merge strict task cases into one training dataset.
+Merge strict task cases into one content-bound training dataset.
 
 Responsibilities:
-  - Resolve the exact ordered fields from a registered TaskSpec
-  - Validate every case schema, fingerprint, identifier, dtype, and shape
-  - Save ordered tensors and deterministic merged-dataset identity
+  - Read prepared cases from the case-data root in deterministic filename order
+  - Validate each task schema, fingerprint, identifier, dtype, and spatial shape
+  - Stack task-ordered tensors and atomically publish merged dataset identity
 
 Design principles:
-  - Callers cannot select or filter learned fields
-  - Stacking always follows task order, never mapping insertion order
-  - Existing merged targets are never overwritten implicitly
+  - TaskSpec alone owns learned fields and channel order
+  - Ordered sample membership and source identities participate in the fingerprint
+  - Existing merged targets are authoritative and are never replaced implicitly
+
+This module does NOT:
+  - Build cases from COMSOL exports or choose a training split
+  - Filter fields, repair invalid cases, or provide compatibility for stale schemas
 ===============================================================================
 """
 
@@ -33,6 +37,7 @@ def merge_batch_cases(
     verbose: bool = False,
     *,
     task_id: str = "steady_flow",
+    data_root: Path | str | None = None,
     dataset_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """
@@ -46,25 +51,40 @@ def merge_batch_cases(
         Show merge progress and tensor metadata.
     task_id : str, optional
         Exact registered task identifier.
+    data_root : Path | str | None, optional
+        Explicit case-preparation root containing ``raw/<batch>/cases``.
     dataset_root : Path | str | None, optional
-        Explicit dataset root resolved through ``common.paths``.
+        Explicit merged-dataset root used by training and EDA.
 
     Returns
     -------
     dict[str, Any]
-        Dataset path, verified fingerprint, sample count, and tensor shapes.
+        Dataset path, verified fingerprint, sample count, task identity, and
+        stacked ``(N, C, ...)`` input/output shapes.
 
     Raises
     ------
     FileExistsError
         If the merged output already exists.
+    RuntimeError
+        If the case directory contains no canonical case files.
+    TypeError
+        If a loaded payload violates an exact persisted type contract.
     ValueError
-        If any case violates schema, fields, identity, dtype, or shape.
+        If any case violates schema, task fields, content identity, filename
+        identity, dtype, or shape consistency.
+
+    Notes
+    -----
+    The merged payload is published through the shared atomic serializer. Case
+    files remain owned by the case-data root; this function neither mutates nor
+    removes them and never overwrites an existing merged target.
 
     """
     task = domain.tasks.registry.get_task(task_id)
+    case_batch_dir = common.paths.resolve_case_dataset_dir(batch_name, data_root=data_root)
+    cases_dir = case_batch_dir / "cases"
     batch_dir = common.paths.resolve_dataset_dir(batch_name, dataset_root=dataset_root)
-    cases_dir = batch_dir / "cases"
     destination = common.paths.resolve_dataset_path(batch_name, dataset_root=dataset_root)
     if destination.exists():
         msg = f"Refusing to overwrite existing merged dataset: {destination}"

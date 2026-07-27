@@ -11,12 +11,13 @@ Responsibilities:
 
 Design principles:
   - Callers supply one resolved TaskSpec; fields are never selected ad hoc
-  - Merged and case-directory modes share the same identity validators
-  - Unsupported payloads and noncanonical aliases fail before sample exposure
+  - Every admitted payload receives strict tensor-byte identity verification
+  - Returned metadata is isolated while tensor channel order remains task-owned
 
-Boundaries:
-  - Schema and fingerprint algorithms belong to datasets.identity
-  - Split construction and normalization belong to datasets.base
+This module does NOT:
+  - Create, merge, repair, overwrite, split, or normalize stored datasets
+  - Define schemas, fingerprints, task fields, or DataLoader worker behavior
+  - Accept historical payloads, field aliases, or unverified lazy membership
 ===============================================================================
 """
 
@@ -40,7 +41,48 @@ if TYPE_CHECKING:
 
 
 class PhysicsDataset(Dataset[dict[str, Any]]):
-    """Expose strict task tensors from a merged file or case directory."""
+    """
+    Expose verified task tensors from a merged file or strict case directory.
+
+    Parameters
+    ----------
+    data_path : str | pathlib.Path
+        Merged ``.pt`` payload or directory containing ordered ``case_*.pt``
+        payloads. A directory named ``cases`` inherits its dataset ID from the
+        parent; other directories use their own name.
+    task : TaskSpec
+        Authoritative schema, field order, layout, and identity contract.
+
+    Attributes
+    ----------
+    mode : str
+        ``"merged"`` or ``"cases"``.
+    identity : DatasetIdentity
+        Verified portable ordered identity for the complete source.
+    input_fields, output_fields : list[str]
+        Task-order channel names exposed by every sample.
+    case_files : list[pathlib.Path]
+        Lexically sorted case paths in directory mode; empty in merged mode.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``data_path`` is neither an existing file nor directory.
+    OSError, RuntimeError
+        If a payload cannot be loaded, a case directory is empty, or merged
+        state cannot be initialized consistently.
+    TypeError, ValueError
+        If serialized containers, current schema, ordered fields, identities,
+        tensor geometry, metadata, or strict content fingerprints are invalid.
+
+    Notes
+    -----
+    Construction strictly verifies all tensor bytes before exposing membership.
+    Directory samples are loaded and reverified again on access; merged tensors
+    remain resident. Returned ``x``/``y`` channels retain TaskSpec physical/stored
+    representation, and metadata is deep-copied for consumer isolation.
+
+    """
 
     def __init__(
         self,
@@ -48,17 +90,7 @@ class PhysicsDataset(Dataset[dict[str, Any]]):
         *,
         task: TaskSpec,
     ) -> None:
-        """
-        Initialize and validate a current task dataset.
-
-        Parameters
-        ----------
-        data_path : str | Path
-            Merged ``.pt`` file or directory of strict case files.
-        task : TaskSpec
-            Authoritative task contract used by every producer and consumer.
-
-        """
+        """Load and strictly verify the complete source before sample exposure."""
         path = Path(data_path)
         self.path = path
         self.task = task
@@ -134,7 +166,17 @@ class PhysicsDataset(Dataset[dict[str, Any]]):
         Returns
         -------
         dict[str, Any]
-            Model-ready ``x``/``y`` tensors and source metadata.
+            Task-order ``x``/``y`` tensors and a deep copy of source metadata.
+
+        Raises
+        ------
+        IndexError
+            If ``idx`` is outside the ordered case-file list.
+        OSError, RuntimeError
+            If the admitted file can no longer be loaded.
+        TypeError, ValueError
+            If the case changed after construction or now violates strict schema,
+            metadata, identity, or content-fingerprint validation.
 
         """
         case_path = self.case_files[idx]
@@ -165,7 +207,16 @@ class PhysicsDataset(Dataset[dict[str, Any]]):
         Returns
         -------
         dict[str, Any]
-            ``x`` and ``y`` tensors plus isolated per-sample source metadata.
+            Channel-first ``x`` and ``y`` tensors in TaskSpec order plus isolated
+            per-sample source metadata.
+
+        Raises
+        ------
+        IndexError
+            If ``idx`` is outside the ordered dataset bounds.
+        OSError, TypeError, ValueError, RuntimeError
+            If a directory case cannot be reloaded/revalidated, merged state is
+            inconsistent, or source metadata is not a mapping.
 
         """
         if self.mode == "cases":
@@ -206,7 +257,13 @@ def create_task_dataset(
     Returns
     -------
     PhysicsDataset
-        Fully validated task-aware dataset.
+        Fully validated task-aware dataset shared by training and inference.
+
+    Raises
+    ------
+    FileNotFoundError, OSError, RuntimeError, TypeError, ValueError
+        Propagated from ``PhysicsDataset`` when path loading or strict dataset
+        validation fails.
 
     """
     return PhysicsDataset(data_path, task=task)

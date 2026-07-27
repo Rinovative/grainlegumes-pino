@@ -1,5 +1,12 @@
 # ruff: noqa: RUF043, S101, TC003
-"""Verify completed-run admission and strict inference/resume checkpoint roles."""
+"""
+Protect completed-run admission and strict inference versus resume checkpoint roles.
+
+Temporary saved-run fixtures show that status, required files, digests, normalizer
+identity, and ``best``/``last`` roles fail before model forward or redundant loads.
+Detailed checkpoint-state restoration and artifact payload generation are covered
+elsewhere; this module performs no production inference.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +29,12 @@ _REQUIRED_PAYLOAD_FILES = (
 
 
 class _SyntheticDataset(Dataset[dict[str, Any]]):
-    """Minimal field-aware dataset for inference context reconstruction."""
+    """
+    Model the minimal field-aware dataset needed for context reconstruction.
+
+    The single zero sample deliberately omits production storage and scientific
+    meaning; it only exercises validated normalizer and split wiring.
+    """
 
     input_fields: ClassVar[list[str]] = ["source"]
     output_fields: ClassVar[list[str]] = ["target"]
@@ -41,7 +53,12 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
 
 
 def _status_run(tmp_path: Path, status: str, *, touch_payloads: bool) -> Path:
-    """Create one synthetic run summary and optional placeholder payload set."""
+    """
+    Create one synthetic run leaf at a requested lifecycle status.
+
+    Optional empty payload files test that filename presence cannot override the
+    authoritative status marker; no payload is intended to be deserialized.
+    """
     run_dir = experiments.run.allocate_run_directory(tmp_path / status)
     experiments.run.transition_run_status(run_dir, "initializing")
     if status == "running":
@@ -55,21 +72,31 @@ def _status_run(tmp_path: Path, status: str, *, touch_payloads: bool) -> Path:
 
 
 def test_inference_and_artifacts_reject_running_status(tmp_path: Path) -> None:
-    """Present filenames cannot make a running run loadable."""
+    """
+    Create a running run leaf containing every required payload filename.
+
+    Inference and artifact planning must both reject it by lifecycle status,
+    proving apparent file completeness cannot bypass completion admission.
+    """
     run_dir = _status_run(tmp_path, "running", touch_payloads=True)
 
     with pytest.raises(experiments.run.RunLifecycleError, match="status must be 'completed'"):
-        learning.inference.context.load_inference_context(run_dir=run_dir, prefer_cuda=False)
+        learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
     with pytest.raises(experiments.run.RunLifecycleError, match="status must be 'completed'"):
         analysis.artifact_service.load_run_artifact_plan(run_dir)
 
 
 def test_incomplete_run_is_rejected_before_reconstruction(tmp_path: Path) -> None:
-    """An allocated but incomplete leaf cannot reach model reconstruction."""
+    """
+    Create an initializing run leaf without any required payload files.
+
+    Both inference and artifact planning must reject it at run admission before
+    reconstruction, keeping partial allocation distinct from a loadable run.
+    """
     run_dir = _status_run(tmp_path, "initializing", touch_payloads=False)
 
     with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
-        learning.inference.context.load_inference_context(run_dir=run_dir, prefer_cuda=False)
+        learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
     with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
         analysis.artifact_service.load_run_artifact_plan(run_dir)
 
@@ -78,10 +105,23 @@ def test_resume_requires_last_checkpoint_even_when_other_files_exist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Resume never substitutes best_checkpoint.pt for missing continuation state."""
+    """
+    Remove ``last_checkpoint.pt`` from an otherwise populated running run.
+
+    Resume must fail on the continuation artifact instead of substituting the
+    selection-only best checkpoint, preserving exact optimizer/RNG continuation.
+    """
     run_dir = _status_run(tmp_path, "running", touch_payloads=True)
     (run_dir / "last_checkpoint.pt").unlink()
-    monkeypatch.setattr(experiments.run.config_loader, "load_and_resolve_config", lambda _path: {})
+    monkeypatch.setattr(experiments.run.config_loader, "load_yaml", lambda _path: {})
+    monkeypatch.setattr(
+        experiments.run.config_loader,
+        "resolve_config",
+        lambda _raw: {
+            "run": {"device": "cpu"},
+            "training": {"mixed_precision": False},
+        },
+    )
 
     with pytest.raises(experiments.run.RunLifecycleError, match="last_checkpoint.pt"):
         experiments.run.run_experiment("unused.yaml", resume=run_dir)
@@ -91,7 +131,12 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Inference reconstructs preprocessing without reopening normalizer.pt."""
+    """
+    Return validated normalizer tensors directly and forbid every later ``torch.load``.
+
+    Context reconstruction must use those exact objects and still build the selected
+    loader/model, preventing a time-of-check/time-of-use artifact reopen.
+    """
     context = learning.inference.context
     model = nn.Conv2d(1, 1, kernel_size=1, bias=False)
     normalizer_state = {
@@ -115,12 +160,20 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
 
     monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _run_dir: completed_run)
     monkeypatch.setattr(context, "_field_contract", lambda _config: (["source"], ["target"]))
-    monkeypatch.setattr(experiments.run, "configure_reproducibility", lambda _config: {"model_init": 1})
-    monkeypatch.setattr(experiments.run, "seed_process", lambda _seed: None)
+
+    def configure_reproducibility(_config: dict[str, Any], *, device: torch.device) -> dict[str, int]:
+        assert device == torch.device("cpu")
+        return {"model_init": 1}
+
+    def seed_process(_seed: int, *, device: torch.device) -> None:
+        assert device == torch.device("cpu")
+
+    monkeypatch.setattr(experiments.run, "configure_reproducibility", configure_reproducibility)
+    monkeypatch.setattr(experiments.run, "seed_process", seed_process)
     monkeypatch.setattr(context, "_select_split", lambda **_kwargs: selection)
 
     def build_model(_config: dict[str, Any], *, device: torch.device) -> nn.Module:
-        del device
+        assert device == torch.device("cpu")
         return model
 
     def create_dataset(_path: Path, *, task: object) -> _SyntheticDataset:
@@ -140,7 +193,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
 
     loaded_model, loader, processor, device = context.load_inference_context(
         run_dir=tmp_path / "run",
-        prefer_cuda=False,
+        device_policy="cpu",
     )
 
     assert loaded_model is model

@@ -12,12 +12,12 @@ Responsibilities:
 Design principles:
   - Task-fixed semantics have one immutable source of truth
   - Physical units remain distinct from stored/model representations
-  - Channel counts and operator dimensionality are derived values
+  - Channel counts, objective identity, and contract digests are deterministic
 
-Boundaries:
-  - Task registration belongs to domain.tasks.registry
-  - Concrete task declarations belong to task-specific modules
-  - Physics equations and numerical implementations belong outside this module
+This module does NOT:
+  - Register tasks or declare a concrete task's fields and defaults
+  - Implement metric, loss, normalization, or physics equations
+  - Load datasets or mutate persisted task contracts after construction
 ===============================================================================
 """
 
@@ -36,14 +36,14 @@ FieldRole = Literal[
     "state",
 ]
 MetricSpace = Literal["normalized", "physical"]
-MetricReduction = Literal["sample_mean", "element_mean"]
+MetricReduction = Literal["sample_mean", "element_mean", "field_macro_element_mean"]
 OptimizationDirection = Literal["minimize", "maximize"]
 _SUPPORTED_TENSOR_LAYOUT = ("batch", "channel", "y", "x")
 _SUPPORTED_OPERATOR_AXES = (2, 3)
 _SUPPORTED_NORMALIZATION_AXES = (0, 2, 3)
 _FIELD_ROLES = frozenset({"coordinate", "permeability", "porosity", "boundary", "state"})
 _METRIC_SPACES = frozenset({"normalized", "physical"})
-_METRIC_REDUCTIONS = frozenset({"sample_mean", "element_mean"})
+_METRIC_REDUCTIONS = frozenset({"sample_mean", "element_mean", "field_macro_element_mean"})
 _OPTIMIZATION_DIRECTIONS = frozenset({"minimize", "maximize"})
 
 
@@ -64,6 +64,12 @@ class FieldSpec:
         Stored/model representation distinct from the physical unit.
     source_name : str | None
         Exact producer column name when it differs from the canonical field.
+
+    Raises
+    ------
+    ValueError
+        If names, units, or representations are empty, the role is unsupported,
+        or ``source_name`` is neither ``None`` nor a non-empty string.
 
     """
 
@@ -117,6 +123,12 @@ class DatasetDefaults:
     ood : tuple[str, ...]
         Ordered default out-of-distribution dataset identifiers.
 
+    Raises
+    ------
+    ValueError
+        If identifiers are empty, OOD defaults are not a non-empty tuple, or any
+        train/OOD identifier is duplicated.
+
     """
 
     train: str
@@ -159,7 +171,14 @@ class PreprocessingSpec:
     output_normalization : str
         Semantic output normalization strategy.
     fit_split : str
-        Dataset split used to fit preprocessing statistics.
+        Dataset split used to fit preprocessing statistics; only ``"train"`` is
+        supported so evaluation membership cannot influence fitted state.
+
+    Raises
+    ------
+    ValueError
+        If normalization identifiers are empty or ``fit_split`` is not exactly
+        ``"train"``.
 
     """
 
@@ -212,9 +231,18 @@ class MetricSpec:
     fields : tuple[str, ...]
         Ordered task output fields evaluated by the metric.
     reduction : MetricReduction
-        Semantic reduction across samples or elements.
+        Aggregation contract. ``sample_mean`` averages independently computed
+        per-sample values; ``element_mean`` pools selected elements before the
+        metric's final transform; ``field_macro_element_mean`` pools elements
+        per field and then gives each finalized field value equal weight.
     direction : OptimizationDirection
         Objective optimization direction.
+
+    Raises
+    ------
+    ValueError
+        If identifiers or fields are empty/duplicated, or a runtime literal is
+        outside the supported metric space, reduction, or direction sets.
 
     """
 
@@ -275,7 +303,7 @@ class MetricSpec:
 @dataclass(frozen=True, slots=True)
 class PhysicsSpec:
     """
-    Describe the semantic selector for a reusable task equation set.
+    Describe the semantic selector for a task-owned equation set.
 
     Attributes
     ----------
@@ -284,38 +312,60 @@ class PhysicsSpec:
     equation_set : str
         Descriptive equation-set identifier.
     continuity : str
-        Descriptive continuity-formulation identifier.
+        Default continuity-formulation identifier.
+    allowed_continuities : tuple[str, ...]
+        Exact continuity identifiers experiments may select.
     boundary : str
         Descriptive boundary-formulation identifier.
+
+    Raises
+    ------
+    ValueError
+        If selectors are empty, allowed continuities are empty or duplicated,
+        or the default continuity is not in the allowed tuple.
 
     """
 
     kind: str
     equation_set: str
     continuity: str
+    allowed_continuities: tuple[str, ...]
     boundary: str
 
     def __post_init__(self) -> None:
-        """Require explicit non-empty semantic physics selectors."""
+        """Require explicit, internally consistent semantic physics selectors."""
         values = (self.kind, self.equation_set, self.continuity, self.boundary)
         if any(not isinstance(value, str) or not value for value in values):
             msg = "Physics kind, equation_set, continuity, and boundary must be non-empty strings."
             raise ValueError(msg)
+        if (
+            not isinstance(self.allowed_continuities, tuple)
+            or not self.allowed_continuities
+            or any(not isinstance(value, str) or not value for value in self.allowed_continuities)
+            or len(set(self.allowed_continuities)) != len(self.allowed_continuities)
+        ):
+            msg = "Physics allowed_continuities must be a unique non-empty tuple of non-empty strings."
+            raise ValueError(msg)
+        if self.continuity not in self.allowed_continuities:
+            msg = f"Default continuity {self.continuity!r} must be one of the allowed identifiers {list(self.allowed_continuities)!r}."
+            raise ValueError(msg)
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, object]:
         """
         Return a JSON-serializable physics selection.
 
         Returns
         -------
-        dict[str, str]
-            Semantic physics selector and descriptive formulation identifiers.
+        dict[str, object]
+            Semantic physics selector, default continuity, allowed continuity
+            identifiers, and descriptive formulation identifiers.
 
         """
         return {
             "kind": self.kind,
             "equation_set": self.equation_set,
             "continuity": self.continuity,
+            "allowed_continuities": list(self.allowed_continuities),
             "boundary": self.boundary,
         }
 
@@ -351,6 +401,21 @@ class TaskSpec:
         Default semantic evaluation metrics and objective ordering.
     physics : PhysicsSpec
         Task-owned physics selector.
+
+    Raises
+    ------
+    TypeError
+        If nested dataset, preprocessing, or physics declarations have the
+        wrong runtime type.
+    ValueError
+        If identifiers, fields, axes, losses, or metrics violate the current
+        immutable task schema, including duplicate or unknown metric fields.
+
+    Notes
+    -----
+    The first ``default_metrics`` entry is the default objective. Contract
+    payloads and SHA-256 digests preserve declaration order and contain no
+    mutable runtime state.
 
     """
 

@@ -15,6 +15,11 @@ Design principles:
   - ``best_checkpoint.pt`` is the inference and artifact source
   - Resume is exact at a completed epoch boundary, never mid-epoch
   - Missing or mixed-schema state fails closed without translation
+
+This module does NOT:
+  - Allocate run directories, choose resume policy, or validate mutable run status
+  - Construct models, optimizers, schedulers, scalers, losses, or dataloaders
+  - Translate legacy or partial checkpoints into the current schema
 ===============================================================================
 """
 
@@ -78,7 +83,14 @@ _CHECKPOINT_KEYS = frozenset(
 
 
 def _config_identity_view(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Return config semantics that must remain fixed across resume."""
+    """
+    Copy the config semantics that must remain fixed across exact resume.
+
+    Resolved locations, requested device policy, and terminal epoch count are
+    removed because resume may relocate execution metadata or extend duration.
+    Every remaining scientific, data, optimizer, and lifecycle field retains
+    identity significance.
+    """
     view = copy.deepcopy(dict(config))
     view.pop("paths", None)
     run = view.get("run")
@@ -92,7 +104,11 @@ def _config_identity_view(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def config_digest(config: Mapping[str, Any]) -> str:
     """
-    Return the exact canonical digest of a persisted effective config.
+    Return the scientific effective-config digest for a persisted config.
+
+    The requested device policy is retained in ``config.yaml`` as operational
+    provenance but excluded from scientific identity. Concrete runtime device
+    facts never enter this function.
 
     Parameters
     ----------
@@ -102,10 +118,14 @@ def config_digest(config: Mapping[str, Any]) -> str:
     Returns
     -------
     str
-        Canonical SHA-256 digest.
+        Canonical SHA-256 digest excluding only the operational device policy.
 
     """
-    return common.serialization.canonical_json_sha256(dict(config))
+    view = copy.deepcopy(dict(config))
+    run = view.get("run")
+    if isinstance(run, dict):
+        run.pop("device", None)
+    return common.serialization.canonical_json_sha256(view)
 
 
 def resume_contract_digest(config: Mapping[str, Any]) -> str:
@@ -114,6 +134,17 @@ def resume_contract_digest(config: Mapping[str, Any]) -> str:
 
     The only excluded semantic duration field is ``training.epochs``. Resolved
     paths and ``run.device`` are runtime location/execution metadata.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Fully resolved saved or resume-requested config.
+
+    Returns
+    -------
+    str
+        Canonical SHA-256 digest of the resume-fixed comparison view.
+
     """
     return common.serialization.canonical_json_sha256(_config_identity_view(config))
 
@@ -130,7 +161,13 @@ _OBJECTIVE_KEYS = frozenset({"id", "kind", "space", "fields", "reduction", "dire
 
 
 def _validate_objective(value: Any, *, label: str) -> dict[str, Any]:
-    """Return one exact full resolved objective mapping."""
+    """
+    Validate and isolate one exact persisted objective identity.
+
+    All six canonical fields are required, unknown fields are rejected, ordered
+    output fields must be unique, and direction is limited to minimize/maximize.
+    The returned deep copy prevents caller mutation from altering admitted state.
+    """
     objective = _required_mapping(value, label=label)
     missing = sorted(_OBJECTIVE_KEYS.difference(objective))
     unknown = sorted(set(objective).difference(_OBJECTIVE_KEYS))
@@ -155,7 +192,13 @@ def _validate_objective(value: Any, *, label: str) -> dict[str, Any]:
 
 
 def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
-    """Return one exact current checkpoint identity mapping."""
+    """
+    Validate and isolate the complete current checkpoint identity schema.
+
+    Task/config digests, train/OOD fingerprints, all split membership digests,
+    and the full objective must be present with no unknown keys. Validation is
+    performed before any runtime component is restored.
+    """
     identity = _required_mapping(value, label=label)
     missing = sorted(_CHECKPOINT_IDENTITY_KEYS.difference(identity))
     unknown = sorted(set(identity).difference(_CHECKPOINT_IDENTITY_KEYS))
@@ -286,21 +329,32 @@ def _sampler_state(train_loader: DataLoader[Any]) -> Mapping[str, Any] | None:
 
 
 def _cuda_device_index(device: torch.device) -> int:
-    """Return an explicit CUDA device index for one active runtime device."""
-    return torch.cuda.current_device() if device.index is None else device.index
+    """Return the already concrete CUDA index without querying runtime defaults."""
+    if device.type != "cuda" or device.index is None:
+        msg = f"Checkpoint CUDA state requires an indexed concrete CUDA device, got {device}."
+        raise ValueError(msg)
+    return device.index
 
 
 def _active_cuda_devices(
     model: nn.Module,
     *,
-    runtime_device: torch.device | str | None = None,
+    runtime_device: torch.device | None = None,
 ) -> tuple[torch.device, ...]:
-    """Return sorted CUDA devices actively used by the runtime or model."""
+    """
+    Discover sorted concrete CUDA devices owned by this runtime or model.
+
+    Only an explicitly supplied indexed runtime device and devices already
+    owning model parameters or buffers participate. The helper never queries a
+    process-default CUDA device or initializes availability-based fallback.
+    """
     indices: set[int] = set()
     if runtime_device is not None:
-        device = torch.device(runtime_device)
-        if device.type == "cuda":
-            indices.add(_cuda_device_index(device))
+        if not isinstance(runtime_device, torch.device):
+            msg = f"runtime_device must be a concrete torch.device, got {runtime_device!r}."
+            raise TypeError(msg)
+        if runtime_device.type == "cuda":
+            indices.add(_cuda_device_index(runtime_device))
     for tensors in (model.parameters(), model.buffers()):
         for tensor in tensors:
             if tensor.device.type == "cuda":
@@ -324,7 +378,13 @@ def _attempt_rollback(
     action: Callable[[], Any],
     errors: list[str],
 ) -> None:
-    """Run one rollback action while retaining every rollback failure."""
+    """
+    Attempt one transactional rollback action and retain any failure.
+
+    Arbitrary component exceptions are converted to bounded diagnostic strings
+    so later rollback actions still run. The original restore error remains the
+    primary exception unless the collected failures make rollback incomplete.
+    """
     try:
         action()
     except Exception as error:  # noqa: BLE001 -- rollback must retain arbitrary component failures
@@ -347,7 +407,7 @@ def make_checkpoint(
     best_epoch: int | None,
     objective_history: list[dict[str, Any]],
     train_loader: DataLoader[Any],
-    runtime_device: torch.device | str | None = None,
+    runtime_device: torch.device,
 ) -> dict[str, Any]:
     """
     Capture a complete epoch-boundary checkpoint payload.
@@ -374,8 +434,8 @@ def make_checkpoint(
         Ordered finite evaluation history.
     train_loader : DataLoader
         Shuffled loader whose generator state controls the next epoch.
-    runtime_device : torch.device | str | None, optional
-        Active execution device. CUDA RNG is captured only for this device and
+    runtime_device : torch.device
+        Active concrete execution device. CUDA RNG is captured only for this device and
         any CUDA devices that actually own model parameters or buffers.
 
     Returns
@@ -402,8 +462,14 @@ def make_checkpoint(
     if role == "best" and best_metric is None:
         msg = "A best checkpoint requires a finite best objective."
         raise ValueError(msg)
+    if not isinstance(runtime_device, torch.device) or runtime_device.type not in {"cpu", "cuda"}:
+        msg = f"Checkpoint capture requires one concrete CPU or CUDA torch.device, got {runtime_device!r}."
+        raise TypeError(msg)
     if amp_enabled and scaler is None:
         msg = "AMP-enabled checkpoints require a scaler."
+        raise ValueError(msg)
+    if amp_enabled and runtime_device.type != "cuda":
+        msg = "AMP-enabled checkpoints require a concrete CUDA runtime device."
         raise ValueError(msg)
 
     validated_identity = _validate_checkpoint_identity(identity, label="identity")
@@ -446,8 +512,39 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     """
     Validate a checkpoint completely before runtime state restoration.
 
-    Returns an isolated shallow mapping only after schema, identity, progress,
-    component-state, RNG, and loader-state checks pass.
+    Parameters
+    ----------
+    payload : Mapping[str, Any]
+        Untrusted loaded checkpoint mapping.
+    expected_identity : Mapping[str, Any]
+        Exact task/config/dataset/split/objective identity for the current run.
+    expected_role : {"best", "last"}
+        Required lifecycle role.
+    scheduler_expected : bool
+        Whether scheduler state must be present.
+    amp_expected : bool
+        Whether AMP and scaler state must be present.
+    require_best : bool
+        Whether finite best-objective state is mandatory.
+
+    Returns
+    -------
+    dict[str, Any]
+        Isolated shallow mapping admitted under the current schema.
+
+    Raises
+    ------
+    TypeError
+        If required mappings, scalar types, or RNG/sampler state shapes are invalid.
+    ValueError
+        If schema, identity, role, progress, best selection, or component presence
+        contradicts the expected run contract.
+
+    Notes
+    -----
+    Validation mutates no runtime object. RNG payloads are tested on temporary
+    generators before the checkpoint can reach transactional restoration.
+
     """
     missing = sorted(_CHECKPOINT_KEYS.difference(payload))
     unknown = sorted(set(payload).difference(_CHECKPOINT_KEYS))
@@ -678,6 +775,37 @@ def restore_checkpoint(
     before mutation. If any component, loader, sampler, or RNG restore fails,
     every supplied runtime object and process RNG is restored to its exact
     pre-call state before the original failure is re-raised.
+
+    Parameters
+    ----------
+    payload : Mapping[str, Any]
+        Candidate strict ``last`` checkpoint.
+    expected_identity : Mapping[str, Any]
+        Immutable identity required by the current resumed run.
+    model, optimizer, scheduler, scaler, loss : Any
+        Current runtime components whose state may be replaced.
+    amp_enabled : bool
+        Whether scaler state is required by the resumed runtime.
+    train_loader : DataLoader
+        Loader owning the explicit shuffle generator and optional sampler state.
+
+    Returns
+    -------
+    dict[str, Any]
+        Restored progress, best-objective state, and isolated objective history.
+
+    Raises
+    ------
+    TypeError
+        If checkpoint or current loader/sampler capabilities cannot support exact restore.
+    RuntimeError
+        If CUDA state cardinality differs or rollback after a restore failure is incomplete.
+
+    Notes
+    -----
+    Process-global Python, NumPy, Torch CPU, and active-device CUDA RNG states
+    are part of both the restore transaction and its rollback snapshot.
+
     """
     checkpoint = validate_checkpoint(
         payload,

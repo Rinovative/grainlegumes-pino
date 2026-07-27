@@ -5,18 +5,18 @@ experiments_tuning_search_space.py
 Parse YAML-defined Optuna search spaces and apply trial overrides.
 
 Responsibilities:
-  - Validate search_space blocks from Optuna YAML files
-  - Convert parameter specs into Optuna trial suggestions
-  - Apply sampled values to resolved configs by dotted paths
+  - Parse exact categorical, float, integer, and fixed parameter schemas
+  - Validate approved dotted paths, supported values, and base-value containment
+  - Request typed Optuna suggestions and apply them to isolated config copies
 
 Design principles:
-  - Search-space paths are explicit and auditable
-  - Invalid paths fail fast
-  - Parsing is independent of model-specific code
+  - Search dimensions are explicit, finite where required, and independently auditable
+  - Trial overrides cannot mutate task, objective, path, seed, or derived channel identity
+  - Parsing and config application remain independent of model implementations
 
-Boundaries:
-  - Study creation and trial execution belong to experiments.tuning.optuna
-  - Model and optimizer construction belong to learning factories
+This module does NOT:
+  - Create studies or execute trials; ``experiments.tuning.optuna`` owns lifecycle
+  - Construct models or optimizers; learning factories own runtime objects
 ===============================================================================
 """
 
@@ -29,6 +29,34 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
 SearchKind = Literal["categorical", "float", "int", "fixed"]
+
+_COMMON_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {
+    "data.batch_size": frozenset({"categorical", "int"}),
+    "optimizer.lr": frozenset({"categorical", "float"}),
+    "optimizer.weight_decay": frozenset({"categorical", "float"}),
+}
+_MODEL_SEARCH_PATH_KINDS: dict[str, dict[str, frozenset[SearchKind]]] = {
+    "fno": {
+        "model.params.n_modes.0": frozenset({"categorical"}),
+        "model.params.n_modes.1": frozenset({"categorical"}),
+        "model.params.hidden_channels": frozenset({"categorical"}),
+        "model.params.n_layers": frozenset({"categorical"}),
+    },
+    "uno": {
+        "model.params.modes_x": frozenset({"categorical"}),
+        "model.params.modes_y": frozenset({"categorical"}),
+        "model.params.hidden_channels": frozenset({"categorical"}),
+        "model.params.n_layers": frozenset({"categorical"}),
+        "model.params.mode_ratio": frozenset({"categorical", "float"}),
+    },
+}
+_PHYSICS_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {
+    "loss.physics.residual_weight.target": frozenset({"categorical", "float"}),
+    "loss.physics.residual_weight.warmup.epochs": frozenset({"categorical", "int"}),
+    "loss.physics.boundary_weight.target": frozenset({"categorical", "float"}),
+    "loss.physics.boundary_weight.warmup.epochs": frozenset({"categorical", "int"}),
+    "loss.physics.continuity": frozenset({"categorical"}),
+}
 
 
 class TrialLike(Protocol):
@@ -87,7 +115,13 @@ class SearchSpaceParameter:
     log : bool
         Whether numeric sampling should use log scale
     value : Any
-        Fixed value, used for fixed parameters
+        Fixed value, used for fixed parameters.
+
+    Notes
+    -----
+    Instances are immutable parsed transport records. Path admission against a
+    resolved model/task contract occurs separately in
+    :func:`validate_search_space_paths`.
 
     """
 
@@ -164,7 +198,13 @@ def _parse_numeric_spec(
     path: str,
     kind: Literal["float", "int"],
 ) -> tuple[int | float, int | float, int | float | None, bool]:
-    """Parse and validate one exact numeric search specification."""
+    """
+    Parse one exact numeric parameter domain without scalar coercion.
+
+    Required/optional keys depend on integer versus float kind. Bounds must be
+    finite and ordered, log sampling requires positive bounds and forbids a
+    step, and any step must divide the closed bound span exactly.
+    """
     required_keys = {"name", "kind", "low", "high"}
     optional_keys = {"step", "log"}
     missing_keys = sorted(required_keys.difference(spec))
@@ -240,7 +280,9 @@ def parse_search_space(raw_search_space: Any) -> tuple[SearchSpaceParameter, ...
     TypeError
         If the search_space block or a spec has the wrong type
     ValueError
-        If a spec is incomplete or invalid
+        If a domain, choice, bound, step, or parameter name is invalid.
+    KeyError
+        If a kind-specific required key is absent.
 
     """
     mapping = _require_mapping(raw_search_space, label="search_space")
@@ -333,32 +375,113 @@ def parse_search_space(raw_search_space: Any) -> tuple[SearchSpaceParameter, ...
     return tuple(parameters)
 
 
+def _resolved_path_value(config: dict[str, Any], path: str) -> Any:
+    """Return the current value at one validated dotted config path."""
+    current: Any = config
+    for token in path.split("."):
+        current = _descend(current, token, full_path=path)
+    return current
+
+
+def _parameter_contains_value(parameter: SearchSpaceParameter, value: Any) -> bool:
+    """
+    Test whether a parsed domain contains the resolved base value exactly.
+
+    Categorical and fixed domains use equality; numeric domains require type,
+    inclusive bounds, and step-grid alignment. This admission rule guarantees
+    the embedded base experiment is itself a member of the declared study.
+    """
+    if parameter.kind == "categorical":
+        return value in parameter.values
+    if parameter.kind == "fixed":
+        return value == parameter.value
+    if parameter.low is None or parameter.high is None:
+        return False
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    numeric_value = float(value)
+    if not float(parameter.low) <= numeric_value <= float(parameter.high):
+        return False
+    if parameter.step is None:
+        return True
+    offset = (numeric_value - float(parameter.low)) / float(parameter.step)
+    return math.isclose(offset, round(offset), rel_tol=1e-9, abs_tol=1e-9)
+
+
 def validate_search_space_paths(
     config: dict[str, Any],
     search_space: Sequence[SearchSpaceParameter],
 ) -> None:
-    """Validate every resolved dotted path without applying an override."""
+    """
+    Validate approved search paths, parameter kinds, and base-value containment.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Fully resolved experiment base config.
+    search_space : Sequence[SearchSpaceParameter]
+        Parsed semantic override definitions.
+
+    Raises
+    ------
+    ValueError
+        If a path is unapproved for the model/physics mode, its parameter kind is
+        unsupported, structural UNO depth is invalid, or the resolved base value
+        lies outside the declared domain.
+
+    Notes
+    -----
+    Requiring the base point makes every study configuration internally coherent
+    and prevents a search recipe from describing a different model than it embeds.
+
+    """
+    model = _require_mapping(config.get("model"), label="config.model")
+    model_kind = _require_nonempty_string(model.get("kind"), label="config.model.kind")
+    model_paths = _MODEL_SEARCH_PATH_KINDS.get(model_kind)
+    if model_paths is None:
+        msg = f"No maintained Optuna search policy exists for model kind {model_kind!r}."
+        raise ValueError(msg)
+
+    allowed = {**_COMMON_SEARCH_PATH_KINDS, **model_paths}
+    loss = _require_mapping(config.get("loss"), label="config.loss")
+    physics = _require_mapping(loss.get("physics"), label="config.loss.physics")
+    if physics.get("enabled") is True:
+        allowed.update(_PHYSICS_SEARCH_PATH_KINDS)
+
     for parameter in search_space:
         tokens = parameter.path.split(".")
         if not tokens or any(token == "" for token in tokens):
             msg = f"Invalid override path: {parameter.path!r}"
             raise ValueError(msg)
-        if tokens[0] in {"task", "task_contract", "paths", "evaluation"}:
-            msg = f"Search-space path {parameter.path!r} targets immutable experiment/objective identity."
+        allowed_kinds = allowed.get(parameter.path)
+        if allowed_kinds is None:
+            msg = f"Search-space path {parameter.path!r} is not approved for model={model_kind!r}, physics_enabled={physics.get('enabled') is True}."
             raise ValueError(msg)
-        derived_paths = {
-            "model.params.in_channels",
-            "model.params.out_channels",
-            "run.name",
-            "run.seed",
-            "run.suffix",
-        }
-        if parameter.path in derived_paths:
-            msg = f"Search-space path {parameter.path!r} targets a derived run/task value."
+        if parameter.kind not in allowed_kinds:
+            msg = f"Search-space path {parameter.path!r} does not support kind {parameter.kind!r}; allowed kinds are {sorted(allowed_kinds)}."
             raise ValueError(msg)
-        current: Any = config
-        for token in tokens:
-            current = _descend(current, token, full_path=parameter.path)
+        if model_kind == "uno" and parameter.path == "model.params.n_layers" and parameter.kind == "categorical":
+            unsupported_depths = sorted(set(parameter.values).difference({5, 7}))
+            if unsupported_depths:
+                msg = f"UNO search-space depths must be structurally supported values 5 or 7, got {unsupported_depths}."
+                raise ValueError(msg)
+        base_value = _resolved_path_value(config, parameter.path)
+        if not _parameter_contains_value(parameter, base_value):
+            msg = f"Search-space parameter {parameter.path!r} must contain its resolved base value {base_value!r}."
+            raise ValueError(msg)
+
+    continuity = next(
+        (parameter for parameter in search_space if parameter.path == "loss.physics.continuity"),
+        None,
+    )
+    if continuity is not None:
+        task_contract = _require_mapping(config.get("task_contract"), label="config.task_contract")
+        physics_contract = _require_mapping(task_contract.get("physics"), label="config.task_contract.physics")
+        allowed_continuities = tuple(physics_contract.get("allowed_continuities", ()))
+        unsupported = sorted(set(continuity.values).difference(allowed_continuities))
+        if unsupported:
+            msg = f"Search-space continuity choices are unsupported by the task contract: {unsupported}."
+            raise ValueError(msg)
 
 
 def suggest_trial_overrides(trial: TrialLike, search_space: Sequence[SearchSpaceParameter]) -> dict[str, Any]:
@@ -413,7 +536,12 @@ def suggest_trial_overrides(trial: TrialLike, search_space: Sequence[SearchSpace
 
 
 def _descend(container: Any, token: str, *, full_path: str) -> Any:
-    """Descend one token into a dict or list config container."""
+    """
+    Descend one validated dotted-path token without creating structure.
+
+    Mappings require an existing key and lists require an in-range decimal
+    index. Error messages retain the complete original path for YAML diagnostics.
+    """
     if isinstance(container, MutableMapping):
         if token not in container:
             msg = f"Override path {full_path!r} does not exist at key {token!r}"
@@ -433,7 +561,12 @@ def _descend(container: Any, token: str, *, full_path: str) -> Any:
 
 
 def _assign(container: Any, token: str, value: Any, *, full_path: str) -> None:
-    """Assign one value into a dict or list config container."""
+    """
+    Assign one terminal path token without creating keys or extending lists.
+
+    The caller owns value copying. Missing keys, non-numeric list tokens,
+    out-of-range indices, and scalar descent fail with full-path context.
+    """
     if isinstance(container, MutableMapping):
         if token not in container:
             msg = f"Override path {full_path!r} does not exist at key {token!r}"
@@ -465,7 +598,23 @@ def set_config_path(config: dict[str, Any], path: str, value: Any) -> None:
     path : str
         Dotted path. Numeric tokens index into lists, e.g. model.params.n_modes.0
     value : Any
-        Value to assign
+        Value deep-copied into the existing terminal node.
+
+    Raises
+    ------
+    ValueError
+        If ``path`` is empty or contains an empty token.
+    KeyError
+        If a mapping token does not already exist.
+    TypeError
+        If a token cannot descend into or index the current container.
+    IndexError
+        If a list token is outside the existing list.
+
+    Notes
+    -----
+    This function mutates ``config`` but never creates schema structure; callers
+    must revalidate the resulting resolved config.
 
     """
     tokens = path.split(".")

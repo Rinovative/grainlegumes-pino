@@ -43,7 +43,7 @@ jobs:
         shell: bash -l {0}
         run: ruff format --check model_training/src model_training/tests data_generation/matlab scripts/check_notebooks.py --exclude '*.ipynb'
 
-      - name: Validate and lint notebooks
+      - name: Validate maintained notebooks and archive notices
         shell: bash -l {0}
         run: |
           python scripts/check_notebooks.py
@@ -57,7 +57,8 @@ jobs:
         shell: bash -l {0}
         run: python -m basedpyright
 
-      - name: Complexity report
+      - name: Complexity report (informational)
+        continue-on-error: true
         shell: bash -l {0}
         run: |
           python - << 'EOF'

@@ -9,30 +9,31 @@ Responsibilities:
   - Consume the resolved semantic objective for scheduler and best-metric updates
   - Manage checkpoints, histories, and reproducibility state
   - Track histories, RNG state and optional mixed precision
-  - Invoke optional epoch-end callbacks for tuning
+  - Invoke optional epoch-end callbacks for local lifecycle observers
 
 Design principles:
   - Reproducibility state is explicit in checkpoints
   - Data, model and loss objects are caller-provided
   - Controller behavior stays independent of model architecture
 
-Boundaries:
-  - Config loading belongs to experiments.config.loader
-  - Model and loss construction belong to learning factories
-  - CLI argument parsing belongs to experiments.cli
+This module does NOT:
+  - Load or resolve configs; ``experiments.config.loader`` owns semantic admission
+  - Construct models or losses; caller-selected learning factories own construction
+  - Parse CLI arguments; ``experiments.cli`` owns command boundaries
 ===============================================================================
 """
 
 from __future__ import annotations
 
-import importlib
 import math
+import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
+from torch.amp.grad_scaler import GradScaler
 
 from src import common
 
@@ -67,7 +68,13 @@ def _prepare_batch(
     *,
     training: bool,
 ) -> TensorBatch:
-    """Prepare one raw dataloader batch for model execution."""
+    """
+    Prepare one raw batch with the processor in the requested lifecycle mode.
+
+    When present, the processor is switched to train/eval state and preprocesses
+    a copied mapping before tensor transfer. The final batch must contain tensor
+    ``x`` and ``y`` keys on the concrete device.
+    """
     if data_processor is None:
         return _move_batch_to_device(raw_batch, device)
 
@@ -105,35 +112,57 @@ def train_one_epoch(
     use_amp: bool = False,
 ) -> dict[str, float]:
     """
-    Execute one training epoch.
+    Execute one training epoch and sample-weight every named loss component.
+
+    Batch means are multiplied by their actual sample counts before epoch
+    reduction. Supervised runs publish only total/data loss; physics-informed
+    runs additionally publish momentum, boundary, one formulation-qualified
+    continuity contribution, applied weights, and warmup fractions.
 
     Parameters
     ----------
-    model : nn.Module
-        Model to train
+    model : torch.nn.Module
+        Model mutated through training-mode forward/backward updates.
     train_loader : DataLoader
-        Training data loader
+        Loader providing mapping batches with ``x`` and ``y`` tensors.
     optimizer : Optimizer
-        Optimizer
-    loss_fn : nn.Module
-        Loss function
+        Optimizer stepped once per finite batch, subject to AMP overflow skips.
+    loss_fn : torch.nn.Module
+        Conventional loss or semantic composition exposing named components.
     device : torch.device
-        Compute device
-    data_processor : Any | None
-        Optional neuralop data processor
-    scaler : Any | None
-        GradScaler for mixed precision (optional)
-    use_amp : bool
-        Whether to use automatic mixed precision
+        Concrete device receiving each prepared batch.
+    data_processor : Any | None, optional
+        Processor switched to training mode before preprocessing each batch.
+    scaler : Any | None, optional
+        CUDA gradient scaler required when ``use_amp`` is true.
+    use_amp : bool, optional
+        Whether to execute CUDA autocast and scaled optimization.
 
     Returns
     -------
     dict[str, float]
-        Dictionary with key "train_loss" (average loss over epoch)
+        Stable per-epoch training telemetry plus an internal optimizer-step
+        count consumed by the checkpoint lifecycle.
+
+    Raises
+    ------
+    ValueError
+        If AMP is requested without CUDA or a scaler.
+    FloatingPointError
+        If any batch loss is non-finite before optimizer mutation.
+    RuntimeError
+        If the loader is empty or physics component telemetry is incomplete.
 
     """
+    if use_amp and device.type != "cuda":
+        msg = "Mixed-precision training requires a concrete CUDA device; CPU autocast is unsupported."
+        raise ValueError(msg)
+    if use_amp and scaler is None:
+        msg = "Mixed-precision training requires a CUDA GradScaler."
+        raise ValueError(msg)
+
     model.train()
-    total_loss = 0.0
+    component_sums: dict[str, float] = {}
     sample_count = 0
     optimizer_steps = 0
 
@@ -158,15 +187,166 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
             optimizer_steps += 1
+
         batch_samples = int(batch["y"].shape[0])
-        total_loss += loss.detach().item() * batch_samples
+        raw_components = getattr(loss_fn, "last_components", {})
+        components = (
+            dict(raw_components) if isinstance(raw_components, Mapping) and raw_components else {"total": loss.detach(), "data": loss.detach()}
+        )
+        for name, value in components.items():
+            if not isinstance(value, torch.Tensor) or value.numel() != 1:
+                msg = f"Training loss component {name!r} must be one scalar tensor."
+                raise TypeError(msg)
+            component_sums[name] = component_sums.get(name, 0.0) + float(value.item()) * batch_samples
         sample_count += batch_samples
 
     if sample_count == 0:
         msg = "Training loader produced no samples."
         raise RuntimeError(msg)
-    avg_loss = total_loss / sample_count
-    return {"train_loss": avg_loss, "optimizer_steps": float(optimizer_steps)}
+
+    averaged = {name: value / sample_count for name, value in component_sums.items()}
+    result = {
+        "train/loss_total": averaged["total"],
+        "train/loss_data": averaged.get("data", averaged["total"]),
+        "optimizer_steps": float(optimizer_steps),
+    }
+    if bool(getattr(loss_fn, "physics_enabled", False)):
+        continuity = str(getattr(loss_fn, "continuity", ""))
+        continuity_component = f"continuity_{continuity}"
+        required = {"momentum", "boundary", continuity_component}
+        missing = sorted(required.difference(averaged))
+        if missing:
+            msg = f"Physics-informed epoch aggregation is missing component(s): {missing}."
+            raise RuntimeError(msg)
+        result.update(
+            {
+                "train/loss_momentum": averaged["momentum"],
+                "train/loss_boundary": averaged["boundary"],
+                f"train/loss_continuity_{continuity}": averaged[continuity_component],
+            }
+        )
+        telemetry_state = getattr(loss_fn, "telemetry_state", None)
+        if not callable(telemetry_state):
+            msg = "Physics-informed loss does not expose applied weight telemetry."
+            raise RuntimeError(msg)
+        telemetry = cast("Mapping[str, float]", telemetry_state())
+        for name, value in telemetry.items():
+            result[f"train/{name}"] = float(value)
+    return result
+
+
+def evaluate_physics_monitor(
+    model: nn.Module,
+    eval_loader: Iterable[Any],
+    loss_fn: nn.Module,
+    device: torch.device,
+    data_processor: Any,
+    *,
+    max_cases: int,
+) -> dict[str, float]:
+    """
+    Evaluate bounded deterministic physics monitors on the saved eval prefix.
+
+    The caller persists the exact prefix membership. This function consumes no
+    more than ``max_cases`` in loader order, reuses the semantic loss's domain
+    physics evaluator and saved normalizers, and produces no artifact files.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained model evaluated temporarily in evaluation mode.
+    eval_loader : Iterable[Any]
+        Deterministic saved-evaluation membership in source order.
+    loss_fn : torch.nn.Module
+        Semantic loss exposing ``compute_physics_diagnostics``.
+    device : torch.device
+        Concrete device for bounded inference.
+    data_processor : Any
+        Fitted processor owning the saved normalizers.
+    max_cases : int
+        Positive upper bound on prefix samples, not batches.
+
+    Returns
+    -------
+    dict[str, float]
+        Sample-weighted momentum, both continuity, and boundary monitor means.
+
+    Raises
+    ------
+    TypeError
+        If batches or the diagnostic interface violate their contracts.
+    ValueError
+        If ``max_cases`` is not a positive exact integer.
+    FloatingPointError
+        If a diagnostic scalar is non-finite.
+    RuntimeError
+        If the selected membership produces no samples.
+
+    Notes
+    -----
+    The model's incoming training/evaluation state is restored even on failure.
+
+    """
+    if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
+        msg = f"max_cases must be a positive integer, got {max_cases!r}."
+        raise ValueError(msg)
+    compute = getattr(loss_fn, "compute_physics_diagnostics", None)
+    if not callable(compute):
+        msg = "Physics monitoring requires the semantic physics diagnostic adapter."
+        raise TypeError(msg)
+
+    totals = {
+        "monitor/momentum_residual_mse": 0.0,
+        "monitor/div_velocity_mse": 0.0,
+        "monitor/div_eps_velocity_mse": 0.0,
+        "monitor/pressure_boundary_mse": 0.0,
+    }
+    sample_count = 0
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for raw_batch in eval_loader:
+                if not isinstance(raw_batch, Mapping):
+                    msg = f"Expected monitor batch mapping, got {type(raw_batch).__name__}."
+                    raise TypeError(msg)
+                remaining = max_cases - sample_count
+                if remaining <= 0:
+                    break
+                raw_y = raw_batch.get("y")
+                raw_x = raw_batch.get("x")
+                if not isinstance(raw_x, torch.Tensor) or not isinstance(raw_y, torch.Tensor):
+                    msg = "Monitor batches must contain tensor keys 'x' and 'y'."
+                    raise TypeError(msg)
+                take = min(remaining, int(raw_y.shape[0]))
+                batch = _prepare_batch(
+                    {"x": raw_x[:take], "y": raw_y[:take]},
+                    device,
+                    data_processor,
+                    training=False,
+                )
+                pred = model(batch["x"])
+                diagnostics = cast("Any", compute(pred, x=batch["x"]))
+                values = {
+                    "monitor/momentum_residual_mse": diagnostics.momentum_residual_mse,
+                    "monitor/div_velocity_mse": diagnostics.div_velocity_mse,
+                    "monitor/div_eps_velocity_mse": diagnostics.div_eps_velocity_mse,
+                    "monitor/pressure_boundary_mse": diagnostics.boundary_mse,
+                }
+                for name, value in values.items():
+                    scalar = float(value.detach().item())
+                    if not math.isfinite(scalar):
+                        msg = f"Physics monitor {name!r} is non-finite: {scalar}."
+                        raise FloatingPointError(msg)
+                    totals[name] += scalar * take
+                sample_count += take
+    finally:
+        model.train(was_training)
+
+    if sample_count == 0:
+        msg = "Physics monitor evaluation membership produced no samples."
+        raise RuntimeError(msg)
+    return {name: value / sample_count for name, value in totals.items()}
 
 
 def eval_one_epoch(
@@ -179,10 +359,41 @@ def eval_one_epoch(
     """
     Execute evaluation with explicit tensor spaces and dataset accumulation.
 
-    Normalized model outputs and targets remain available unchanged. When at
-    least one physical metric is configured, each is inverse-normalized exactly
-    once per batch before any metric sees it. Metrics accumulate sufficient
-    statistics and finalize only after the complete loader.
+    Evaluation preprocessing normalizes model inputs while preserving physical
+    targets. This function derives normalized targets once with the fitted
+    output normalizer and derives physical predictions once by inverse transform.
+    Metrics accumulate sufficient statistics and finalize only after the loader.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Model evaluated without gradients.
+    eval_loader : Iterable[Any]
+        Loader providing task ``x`` and ``y`` batches.
+    eval_metrics : dict[str, Any]
+        Metric-ID keyed explicit-space dataset accumulators.
+    device : torch.device
+        Concrete device receiving prepared batches.
+    data_processor : Any | None, optional
+        Fitted processor needed for normalized/physical view construction.
+
+    Returns
+    -------
+    dict[str, float]
+        One finalized dataset value per configured metric ID.
+
+    Raises
+    ------
+    ValueError
+        If metric IDs, spaces, or tensor views are inconsistent.
+    RuntimeError
+        If required normalizer state or a requested tensor space is unavailable.
+
+    Notes
+    -----
+    Dataset accumulators are reset at entry and finalized once after all batches;
+    no batch-level metric means are averaged.
+
     """
     model.eval()
     for metric_id, metric in eval_metrics.items():
@@ -191,26 +402,40 @@ def eval_one_epoch(
             raise ValueError(msg)
         metric.reset()
 
-    requires_physical = any(getattr(metric, "space", None) == "physical" for metric in eval_metrics.values())
+    metric_spaces = {str(getattr(metric, "space", "")) for metric in eval_metrics.values()}
+    requires_physical = "physical" in metric_spaces
     if requires_physical and data_processor is None:
         msg = "Physical evaluation metrics require a fitted data processor."
+        raise RuntimeError(msg)
+    out_normalizer = getattr(data_processor, "out_normalizer", None) if data_processor is not None else None
+    if data_processor is not None and out_normalizer is None:
+        msg = "Evaluation with a data processor requires data_processor.out_normalizer."
         raise RuntimeError(msg)
 
     with torch.no_grad():
         for batch_index, raw_batch in enumerate(eval_loader):
             batch = _prepare_batch(raw_batch, device, data_processor, training=False)
             pred_normalized = model(batch["x"])
-            target_normalized = batch["y"]
+            if data_processor is None:
+                target_normalized = batch["y"]
+                target_physical = None
+            else:
+                if out_normalizer is None:
+                    msg = "Evaluation normalized target construction requires an output normalizer."
+                    raise RuntimeError(msg)
+                target_physical = batch["y"]
+                target_normalized = out_normalizer.transform(target_physical)
             views: dict[str, tuple[torch.Tensor, torch.Tensor]] = {
                 "normalized": (pred_normalized, target_normalized),
             }
             if requires_physical:
-                out_normalizer = getattr(data_processor, "out_normalizer", None)
                 if out_normalizer is None:
-                    msg = "Physical evaluation metrics require data_processor.out_normalizer."
+                    msg = "Physical evaluation prediction construction requires an output normalizer."
                     raise RuntimeError(msg)
                 pred_physical = out_normalizer.inverse_transform(pred_normalized)
-                target_physical = out_normalizer.inverse_transform(target_normalized)
+                if target_physical is None:
+                    msg = "Physical evaluation target construction requires a fitted data processor."
+                    raise RuntimeError(msg)
                 views["physical"] = (pred_physical, target_physical)
 
             for metric in eval_metrics.values():
@@ -232,6 +457,7 @@ def eval_one_epoch(
 
 def train_loop(  # noqa: C901, PLR0912, PLR0915
     config: dict[str, Any],
+    device: torch.device,
     model: nn.Module,
     optimizer: Optimizer,
     train_loader: DataLoader,
@@ -253,7 +479,9 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     Parameters
     ----------
     config : dict[str, Any]
-        Fully resolved runtime config.
+        Fully resolved runtime config retaining the requested device policy.
+    device : torch.device
+        Concrete indexed runtime device resolved at the service boundary.
     model, optimizer, train_loader, eval_loader, train_loss, eval_metrics : Any
         Already constructed runtime components. Fresh-run seeding must occur
         before their construction.
@@ -268,7 +496,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     resume_from : Path | str | None, optional
         Exact ``last_checkpoint.pt`` continuation source.
     epoch_end_callback : Callable | None, optional
-        Callback invoked only after an evaluated epoch is safely checkpointed.
+        Callback invoked after every completed epoch is safely checkpointed.
+        Evaluation metrics are present only on ordinary evaluation events.
     checkpoint_identity : Mapping[str, Any] | None, optional
         Immutable task/config/dataset/split/objective identity.
     scaler : Any | None, optional
@@ -297,7 +526,12 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         msg = "Canonical training requires a non-empty checkpoint_identity."
         raise ValueError(msg)
 
-    device = torch.device(config["run"].get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
+        msg = f"Training requires one concrete CPU or CUDA torch.device, got {device!r}."
+        raise TypeError(msg)
+    if device.type == "cuda" and device.index is None:
+        msg = "Training requires an indexed CUDA device resolved by the runtime boundary."
+        raise ValueError(msg)
     model = model.to(device)
     if data_processor is not None:
         data_processor.to(device)
@@ -320,10 +554,15 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         msg = f"Configured evaluation objective {objective_id!r} is absent from evaluation metrics."
         raise KeyError(msg)
 
-    amp_enabled = bool(use_amp and device.type == "cuda")
+    if type(use_amp) is not bool:
+        msg = f"use_amp must be boolean, got {use_amp!r}."
+        raise TypeError(msg)
+    if use_amp and device.type != "cuda":
+        msg = "training.mixed_precision=true requires a resolved CUDA device; CPU autocast is unsupported."
+        raise ValueError(msg)
+    amp_enabled = use_amp
     if amp_enabled and scaler is None:
-        torch_amp = importlib.import_module("torch.amp")
-        scaler = torch_amp.GradScaler("cuda")
+        scaler = GradScaler("cuda")
     if not amp_enabled and scaler is not None:
         msg = "A scaler was supplied while CUDA AMP is inactive."
         raise ValueError(msg)
@@ -372,6 +611,14 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
 
     for epoch_index in range(start_epoch_index, n_epochs):
         completed_epoch = epoch_index + 1
+        epoch_started = time.perf_counter()
+        parameter_groups = optimizer.param_groups
+        if not parameter_groups:
+            msg = "Optimizer has no parameter groups before a training epoch."
+            raise RuntimeError(msg)
+        epoch_learning_rate = float(parameter_groups[0]["lr"])
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         set_epoch = getattr(train_loss, "set_epoch", None)
         if callable(set_epoch):
             set_epoch(epoch_index)
@@ -454,12 +701,17 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         )
         checkpoints.save_checkpoint(last_payload, last_path)
 
-        if should_evaluate and epoch_end_callback is not None:
+        train_metrics["global_step"] = float(global_step)
+        train_metrics["train/learning_rate"] = epoch_learning_rate
+        train_metrics["train/epoch_duration_seconds"] = time.perf_counter() - epoch_started
+        if device.type == "cuda":
+            train_metrics["train/cuda_peak_memory_allocated_bytes"] = float(torch.cuda.max_memory_allocated(device))
+            train_metrics["train/cuda_peak_memory_reserved_bytes"] = float(torch.cuda.max_memory_reserved(device))
+
+        if epoch_end_callback is not None:
             epoch_end_callback(completed_epoch, {**train_metrics, **evaluated})
         if should_evaluate and (completed_epoch % (eval_interval * 10) == 0 or completed_epoch in {1, n_epochs}):
-            print(
-                f"Epoch {completed_epoch:3d} | train_loss: {train_metrics.get('train_loss', 0):.4f} | {objective_id}: {evaluated[objective_id]:.4f}"
-            )
+            print(f"Epoch {completed_epoch:3d} | train_loss: {train_metrics['train/loss_total']:.4f} | {objective_id}: {evaluated[objective_id]:.4f}")
 
     if best_metric is None or best_epoch is None:
         msg = "Training produced no finite objective and cannot be marked completed."
