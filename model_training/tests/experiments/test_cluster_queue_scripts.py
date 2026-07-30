@@ -141,6 +141,11 @@ case "${1-}" in
     exit 0
     ;;
   ps)
+    if [[ "$*" == *" -a "* || "$*" == *"ps -a"* ]]; then
+      printf '%s' "${DOCKER_ALL_NAMES-}"
+    else
+      printf '%s' "${DOCKER_RUNNING_NAMES-}"
+    fi
     exit 0
     ;;
   start)
@@ -171,7 +176,20 @@ esac
 
     fallback_binary_dir = tmp_path / "fallback commands"
     fallback_binary_dir.mkdir()
-    for command in ("bash", "basename", "cat", "chmod", "date", "dirname", "env", "grep", "id", "mkdir", "mktemp"):
+    for command in (
+        "bash",
+        "basename",
+        "cat",
+        "chmod",
+        "date",
+        "dirname",
+        "env",
+        "grep",
+        "id",
+        "mkdir",
+        "mktemp",
+        "realpath",
+    ):
         resolved = shutil.which(command)
         assert resolved is not None
         (fallback_binary_dir / command).symlink_to(resolved)
@@ -233,9 +251,14 @@ def _run_dev(harness: _Harness) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _queue_log_dir(harness: _Harness) -> Path:
+    """Return the host-visible processed-domain queue-log directory."""
+    return Path(harness.environment["STORAGE_ROOT"]) / "data_training" / "processed" / "steady_flow" / "logs" / "queue"
+
+
 def _log_path(harness: _Harness) -> Path:
     """Return the single queue log created by one harness invocation."""
-    logs = list((harness.repository / "logs").glob("*.log"))
+    logs = list(_queue_log_dir(harness).glob("*.log"))
     assert len(logs) == 1
     return logs[0]
 
@@ -279,7 +302,7 @@ def _assert_wandb_forwarding(
     assert ("WANDB_API_KEY" in docker) is (expected_key is not None)
     assert not any(argument.startswith("WANDB_API_KEY=") for argument in docker)
 
-    log_text = "\n".join(path.read_text(encoding="utf-8") for path in (harness.repository / "logs").glob("*.log"))
+    log_text = "\n".join(path.read_text(encoding="utf-8") for path in _queue_log_dir(harness).glob("*.log"))
     visible_text = "\n".join(("\0".join(docker), result.stdout, result.stderr, log_text))
     for key in possible_keys:
         if key:
@@ -313,25 +336,37 @@ def _assert_common_chain(
     docker = _capture_arguments(harness.docker_capture)
     assert docker[:2] == ["run", "--rm"]
     assert docker[docker.index("--gpus") + 1] == f"device={gpu}"
+    assert docker[docker.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert docker[docker.index("--workdir") + 1] == "/workspace/repo/model_training"
     for expected in (
-        "STORAGE_ROOT=/workspace/storage",
-        "DATA_ROOT=/workspace/storage/data",
-        "DATASET_ROOT=/workspace/storage/data_training/raw",
-        "GENERATED_DATA_ROOT=/workspace/storage/data_generation",
-        "OUTPUT_ROOT=/workspace/storage/data_training/processed",
+        "PROJECT_ROOT=/workspace/repo",
+        "GENERATED_DATA_ROOT=/workspace/repo/data_generation/data",
+        "MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data",
     ):
         assert expected in docker
+    storage_root = Path(harness.environment["STORAGE_ROOT"])
     project_mount = f"{harness.repository}:/workspace/repo:rw"
-    storage_mount = f"{harness.environment['STORAGE_ROOT']}:/workspace/storage:rw"
+    generated_mount = f"{storage_root / 'data_generation'}:/workspace/repo/data_generation/data:ro"
+    training_mount = f"{storage_root / 'data_training'}:/workspace/repo/model_training/data:rw"
+    docker_home_mount = f"{storage_root / '.docker_home'}:/workspace/storage/.docker_home:rw"
+    passwd_mount = f"{storage_root / '.docker_home' / 'passwd'}:/etc/passwd:ro"
+    group_mount = f"{storage_root / '.docker_home' / 'group'}:/etc/group:ro"
     assert project_mount in docker
-    assert storage_mount in docker
-    assert not any("/workspace/repo/data" in argument for argument in docker)
-    assert not any(argument.startswith(("GEN_ROOT=", "TRAIN_ROOT=")) for argument in docker)
+    assert generated_mount in docker
+    assert training_mount in docker
+    assert docker_home_mount in docker
+    assert passwd_mount in docker
+    assert group_mount in docker
+    assert (harness.repository / "data_generation" / "data").is_dir()
+    assert (harness.repository / "model_training" / "data").is_dir()
+    assert f"{storage_root}:/workspace/storage:rw" not in docker
+    assert not any(
+        argument.startswith(("STORAGE_ROOT=", "DATA_ROOT=", "DATASET_ROOT=", "OUTPUT_ROOT=", "GEN_ROOT=", "TRAIN_ROOT=")) for argument in docker
+    )
     inner_arguments = [*_without_device(command_arguments), "--device", "cuda"]
     assert docker[-(len(inner_arguments) + 3) :] == ["python", "-m", module, *inner_arguments]
 
-    log_path = harness.repository / "logs" / log_basename
+    log_path = _queue_log_dir(harness) / log_basename
     log_text = log_path.read_text(encoding="utf-8")
     assert "captured Docker stdout with spaces" in log_text
     assert "captured Docker stderr with spaces" in log_text
@@ -354,7 +389,7 @@ def test_prompted_default_gpu_queues_training_with_exact_arguments(tmp_path: Pat
     arguments = [
         "configs/experiments/config with spaces.yaml",
         "--resume",
-        "/workspace/storage/run with spaces",
+        "/workspace/repo/model_training/data/processed/steady_flow/runs/run with spaces",
         "--device",
         "cuda",
     ]
@@ -384,7 +419,7 @@ def test_prompted_explicit_gpu_queues_optuna_with_runtime_overrides(tmp_path: Pa
         "--n-trials",
         "3",
         "--output-root",
-        "/workspace/storage/output root",
+        "/workspace/repo/model_training/data/processed/output root",
         "--show-progress-bar",
     ]
     result = _run_job(harness, "optuna", *arguments, selection="0\n")
@@ -504,7 +539,7 @@ def test_invalid_job_or_wrapper_arguments_fail_before_submission(
     assert result.returncode == 2
     assert not harness.runtsgpu_capture.exists()
     assert not harness.docker_capture.exists()
-    assert not (harness.repository / "logs").exists()
+    assert not _queue_log_dir(harness).exists()
 
 
 @pytest.mark.parametrize(
@@ -523,7 +558,7 @@ def test_invalid_queued_device_requests_fail_before_submission(
     semantic_arguments: tuple[str, ...],
 ) -> None:
     """
-    Vary queued semantic options across CPU, auto, duplicates, missing values, and retired aliases.
+    Vary queued semantic options across CPU, auto, duplicates, missing values, and unsupported flags.
 
     Every family must fail before submission because GPU queue placement always
     normalizes to one strict inner ``--device cuda`` request.
@@ -637,7 +672,7 @@ def test_repeated_submissions_allocate_distinct_logs(tmp_path: Path) -> None:
 
     assert first.returncode == 0
     assert second.returncode == 0
-    logs = sorted((harness.repository / "logs").glob("*.log"))
+    logs = sorted(_queue_log_dir(harness).glob("*.log"))
     assert len(logs) == 2
     assert logs[0].name != logs[1].name
 
@@ -711,17 +746,176 @@ def test_wandb_credentials_are_resolved_and_forwarded_without_disclosure(
     )
 
 
-def test_custom_storage_root_reaches_mount_and_canonical_inner_environment(tmp_path: Path) -> None:
-    """
-    Launch an artifact job with a custom host ``STORAGE_ROOT`` containing spaces.
+def test_storage_backed_config_maps_to_logical_training_domain(tmp_path: Path) -> None:
+    """An acceptance config under physical training storage reaches the mounted logical path."""
+    harness = _harness(tmp_path)
+    config = Path(harness.environment["STORAGE_ROOT"]) / "data_training" / "processed" / "steady_flow" / "acceptance" / "bounded" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("task: steady_flow\n", encoding="utf-8")
 
-    Docker must mount it at canonical inner storage and export current semantic roots
-    without reintroducing retired ``GEN_ROOT`` or ``TRAIN_ROOT`` variables.
-    """
+    result = _run_job(harness, "--queue-gpu", "auto", "train", str(config))
+
+    assert result.returncode == 0, result.stderr
+    assert _capture_arguments(harness.runtsgpu_capture)[6] == (
+        "/workspace/repo/model_training/data/processed/steady_flow/acceptance/bounded/config.yaml"
+    )
+
+
+def test_train_translates_split_host_paths_including_new_output_destinations(tmp_path: Path) -> None:
+    """Train host paths map to logical mounts even when an output path does not exist."""
+    harness = _harness(tmp_path)
+    resume = harness.repository / "model_training" / "data" / "processed" / "steady_flow" / "runs" / "run with spaces"
+    resume.mkdir(parents=True)
+    output = Path(harness.environment["STORAGE_ROOT"]) / "data_training" / "processed" / "new output"
+    arguments = [
+        "configs/experiments/steady_flow_fno.yaml",
+        "--resume",
+        str(resume),
+        "--output-root",
+        str(output),
+    ]
+    expected = [
+        arguments[0],
+        "--resume",
+        "/workspace/repo/model_training/data/processed/steady_flow/runs/run with spaces",
+        "--output-root",
+        "/workspace/repo/model_training/data/processed/new output",
+    ]
+
+    result = _run_job(harness, "--queue-gpu", "auto", "train", *arguments)
+
+    _assert_common_chain(
+        harness,
+        result,
+        gpu="2",
+        job_type="train",
+        module="src.experiments.cli.cli_train",
+        command_arguments=expected,
+    )
+
+
+def test_optuna_translates_equals_host_output_path_without_requiring_existence(tmp_path: Path) -> None:
+    """Equals-form Optuna output paths map without pre-creating the destination."""
+    harness = _harness(tmp_path)
+    output = Path(harness.environment["STORAGE_ROOT"]) / "data_training" / "processed" / "future study"
+    arguments = [
+        "configs/optuna/steady_flow_fno_search.yaml",
+        f"--output-root={output}",
+    ]
+    expected = [
+        arguments[0],
+        "--output-root=/workspace/repo/model_training/data/processed/future study",
+    ]
+
+    result = _run_job(harness, "--queue-gpu", "auto", "optuna", *arguments)
+
+    _assert_common_chain(
+        harness,
+        result,
+        gpu="2",
+        job_type="optuna",
+        module="src.experiments.cli.cli_optuna",
+        command_arguments=expected,
+    )
+
+
+def test_artifacts_translate_all_supported_host_path_options(tmp_path: Path) -> None:
+    """Artifact input roots translate in split and equals forms without host leakage."""
+    harness = _harness(tmp_path)
+    training = Path(harness.environment["STORAGE_ROOT"]) / "data_training"
+    arguments = [
+        "--runs-root",
+        str(training / "processed" / "steady_flow" / "runs"),
+        f"--dataset-root={training / 'raw'}",
+        "--metadata-root",
+        str(training / "meta" / "not built yet"),
+    ]
+    expected = [
+        "--runs-root",
+        "/workspace/repo/model_training/data/processed/steady_flow/runs",
+        "--dataset-root=/workspace/repo/model_training/data/raw",
+        "--metadata-root",
+        "/workspace/repo/model_training/data/meta/not built yet",
+    ]
+
+    result = _run_job(harness, "--queue-gpu", "auto", "artifacts", *arguments)
+
+    _assert_common_chain(
+        harness,
+        result,
+        gpu="2",
+        job_type="artifacts",
+        module="src.experiments.cli.cli_build_artifacts",
+        command_arguments=expected,
+    )
+
+
+def test_development_launcher_uses_same_two_domain_mount_contract(tmp_path: Path) -> None:
+    """Interactive development exposes the same logical roots and permissions as queued jobs."""
+    harness = _harness(tmp_path)
+
+    result = _run_dev(harness)
+
+    assert result.returncode == 0, result.stderr
+    docker = _capture_arguments(harness.docker_capture)
+    storage_root = Path(harness.environment["STORAGE_ROOT"])
+    assert docker[docker.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+    assert docker[docker.index("--workdir") + 1] == "/workspace/repo"
+    assert "PROJECT_ROOT=/workspace/repo" in docker
+    assert "GENERATED_DATA_ROOT=/workspace/repo/data_generation/data" in docker
+    assert "MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data" in docker
+    assert f"{storage_root / 'data_generation'}:/workspace/repo/data_generation/data:ro" in docker
+    assert f"{storage_root / 'data_training'}:/workspace/repo/model_training/data:rw" in docker
+    assert f"{storage_root / '.docker_home' / 'passwd'}:/etc/passwd:ro" in docker
+    assert f"{storage_root / '.docker_home' / 'group'}:/etc/group:ro" in docker
+    assert f"{storage_root}:/workspace/storage:rw" not in docker
+    assert (harness.repository / "data_generation" / "data").is_dir()
+    assert (harness.repository / "model_training" / "data").is_dir()
+
+
+def test_development_launcher_refuses_silent_container_reuse(tmp_path: Path) -> None:
+    """An existing named container must be stopped rather than silently reused."""
+    harness = _harness(tmp_path)
+    harness.environment["DOCKER_RUNNING_NAMES"] = "grainlegumes-pino-airflow-dev\n"
+
+    result = _run_dev(harness)
+
+    assert result.returncode == 1
+    assert "stale image or mount contract" in result.stderr
+    assert "docker stop grainlegumes-pino-airflow-dev" in result.stderr
+    assert not harness.docker_capture.exists()
+
+
+def test_dockerfile_exports_only_two_application_data_roots() -> None:
+    """Image defaults match direct, queued, and development logical paths."""
+    dockerfile = (_REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "ENV GENERATED_DATA_ROOT=/workspace/repo/data_generation/data" in dockerfile
+    assert "ENV MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data" in dockerfile
+    for forbidden in ("ENV STORAGE_ROOT=", "ENV DATA_ROOT=", "ENV DATASET_ROOT=", "ENV OUTPUT_ROOT="):
+        assert forbidden not in dockerfile
+
+
+def test_two_data_domains_are_excluded_from_git_and_docker_context() -> None:
+    """Both public data-domain trees remain runtime-only regardless of contained artifacts."""
+    gitignore = (_REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    dockerignore = (_REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    expected = {"/data_generation/data/", "/model_training/data/"}
+    assert expected.issubset(gitignore)
+    assert expected.issubset(dockerignore)
+    assert not any(line.startswith("!data_generation/data/") for line in gitignore)
+    assert not any(line.startswith("!model_training/data/") for line in gitignore)
+
+
+def test_custom_storage_root_maps_two_domains_with_distinct_permissions(tmp_path: Path) -> None:
+    """Host storage locates two targeted mounts without becoming an application root."""
     harness = _harness(tmp_path)
     result = _run_job(harness, "--queue-gpu", "auto", "artifacts")
 
     assert result.returncode == 0, result.stderr
     docker = _capture_arguments(harness.docker_capture)
-    assert f"{harness.environment['STORAGE_ROOT']}:/workspace/storage:rw" in docker
-    assert "STORAGE_ROOT=/workspace/storage" in docker
+    storage_root = Path(harness.environment["STORAGE_ROOT"])
+    assert f"{storage_root / 'data_generation'}:/workspace/repo/data_generation/data:ro" in docker
+    assert f"{storage_root / 'data_training'}:/workspace/repo/model_training/data:rw" in docker
+    assert f"{storage_root}:/workspace/storage:rw" not in docker
+    assert "GENERATED_DATA_ROOT=/workspace/repo/data_generation/data" in docker
+    assert "MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data" in docker

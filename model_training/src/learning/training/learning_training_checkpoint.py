@@ -14,12 +14,12 @@ Design principles:
   - ``last_checkpoint.pt`` is the only continuation source
   - ``best_checkpoint.pt`` is the inference and artifact source
   - Resume is exact at a completed epoch boundary, never mid-epoch
-  - Missing or mixed-schema state fails closed without translation
+  - Missing or mismatched state fails closed before runtime restoration
 
 This module does NOT:
   - Allocate run directories, choose resume policy, or validate mutable run status
   - Construct models, optimizers, schedulers, scalers, losses, or dataloaders
-  - Translate legacy or partial checkpoints into the current schema
+  - Repair or reinterpret malformed checkpoints
 ===============================================================================
 """
 
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
 CheckpointRole = Literal["best", "last"]
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_IDENTITY_KEYS = frozenset(
     {
         "task",
@@ -551,8 +551,9 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     if missing or unknown:
         msg = f"Checkpoint schema mismatch. Missing keys: {missing}; unknown keys: {unknown}."
         raise ValueError(msg)
-    if payload["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
-        msg = f"Unsupported checkpoint schema_version {payload['schema_version']!r}; expected {CHECKPOINT_SCHEMA_VERSION}."
+    schema_version = payload["schema_version"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != CHECKPOINT_SCHEMA_VERSION:
+        msg = f"Unsupported checkpoint schema_version {schema_version!r}; expected integer {CHECKPOINT_SCHEMA_VERSION}."
         raise ValueError(msg)
     if payload["checkpoint_role"] != expected_role:
         msg = f"Checkpoint role mismatch: expected {expected_role!r}, got {payload['checkpoint_role']!r}."

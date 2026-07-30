@@ -1,11 +1,15 @@
 function payload = comsol_solve_timing( ...
-        batch_name, cases, runtime, batch_manifest_sha256, output_path)
+        batch_name, cases, runtime, batch_manifest_sha256, output_path, ...
+        intended_case_ids)
 %COMSOL_SOLVE_TIMING Build, validate, and optionally publish solve timings.
 % Per-case timings are operational metadata and never change case identity.
 % batch_run publishes this sidecar beside the processed COMSOL results.
 
 if nargin < 5
     output_path = "";
+end
+if nargin < 6
+    intended_case_ids = strings(0, 1);
 end
 batch_name = require_text(batch_name, 'batch_name', false);
 manifest_digest = require_text( ...
@@ -16,7 +20,7 @@ if ~isempty(manifest_digest) && ...
         'batch_manifest_sha256 must be empty or a lowercase SHA-256.');
 end
 validated_runtime = validate_runtime(runtime);
-validated_cases = validate_cases(cases);
+validated_cases = validate_cases(cases, intended_case_ids);
 durations = [validated_cases.comsol_solve_s]';
 aggregates = summarize(durations);
 payload = struct( ...
@@ -37,8 +41,9 @@ serializable.cases = reshape(num2cell(validated_cases), [], 1);
 write_json_atomic(path, serializable);
 end
 
-function cases = validate_cases(cases)
+function cases = validate_cases(cases, intended_case_ids)
 required = {'case_id'; 'comsol_solve_s'};
+intended_ids = validate_intended_case_ids(intended_case_ids);
 if isempty(cases)
     cases = repmat(struct('case_id', "", 'comsol_solve_s', []), 0, 1);
     return;
@@ -70,9 +75,50 @@ if numel(unique(case_ids)) ~= numel(case_ids)
     error('comsol_solve_timing:DuplicateCase', ...
         'COMSOL solve timing case IDs must be unique.');
 end
-[~, order] = sort(case_ids);
+if isempty(intended_ids)
+    [~, order] = sort(case_ids);
+else
+    [is_member, manifest_positions] = ismember(case_ids, intended_ids);
+    if any(~is_member)
+        error('comsol_solve_timing:CaseMembership', ...
+            'Every timing case must belong to intended_case_ids.');
+    end
+    [~, order] = sort(manifest_positions);
+end
 cases = cases(order);
 cases = cases(:);
+end
+
+function case_ids = validate_intended_case_ids(value)
+if isempty(value)
+    case_ids = strings(0, 1);
+elseif isstring(value) && isvector(value)
+    case_ids = value(:);
+elseif iscell(value) && isvector(value)
+    case_ids = strings(numel(value), 1);
+    for case_index = 1:numel(value)
+        case_ids(case_index) = string(require_text( ...
+            value{case_index}, 'intended_case_ids', false));
+    end
+else
+    error('comsol_solve_timing:IntendedCases', ...
+        'intended_case_ids must be a vector of text values.');
+end
+if any(ismissing(case_ids)) || any(strlength(case_ids) == 0)
+    error('comsol_solve_timing:IntendedCases', ...
+        'intended_case_ids cannot contain missing or empty values.');
+end
+for case_index = 1:numel(case_ids)
+    if isempty(regexp(char(case_ids(case_index)), ...
+            '^case_[0-9]{4}$', 'once'))
+        error('comsol_solve_timing:IntendedCases', ...
+            'intended_case_ids must use canonical case_0000 values.');
+    end
+end
+if numel(unique(case_ids)) ~= numel(case_ids)
+    error('comsol_solve_timing:IntendedCases', ...
+        'intended_case_ids must be unique.');
+end
 end
 
 function runtime = validate_runtime(runtime)
@@ -160,7 +206,7 @@ catch write_error
     if isfile(temp_path), delete(temp_path); end
     rethrow(write_error);
 end
-[move_ok, move_message] = movefile(temp_path, path);
+[move_ok, move_message] = movefile(temp_path, path, 'f');
 if ~move_ok
     if isfile(temp_path), delete(temp_path); end
     error('comsol_solve_timing:Publish', ...

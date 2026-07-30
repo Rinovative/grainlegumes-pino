@@ -502,7 +502,7 @@ def evaluate_steady_2d_brinkman(
     derivatives : DerivativeOperator
         Explicit physical or spectral derivative backend.
     continuity : str
-        Training-selected continuity identifier retained for compatibility;
+        Training-selected continuity identifier used for the selected aggregate;
         both plain and porosity-weighted formulations are always evaluated.
     boundary : str
         Semantic pressure boundary formulation.
@@ -531,7 +531,7 @@ def evaluate_steady_2d_brinkman(
     Notes
     -----
     Both continuity formulations are always computed. ``continuity`` selects
-    only compatibility properties used by training; formulation-explicit fields
+    only selected aggregate properties used by training; formulation-explicit fields
     and scalars remain available regardless of that selection.
 
     """

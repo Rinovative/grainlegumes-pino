@@ -11,7 +11,7 @@ Responsibilities:
   - Overlay dimensionless local-error quantiles on physical permeability fields
 
 Design principles:
-  - Ranking never accepts retired ``cont_mse`` or ``Rc`` aliases
+  - Ranking uses only metrics declared by the current artifact contract
   - Error overlays normalize one selected field by its own reference RMS
   - Permeability components remain in square metres and are never error aggregates
   - Generic task outputs remain usable when steady-flow-only inputs are unavailable
@@ -44,7 +44,7 @@ _DEFAULT_TOP_K = 3
 
 
 def _metric_columns(frame: pd.DataFrame) -> tuple[str, ...]:
-    """Return explicit ranked case metrics, with no ambiguous continuity aliases."""
+    """Return the explicit current metrics available for case ranking."""
     fields = tuple(frame.attrs["output_fields"])
     predictive = ("rel_l2", "rel_h1", *(f"normalized_rmse_{field}" for field in fields))
     physics = tuple(metric for metric in dataframe.STEADY_PHYSICS_METRICS if metric in frame.columns)
@@ -58,13 +58,13 @@ def available_case_metrics(frame: pd.DataFrame) -> tuple[str, ...]:
     Parameters
     ----------
     frame : pandas.DataFrame
-        Current artifact frame with TaskSpec outputs and schema-4 columns.
+        Current artifact frame with TaskSpec outputs and exact schema columns.
 
     Returns
     -------
     tuple[str, ...]
         Relative/per-field normalized errors followed by available named physics
-        diagnostics; retired ambiguous continuity aliases are never returned.
+        diagnostics declared by the current artifact contract.
 
     """
     return _metric_columns(frame)

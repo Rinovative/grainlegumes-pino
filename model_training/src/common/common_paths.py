@@ -2,18 +2,18 @@
 ===============================================================================
 common_paths.py
 ===============================================================================
-Resolve project, storage, dataset, generated-data, run, and artifact paths.
+Resolve the two public data domains and their owned runtime paths.
 
 Responsibilities:
-  - Map established case, dataset, generated-data, and output storage stages
-  - Provide stable logical case, merged-dataset, and run-directory resolvers
-  - Resolve split-index, normalizer, checkpoint and artifact paths
+  - Resolve generation and model-training roots from their two public variables
+  - Derive each domain's ``meta``, ``raw``, and ``processed`` lifecycle stages
+  - Resolve final datasets, metadata snapshots, runs, studies, and artifacts
   - Identify current saved-run directories by their required artifact files
 
 Design principles:
-  - Environment variables are the canonical path source
-  - Case preparation, merged datasets, and outputs have independent roots
-  - Missing overrides resolve from the repository and shared storage roots
+  - Application paths never derive scientific data locations from host storage
+  - Repository-local domain paths are the portable defaults in every runtime
+  - Training datasets and outputs share one model-training ownership boundary
   - Logical names are validated as single path components before composition
   - The current saved-run file contract is explicit and centralized
 
@@ -68,89 +68,80 @@ def get_project_root() -> Path:
     return Path(__file__).parent.parent.parent.parent
 
 
-def get_storage_root() -> Path:
-    """
-    Return the shared storage root.
-
-    Returns
-    -------
-    Path
-        Root selected by ``STORAGE_ROOT`` or the project sibling default.
-
-    """
-    root = os.environ.get("STORAGE_ROOT")
-    if root:
-        return Path(root)
-    # Default: sibling directory to repository
-    return get_project_root().parent / "storage"
-
-
-def get_data_root() -> Path:
-    """
-    Return the shared case-preparation data root.
-
-    Returns
-    -------
-    Path
-        Root selected by ``DATA_ROOT`` or ``<STORAGE_ROOT>/data``. Strict
-        per-case payloads live below its ``raw`` stage; merged model inputs and
-        run outputs deliberately do not.
-
-    """
-    root = os.environ.get("DATA_ROOT")
-    if root:
-        return Path(root).expanduser()
-    return get_storage_root() / "data"
-
-
-def get_dataset_root() -> Path:
-    """
-    Return the root containing immutable task datasets.
-
-    Returns
-    -------
-    Path
-        Root selected by ``DATASET_ROOT`` or
-        ``<STORAGE_ROOT>/data_training/raw``.
-
-    """
-    root = os.environ.get("DATASET_ROOT")
-    if root:
-        return Path(root).expanduser()
-    return get_storage_root() / "data_training" / "raw"
-
-
 def get_generated_data_root() -> Path:
     """
-    Return the root containing raw and processed generated data.
+    Return the authoritative generation-domain root.
 
-    Returns
-    -------
-    Path
-        Root selected by ``GENERATED_DATA_ROOT`` or the storage default.
-
+    ``GENERATED_DATA_ROOT`` is the only public override. The portable default
+    is the repository-local ``data_generation/data`` mount target.
     """
     root = os.environ.get("GENERATED_DATA_ROOT")
     if root:
         return Path(root).expanduser()
-    return get_storage_root() / "data_generation"
+    return get_project_root() / "data_generation" / "data"
+
+
+def get_model_training_data_root() -> Path:
+    """
+    Return the self-contained model-training data-domain root.
+
+    ``MODEL_TRAINING_DATA_ROOT`` is the only public override. The portable
+    default is the repository-local ``model_training/data`` mount target.
+    """
+    root = os.environ.get("MODEL_TRAINING_DATA_ROOT")
+    if root:
+        return Path(root).expanduser()
+    return get_project_root() / "model_training" / "data"
+
+
+def get_generation_meta_root() -> Path:
+    """Return the authoritative generation metadata stage."""
+    return get_generated_data_root() / "meta"
+
+
+def get_generation_raw_root() -> Path:
+    """Return the authoritative generated raw-input stage."""
+    return get_generated_data_root() / "raw"
+
+
+def get_generation_processed_root() -> Path:
+    """Return the authoritative generated COMSOL-output stage."""
+    return get_generated_data_root() / "processed"
+
+
+def get_training_meta_root() -> Path:
+    """Return the validated model-training metadata-snapshot stage."""
+    return get_model_training_data_root() / "meta"
+
+
+def get_training_raw_root() -> Path:
+    """Return the immutable final-dataset stage used by training."""
+    return get_model_training_data_root() / "raw"
+
+
+def get_training_processed_root() -> Path:
+    """Return the stage owning runs, studies, logs, and acceptance outputs."""
+    return get_model_training_data_root() / "processed"
+
+
+def get_dataset_root() -> Path:
+    """
+    Return the derived final-dataset root.
+
+    This derived convenience reads no independent dataset-root variable; callers needing
+    a bounded alternate location pass an explicit resolver or CLI override.
+    """
+    return get_training_raw_root()
 
 
 def get_output_root() -> Path:
     """
-    Return the root containing training runs and tuning studies.
+    Return the derived training and evaluation output root.
 
-    Returns
-    -------
-    Path
-        Root selected by ``OUTPUT_ROOT`` or
-        ``<STORAGE_ROOT>/data_training/processed``.
-
+    This derived convenience reads no independent output-root variable; callers needing a
+    bounded alternate location pass an explicit resolver or CLI override.
     """
-    root = os.environ.get("OUTPUT_ROOT")
-    if root:
-        return Path(root).expanduser()
-    return get_storage_root() / "data_training" / "processed"
+    return get_training_processed_root()
 
 
 def validate_logical_name(value: object, *, label: str) -> str:
@@ -185,38 +176,6 @@ def validate_logical_name(value: object, *, label: str) -> str:
     return value
 
 
-def resolve_case_dataset_dir(
-    dataset_id: str,
-    *,
-    data_root: Path | str | None = None,
-) -> Path:
-    """
-    Resolve the strict per-case directory for one generated batch.
-
-    Parameters
-    ----------
-    dataset_id : str
-        Non-empty logical batch and dataset identifier.
-    data_root : Path | str | None, optional
-        Explicit shared case-preparation root.
-
-    Returns
-    -------
-    Path
-        ``<data_root>/raw/<dataset_id>``. This established stage is separate
-        from the merged dataset root used by training.
-
-    Raises
-    ------
-    ValueError
-        If ``dataset_id`` is not one safe logical path component.
-
-    """
-    dataset_id = validate_logical_name(dataset_id, label="dataset_id")
-    root = Path(data_root).expanduser() if data_root is not None else get_data_root()
-    return root / "raw" / dataset_id
-
-
 def resolve_dataset_dir(dataset_id: str, *, dataset_root: Path | str | None = None) -> Path:
     """
     Resolve one logical dataset directory.
@@ -244,9 +203,25 @@ def resolve_dataset_dir(dataset_id: str, *, dataset_root: Path | str | None = No
     return root / dataset_id
 
 
+def resolve_dataset_metadata_dir(
+    dataset_id: str,
+    *,
+    metadata_root: Path | str | None = None,
+) -> Path:
+    """
+    Resolve one dataset's validated metadata snapshot directory.
+
+    The directory is distinct from the authoritative ``.pt`` payload and
+    contains only small, builder-validated training/evaluation provenance.
+    """
+    dataset_id = validate_logical_name(dataset_id, label="dataset_id")
+    root = Path(metadata_root).expanduser() if metadata_root is not None else get_training_meta_root()
+    return root / dataset_id
+
+
 def resolve_dataset_path(dataset_id: str, *, dataset_root: Path | str | None = None) -> Path:
     """
-    Resolve one logical merged-dataset file.
+    Resolve one logical final training-dataset file.
 
     Parameters
     ----------
@@ -366,7 +341,7 @@ def resolve_optuna_trial_dir(
     Returns
     -------
     Path
-        ``<output_root>/<task>/optuna/<study>/trials/trial_<number>``.
+        ``<output_root>/<task>/studies/<study>/trials/trial_<number>``.
 
     Raises
     ------
@@ -380,8 +355,20 @@ def resolve_optuna_trial_dir(
     if isinstance(trial_number, bool) or not isinstance(trial_number, int) or trial_number < 0:
         msg = f"trial_number must be a non-negative integer, got {trial_number!r}."
         raise ValueError(msg)
+    return resolve_study_dir(task, study_name, output_root=output_root) / "trials" / f"trial_{trial_number:06d}"
+
+
+def resolve_study_dir(
+    task: str,
+    study_name: str,
+    *,
+    output_root: Path | str | None = None,
+) -> Path:
+    """Resolve one Optuna study below the task-owned ``studies`` subtree."""
+    task = validate_logical_name(task, label="task")
+    study_name = validate_logical_name(study_name, label="study_name")
     root = Path(output_root).expanduser() if output_root is not None else get_output_root()
-    return root / task / "optuna" / study_name / "trials" / f"trial_{trial_number:06d}"
+    return root / task / "studies" / study_name
 
 
 def resolve_runs_root(task: str, *, output_root: Path | str | None = None) -> Path:
@@ -606,7 +593,10 @@ def is_current_run_dir(run_dir: Path | str) -> bool:
             summary = json.load(stream)
     except (OSError, json.JSONDecodeError):
         return False
-    return isinstance(summary, dict) and summary.get("schema_version") == 1 and summary.get("status") == "completed"
+    if not isinstance(summary, dict):
+        return False
+    schema_version = summary.get("schema_version")
+    return isinstance(schema_version, int) and not isinstance(schema_version, bool) and schema_version == 1 and summary.get("status") == "completed"
 
 
 def resolve_analysis_root(run_dir: Path | str) -> Path:

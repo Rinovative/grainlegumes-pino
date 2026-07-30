@@ -317,7 +317,7 @@ def plot_mean_spatial_fields(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
     Parameters
     ----------
     datasets : Mapping[str, pandas.DataFrame]
-        Comparable schema-4 frames. Cases must share coordinates and learned-
+        Comparable current-schema frames. Cases must share coordinates and learned-
         field order within each artifact.
 
     Returns

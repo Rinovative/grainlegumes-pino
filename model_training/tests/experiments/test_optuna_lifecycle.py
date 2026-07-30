@@ -48,7 +48,7 @@ _EXPECTED_RECIPES = {
 
 class _Trial:
     """
-    Implement only the Optuna trial surface needed by phase-five policy tests.
+    Implement only the Optuna trial surface needed by lifecycle policy tests.
 
     Suggestions choose the first or lower-bound value; reports and attributes remain
     in memory, and one toggle decides pruning. The fake performs no persistence,
@@ -271,14 +271,14 @@ def test_search_policy_rejects_unapproved_kinds_defaults_and_model_values() -> N
 
 def test_existing_zero_trial_study_without_metadata_fails_closed(tmp_path: Path) -> None:
     """
-    Create a zero-trial SQLite study without the current semantic metadata.
+    Create a zero-trial SQLite study without the required semantic metadata.
 
     Reopening must fail closed before allocating any trial leaf, preventing an empty
-    legacy database from being silently adopted under current scientific identity.
+    unbound database from being silently adopted under the maintained scientific identity.
     """
     config = optuna_runtime.with_runtime_overrides(_load(), device="cpu", output_root=tmp_path)
     study_name = config.study["name"]
-    study_dir = tmp_path / "steady_flow" / "optuna" / study_name
+    study_dir = tmp_path / "steady_flow" / "studies" / study_name
     study_dir.mkdir(parents=True)
     storage = f"sqlite:///{study_dir / (study_name + '.db')}"
     optuna.create_study(study_name=study_name, direction="minimize", storage=storage)
@@ -353,7 +353,7 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
     assert resumed.trials[0].intermediate_values == {1: 0.10, 2: 0.09}
     assert resumed.trials[2].intermediate_values == {1: 1.0}
     assert resumed.user_attrs["semantic_signature"] == optuna_runtime.build_study_signature(config)["digest"]
-    study_dir = tmp_path / "steady_flow" / "optuna" / settings["name"]
+    study_dir = tmp_path / "steady_flow" / "studies" / settings["name"]
     assert (study_dir / f"{settings['name']}.db").is_file()
     assert not list(study_dir.glob("trial_*"))
 

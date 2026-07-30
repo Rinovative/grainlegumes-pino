@@ -65,6 +65,7 @@ verifyTrue(testCase, isfile(path_json));
 verifyFalse(testCase, isfile([path_json '.tmp']));
 decoded = jsondecode(fileread(path_json));
 verifyEqual(testCase, decoded.schema_kind, 'comsol_solve_timing');
+verifyEqual(testCase, decoded.schema_version, 1);
 verifyEqual(testCase, decoded.cases.comsol_solve_s, 2);
 verifyEqual(testCase, decoded.aggregates.mean_s, payload.aggregates.mean_s);
 verifyNotEmpty(testCase, regexp(fileread(path_json), ...

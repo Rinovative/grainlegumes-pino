@@ -121,10 +121,10 @@ def test_artifact_cli_accepts_any_positive_processing_batch_size() -> None:
 
 def test_artifact_cli_removes_cpu_flag() -> None:
     """
-    Pass the retired ``--cpu`` flag to the artifact parser.
+    Pass the unsupported ``--cpu`` flag to the artifact parser.
 
     Parsing must fail so all runtime commands expose only the shared ``--device``
-    vocabulary and no hidden compatibility path.
+    vocabulary.
     """
     with pytest.raises(SystemExit):
         cli_build_artifacts._build_parser().parse_args(["--runs-root", "runs", "--cpu"])
@@ -174,11 +174,22 @@ def test_artifact_cli_forwards_device_override(
     monkeypatch.setattr(analysis.artifact_service, "build_artifacts", capture_build)
     assert (
         cli_build_artifacts.main(
-            ["--runs-root", str(tmp_path), "--device", "cuda"],
+            [
+                "--runs-root",
+                str(tmp_path),
+                "--dataset-root",
+                str(tmp_path / "raw"),
+                "--metadata-root",
+                str(tmp_path / "meta"),
+                "--device",
+                "cuda",
+            ],
         )
         == 0
     )
     assert captured["device_policy"] == "cuda"
+    assert captured["dataset_root"] == tmp_path / "raw"
+    assert captured["metadata_root"] == tmp_path / "meta"
 
 
 def test_optuna_dry_run_applies_device_override_without_side_effects(

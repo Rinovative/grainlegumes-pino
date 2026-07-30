@@ -395,7 +395,7 @@ class SemanticComposedLoss(nn.Module):
 
         ``y`` is mandatory; physics-enabled compositions additionally require
         ``x`` through :meth:`compute_components`. Extra keyword arguments are
-        ignored for compatibility with generic training-loop loss calls.
+        accepted because the generic training loop supplies shared loss arguments.
         """
         if y is None:
             msg = "SemanticComposedLoss requires a target tensor y."

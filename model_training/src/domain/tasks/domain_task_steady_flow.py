@@ -24,6 +24,7 @@ This module does NOT:
 from __future__ import annotations
 
 from .domain_task_spec import (
+    TASK_SCHEMA_VERSION,
     DatasetDefaults,
     FieldSpec,
     MetricSpec,
@@ -34,7 +35,7 @@ from .domain_task_spec import (
 
 STEADY_FLOW = TaskSpec(
     id="steady_flow",
-    schema_version=1,
+    schema_version=TASK_SCHEMA_VERSION,
     inputs=(
         FieldSpec("x", "coordinate", "m", "identity"),
         FieldSpec("y", "coordinate", "m", "identity"),

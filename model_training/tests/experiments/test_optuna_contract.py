@@ -1,11 +1,11 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, SLF001
 """
 Protect objective-driven Optuna configuration, search parsing, and trial contracts.
 
 Fake trials/studies exercise exact YAML schemas, sampler subseeds, device/output
 identity exclusion, suggestion application, reporting, pruning, allocation, and
 W&B-independent objective consumption. Real tiny SQLite continuation and the
-complete failure taxonomy are covered by ``test_optuna_phase5``.
+complete failure taxonomy are covered by ``test_optuna_lifecycle``.
 """
 
 from __future__ import annotations
@@ -132,6 +132,54 @@ def test_every_optuna_yaml_resolves_one_complete_objective(path: Path) -> None:
         "interval_steps": 1,
     }
     assert "seed" not in config.study["sampler"]
+
+
+@pytest.mark.parametrize(
+    ("target", "invalid_version"),
+    [
+        ("study", True),
+        ("payload", 1.0),
+        ("task", True),
+        ("trial_lifecycle", 1.0),
+        ("run_summary", True),
+    ],
+)
+def test_existing_study_requires_type_exact_schema_versions(
+    target: str,
+    invalid_version: object,
+) -> None:
+    """Reject boolean and floating-point lookalikes in every persisted version field."""
+    config = optuna_runtime.load_optuna_study_config(
+        _CONFIG_ROOT / "steady_flow_fno_search.yaml",
+    )
+    signature = optuna_runtime.build_study_signature(config)
+    objective = experiments.config.loader.get_resolved_objective(config.base_config)
+    user_attrs: dict[str, Any] = {}
+    study = SimpleNamespace(
+        direction=SimpleNamespace(name="MINIMIZE"),
+        user_attrs=user_attrs,
+        set_user_attr=user_attrs.__setitem__,
+    )
+    optuna_runtime._publish_study_signature(study, signature, objective)
+    payload = copy.deepcopy(user_attrs[optuna_runtime._STUDY_SIGNATURE_PAYLOAD_ATTR])
+    user_attrs[optuna_runtime._STUDY_SIGNATURE_PAYLOAD_ATTR] = payload
+    if target == "study":
+        user_attrs[optuna_runtime._STUDY_SIGNATURE_SCHEMA_ATTR] = invalid_version
+    elif target == "payload":
+        payload["schema_version"] = invalid_version
+    elif target == "task":
+        payload["task"]["schema_version"] = invalid_version
+    elif target == "trial_lifecycle":
+        payload["trial_lifecycle"]["schema_version"] = invalid_version
+    else:
+        payload["trial_lifecycle"]["run_summary_schema_version"] = invalid_version
+
+    with pytest.raises(ValueError, match="schema version"):
+        optuna_runtime._validate_existing_study(
+            study,
+            signature=signature,
+            objective=objective,
+        )
 
 
 def test_device_override_is_visible_but_outside_optuna_study_identity() -> None:
@@ -326,7 +374,7 @@ def test_study_scalars_are_type_exact_during_load(monkeypatch: pytest.MonkeyPatc
     """
     Mutate each scalar study setting while retaining an otherwise valid raw recipe.
 
-    Blank names/storage, coerced seeds/counts, and retired schedule keys must fail
+    Blank names/storage, coerced seeds/counts, and unsupported schedule keys must fail
     during load, keeping runtime orchestration free of YAML truthiness shortcuts.
     """
     source_path = _CONFIG_ROOT / "steady_flow_fno_search.yaml"

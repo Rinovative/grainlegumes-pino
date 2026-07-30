@@ -91,6 +91,15 @@ _TASK_FIXED_KEYS = frozenset(
     }
 )
 _ADAM_BETA_COUNT = 2
+_RESOLVED_PATH_KEYS = frozenset(
+    {
+        "project_root",
+        "model_training_data_root",
+        "training_meta_root",
+        "dataset_root",
+        "output_root",
+    }
+)
 _SECTION_KEYS = {
     "run": frozenset({"seed", "deterministic", "device", "prefix", "suffix", "name"}),
     "data": frozenset(
@@ -267,12 +276,9 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                 metric = _as_mapping(raw_metric, path=f"evaluation.metrics[{index}]")
                 _reject_unknown(
                     metric,
-                    frozenset({"id", "kind", "space", "fields", "field", "reduction"}),
+                    frozenset({"id", "kind", "space", "fields", "reduction"}),
                     path=f"evaluation.metrics[{index}]",
                 )
-                if "field" in metric and "fields" in metric:
-                    msg = f"evaluation.metrics[{index}] cannot contain both field and fields."
-                    raise ConfigError(msg)
         if "objective" in evaluation:
             objective = _as_mapping(evaluation["objective"], path="evaluation.objective")
             _reject_unknown(
@@ -473,15 +479,10 @@ def _metric_fields(
     """
     Validate and canonicalize one metric's output-field selection.
 
-    The legacy singular ``field`` spelling is consumed into an ordered
-    ``fields`` list, ``all`` expands in exact TaskSpec output order, and empty,
-    duplicate, or unknown fields raise ``ConfigError`` at ``path``.
+    ``all`` expands in exact TaskSpec output order. Empty, duplicate, or unknown
+    fields raise ``ConfigError`` at ``path``.
     """
-    raw_field = metric.pop("field", None)
     raw_fields = metric.get("fields", "all")
-    if raw_field is not None:
-        raw_fields = [raw_field]
-        metric["fields"] = raw_fields
     if raw_fields == "all":
         fields = task.output_names
         metric["fields"] = list(fields)
@@ -991,10 +992,9 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     effective["task_contract"] = task.resolved_contract()
     effective["paths"] = {
         "project_root": str(common.paths.get_project_root()),
-        "storage_root": str(common.paths.get_storage_root()),
-        "data_root": str(common.paths.get_data_root()),
+        "model_training_data_root": str(common.paths.get_model_training_data_root()),
+        "training_meta_root": str(common.paths.get_training_meta_root()),
         "dataset_root": str(common.paths.get_dataset_root()),
-        "generated_data_root": str(common.paths.get_generated_data_root()),
         "output_root": str(common.paths.get_output_root()),
     }
     run = _as_mapping(effective["run"], path="run")
@@ -1025,7 +1025,7 @@ def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.s
     Raises
     ------
     ConfigError
-        If task identity, digest, or derived channel counts do not match.
+        If the complete task contract does not exactly match the registered task.
     ValueError
         If the task identifier is unknown.
 
@@ -1039,12 +1039,16 @@ def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.s
     if not isinstance(contract, Mapping):
         msg = "Resolved config must contain the current task_contract."
         raise ConfigError(msg)
-    digest = contract.get("digest")
-    if digest != task.contract_digest:
-        msg = f"Resolved task contract digest mismatch for {task_id!r}: expected {task.contract_digest}, got {digest!r}."
+    expected_contract = task.resolved_contract()
+    schema_version = contract.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != domain.tasks.spec.TASK_SCHEMA_VERSION:
+        msg = (
+            f"Resolved task contract does not exactly match registered task {task_id!r}: "
+            f"schema_version must be integer {domain.tasks.spec.TASK_SCHEMA_VERSION}."
+        )
         raise ConfigError(msg)
-    if contract.get("in_channels") != task.in_channels or contract.get("out_channels") != task.out_channels:
-        msg = f"Resolved task contract channel counts do not match registered task {task_id!r}."
+    if dict(contract) != expected_contract:
+        msg = f"Resolved task contract does not exactly match registered task {task_id!r}."
         raise ConfigError(msg)
     return task
 
@@ -1115,7 +1119,17 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _validate_evaluation(effective, task=task)
     _validate_runtime_sections(effective)
     get_resolved_objective(effective)
-    _as_mapping(effective["paths"], path="paths")
+    paths = _as_mapping(effective["paths"], path="paths")
+    missing_paths = sorted(_RESOLVED_PATH_KEYS.difference(paths))
+    unknown_paths = sorted(set(paths).difference(_RESOLVED_PATH_KEYS))
+    if missing_paths or unknown_paths:
+        msg = f"Resolved paths do not match the two-domain contract. Missing: {missing_paths}; unknown: {unknown_paths}."
+        raise ConfigError(msg)
+    invalid_paths = sorted(key for key, value in paths.items() if not isinstance(value, str) or not value)
+    if invalid_paths:
+        msg = f"Resolved paths must contain non-empty strings; invalid key(s): {invalid_paths}."
+        raise ConfigError(msg)
+    effective["paths"] = paths
     return effective
 
 

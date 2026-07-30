@@ -62,12 +62,7 @@ if nargin < 5 || isempty(output_dir)
         script_dir = fileparts(this_file);
         generation_root = fullfile(script_dir, '..', '..', '..');
         generation_root = char(java.io.File(generation_root).getCanonicalPath());
-        storage_root = getenv('STORAGE_ROOT');
-        if isempty(storage_root)
-            repository_root = fileparts(generation_root);
-            storage_root = fullfile(fileparts(repository_root), 'storage');
-        end
-        generated_data_root = fullfile(storage_root, 'data_generation');
+        generated_data_root = fullfile(generation_root, 'data');
     end
     output_dir = fullfile(generated_data_root, 'meta');
 end

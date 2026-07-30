@@ -20,6 +20,7 @@ import pandas as pd
 import pytest
 import torch
 from src import analysis, datasets, domain, learning
+from support.synthetic_task import build_synthetic_generated_batch_identity
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -340,7 +341,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
     Keep dual continuity and pressure-boundary artifacts explicit.
 
     Both training selections must emit the same named scalar and residual-array
-    contract, while retired ``Rc`` payloads are rejected as ambiguous.
+    contract, while undeclared NPZ arrays fail the generic exact-schema check.
     """
     task = domain.tasks.steady_flow.STEADY_FLOW
     height, width = 9, 11
@@ -415,10 +416,8 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
             "pressure_outlet_mean_square",
         }
         assert required_scalars.issubset(frame.columns)
-        assert not {"cont_mse", "continuity_mse", "mom_mse", "bc_mse"}.intersection(frame.columns)
         with np.load(Path(row["npz_path"]), allow_pickle=False) as payload:
             assert {"Rx", "Ry", "div_u", "div_eps_u", "coordinates"}.issubset(payload.files)
-            assert "Rc" not in payload.files
             for name in ("Rx", "Ry", "div_u", "div_eps_u"):
                 assert payload[name].shape == (height, width)
                 assert np.issubdtype(payload[name].dtype, np.floating)
@@ -440,12 +439,12 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         assert row["pressure_outlet_mean_square"] != pytest.approx(outlet_pointwise_mse)
         assert row["pressure_boundary_mse"] == pytest.approx(row["pressure_inlet_mse"] + row["pressure_outlet_mean_square"])
 
-    old_npz_path = Path(frames[0].iloc[0]["npz_path"])
-    with np.load(old_npz_path, allow_pickle=False) as stored:
-        old_payload = {name: np.asarray(stored[name]) for name in stored.files}
-    old_payload["Rc"] = old_payload["div_eps_u"]
-    with old_npz_path.open("wb") as stream:
-        np.savez_compressed(stream, **old_payload)  # pyright: ignore[reportArgumentType]
+    invalid_npz_path = Path(frames[0].iloc[0]["npz_path"])
+    with np.load(invalid_npz_path, allow_pickle=False) as stored:
+        invalid_payload = {name: np.asarray(stored[name]) for name in stored.files}
+    invalid_payload["unexpected_array"] = invalid_payload["div_eps_u"]
+    with invalid_npz_path.open("wb") as stream:
+        np.savez_compressed(stream, **invalid_payload)  # pyright: ignore[reportArgumentType]
     contract = analysis.artifact_service._EvaluatorArtifactContract(
         task_id=task.id,
         input_fields=task.input_names,
@@ -453,9 +452,9 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         output_units=tuple(field.unit for field in task.outputs),
         physics_kind=task.physics.kind,
     )
-    with pytest.raises(analysis.artifact_service.ArtifactCacheError, match=r"unexpected=\['Rc'\]"):
+    with pytest.raises(analysis.artifact_service.ArtifactCacheError, match=r"unexpected=\['unexpected_array'\]"):
         analysis.artifact_service._validate_npz_payload(
-            old_npz_path,
+            invalid_npz_path,
             case_index=1,
             source_index=0,
             split_local_index=0,
@@ -537,61 +536,41 @@ def test_generic_artifacts_reject_reserved_source_metadata(
         raise AssertionError("reserved identity metadata was accepted")
 
 
-def test_synthetic_task_flows_through_generic_dataset_contract(
+def test_synthetic_task_flows_through_final_dataset_contract(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     synthetic_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """
-    Flow a distinct valid task through generic dataset boundaries.
-
-    Case validation, merge, reload, EDA flattening, and batched metadata must all
-    preserve synthetic-task fields and copy isolation without steady-flow coupling.
-    """
-    input_fields = {name: torch.full((2, 3), _SYNTHETIC_INPUT_VALUE + index) for index, name in enumerate(synthetic_task.input_names)}
-    output_fields = {name: torch.full((2, 3), 20.0 + index) for index, name in enumerate(synthetic_task.output_names)}
-    case = datasets.identity.build_case_payload(
+    """Final dataset loading and metadata flattening remain task-generic."""
+    inputs = torch.stack([torch.full((2, 3), _SYNTHETIC_INPUT_VALUE + index) for index in range(synthetic_task.in_channels)]).unsqueeze(0)
+    outputs = torch.stack([torch.full((2, 3), 20.0 + index) for index in range(synthetic_task.out_channels)]).unsqueeze(0)
+    source_identity = {"token": "synthetic"}
+    expected_metadata = {
+        "generator": {"parameters": {"scalar_parameter": _SYNTHETIC_METADATA_VALUE}},
+    }
+    fingerprint = datasets.identity.compute_case_fingerprint(
         task=synthetic_task,
         case_id="case_0000",
-        input_fields=input_fields,
-        output_fields=output_fields,
-        source_identity={"token": "synthetic"},
-        source_metadata={
-            "generator": {
-                "parameters": {"scalar_parameter": _SYNTHETIC_METADATA_VALUE},
-            },
-        },
+        source_identity=source_identity,
+        source_metadata=expected_metadata,
+        inputs=inputs[0],
+        outputs=outputs[0],
     )
-    validated = datasets.identity.validate_case_payload(case, task=synthetic_task)
-    merged = datasets.identity.build_merged_dataset_payload(
+    payload = datasets.identity.build_training_dataset_payload(
         task=synthetic_task,
         dataset_id="synthetic_train",
         sample_ids=("case_0000",),
-        source_identities=(validated.source_identity,),
-        source_metadata=(validated.source_metadata,),
-        case_fingerprints=(validated.fingerprint,),
-        inputs=validated.inputs.unsqueeze(0),
-        outputs=validated.outputs.unsqueeze(0),
+        generated_batch_identity=build_synthetic_generated_batch_identity(
+            batch_name="synthetic_train",
+            sample_ids=("case_0000",),
+        ),
+        source_identities=(source_identity,),
+        source_metadata=(expected_metadata,),
+        source_provenance={"batch_manifest_sha256": "2" * 64},
+        case_fingerprints=(fingerprint,),
+        inputs=inputs,
+        outputs=outputs,
     )
-    path = _save_dataset(tmp_path, merged)
-    loaded = datasets.simulation.create_task_dataset(path, task=synthetic_task)
-    expected_metadata = {
-        "generator": {
-            "parameters": {"scalar_parameter": _SYNTHETIC_METADATA_VALUE},
-        },
-    }
-    monkeypatch.setenv("DATASET_ROOT", str(tmp_path))
-    frame, logs = analysis.eda.dataframe.generate_eda_dataframe(
-        "synthetic_train",
-        task=synthetic_task,
-        max_cases=1,
-    )
-    assert frame.index.tolist() == ["case_0000"]
-    assert frame.columns.tolist() == [*synthetic_task.input_names, *synthetic_task.output_names, "meta"]
-    assert np.all(frame.loc["case_0000", "feature_a"] == _SYNTHETIC_INPUT_VALUE)
-    assert frame.loc["case_0000", "meta"] == expected_metadata
-    assert str(path) in "\n".join(logs)
-
+    loaded = datasets.simulation.create_task_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
     sample = loaded[0]
     assert sample["meta"] == expected_metadata
     sample["meta"]["generator"]["parameters"]["scalar_parameter"] = -1.0

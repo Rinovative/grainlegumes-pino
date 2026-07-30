@@ -91,6 +91,28 @@ def test_initialization_failure_never_looks_loadable(
     assert not common.paths.is_current_run_dir(run_dir)
 
 
+@pytest.mark.parametrize("invalid_version", [True, 1.0, 0, 2])
+def test_run_summary_requires_type_exact_schema_version(
+    tmp_path: Path,
+    invalid_version: object,
+) -> None:
+    """Reject every non-current integer and numeric lookalike before lifecycle use."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    common.serialization.atomic_write_json(
+        common.paths.resolve_run_summary_path(run_dir),
+        {"schema_version": invalid_version, "status": "completed"},
+    )
+    for filename in common.paths.CURRENT_RUN_REQUIRED_FILES:
+        path = run_dir / filename
+        if not path.exists():
+            path.touch()
+    assert not common.paths.is_current_run_dir(run_dir)
+
+    with pytest.raises(experiments.run.RunLifecycleError, match="run summary schema"):
+        experiments.run.read_run_summary(run_dir)
+
+
 def test_optuna_trial_paths_are_study_and_trial_qualified(tmp_path: Path) -> None:
     """
     Resolve equal trial numbers across studies and unequal trials within one study.

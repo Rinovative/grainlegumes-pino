@@ -6,10 +6,17 @@ CONTAINER_NAME="grainlegumes-pino-airflow-dev"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
-mkdir -p "${PROJECT_DIR}/logs" "${HOST_STORAGE_ROOT}"
+mkdir -p "${HOST_STORAGE_ROOT}"
 STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
+HOST_GENERATED_DATA_ROOT="${STORAGE_DIR}/data_generation"
+HOST_MODEL_TRAINING_DATA_ROOT="${STORAGE_DIR}/data_training"
 DOCKER_HOME="${STORAGE_DIR}/.docker_home"
-mkdir -p "${DOCKER_HOME}"
+mkdir -p \
+  "${PROJECT_DIR}/data_generation/data" \
+  "${PROJECT_DIR}/model_training/data" \
+  "${HOST_GENERATED_DATA_ROOT}" \
+  "${HOST_MODEL_TRAINING_DATA_ROOT}" \
+  "${DOCKER_HOME}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker is required but was not found on PATH. Install Docker and retry." >&2
@@ -63,15 +70,14 @@ if [[ -d "${HOME}/.ssh" ]]; then
 fi
 
 if docker ps --format '{{.Names}}' | grep -Fqx -- "${CONTAINER_NAME}"; then
-  echo "Container '${CONTAINER_NAME}' is already running."
-  echo "Attach with VS Code: Remote Explorer -> Containers -> ${CONTAINER_NAME}"
-  exit 0
+  echo "Container '${CONTAINER_NAME}' already exists and may use a stale image or mount contract." >&2
+  echo "Stop it with: docker stop ${CONTAINER_NAME}; then rerun this script to recreate it." >&2
+  exit 1
 fi
 if docker ps -a --format '{{.Names}}' | grep -Fqx -- "${CONTAINER_NAME}"; then
-  docker start "${CONTAINER_NAME}" >/dev/null
-  echo "Restarted existing container: ${CONTAINER_NAME}"
-  echo "Attach with VS Code: Remote Explorer -> Containers -> ${CONTAINER_NAME}"
-  exit 0
+  echo "Stopped container '${CONTAINER_NAME}' may use a stale image or mount contract." >&2
+  echo "Remove it with: docker rm ${CONTAINER_NAME}; then rerun this script to recreate it." >&2
+  exit 1
 fi
 
 GPU_ARGS=()
@@ -95,23 +101,24 @@ docker run -d --rm \
   --shm-size=16G \
   --workdir /workspace/repo \
   -e HOME=/workspace/storage/.docker_home \
-  -e STORAGE_ROOT=/workspace/storage \
-  -e DATA_ROOT=/workspace/storage/data \
-  -e DATASET_ROOT=/workspace/storage/data_training/raw \
-  -e GENERATED_DATA_ROOT=/workspace/storage/data_generation \
-  -e OUTPUT_ROOT=/workspace/storage/data_training/processed \
+  -e PROJECT_ROOT=/workspace/repo \
+  -e GENERATED_DATA_ROOT=/workspace/repo/data_generation/data \
+  -e MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data \
   "${WANDB_ENV_ARGS[@]}" \
   -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   -v "${DOCKER_HOME}/passwd:/etc/passwd:ro" \
   -v "${DOCKER_HOME}/group:/etc/group:ro" \
   -v "${PROJECT_DIR}:/workspace/repo:rw" \
-  -v "${STORAGE_DIR}:/workspace/storage:rw" \
+  -v "${HOST_GENERATED_DATA_ROOT}:/workspace/repo/data_generation/data:ro" \
+  -v "${HOST_MODEL_TRAINING_DATA_ROOT}:/workspace/repo/model_training/data:rw" \
+  -v "${DOCKER_HOME}:/workspace/storage/.docker_home:rw" \
   "${SSH_ARGS[@]}" \
   "${IMAGE_NAME}" \
   bash -lc "sleep infinity"
 
 echo "Container started: ${CONTAINER_NAME}"
-echo "Repository mount: /workspace/repo"
-echo "Storage mount:    /workspace/storage"
+echo "Repository mount:          /workspace/repo"
+echo "Generated data mount (ro): /workspace/repo/data_generation/data"
+echo "Training data mount (rw):  /workspace/repo/model_training/data"
 echo "Attach with VS Code: Remote Explorer -> Containers -> ${CONTAINER_NAME}"
 echo "Stop with: docker stop ${CONTAINER_NAME}"

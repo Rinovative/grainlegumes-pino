@@ -48,13 +48,8 @@ dist/
 # ================================
 # Data folders
 # ================================
-/data/
 /data_generation/data/
 /model_training/data/
-
-!data/.gitkeep
-!data_generation/data/.gitkeep
-!model_training/data/.gitkeep
 # ================================
 # Logs, temp & system files
 # ================================

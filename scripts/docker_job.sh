@@ -3,8 +3,10 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 MODEL_DIR="${PROJECT_DIR}/model_training"
-LOG_DIR="${PROJECT_DIR}/logs"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
+HOST_GENERATED_DATA_ROOT="${HOST_STORAGE_ROOT}/data_generation"
+HOST_MODEL_TRAINING_DATA_ROOT="${HOST_STORAGE_ROOT}/data_training"
+LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/steady_flow/logs/queue"
 
 usage() {
   cat >&2 <<EOF
@@ -39,7 +41,8 @@ resolve_config_argument() {
   local candidate=""
   local candidate_dir
   local resolved
-  local storage_dir=""
+  local generated_dir=""
+  local training_dir=""
 
   if [[ "${requested}" == /* ]]; then
     candidate="${requested}"
@@ -70,14 +73,121 @@ resolve_config_argument() {
     printf '/workspace/repo/%s' "${resolved#"${PROJECT_DIR}/"}"
     return
   fi
-  if [[ -d "${HOST_STORAGE_ROOT}" ]]; then
-    storage_dir="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
+  if [[ -d "${HOST_GENERATED_DATA_ROOT}" ]]; then
+    generated_dir="$(cd "${HOST_GENERATED_DATA_ROOT}" && pwd -P)"
   fi
-  if [[ -n "${storage_dir}" && "${resolved}" == "${storage_dir}/"* ]]; then
-    printf '/workspace/storage/%s' "${resolved#"${storage_dir}/"}"
+  if [[ -n "${generated_dir}" && "${resolved}" == "${generated_dir}/"* ]]; then
+    printf '/workspace/repo/data_generation/data/%s' "${resolved#"${generated_dir}/"}"
     return
   fi
-  fail 2 "Config path must be inside the repository or configured STORAGE_ROOT: ${requested}"
+  if [[ -d "${HOST_MODEL_TRAINING_DATA_ROOT}" ]]; then
+    training_dir="$(cd "${HOST_MODEL_TRAINING_DATA_ROOT}" && pwd -P)"
+  fi
+  if [[ -n "${training_dir}" && "${resolved}" == "${training_dir}/"* ]]; then
+    printf '/workspace/repo/model_training/data/%s' "${resolved#"${training_dir}/"}"
+    return
+  fi
+  fail 2 "Config path must be inside the repository or one configured data domain: ${requested}"
+}
+
+translate_semantic_path() {
+  local requested="$1"
+  local resolved
+  local generated_root
+  local training_root
+  local project_root
+
+  if [[ -z "${requested}" ]]; then
+    fail 2 "Path-valued semantic options require a non-empty value."
+  fi
+  if [[ "${requested}" != /* ]]; then
+    printf '%s' "${requested}"
+    return
+  fi
+  if [[ "${requested}" == "/workspace/repo" || "${requested}" == "/workspace/repo/"* ]]; then
+    printf '%s' "${requested}"
+    return
+  fi
+  if ! command -v realpath >/dev/null 2>&1; then
+    fail 1 "realpath is required for host-to-container path translation but was not found on PATH."
+  fi
+
+  resolved="$(realpath -m -- "${requested}")"
+  generated_root="$(realpath -m -- "${HOST_GENERATED_DATA_ROOT}")"
+  training_root="$(realpath -m -- "${HOST_MODEL_TRAINING_DATA_ROOT}")"
+  project_root="$(realpath -m -- "${PROJECT_DIR}")"
+
+  if [[ "${resolved}" == "${generated_root}" ]]; then
+    printf '/workspace/repo/data_generation/data'
+  elif [[ "${resolved}" == "${generated_root}/"* ]]; then
+    printf '/workspace/repo/data_generation/data/%s' "${resolved#"${generated_root}/"}"
+  elif [[ "${resolved}" == "${training_root}" ]]; then
+    printf '/workspace/repo/model_training/data'
+  elif [[ "${resolved}" == "${training_root}/"* ]]; then
+    printf '/workspace/repo/model_training/data/%s' "${resolved#"${training_root}/"}"
+  elif [[ "${resolved}" == "${project_root}" ]]; then
+    printf '/workspace/repo'
+  elif [[ "${resolved}" == "${project_root}/"* ]]; then
+    printf '/workspace/repo/%s' "${resolved#"${project_root}/"}"
+  else
+    printf '%s' "${requested}"
+  fi
+}
+
+is_semantic_path_option() {
+  local job_type="$1"
+  local option="$2"
+
+  case "${job_type}:${option}" in
+    train:--resume|train:--output-root|optuna:--output-root|artifacts:--runs-root|artifacts:--dataset-root|artifacts:--metadata-root)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+translate_semantic_path_options() {
+  local job_type="$1"
+  shift
+  local arguments=("$@")
+  local translated=()
+  local index=0
+  local argument
+  local option
+  local value
+
+  while (( index < ${#arguments[@]} )); do
+    argument="${arguments[index]}"
+    if is_semantic_path_option "${job_type}" "${argument}"; then
+      if (( index + 1 >= ${#arguments[@]} )) || [[ -z "${arguments[index + 1]}" ]]; then
+        fail 2 "${argument} requires a non-empty path value."
+      fi
+      value="$(translate_semantic_path "${arguments[index + 1]}")"
+      translated+=("${argument}" "${value}")
+      index=$((index + 2))
+      continue
+    fi
+
+    if [[ "${argument}" == *=* ]]; then
+      option="${argument%%=*}"
+      if is_semantic_path_option "${job_type}" "${option}"; then
+        value="${argument#*=}"
+        if [[ -z "${value}" ]]; then
+          fail 2 "${option} requires a non-empty path value."
+        fi
+        translated+=("${option}=$(translate_semantic_path "${value}")")
+        index=$((index + 1))
+        continue
+      fi
+    fi
+
+    translated+=("${argument}")
+    index=$((index + 1))
+  done
+
+  SEMANTIC_ARGS=("${translated[@]}")
 }
 
 validate_semantic_device_arguments() {
@@ -92,7 +202,7 @@ validate_semantic_device_arguments() {
         fail 2 "--queue-gpu is a wrapper option and must appear before the job type."
         ;;
       --cpu|--cpu=*)
-        fail 2 "Obsolete --cpu is unsupported; queued jobs always use --device cuda."
+        fail 2 "--cpu is unsupported; queued jobs always use --device cuda."
         ;;
       --device)
         if (( index + 1 >= ${#arguments[@]} )); then
@@ -154,6 +264,7 @@ case "${JOB_TYPE}" in
     fail 2 "Unsupported job type: ${JOB_TYPE}"
     ;;
 esac
+translate_semantic_path_options "${JOB_TYPE}" "${SEMANTIC_ARGS[@]}"
 validate_semantic_device_arguments "${SEMANTIC_ARGS[@]}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then

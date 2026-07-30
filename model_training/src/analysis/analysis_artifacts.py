@@ -31,7 +31,7 @@ Notes:
     ---------
     Parquet (global, per case):
         - case_index        : stable one-based source case id
-        - source_index      : zero-based original merged-dataset index
+        - source_index      : zero-based original final-dataset index
         - split_local_index : zero-based position in the saved split
         - npz_path          : path to the corresponding NPZ artifact
 
@@ -66,7 +66,7 @@ Notes:
 
     NPZ (local, full fields per case):
         - case_index   : stable one-based source case id
-        - source_index : zero-based original merged-dataset index
+        - source_index : zero-based original final-dataset index
         - split_local_index : zero-based position in the saved split
         - pred         : (C_artifact, H, W) prediction aligned with artifact_fields
         - gt           : (C_artifact, H, W) ground truth aligned with artifact_fields
@@ -124,8 +124,8 @@ from . import analysis_timing as timing
 # ============================================================================
 
 INTERNAL_KAPPA_NAMES = set(domain.permeability.INTERNAL_KAPPA_2D_ORDER) | set(domain.permeability.INTERNAL_KAPPA_3D_ORDER)
-ARTIFACT_SCHEMA_VERSION = 4
-ARTIFACT_PROVENANCE_SCHEMA_VERSION = 3
+ARTIFACT_SCHEMA_VERSION = 1
+ARTIFACT_PROVENANCE_SCHEMA_VERSION = 1
 RESIDUAL_SCHEMA_VERSION = 1
 ARTIFACT_PROVENANCE_FILENAME = "artifact_provenance.json"
 NORMALIZED_OBJECTIVE_TOLERANCE = {"rtol": 1e-12, "atol": 1e-12}

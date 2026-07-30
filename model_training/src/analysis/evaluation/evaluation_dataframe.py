@@ -2,10 +2,10 @@
 ===============================================================================
 evaluation_dataframe.py
 ===============================================================================
-Build and compare evaluation DataFrames from versioned artifact contracts.
+Build and compare evaluation DataFrames from the current artifact contract.
 
 Responsibilities:
-  - Admit only artifact schema 4 tables and provenance schema 3 metadata
+  - Admit only exact current artifact tables and provenance metadata
   - Preserve exact normalized_macro_rmse sufficient-statistic aggregates
   - Flatten source metadata without colliding with authoritative columns
   - Validate task, objective, units, formulas, role, and membership before plots
@@ -54,16 +54,6 @@ PRESSURE_BOUNDARY_METRICS = (
     "pressure_inlet_mse",
     "pressure_outlet_mean_square",
     "pressure_boundary_mse",
-)
-_REJECTED_AMBIGUOUS_NAMES = frozenset(
-    {
-        "cont_mse",
-        "continuity_mse",
-        "selected_continuity_mse",
-        "Rc",
-        "mom_mse",
-        "bc_mse",
-    }
 )
 _BASE_ARTIFACT_COLUMNS = frozenset(
     {
@@ -172,11 +162,11 @@ def _validate_membership(frame: pd.DataFrame) -> None:
 
 def _validate_artifact_table(frame: pd.DataFrame) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     """
-    Admit one non-empty Parquet frame against the closed schema-4 contract.
+    Admit one non-empty Parquet frame against the closed current contract.
 
     The validator fixes task/output semantics from the first row, requires them
-    on every row, rejects ambiguous retired columns and all unexpected columns,
-    verifies finite non-negative metrics, and proves exact saved membership order.
+    on every row, rejects every unexpected column, verifies finite non-negative
+    metrics, and proves exact saved membership order.
     """
     if not frame.columns.is_unique:
         duplicates = sorted(set(frame.columns[frame.columns.duplicated()].tolist()))
@@ -184,10 +174,6 @@ def _validate_artifact_table(frame: pd.DataFrame) -> tuple[str, tuple[str, ...],
         raise ValueError(msg)
     if frame.empty:
         msg = "Evaluation artifact table must contain at least one case."
-        raise ValueError(msg)
-    ambiguous = sorted(_REJECTED_AMBIGUOUS_NAMES.intersection(frame.columns))
-    if ambiguous:
-        msg = f"Evaluation artifact table contains rejected ambiguous columns: {ambiguous}."
         raise ValueError(msg)
     missing_base = sorted(_BASE_ARTIFACT_COLUMNS.difference(frame.columns))
     if missing_base:
@@ -345,12 +331,14 @@ def _validated_provenance(
     contradictions raise :class:`ComparisonCompatibilityError`.
     """
     payload = dict(provenance)
-    if payload.get("provenance_schema_version") != artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION:
-        msg = f"Evaluation requires provenance schema {artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION}."
-        raise ValueError(msg)
-    if payload.get("artifact_schema_version") != artifacts.ARTIFACT_SCHEMA_VERSION:
-        msg = f"Evaluation provenance requires artifact schema {artifacts.ARTIFACT_SCHEMA_VERSION}."
-        raise ValueError(msg)
+    for field, expected in (
+        ("provenance_schema_version", artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION),
+        ("artifact_schema_version", artifacts.ARTIFACT_SCHEMA_VERSION),
+    ):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, Integral) or int(value) != expected:
+            msg = f"Evaluation provenance requires integer {field}={expected}."
+            raise ValueError(msg)
 
     run = _mapping(payload.get("run"), label="provenance.run")
     evaluator = _mapping(payload.get("evaluator"), label="provenance.evaluator")
@@ -404,6 +392,17 @@ def _validated_provenance(
     if not isinstance(dataset.get("fingerprint"), str) or not dataset.get("fingerprint"):
         msg = "Artifact provenance dataset fingerprint must be non-empty."
         raise TypeError(msg)
+    raw_physics = payload.get("physics")
+    if raw_physics is not None:
+        physics = _mapping(raw_physics, label="provenance.physics")
+        residual_schema_version = physics.get("residual_schema_version")
+        if (
+            isinstance(residual_schema_version, bool)
+            or not isinstance(residual_schema_version, Integral)
+            or int(residual_schema_version) != artifacts.RESIDUAL_SCHEMA_VERSION
+        ):
+            msg = f"Artifact physics requires integer residual_schema_version={artifacts.RESIDUAL_SCHEMA_VERSION}."
+            raise ValueError(msg)
 
     model = _mapping(payload.get("model"), label="provenance.model")
     counts = _mapping(model.get("parameter_counts"), label="provenance.model.parameter_counts")
@@ -531,7 +530,7 @@ def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
 
 def load_and_build_eval_df(parquet_path: str | Path) -> pd.DataFrame:
     """
-    Load and validate one explicit raw schema-4 Parquet table.
+    Load and validate one explicit raw current-schema Parquet table.
 
     Parameters
     ----------
@@ -621,7 +620,7 @@ def require_complete_provenance(frame: pd.DataFrame) -> Mapping[str, Any]:
     Returns
     -------
     Mapping[str, Any]
-        Schema-3 provenance used for comparison and scientific labels.
+        Current provenance used for comparison and scientific labels.
 
     Raises
     ------
@@ -756,8 +755,13 @@ def validate_comparison(
             if frame.attrs.get("task_id") != "steady_flow":
                 msg = f"Physics plots are unavailable for task {frame.attrs.get('task_id')!r}."
                 raise ComparisonCompatibilityError(msg)
-            if frame.attrs.get("residual_schema_version") != artifacts.RESIDUAL_SCHEMA_VERSION:
-                msg = f"Physics plots require residual schema {artifacts.RESIDUAL_SCHEMA_VERSION}."
+            residual_schema_version = frame.attrs.get("residual_schema_version")
+            if (
+                isinstance(residual_schema_version, bool)
+                or not isinstance(residual_schema_version, Integral)
+                or int(residual_schema_version) != artifacts.RESIDUAL_SCHEMA_VERSION
+            ):
+                msg = f"Physics plots require integer residual schema {artifacts.RESIDUAL_SCHEMA_VERSION}."
                 raise ComparisonCompatibilityError(msg)
         role = str(provenance.get("split_role"))
         grouped.setdefault(role, []).append((label, _comparison_identity(provenance, physics=require_physics)))

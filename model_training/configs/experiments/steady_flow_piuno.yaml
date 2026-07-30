@@ -49,17 +49,17 @@ evaluation:
     - id: normalized_rmse_p
       kind: rmse
       space: normalized
-      field: p
+      fields: [p]
       reduction: element_mean
     - id: normalized_rmse_u
       kind: rmse
       space: normalized
-      field: u
+      fields: [u]
       reduction: element_mean
     - id: normalized_rmse_v
       kind: rmse
       space: normalized
-      field: v
+      fields: [v]
       reduction: element_mean
     - id: normalized_rmse
       kind: rmse
@@ -79,17 +79,17 @@ evaluation:
     - id: physical_rmse_p
       kind: rmse
       space: physical
-      field: p
+      fields: [p]
       reduction: element_mean
     - id: physical_rmse_u
       kind: rmse
       space: physical
-      field: u
+      fields: [u]
       reduction: element_mean
     - id: physical_rmse_v
       kind: rmse
       space: physical
-      field: v
+      fields: [v]
       reduction: element_mean
   objective:
     id: normalized_macro_rmse

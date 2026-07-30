@@ -2,7 +2,7 @@
 """
 Protect current artifact reader identity, cache admission, and contained rebuilds.
 
-The tests cover schema-4 table parsing, metadata collision rejection, ordered
+The tests cover current table parsing, metadata collision rejection, ordered
 membership, symlink/path containment, concurrent publication, and provenance
 completion races. Numerical artifact generation is covered in
 ``test_artifact_provenance``; plot usability is covered separately.
@@ -69,33 +69,31 @@ def test_dataframe_reader_exposes_authoritative_normalized_aggregate() -> None:
     assert enriched.attrs["normalized_macro_rmse"]["value"] == 0.0
 
 
-@pytest.mark.parametrize("retired_name", ["cont_mse", "Rc"])
-def test_dataframe_reader_rejects_retired_ambiguous_contracts(retired_name: str) -> None:
-    """
-    Reject each retired ambiguous continuity representation.
-
-    The parameter distinguishes the old scalar and residual-array names; both
-    must fail instead of being interpreted under the schema-4 contract.
-    """
+def test_dataframe_reader_rejects_every_unexpected_column() -> None:
+    """Reject an undeclared column through the generic exact-schema boundary."""
     frame = _current_generic_frame(metadata="{}")
-    frame[retired_name] = 0.0
+    frame["unexpected_metric"] = 0.0
 
-    with pytest.raises(ValueError, match="rejected ambiguous"):
+    with pytest.raises(ValueError, match="schema mismatch"):
         analysis.evaluation.dataframe.build_eval_df(frame)
 
 
-def test_dataframe_reader_rejects_old_missing_and_duplicate_schemas() -> None:
-    """
-    Reject old versions, missing evidence, and duplicate columns.
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, 1.0, 2],
+    ids=("boolean-one", "floating-one", "unsupported-integer"),
+)
+def test_dataframe_reader_requires_integer_artifact_version_one(schema_version: object) -> None:
+    """Reject alternate representations and unsupported Parquet schema versions."""
+    frame = _current_generic_frame(metadata="{}")
+    frame["artifact_schema_version"] = schema_version  # pyright: ignore[reportCallIssue, reportArgumentType]
 
-    Each malformed frame isolates one schema defect so a permissive reader
-    cannot silently admit stale or ambiguous scientific evidence.
-    """
-    old = _current_generic_frame(metadata="{}")
-    old["artifact_schema_version"] = analysis.artifacts.ARTIFACT_SCHEMA_VERSION - 1
-    with pytest.raises(ValueError, match="requires schema version"):
-        analysis.evaluation.dataframe.build_eval_df(old)
+    with pytest.raises((TypeError, ValueError), match=r"artifact_schema_version|schema version"):
+        analysis.evaluation.dataframe.build_eval_df(frame)
 
+
+def test_dataframe_reader_rejects_missing_and_duplicate_columns() -> None:
+    """Reject missing evidence and duplicate columns through exact schema admission."""
     missing = _current_generic_frame(metadata="{}").drop(columns="normalized_sse_target")
     with pytest.raises(ValueError, match="schema mismatch"):
         analysis.evaluation.dataframe.build_eval_df(missing)
@@ -247,6 +245,24 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
     operational["outputs"] = {"generated": "digest"}
     operational["aggregate"] = {"value": 123.0}
     assert analysis.artifact_service._scientific_provenance(operational) == baseline
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, 1.0, 2],
+    ids=("boolean-one", "floating-one", "unsupported-integer"),
+)
+def test_artifact_provenance_requires_integer_version_one(schema_version: object) -> None:
+    """Reject alternate representations in both artifact provenance version fields."""
+    current: dict[str, object] = {
+        "provenance_schema_version": analysis.artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+        "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+    }
+    for field in tuple(current):
+        invalid = dict(current)
+        invalid[field] = schema_version
+        with pytest.raises(analysis.artifact_service.ArtifactCacheError, match=field):
+            analysis.artifact_service._require_current_provenance_schema(invalid)
 
 
 def test_rebuild_removes_only_one_exact_target(tmp_path: Path) -> None:
@@ -560,6 +576,7 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
             batch_size=2,
             device_resolution=learning.device.resolve_device("cpu"),
             dataset_root=tmp_path / "datasets",
+            metadata_root=tmp_path / "meta",
             rebuild=True,
         )
 
@@ -711,6 +728,7 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
         "batch_size": 1,
         "device_resolution": learning.device.resolve_device("cpu"),
         "dataset_root": tmp_path / "datasets",
+        "metadata_root": tmp_path / "meta",
         "rebuild": True,
     }
     workers = [context.Process(target=_run_artifact_worker, args=(arguments, outcomes)) for _ in range(2)]
@@ -767,6 +785,7 @@ def test_rebuild_waiter_recovers_after_prior_generator_removed_completion(
         batch_size=1,
         device_resolution=learning.device.resolve_device("cpu"),
         dataset_root=tmp_path / "datasets",
+        metadata_root=tmp_path / "meta",
         rebuild=True,
     )
 
@@ -811,6 +830,7 @@ def test_artifact_operation_waits_for_the_active_run_writer(
                 batch_size=1,
                 device_resolution=learning.device.resolve_device("cpu"),
                 dataset_root=tmp_path / "datasets",
+                metadata_root=tmp_path / "meta",
                 rebuild=True,
             )
         except Exception as error:

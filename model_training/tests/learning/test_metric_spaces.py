@@ -157,7 +157,6 @@ def test_incompatible_physical_aggregate_is_rejected() -> None:
     """
     raw = experiments.config.loader.load_yaml(_CONFIG)
     aggregate = copy.deepcopy(next(metric for metric in raw["evaluation"]["metrics"] if metric["id"] == "physical_rmse_p"))
-    aggregate.pop("field")
     aggregate["id"] = "physical_rmse_all"
     aggregate["fields"] = ["p", "u", "v"]
     raw["evaluation"]["metrics"] = [aggregate]

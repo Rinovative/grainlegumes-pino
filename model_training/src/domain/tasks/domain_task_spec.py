@@ -28,6 +28,8 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
+TASK_SCHEMA_VERSION = 1
+
 FieldRole = Literal[
     "coordinate",
     "permeability",
@@ -437,8 +439,8 @@ class TaskSpec:
         if not isinstance(self.id, str) or not self.id:
             msg = "Task id must be a non-empty string."
             raise ValueError(msg)
-        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version <= 0:
-            msg = f"Task {self.id!r} schema_version must be a positive integer."
+        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version != TASK_SCHEMA_VERSION:
+            msg = f"Task {self.id!r} schema_version must be integer {TASK_SCHEMA_VERSION}."
             raise ValueError(msg)
         if self.tensor_layout != _SUPPORTED_TENSOR_LAYOUT:
             msg = f"Task {self.id!r} tensor_layout must be the current 2D layout {_SUPPORTED_TENSOR_LAYOUT!r}."

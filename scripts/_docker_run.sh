@@ -49,7 +49,7 @@ while (( INDEX < ${#SEMANTIC_ARGS[@]} )); do
       exit 2
       ;;
     --cpu|--cpu=*)
-      echo "Obsolete --cpu is unsupported; queued jobs always use --device cuda." >&2
+      echo "--cpu is unsupported; queued jobs always use --device cuda." >&2
       exit 2
       ;;
     --device)
@@ -86,11 +86,20 @@ CLI_ARGS+=("--device" "cuda")
 IMAGE_NAME="grainlegumes-pino-airflow"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
-mkdir -p "${PROJECT_DIR}/logs" "${HOST_STORAGE_ROOT}"
+mkdir -p "${HOST_STORAGE_ROOT}"
 STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
+HOST_GENERATED_DATA_ROOT="${STORAGE_DIR}/data_generation"
+HOST_MODEL_TRAINING_DATA_ROOT="${STORAGE_DIR}/data_training"
 DOCKER_HOME="${STORAGE_DIR}/.docker_home"
-LOG_FILE="${PROJECT_DIR}/logs/${LOG_BASENAME}"
-mkdir -p "${DOCKER_HOME}"
+QUEUE_LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/steady_flow/logs/queue"
+LOG_FILE="${QUEUE_LOG_DIR}/${LOG_BASENAME}"
+mkdir -p \
+  "${PROJECT_DIR}/data_generation/data" \
+  "${PROJECT_DIR}/model_training/data" \
+  "${HOST_GENERATED_DATA_ROOT}" \
+  "${HOST_MODEL_TRAINING_DATA_ROOT}" \
+  "${DOCKER_HOME}" \
+  "${QUEUE_LOG_DIR}"
 
 # Capture both streams and the final Docker status in the unique host-visible log.
 exec > "${LOG_FILE}" 2>&1
@@ -149,17 +158,17 @@ docker run --rm \
   --shm-size=16G \
   --workdir /workspace/repo/model_training \
   -e HOME=/workspace/storage/.docker_home \
-  -e STORAGE_ROOT=/workspace/storage \
-  -e DATA_ROOT=/workspace/storage/data \
-  -e DATASET_ROOT=/workspace/storage/data_training/raw \
-  -e GENERATED_DATA_ROOT=/workspace/storage/data_generation \
-  -e OUTPUT_ROOT=/workspace/storage/data_training/processed \
+  -e PROJECT_ROOT=/workspace/repo \
+  -e GENERATED_DATA_ROOT=/workspace/repo/data_generation/data \
+  -e MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data \
   "${WANDB_ENV_ARGS[@]}" \
   -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   -v "${DOCKER_HOME}/passwd:/etc/passwd:ro" \
   -v "${DOCKER_HOME}/group:/etc/group:ro" \
   -v "${PROJECT_DIR}:/workspace/repo:rw" \
-  -v "${STORAGE_DIR}:/workspace/storage:rw" \
+  -v "${HOST_GENERATED_DATA_ROOT}:/workspace/repo/data_generation/data:ro" \
+  -v "${HOST_MODEL_TRAINING_DATA_ROOT}:/workspace/repo/model_training/data:rw" \
+  -v "${DOCKER_HOME}:/workspace/storage/.docker_home:rw" \
   "${SSH_ARGS[@]}" \
   "${IMAGE_NAME}" \
   python -m "${MODULE}" "${CLI_ARGS[@]}"

@@ -71,6 +71,25 @@ def test_every_experiment_yaml_resolves(path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "schema_version",
+    [True, 1.0, 2],
+    ids=("boolean-one", "floating-one", "unsupported-integer"),
+)
+def test_resolved_task_contract_requires_complete_current_schema(schema_version: object) -> None:
+    """Reject a saved task contract that differs from the registered contract."""
+    config = experiments.config.loader.load_and_resolve_config(_CONFIG_ROOT / "experiments/steady_flow_fno.yaml")
+    contract = config["task_contract"]
+    assert isinstance(contract, dict)
+    contract["schema_version"] = schema_version
+
+    with pytest.raises(
+        experiments.config.loader.ConfigError,
+        match="does not exactly match registered task",
+    ):
+        experiments.config.loader.validate_resolved_task_contract(config)
+
+
+@pytest.mark.parametrize(
     ("saved_policy", "requested_policy"),
     [("auto", "cpu"), ("auto", "cuda"), ("cuda", "cpu"), ("cpu", "cuda")],
 )
@@ -210,7 +229,7 @@ def test_continuity_selection_changes_effective_digest_and_resume_contract() -> 
 @pytest.mark.parametrize("unknown", ["div_u", "div_eps_u", "automatic"])
 def test_unknown_continuity_identifier_fails_with_exact_config_path(unknown: str) -> None:
     """
-    Vary retired residual aliases and an automatic sentinel at one PI config path.
+    Vary unsupported residual spellings and an automatic sentinel at one PI config path.
 
     Every spelling must fail with the exact ``loss.physics.continuity`` path, proving
     resolution accepts only task-declared semantic identifiers.
@@ -232,6 +251,7 @@ def test_unknown_continuity_identifier_fails_with_exact_config_path(unknown: str
         (lambda cfg: cfg["model"].update({"kind": "PI-FNO"}), "Unknown model identifier"),
         (lambda cfg: cfg["loss"]["data"].update({"kind": "H1Loss"}), "not allowed by task"),
         (lambda cfg: cfg["evaluation"]["metrics"][0].update({"kind": "RMSEOverall"}), "Unknown metric identifier"),
+        (lambda cfg: cfg["evaluation"]["metrics"][0].update({"field": "p"}), "unknown key"),
         (lambda cfg: cfg["evaluation"]["metrics"][0].update({"fields": ["temperature"]}), "unknown task output"),
         (
             lambda cfg: cfg["evaluation"]["metrics"][0].update({"fields": ["p", "u"]}),

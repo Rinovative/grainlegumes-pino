@@ -61,6 +61,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Current dataset root, independent from output/run paths.",
     )
     parser.add_argument(
+        "--metadata-root",
+        type=Path,
+        default=None,
+        help="Validated dataset metadata root; defaults below MODEL_TRAINING_DATA_ROOT.",
+    )
+    parser.add_argument(
         "--run-name",
         dest="run_names",
         action="append",
@@ -126,9 +132,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             parser.error("--task is required when --runs-root is not supplied")
         dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_dataset_root()
+        metadata_root = args.metadata_root if args.metadata_root is not None else common.paths.get_training_meta_root()
         results = analysis.artifact_service.build_artifacts(
             runs_root=runs_root,
             dataset_root=dataset_root,
+            metadata_root=metadata_root,
             run_names=args.run_names,
             max_cases=args.max_cases,
             batch_size=args.batch_size,

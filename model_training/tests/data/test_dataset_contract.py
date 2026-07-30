@@ -1,194 +1,26 @@
-# ruff: noqa: S101
-"""
-Protect strict case, merged-dataset, builder, and merger publication contracts.
-
-Synthetic COMSOL-like files exercise TaskSpec ordering, shapes/dtypes, manifest
-and source digests, staging cleanup, overwrite refusal, and separate case versus
-merged roots. Dataset fingerprint algebra is covered in
-``test_dataset_fingerprint``; MATLAB/COMSOL production is never invoked.
-"""
+# ruff: noqa: S101, D103, EM101, EM102, PERF401, PLC0415, PLR2004, SLF001, TRY003
+"""Protect direct generated-source to final training-dataset publication."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
+import numpy as np
+import pandas as pd
 import pytest
 import torch
-from src import datasets, domain
+from src import common, datasets, domain
 
+from data_generation.matlab import build_batch_dataset as builder_module
 from data_generation.matlab.build_batch_dataset import build_batch_dataset
-from data_generation.matlab.merge_batch_cases import merge_batch_cases
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-    from pathlib import Path
-
-
-def test_valid_seven_input_three_output_case_is_canonical(
-    steady_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Build a valid case from reverse-ordered input and output mappings.
-
-    Persisted declarations and stacked tensors must still follow TaskSpec order,
-    preventing caller mapping order from changing channel semantics.
-    """
-    reverse_inputs = OrderedDict(
-        (
-            name,
-            torch.full((2, 3), float(index)),
-        )
-        for index, name in reversed(tuple(enumerate(steady_task.input_names)))
-    )
-    reverse_outputs = OrderedDict(
-        (
-            name,
-            torch.full((2, 3), float(index + 20)),
-        )
-        for index, name in reversed(tuple(enumerate(steady_task.output_names)))
-    )
-    payload = datasets.identity.build_case_payload(
-        task=steady_task,
-        case_id="case_0000",
-        input_fields=reverse_inputs,
-        output_fields=reverse_outputs,
-        source_identity={"token": "case_0000"},
-        source_metadata={},
-    )
-    validated = datasets.identity.validate_case_payload(payload, task=steady_task)
-
-    assert payload["fields"]["inputs"] == list(steady_task.input_names)
-    assert payload["fields"]["outputs"] == list(steady_task.output_names)
-    assert validated.inputs.shape == (7, 2, 3)
-    assert validated.outputs.shape == (3, 2, 3)
-    assert validated.inputs[:, 0, 0].tolist() == list(range(7))
-
-
-@pytest.mark.parametrize(
-    ("missing", "noncanonical"),
-    [
-        ("eps", None),
-        ("p_bc", None),
-        ("eps", "phi"),
-        ("p_bc", "pbc"),
-    ],
-    ids=("missing-eps", "missing-p-bc", "noncanonical-phi", "noncanonical-pbc"),
-)
-def test_missing_and_noncanonical_input_fields_fail(
-    steady_task: domain.tasks.spec.TaskSpec,
-    missing: str,
-    noncanonical: str | None,
-) -> None:
-    """
-    Vary each required alias pair between omission and its retired spelling.
-
-    Every family must be rejected while the remaining task fields stay fixed,
-    proving case creation accepts only the exact canonical field set.
-    """
-    inputs = {name: torch.zeros((2, 3)) for name in steady_task.input_names if name != missing}
-    if noncanonical is not None:
-        inputs[noncanonical] = torch.zeros((2, 3))
-    outputs = {name: torch.zeros((2, 3)) for name in steady_task.output_names}
-
-    with pytest.raises(ValueError, match=r"Missing|unexpected"):
-        datasets.identity.build_case_payload(
-            task=steady_task,
-            case_id="case_0000",
-            input_fields=inputs,
-            output_fields=outputs,
-            source_identity={},
-            source_metadata={},
-        )
-
-
-def test_duplicate_and_wrong_order_declarations_fail(
-    steady_task: domain.tasks.spec.TaskSpec,
-    case_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """
-    Corrupt one current payload with a duplicate and then a swapped declaration.
-
-    Validation must distinguish both failures before tensor use because labels
-    are the authoritative interpretation of persisted channels.
-    """
-    duplicate = case_payload_factory()
-    duplicate["fields"]["inputs"][4] = "kxy"
-    with pytest.raises(ValueError, match="duplicate"):
-        datasets.identity.validate_case_payload(duplicate, task=steady_task)
-
-    wrong_order = case_payload_factory()
-    fields = wrong_order["fields"]["inputs"]
-    fields[3], fields[4] = fields[4], fields[3]
-    with pytest.raises(ValueError, match="wrong channel order"):
-        datasets.identity.validate_case_payload(wrong_order, task=steady_task)
-
-
-def test_inconsistent_case_field_shapes_fail(
-    steady_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Give one required input a spatial shape different from every peer field.
-
-    Case construction must reject the mismatch before stacking so a malformed
-    grid cannot acquire an apparently valid content fingerprint.
-    """
-    inputs = {name: torch.zeros((2, 3)) for name in steady_task.input_names}
-    inputs["eps"] = torch.zeros((3, 3))
-    outputs = {name: torch.zeros((2, 3)) for name in steady_task.output_names}
-    with pytest.raises(ValueError, match="inconsistent spatial shapes"):
-        datasets.identity.build_case_payload(
-            task=steady_task,
-            case_id="case_0000",
-            input_fields=inputs,
-            output_fields=outputs,
-            source_identity={},
-            source_metadata={},
-        )
-
-
-def test_extra_output_and_wrong_tensor_counts_fail(
-    steady_task: domain.tasks.spec.TaskSpec,
-    case_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """
-    Add an undeclared output, then build merged tensors with too few input channels.
-
-    Both creation boundaries must reject semantic drift so field declarations
-    and tensor channel counts remain inseparable.
-    """
-    case = case_payload_factory()
-    inputs = dict(case["input_fields"])
-    outputs = dict(case["output_fields"])
-    outputs["U"] = torch.zeros((2, 3))
-    with pytest.raises(ValueError, match="unexpected"):
-        datasets.identity.build_case_payload(
-            task=steady_task,
-            case_id="case_0000",
-            input_fields=inputs,
-            output_fields=outputs,
-            source_identity={},
-            source_metadata={},
-        )
-
-    validated = datasets.identity.validate_case_payload(case, task=steady_task)
-    with pytest.raises(ValueError, match="channel counts"):
-        datasets.identity.build_merged_dataset_payload(
-            task=steady_task,
-            dataset_id="wrong_channels",
-            sample_ids=(validated.case_id,),
-            source_identities=(validated.source_identity,),
-            source_metadata=(validated.source_metadata,),
-            case_fingerprints=(validated.fingerprint,),
-            inputs=validated.inputs[:-1].unsqueeze(0),
-            outputs=validated.outputs.unsqueeze(0),
-        )
-
-
-_COMSOL_HEADER = (
-    "% x (m);y (m);br.kappaxx (m^2);br.kappayx (m^2);br.kappaxy (m^2);br.kappayy (m^2);int4(x,y) (1);int5(x,y) (Pa);p (Pa);u (m/s);v (m/s);br.U (m/s)"
+_SOLUTION_HEADER = (
+    "% Length unit,m\n"
+    "% x;y;br.kappaxx (m^2);br.kappayx (m^2);br.kappaxy (m^2);"
+    "br.kappayy (m^2);int4(x,y) (1);int5(x,y) (Pa);p (Pa);u (m/s);v (m/s);br.U (m/s)"
 )
 _MANIFEST_FIELD_SCHEMA = {
     "input_columns": ["x", "y", "Kxx", "Kxy", "Kyy", "eps", "p_bc"],
@@ -197,43 +29,143 @@ _MANIFEST_FIELD_SCHEMA = {
 
 
 def _sha256(path: Path) -> str:
-    """Hash one small synthetic producer artifact."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_raw_export(raw_dir: Path, case_id: str, rows: list[list[Any]]) -> None:
-    """
-    Write the seven-column authoritative input export for one synthetic case.
+def _case_rows(case_number: int) -> list[list[Any]]:
+    offset = 10 * case_number
+    return [
+        ["0", "0", "1e-10", "0", "0", "2e-10", "0.4", "100", str(10 + offset), "1", "2", "3"],
+        ["1", "0", "1e-10", "0", "0", "2e-10", "0.5", "101", str(11 + offset), "2", "3", "4"],
+        ["0", "1", "1e-10", "0", "0", "2e-10", "0.6", "102", str(12 + offset), "3", "4", "5"],
+        ["1", "1", "1e-10", "0", "0", "2e-10", "0.7", "103", str(13 + offset), "4", "5", "6"],
+    ]
 
-    The helper projects solution rows to the producer's raw-input columns and is
-    intentionally limited to tiny local files used by builder contract tests.
-    """
+
+def _synthetic_generator_metadata() -> dict[str, Any]:
+    statistics = {"min": 0.1, "max": 0.9, "mean": 0.5, "std": 0.1}
+    return {
+        "structure": {
+            "parameters": {
+                "background": {
+                    "anisotropy": [1.0, 1.0],
+                    "base_len_rel": 0.1,
+                    "coupling": 0.0,
+                    "ms_weight": [0.5, 0.5],
+                    "smooth_len_rel": 0.1,
+                },
+                "noise": {"bias": 0.0, "granularity": 0.1, "level": 0.1},
+                "rng_state": {"Seed": 1, "State": [1], "Type": "twister"},
+                "seed": 1,
+            },
+            "statistics": {
+                "noise": {"l2_norm": 1.0, "max_abs": 1.0},
+                "structure": {
+                    "z": dict(statistics),
+                    "z_bg": {"mean": 0.5, "std": 0.1},
+                    "z_noises": {"rms": 0.1},
+                },
+            },
+        },
+        "permeability": {
+            "parameters": {
+                "orientation": {"theta_jitter": 0.1, "theta_smooth_rel": 0.1},
+                "permeability": {"k_mean": 1e-10, "s_logn": 0.1, "var_rel": 0.1},
+                "tensor": {"a_gamma": 1.0, "a_max": 1.0, "tensor_strength": 0.1},
+            },
+            "statistics": {
+                "kappa": dict(statistics),
+                "tensor": {"det": {"mean": 1e-20}, "trace": {"mean": 2e-10}},
+            },
+        },
+        "porosity": {
+            "parameters": {
+                "A_mat": 0.1,
+                "A_rel": 0.1,
+                "eps_max_global": 0.9,
+                "eps_min_global": 0.1,
+                "eps_ref": 0.5,
+                "eps_smooth_rel": 0.1,
+                "texture_amp": 0.1,
+            },
+            "statistics": {"eps": dict(statistics)},
+        },
+        "bc": {
+            "parameters": {
+                "a_gauss": 1.0,
+                "a_lin": 1.0,
+                "a_sin": 1.0,
+                "f_sin": 1.0,
+                "gauss_jitter": 0.1,
+                "k_gauss": 1,
+                "p_inlet_mean": 100.0,
+                "sigma_gauss": 0.1,
+            },
+            "statistics": {"p_inlet": dict(statistics)},
+        },
+    }
+
+
+def _write_case(raw_dir: Path, processed_dir: Path, case_number: int) -> str:
+    case_id = f"case_{case_number:04d}"
+    rows = _case_rows(case_number)
     raw_rows = [[row[index] for index in (0, 1, 2, 4, 5, 6, 7)] for row in rows]
-    content = "\n".join(";".join(map(str, row)) for row in raw_rows) + "\n"
-    (raw_dir / f"{case_id}.csv").write_text(content, encoding="utf-8")
+    (raw_dir / f"{case_id}.csv").write_text(
+        "\n".join(";".join(map(str, row)) for row in raw_rows) + "\n",
+        encoding="utf-8",
+    )
+    metadata = {
+        "export": {
+            "columns": _MANIFEST_FIELD_SCHEMA["input_columns"],
+            "delimiter": ";",
+            "file_base": case_id,
+        },
+        "fields_present": {"porosity": True, "pressure_bc": True, "tensor": True},
+        "generator": _synthetic_generator_metadata(),
+        "geometry": {"Lx": 1.0, "Ly": 1.0, "dx": 1.0, "dy": 1.0, "nx": 2, "ny": 2, "res": 1.0},
+        "paths": {"csv": f"C:/Users/example/{case_id}.csv", "json": f"C:/Users/example/{case_id}.json"},
+        "timestamp": "2026-01-01 00:00:00",
+    }
+    (raw_dir / f"{case_id}.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (processed_dir / f"{case_id}_sol.csv").write_text(
+        _SOLUTION_HEADER + "\n" + "\n".join(";".join(map(str, row)) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return case_id
 
 
-def _write_batch_manifest(
-    raw_dir: Path,
-    processed_dir: Path,
-    batch_name: str,
+def _write_generated_batch(
+    root: Path,
     *,
-    status: str = "complete",
-    save_model: bool = False,
-) -> None:
-    """
-    Publish the exact terminal synthetic producer contract and current file hashes.
-
-    The helper models the maintained manifest schema and ordered case membership;
-    it is not a substitute for MATLAB/COMSOL generation or atomic producer writes.
-    """
-    case_ids = sorted(path.stem for path in raw_dir.glob("case_*.json"))
+    batch_name: str = "synthetic",
+    case_numbers: tuple[int, ...] = (1, 2),
+    timing_count: int = 1,
+) -> tuple[Path, Path, Path]:
+    meta_dir = root / "meta"
+    raw_dir = root / "raw" / batch_name
+    processed_dir = root / "processed" / batch_name
+    meta_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+    processed_dir.mkdir(parents=True)
+    case_ids = [_write_case(raw_dir, processed_dir, number) for number in case_numbers]
+    sample_frame = pd.DataFrame({"case_id": list(case_numbers), "alpha": [float(number) / 10 for number in case_numbers]})
+    sample_csv = meta_dir / f"{batch_name}.csv"
+    sample_frame.to_csv(sample_csv, sep=";", index=False, lineterminator="\n")
+    sample_json = {
+        "meta": {
+            "method": "lhs",
+            "variation": 0.2,
+            "N": len(case_ids),
+            "seed": 17,
+            "base": {"alpha": 0.1},
+            "param_names": ["alpha"],
+            "timestamp": "2026-01-01 00:00:00",
+        },
+        "n_cases": len(case_ids),
+    }
+    (meta_dir / f"{batch_name}.json").write_text(json.dumps(sample_json), encoding="utf-8")
     records = []
     for case_id in case_ids:
-        raw_csv = raw_dir / f"{case_id}.csv"
-        raw_json = raw_dir / f"{case_id}.json"
-        solution_csv = processed_dir / f"{case_id}_sol.csv"
-        solution_model = processed_dir / f"{case_id}_sol.mph"
         records.append(
             {
                 "case_id": case_id,
@@ -241,28 +173,28 @@ def _write_batch_manifest(
                 "stage": "simulation",
                 "message": "",
                 "files": {
-                    "raw_csv_sha256": _sha256(raw_csv),
-                    "raw_json_sha256": _sha256(raw_json),
-                    "solution_csv_sha256": _sha256(solution_csv),
-                    "solution_model_sha256": _sha256(solution_model) if save_model else "",
+                    "raw_csv_sha256": _sha256(raw_dir / f"{case_id}.csv"),
+                    "raw_json_sha256": _sha256(raw_dir / f"{case_id}.json"),
+                    "solution_csv_sha256": _sha256(processed_dir / f"{case_id}_sol.csv"),
+                    "solution_model_sha256": "",
                 },
-            },
+            }
         )
     manifest = {
         "schema_kind": "comsol_batch_manifest",
         "schema_version": 1,
         "batch_name": batch_name,
-        "status": status,
+        "status": "complete",
         "configuration": {
             "method": "lhs",
             "variation": 0.2,
-            "N": max(len(case_ids), 1),
+            "N": len(case_ids),
             "seed": 17,
             "Lx": 1.0,
             "Ly": 1.0,
-            "res": 0.5,
-            "save_model": save_model,
-            "sample_sha256": "0" * 64,
+            "res": 1.0,
+            "save_model": False,
+            "sample_sha256": _sha256(sample_csv),
             "template_name": "template_brinkman.mph",
             "template_sha256": "1" * 64,
         },
@@ -270,543 +202,983 @@ def _write_batch_manifest(
         "intended_case_ids": case_ids,
         "cases": records,
     }
-    (raw_dir / "batch_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_path = raw_dir / "batch_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    if timing_count >= 0:
+        measured = case_ids[:timing_count]
+        durations = np.asarray([float(index + 1) for index in range(len(measured))], dtype=np.float64)
+        timing = {
+            "schema_kind": "comsol_solve_timing",
+            "schema_version": 1,
+            "batch_name": batch_name,
+            "batch_manifest_sha256": _sha256(manifest_path),
+            "runtime": {
+                "matlab_version": "test",
+                "comsol_version": "test",
+                "os": "test",
+                "hostname": "test",
+                "processor": "test",
+                "case_execution": "sequential",
+            },
+            "cases": [{"case_id": case_id, "comsol_solve_s": float(index + 1)} for index, case_id in enumerate(measured)],
+            "aggregates": {
+                "measured_case_count": len(measured),
+                "mean_s": [] if not measured else float(np.mean(durations)),
+                "median_s": [] if not measured else float(np.percentile(durations, 50.0)),
+                "p10_s": [] if not measured else float(np.percentile(durations, 10.0)),
+                "p90_s": [] if not measured else float(np.percentile(durations, 90.0)),
+            },
+        }
+        (processed_dir / "comsol_solve_timing.json").write_text(json.dumps(timing), encoding="utf-8")
+    return meta_dir, raw_dir, processed_dir
 
 
-def _write_synthetic_comsol_case(
+def _write_private_batch_progress(raw_dir: Path) -> Path:
+    manifest = json.loads((raw_dir / "batch_manifest.json").read_text(encoding="utf-8"))
+    progress = {
+        **manifest,
+        "schema_kind": "comsol_batch_progress",
+        "schema_version": 1,
+        "status": "in_progress",
+    }
+    progress_path = raw_dir / "batch_progress.json"
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    return progress_path
+
+
+def _build(tmp_path: Path, *, batch_name: str = "synthetic", **kwargs: Any) -> tuple[dict[str, Any], Path, Path]:
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root, batch_name=batch_name, **kwargs)
+    training_root = tmp_path / "training"
+    result = build_batch_dataset(
+        batch_name,
+        generated_data_root=generated_root,
+        model_training_data_root=training_root,
+    )
+    return result, generated_root, training_root
+
+
+def _rebind_case_sources(
     raw_dir: Path,
     processed_dir: Path,
-    case_index: int,
     *,
-    include_pressure: bool = True,
+    case_id: str = "case_0001",
 ) -> None:
-    """
-    Write one small unit-bearing COMSOL solution, raw export, and metadata record.
-
-    Values are deterministic and scientifically minimal; ``include_pressure``
-    deliberately creates a missing-output failure rather than a production case.
-    """
-    case_id = f"case_{case_index:04d}"
-    (raw_dir / f"{case_id}.json").write_text(
-        json.dumps({"geometry": {"nx": 2, "ny": 2}}),
-        encoding="utf-8",
-    )
-    offset = 10 * case_index
-    rows = [
-        ["0", "0", "1e-10", "0", "0", "2e-10", "0.4", "100", str(10 + offset), "1", "2", "3"],
-        ["1", "0", "1e-10", "0", "0", "2e-10", "0.5", "101", str(11 + offset), "2", "3", "4"],
-        ["0", "1", "1e-10", "0", "0", "2e-10", "0.6", "102", str(12 + offset), "3", "4", "5"],
-        ["1", "1", "1e-10", "0", "0", "2e-10", "0.7", "103", str(13 + offset), "4", "5", "6"],
-    ]
-    _write_raw_export(raw_dir, case_id, rows)
-    header = _COMSOL_HEADER
-    if not include_pressure:
-        header = header.replace(";p (Pa)", "")
-        for row in rows:
-            row.pop(8)
-    content = f"{header}\n" + "\n".join(";".join(row) for row in rows) + "\n"
-    (processed_dir / f"{case_id}_sol.csv").write_text(content, encoding="utf-8")
-    _write_batch_manifest(raw_dir, processed_dir, raw_dir.name)
-
-
-def test_synthetic_comsol_case_builder_emits_strict_schema(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Feed two synthetic COMSOL cases through the real builder, merger, and loader.
-
-    Published field order, shapes, values, metadata, and sample membership must
-    agree end to end, protecting the case-root versus merged-root handoff.
-    """
-    generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "synthetic"
-    processed_dir = generated_root / "processed" / "synthetic"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    for case_index in range(2):
-        _write_synthetic_comsol_case(raw_dir, processed_dir, case_index)
+    manifest_path = raw_dir / "batch_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = next(record for record in manifest["cases"] if record["case_id"] == case_id)
+    record["files"]["raw_csv_sha256"] = _sha256(raw_dir / f"{case_id}.csv")
+    record["files"]["raw_json_sha256"] = _sha256(raw_dir / f"{case_id}.json")
+    record["files"]["solution_csv_sha256"] = _sha256(processed_dir / f"{case_id}_sol.csv")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     timing_path = processed_dir / "comsol_solve_timing.json"
-    timing_path.write_text(json.dumps({"schema_kind": "comsol_solve_timing"}), encoding="utf-8")
-    assert not (raw_dir / timing_path.name).exists()
-
-    result = build_batch_dataset(
-        "synthetic",
-        task_id=steady_task.id,
-        generated_data_root=generated_root,
-        data_root=tmp_path / "datasets",
-    )
-    payload = torch.load(
-        result["cases_dir"] / "case_0000.pt",
-        map_location="cpu",
-        weights_only=False,
-    )
-    validated = datasets.identity.validate_case_payload(payload, task=steady_task)
-    merged_result = merge_batch_cases(
-        "synthetic",
-        task_id=steady_task.id,
-        data_root=tmp_path / "datasets",
-        dataset_root=tmp_path / "merged_datasets",
-    )
-    merged = torch.load(
-        merged_result["dataset_path"],
-        map_location="cpu",
-        weights_only=False,
-    )
-    merged_identity = datasets.identity.validate_merged_dataset_payload(
-        merged,
-        task=steady_task,
-    )
-    loaded = datasets.simulation.create_task_dataset(
-        merged_result["dataset_path"],
-        task=steady_task,
-    )
-
-    assert payload["fields"]["inputs"] == list(steady_task.input_names)
-    assert payload["fields"]["outputs"] == list(steady_task.output_names)
-    assert validated.inputs.shape == (7, 2, 2)
-    assert validated.outputs.shape == (3, 2, 2)
-    assert torch.count_nonzero(validated.inputs[3]).item() == 0
-    assert validated.inputs[5, 0, 0].item() == pytest.approx(0.4)
-    assert validated.inputs[6, 0, 0].item() == pytest.approx(100.0)
-    assert merged_identity.sample_ids == ("case_0000", "case_0001")
-    assert merged["source_metadata"] == [payload["source_metadata"], payload["source_metadata"]]
-    assert loaded[0]["meta"] == payload["source_metadata"]
-    assert set(payload["source_identity"]) == {
-        "raw_export",
-        "raw_metadata",
-        "solution_export",
-        "batch_manifest",
-    }
-    assert merged["inputs"].shape == (2, 7, 2, 2)
-    assert merged["outputs"].shape == (2, 3, 2, 2)
-    assert torch.equal(merged["inputs"][0], validated.inputs)
-    assert merged["outputs"][1, 0, 0, 0].item() == pytest.approx(20.0)
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    timing["batch_manifest_sha256"] = _sha256(manifest_path)
+    timing_path.write_text(json.dumps(timing), encoding="utf-8")
 
 
-@pytest.mark.parametrize("missing_side", ["solution", "metadata"])
-def test_builder_rejects_incomplete_generated_batches(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-    missing_side: str,
-) -> None:
-    """
-    Remove either metadata or the solution export from a manifest-bound case.
-
-    Both parameter families must fail file-integrity validation and leave no
-    authoritative case directory, protecting complete producer membership.
-    """
-    generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "incomplete"
-    processed_dir = generated_root / "processed" / "incomplete"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    _write_synthetic_comsol_case(raw_dir, processed_dir, 0)
-    if missing_side == "solution":
-        (processed_dir / "case_0000_sol.csv").unlink()
-    else:
-        (raw_dir / "case_0000.json").unlink()
-
-    dataset_root = tmp_path / "datasets"
-    with pytest.raises(RuntimeError, match="file integrity failure: missing"):
-        build_batch_dataset(
-            "incomplete",
-            task_id=steady_task.id,
-            generated_data_root=generated_root,
-            data_root=dataset_root,
-        )
-    assert not (dataset_root / "raw" / "incomplete" / "cases").exists()
-
-
-def test_builder_failure_does_not_publish_partial_cases(
+def test_direct_builder_publishes_one_final_dataset_and_metadata(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
-    """
-    Make the second source case invalid after a valid first case can be staged.
+    result, _generated_root, training_root = _build(tmp_path)
+    dataset_path = training_root / "raw" / "synthetic" / "synthetic.pt"
+    metadata_path = training_root / "meta" / "synthetic"
+    payload = torch.load(dataset_path, map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    package = datasets.metadata.validate_dataset_metadata_directory(metadata_path, dataset_identity=identity)
+    loaded = datasets.simulation.create_task_dataset(dataset_path, task=steady_task)
 
-    The batch must fail and remove all staging state, proving partial work never
-    becomes an authoritative ``cases`` directory.
-    """
-    generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "invalid"
-    processed_dir = generated_root / "processed" / "invalid"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    _write_synthetic_comsol_case(raw_dir, processed_dir, 0)
-    _write_synthetic_comsol_case(
-        raw_dir,
-        processed_dir,
-        1,
-        include_pressure=False,
-    )
-
-    dataset_root = tmp_path / "datasets"
-    with pytest.raises(KeyError, match="output source column 'p'"):
-        build_batch_dataset(
-            "invalid",
-            task_id=steady_task.id,
-            generated_data_root=generated_root,
-            data_root=dataset_root,
-        )
-    batch_dir = dataset_root / "raw" / "invalid"
-    assert not (batch_dir / "cases").exists()
-    assert not list(batch_dir.glob(".cases.*"))
+    assert result["dataset_path"] == dataset_path
+    assert result["metadata_path"] == metadata_path
+    assert payload["schema_version"] == datasets.identity.TRAINING_DATASET_SCHEMA_VERSION
+    assert payload["schema_kind"] == datasets.identity.TRAINING_DATASET_SCHEMA_KIND
+    assert payload["sample_ids"] == ["case_0001", "case_0002"]
+    assert payload["inputs"].shape == (2, 7, 2, 2)
+    assert payload["outputs"].shape == (2, 3, 2, 2)
+    assert payload["source_metadata"][0]["parameters"] == {"alpha": 0.1}
+    assert set(payload["source_metadata"][0]) == {"case_id", "geometry", "parameters"}
+    assert "paths" not in payload["source_metadata"][0]
+    assert "timestamp" not in payload["source_metadata"][0]
+    assert loaded[0]["meta"] == payload["source_metadata"][0]
+    assert package.timing is not None
+    assert package.provenance["timing"] == {"status": "partial", "measured_case_count": 1, "intended_case_count": 2}
+    assert not list(training_root.rglob("case_*.pt"))
+    assert not list(training_root.rglob("meta.pt"))
 
 
-def test_builder_sorts_a_shuffled_non_square_cartesian_grid(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Shuffle a complete non-square Cartesian export before case construction.
-
-    The builder must restore stable ``(y, x)`` order and field values, protecting
-    tensor orientation from arbitrary COMSOL row ordering.
-    """
-    generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "shuffled"
-    processed_dir = generated_root / "processed" / "shuffled"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    case_id = "case_0000"
-    (raw_dir / f"{case_id}.json").write_text(json.dumps({"geometry": {"nx": 3, "ny": 2}}))
-    rows = [
-        [x_value, y_value, 1e-10, 0.0, 0.0, 2e-10, 0.5, 100.0, x_value + 10 * y_value, 1.0, 2.0, 3.0]
-        for y_value in (0.0, 2.0)
-        for x_value in (0.0, 1.0, 2.0)
-    ]
-    rows = [rows[index] for index in (4, 0, 5, 2, 1, 3)]
-    _write_raw_export(raw_dir, case_id, rows)
-    content = _COMSOL_HEADER + "\n" + "\n".join(";".join(map(str, row)) for row in rows) + "\n"
-    (processed_dir / f"{case_id}_sol.csv").write_text(content, encoding="utf-8")
-    _write_batch_manifest(raw_dir, processed_dir, "shuffled")
-
-    result = build_batch_dataset(
-        "shuffled",
-        task_id=steady_task.id,
-        generated_data_root=generated_root,
-        data_root=tmp_path / "datasets",
-    )
-    payload = torch.load(result["cases_dir"] / f"{case_id}.pt", map_location="cpu", weights_only=False)
-    validated = datasets.identity.validate_case_payload(payload, task=steady_task)
-
-    assert validated.inputs.shape == (7, 2, 3)
-    assert torch.equal(validated.inputs[0], torch.tensor([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]))
-    assert torch.equal(validated.inputs[1], torch.tensor([[0.0, 0.0, 0.0], [2.0, 2.0, 2.0]]))
-    assert torch.equal(validated.outputs[0], torch.tensor([[0.0, 1.0, 2.0], [20.0, 21.0, 22.0]]))
+def test_manifest_order_drives_final_sample_order(tmp_path: Path) -> None:
+    result, _generated_root, _training_root = _build(tmp_path, case_numbers=(2, 1), timing_count=2)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    assert payload["sample_ids"] == ["case_0002", "case_0001"]
+    assert payload["source_metadata"][0]["case_id"] == "case_0002"
+    assert payload["source_metadata"][1]["case_id"] == "case_0001"
 
 
-def test_builder_rejects_nonuniform_grid_and_invalid_physical_fields(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Vary grid spacing and one physical field across four invalid scientific domains.
-
-    Non-uniform coordinates, non-SPD permeability, invalid porosity, and non-finite
-    outputs must each fail before case publication while the task contract stays fixed.
-    """
-    nonuniform_root = tmp_path / "nonuniform" / "generated"
-    nonuniform_raw = nonuniform_root / "raw" / "nonuniform"
-    nonuniform_processed = nonuniform_root / "processed" / "nonuniform"
-    nonuniform_raw.mkdir(parents=True)
-    nonuniform_processed.mkdir(parents=True)
-    (nonuniform_raw / "case_0000.json").write_text(json.dumps({"geometry": {"nx": 3, "ny": 2}}))
-    rows = [[x_value, y_value, 1e-10, 0.0, 0.0, 2e-10, 0.5, 100.0, 1.0, 1.0, 2.0, 3.0] for y_value in (0.0, 1.0) for x_value in (0.0, 1.0, 3.0)]
-    _write_raw_export(nonuniform_raw, "case_0000", rows)
-    (nonuniform_processed / "case_0000_sol.csv").write_text(
-        _COMSOL_HEADER + "\n" + "\n".join(";".join(map(str, row)) for row in rows) + "\n",
-        encoding="utf-8",
-    )
-    _write_batch_manifest(nonuniform_raw, nonuniform_processed, "nonuniform")
-    with pytest.raises(ValueError, match="uniform"):
-        build_batch_dataset(
-            "nonuniform",
-            task_id=steady_task.id,
-            generated_data_root=nonuniform_root,
-            data_root=tmp_path / "nonuniform" / "datasets",
-        )
-
-    mutations = {
-        "non_spd": (3, "2e-10", "positive definite"),
-        "porosity": (6, "0", "Porosity"),
-        "nonfinite": (8, "nan", "non-finite"),
-    }
-    for batch_name, (column, replacement, message) in mutations.items():
-        generated_root = tmp_path / batch_name / "generated"
-        raw_dir = generated_root / "raw" / batch_name
-        processed_dir = generated_root / "processed" / batch_name
-        raw_dir.mkdir(parents=True)
-        processed_dir.mkdir(parents=True)
-        _write_synthetic_comsol_case(raw_dir, processed_dir, 0)
-        csv_path = processed_dir / "case_0000_sol.csv"
-        lines = csv_path.read_text().splitlines()
-        values = lines[1].split(";")
-        values[column] = replacement
-        if batch_name == "non_spd":
-            values[4] = replacement
-        lines[1] = ";".join(values)
-        csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        _write_batch_manifest(raw_dir, processed_dir, batch_name)
-
-        with pytest.raises(ValueError, match=message):
-            build_batch_dataset(
-                batch_name,
-                task_id=steady_task.id,
-                generated_data_root=generated_root,
-                data_root=tmp_path / batch_name / "datasets",
-            )
-
-
-def test_builder_requires_a_complete_terminal_manifest(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Exercise both an absent terminal manifest and one declaring failed status.
-
-    Neither producer state may authorize case publication, preserving the manifest
-    as the required completion boundary rather than treating files as sufficient.
-    """
-    generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "manifest"
-    processed_dir = generated_root / "processed" / "manifest"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    _write_synthetic_comsol_case(raw_dir, processed_dir, 0)
-    (raw_dir / "batch_manifest.json").unlink()
-    with pytest.raises(FileNotFoundError, match="terminal completion manifest"):
-        build_batch_dataset(
-            "manifest",
-            task_id=steady_task.id,
-            generated_data_root=generated_root,
-            data_root=tmp_path / "datasets_missing",
-        )
-
-    _write_batch_manifest(raw_dir, processed_dir, "manifest", status="failed")
-    with pytest.raises(RuntimeError, match="not complete"):
-        build_batch_dataset(
-            "manifest",
-            task_id=steady_task.id,
-            generated_data_root=generated_root,
-            data_root=tmp_path / "datasets_failed",
-        )
-
-
-@pytest.mark.parametrize(
-    ("variant", "message"),
-    [
-        ("field-schema-extra", "field_schema must exactly match"),
-        ("record-stage", "complete case records must exactly match"),
-        ("record-extra", "keys do not match"),
-    ],
-)
-def test_builder_rejects_malformed_complete_manifest_contract(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-    variant: str,
-    message: str,
-) -> None:
-    """
-    Corrupt a complete manifest's field schema, terminal stage, or record key set.
-
-    Each parametrized variant must fail exact-schema validation, proving the
-    ``complete`` label cannot bless structurally incompatible producer evidence.
-    """
-    generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "strict_manifest"
-    processed_dir = generated_root / "processed" / "strict_manifest"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    _write_synthetic_comsol_case(raw_dir, processed_dir, 0)
+def test_sample_csv_serialization_is_operational_not_scientific_identity(tmp_path: Path) -> None:
+    first, _generated, _training = _build(tmp_path / "first")
+    second_generated = tmp_path / "second" / "generated"
+    meta_dir, raw_dir, processed_dir = _write_generated_batch(second_generated)
+    sample_path = meta_dir / "synthetic.csv"
+    sample_path.write_text(sample_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     manifest_path = raw_dir / "batch_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if variant == "field-schema-extra":
-        manifest["field_schema"]["unexpected"] = []
-    elif variant == "record-stage":
-        manifest["cases"][0]["stage"] = "synthetic"
-    elif variant == "record-extra":
-        manifest["cases"][0]["unexpected"] = True
-    else:  # pragma: no cover - parametrization is closed above
-        raise AssertionError(variant)
+    manifest["configuration"]["sample_sha256"] = _sha256(sample_path)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    timing_path = processed_dir / "comsol_solve_timing.json"
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    timing["batch_manifest_sha256"] = _sha256(manifest_path)
+    timing_path.write_text(json.dumps(timing), encoding="utf-8")
+    second = build_batch_dataset(
+        "synthetic",
+        generated_data_root=second_generated,
+        model_training_data_root=tmp_path / "second" / "training",
+    )
 
-    with pytest.raises((TypeError, ValueError, RuntimeError), match=message):
-        build_batch_dataset(
-            "strict_manifest",
-            task_id=steady_task.id,
-            generated_data_root=generated_root,
-            data_root=tmp_path / "datasets",
-        )
+    assert first["dataset_fingerprint"] == second["dataset_fingerprint"]
 
 
-@pytest.mark.parametrize(
-    ("operation", "key", "value", "message"),
-    [
-        ("delete", "template_sha256", None, "keys do not match"),
-        ("extra", "unexpected", True, "keys do not match"),
-        ("set", "N", 0, r"configuration\.N must be in"),
-        ("set", "seed", -1, r"configuration\.seed must be in"),
-        ("set", "save_model", 1, "save_model must be boolean"),
-        ("set", "sample_sha256", "A" * 64, "64-character lowercase"),
-        ("set", "res", 2.0, "cannot exceed the shorter domain"),
-    ],
-)
-def test_builder_enforces_production_manifest_configuration(
+def test_sample_snapshots_remain_coherent_when_live_sidecars_change_mid_build(
     tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-    operation: str,
-    key: str,
-    value: Any,
-    message: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Delete, add, or replace one producer-configuration field across schema domains.
-
-    Every parametrized key/type/range/digest violation must fail before source use,
-    while the surrounding manifest remains valid to isolate the declared invariant.
-    """
     generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "bad_configuration"
-    processed_dir = generated_root / "processed" / "bad_configuration"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    _write_synthetic_comsol_case(raw_dir, processed_dir, 0)
-    manifest_path = raw_dir / "batch_manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    configuration = manifest["configuration"]
-    if operation == "delete":
-        del configuration[key]
-    else:
-        configuration[key] = value
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    meta_dir, _raw_dir, _processed_dir = _write_generated_batch(generated_root)
+    sample_csv_path = meta_dir / "synthetic.csv"
+    sample_json_path = meta_dir / "synthetic.json"
+    original_csv = sample_csv_path.read_bytes()
+    original_json = sample_json_path.read_bytes()
+    original_interpret = builder_module._interpret_generated_case
+    call_count = 0
 
-    with pytest.raises((TypeError, ValueError), match=message):
-        build_batch_dataset(
-            "bad_configuration",
-            task_id=steady_task.id,
-            generated_data_root=generated_root,
-            data_root=tmp_path / "datasets",
-        )
+    def mutate_live_samples_after_first_case(*args: Any, **kwargs: Any) -> Any:
+        nonlocal call_count
+        interpreted = original_interpret(*args, **kwargs)
+        call_count += 1
+        if call_count == 1:
+            sample_csv_path.write_bytes(original_csv + b"\n")
+            sample_json_path.write_bytes(original_json + b"\n")
+        return interpreted
+
+    monkeypatch.setattr(builder_module, "_interpret_generated_case", mutate_live_samples_after_first_case)
+    training_root = tmp_path / "training"
+    result = build_batch_dataset(
+        "synthetic",
+        generated_data_root=generated_root,
+        model_training_data_root=training_root,
+    )
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    snapshot_csv = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
+    snapshot_json = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME
+
+    assert snapshot_csv.read_bytes() == original_csv
+    assert snapshot_json.read_bytes() == original_json
+    assert _sha256(snapshot_csv) == payload["source_provenance"]["source_sample_csv_sha256"]
+    assert _sha256(snapshot_json) == payload["source_provenance"]["source_sample_json_sha256"]
 
 
-@pytest.mark.parametrize(
-    ("target", "save_model"),
-    [
-        ("raw_csv", False),
-        ("raw_json", False),
-        ("solution_csv", False),
-        ("solution_model", True),
-    ],
-)
-def test_builder_rejects_authoritative_file_tampering(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-    target: str,
-    save_model: bool,
-) -> None:
-    """
-    Tamper with each raw, metadata, solution, and optional-model file after hashing.
-
-    Every target family must fail digest verification, proving the terminal
-    manifest binds bytes rather than merely expected filenames.
-    """
+@pytest.mark.parametrize("target", ["raw_csv", "raw_json", "solution_csv"])
+def test_builder_rejects_manifest_bound_source_tampering(tmp_path: Path, target: str) -> None:
     generated_root = tmp_path / "generated"
-    raw_dir = generated_root / "raw" / "tamper"
-    processed_dir = generated_root / "processed" / "tamper"
-    raw_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
-    _write_synthetic_comsol_case(raw_dir, processed_dir, 0)
-    solution_model = processed_dir / "case_0000_sol.mph"
-    if save_model:
-        solution_model.write_bytes(b"synthetic solved model")
-        _write_batch_manifest(raw_dir, processed_dir, "tamper", save_model=True)
+    _meta, raw_dir, processed_dir = _write_generated_batch(generated_root)
     targets = {
-        "raw_csv": raw_dir / "case_0000.csv",
-        "raw_json": raw_dir / "case_0000.json",
-        "solution_csv": processed_dir / "case_0000_sol.csv",
-        "solution_model": solution_model,
+        "raw_csv": raw_dir / "case_0001.csv",
+        "raw_json": raw_dir / "case_0001.json",
+        "solution_csv": processed_dir / "case_0001_sol.csv",
     }
-    target_path = targets[target]
-    target_path.write_bytes(target_path.read_bytes() + b"\ntampered")
+    targets[target].write_bytes(targets[target].read_bytes() + b"tampered")
+    training_root = tmp_path / "training"
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=training_root)
+    assert not (training_root / "raw" / "synthetic").exists()
+    assert not (training_root / "meta" / "synthetic").exists()
 
-    with pytest.raises(RuntimeError, match="file integrity failure: SHA-256 mismatch"):
+
+def test_builder_rejects_extra_generated_membership(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, _processed = _write_generated_batch(generated_root)
+    (raw_dir / "case_9999.csv").write_text("unexpected", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="exactly match"):
+        build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=tmp_path / "training")
+
+
+@pytest.mark.parametrize("source_kind", ["raw", "solution"])
+def test_builder_rejects_extra_csv_columns(tmp_path: Path, source_kind: str) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, processed_dir = _write_generated_batch(
+        generated_root,
+        case_numbers=(1,),
+        timing_count=1,
+    )
+    if source_kind == "raw":
+        path = raw_dir / "case_0001.csv"
+        lines = [f"{line};999" for line in path.read_text(encoding="utf-8").splitlines()]
+    else:
+        path = processed_dir / "case_0001_sol.csv"
+        source_lines = path.read_text(encoding="utf-8").splitlines()
+        lines = [*source_lines[:2], *(f"{line};999" for line in source_lines[2:])]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _rebind_case_sources(raw_dir, processed_dir)
+
+    expected_count = 7 if source_kind == "raw" else 12
+    with pytest.raises(ValueError, match=rf"exactly {expected_count} columns"):
         build_batch_dataset(
-            "tamper",
-            task_id=steady_task.id,
+            "synthetic",
             generated_data_root=generated_root,
-            data_root=tmp_path / "datasets",
+            model_training_data_root=tmp_path / "training",
         )
 
 
-def test_unversioned_merged_payload_is_rejected(
-    steady_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Present legacy-shaped tensors without the required merged schema marker.
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("export_columns", "export contract"),
+        ("delimiter", "export contract"),
+        ("fields_present", "every generated field"),
+        ("spacing", "dx/dy must equal res"),
+        ("nested_generator_key", "generator.structure.parameters keys"),
+    ],
+)
+def test_builder_rejects_raw_metadata_schema_drift(tmp_path: Path, corruption: str, message: str) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, processed_dir = _write_generated_batch(
+        generated_root,
+        case_numbers=(1,),
+        timing_count=1,
+    )
+    metadata_path = raw_dir / "case_0001.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if corruption == "export_columns":
+        metadata["export"]["columns"] = [*metadata["export"]["columns"], "extra"]
+    elif corruption == "delimiter":
+        metadata["export"]["delimiter"] = ","
+    elif corruption == "fields_present":
+        metadata["fields_present"]["tensor"] = False
+    elif corruption == "spacing":
+        metadata["geometry"]["dx"] = 0.5
+    else:
+        metadata["generator"]["structure"]["parameters"]["source_path"] = "C:/private"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    _rebind_case_sources(raw_dir, processed_dir)
 
-    The flow module must reject them instead of inferring compatibility, keeping
-    maintained dataset loading fail-closed at the persistence boundary.
-    """
-    unversioned = {
-        "inputs": torch.zeros((1, 7, 2, 3)),
-        "outputs": torch.zeros((1, 3, 2, 3)),
-        "fields": {
-            "inputs": list(steady_task.input_names),
-            "outputs": list(steady_task.output_names),
-        },
+    with pytest.raises(ValueError, match=message):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=tmp_path / "training",
+        )
+
+
+def test_builder_reverifies_manifest_hashes_after_case_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root, case_numbers=(1,), timing_count=1)
+    original = builder_module._load_case_sources
+
+    def mutate_after_read(csv_path: Path, metadata_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+        result = original(csv_path, metadata_path)
+        metadata_path.write_text(metadata_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(builder_module, "_load_case_sources", mutate_after_read)
+    with pytest.raises(RuntimeError, match=r"SHA-256 mismatch.*raw JSON"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=tmp_path / "training",
+        )
+
+
+@pytest.mark.parametrize("corruption", ["csv_hash", "json_seed", "json_columns"])
+def test_builder_validates_parameter_sample_metadata(tmp_path: Path, corruption: str) -> None:
+    generated_root = tmp_path / "generated"
+    meta_dir, _raw, _processed = _write_generated_batch(generated_root)
+    if corruption == "csv_hash":
+        path = meta_dir / "synthetic.csv"
+        path.write_text(path.read_text(encoding="utf-8") + "3;0.3\n", encoding="utf-8")
+        match = "CSV SHA-256"
+    else:
+        path = meta_dir / "synthetic.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if corruption == "json_seed":
+            payload["meta"]["seed"] = 18
+            match = "meta.seed"
+        else:
+            payload["meta"]["param_names"] = ["different"]
+            match = "columns"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=tmp_path / "training")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_length_unit", "Length unit"),
+        ("wrong_pressure_unit", "field/unit header"),
+        ("nonuniform_grid", "dimensions"),
+        ("invalid_porosity", "Porosity"),
+        ("non_spd", "positive definite"),
+        ("nonfinite", "non-finite"),
+    ],
+)
+def test_builder_rejects_invalid_units_grid_and_physics(tmp_path: Path, mutation: str, message: str) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, processed_dir = _write_generated_batch(generated_root, case_numbers=(1,), timing_count=1)
+    solution = processed_dir / "case_0001_sol.csv"
+    lines = solution.read_text(encoding="utf-8").splitlines()
+    if mutation == "missing_length_unit":
+        lines.pop(0)
+    elif mutation == "wrong_pressure_unit":
+        lines[1] = lines[1].replace("p (Pa)", "p (bar)")
+    elif mutation == "nonuniform_grid":
+        # A 2-point axis is necessarily uniform; make the metadata/grid cardinality invalid.
+        metadata_path = raw_dir / "case_0001.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["geometry"]["nx"] = 3
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    else:
+        values = lines[2].split(";")
+        if mutation == "invalid_porosity":
+            values[6] = "0"
+        elif mutation == "non_spd":
+            values[3] = "2e-10"
+            values[4] = "2e-10"
+        elif mutation == "nonfinite":
+            values[8] = "nan"
+        lines[2] = ";".join(values)
+        if mutation in {"invalid_porosity", "non_spd"}:
+            raw_path = raw_dir / "case_0001.csv"
+            raw_lines = raw_path.read_text(encoding="utf-8").splitlines()
+            raw_values = raw_lines[0].split(";")
+            raw_values[5 if mutation == "invalid_porosity" else 3] = values[6 if mutation == "invalid_porosity" else 4]
+            raw_lines[0] = ";".join(raw_values)
+            raw_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+    solution.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Rebind only the intentionally changed source so scientific validation is reached.
+    manifest_path = raw_dir / "batch_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cases"][0]["files"]["solution_csv_sha256"] = _sha256(solution)
+    if mutation == "nonuniform_grid":
+        manifest["cases"][0]["files"]["raw_json_sha256"] = _sha256(raw_dir / "case_0001.json")
+    if mutation in {"invalid_porosity", "non_spd"}:
+        manifest["cases"][0]["files"]["raw_csv_sha256"] = _sha256(raw_dir / "case_0001.csv")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    timing_path = processed_dir / "comsol_solve_timing.json"
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    timing["batch_manifest_sha256"] = _sha256(manifest_path)
+    timing_path.write_text(json.dumps(timing), encoding="utf-8")
+
+    with pytest.raises((ValueError, KeyError), match=message):
+        build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=tmp_path / "training")
+
+
+def test_raw_solution_agreement_admits_only_scale_level_interpolation_noise(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, processed_dir = _write_generated_batch(
+        generated_root,
+        case_numbers=(1,),
+        timing_count=1,
+    )
+    raw_path = raw_dir / "case_0001.csv"
+    raw_lines = raw_path.read_text(encoding="utf-8").splitlines()
+    raw_values = raw_lines[0].split(";")
+    raw_values[6] = "0"
+    raw_lines[0] = ";".join(raw_values)
+    raw_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+    solution_path = processed_dir / "case_0001_sol.csv"
+    solution_lines = solution_path.read_text(encoding="utf-8").splitlines()
+    solution_values = solution_lines[2].split(";")
+    solution_values[3] = "1e-24"
+    solution_values[4] = "1e-24"
+    solution_values[7] = "7e-13"
+    solution_lines[2] = ";".join(solution_values)
+    solution_path.write_text("\n".join(solution_lines) + "\n", encoding="utf-8")
+    _rebind_case_sources(raw_dir, processed_dir)
+
+    result = build_batch_dataset(
+        "synthetic",
+        generated_data_root=generated_root,
+        model_training_data_root=tmp_path / "training",
+    )
+    assert result["status"] == "complete"
+
+
+def test_raw_solution_agreement_rejects_material_difference(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, processed_dir = _write_generated_batch(
+        generated_root,
+        case_numbers=(1,),
+        timing_count=1,
+    )
+    solution_path = processed_dir / "case_0001_sol.csv"
+    lines = solution_path.read_text(encoding="utf-8").splitlines()
+    values = lines[2].split(";")
+    values[7] = str(float(values[7]) + 0.01)
+    lines[2] = ";".join(values)
+    solution_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _rebind_case_sources(raw_dir, processed_dir)
+
+    with pytest.raises(ValueError, match="Raw input field 'p_bc' disagrees"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=tmp_path / "training",
+        )
+
+
+def test_partial_or_missing_timing_does_not_invalidate_scientific_dataset(tmp_path: Path) -> None:
+    partial, _generated, _training = _build(tmp_path / "partial", timing_count=1)
+    missing, _generated, _training = _build(tmp_path / "missing", timing_count=-1)
+    assert partial["timing_coverage"]["status"] == "partial"
+    assert missing["timing_coverage"] == {"status": "missing", "measured_case_count": 0, "intended_case_count": 2}
+
+
+def test_empty_timing_snapshot_is_valid_missing_coverage(tmp_path: Path) -> None:
+    result, _generated, _training = _build(tmp_path, timing_count=0)
+    assert result["timing_coverage"] == {
+        "status": "missing",
+        "measured_case_count": 0,
+        "intended_case_count": 2,
     }
-    with pytest.raises(ValueError, match="Unsupported dataset schema"):
-        datasets.modules.flow.FlowModule(unversioned, task=steady_task)
 
 
-def test_merger_strictly_rejects_modified_case_content(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-    case_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """
-    Mutate one saved case tensor while retaining its original case fingerprint.
-
-    The merger must reject the stale content before dataset publication so case
-    files cannot be replaced beneath a trusted logical identity.
-    """
-    cases_dir = tmp_path / "raw" / "modified_case" / "cases"
-    cases_dir.mkdir(parents=True)
-    payload = case_payload_factory("case_0000")
-    payload["input_fields"][steady_task.input_names[0]][0, 0] += 1.0
-    torch.save(payload, cases_dir / "case_0000.pt")
-
-    with pytest.raises(ValueError, match="fingerprint mismatch"):
-        merge_batch_cases(
-            "modified_case",
-            task_id=steady_task.id,
-            data_root=tmp_path,
-            dataset_root=tmp_path / "merged",
+def test_direct_builder_rejects_timing_aggregate_corruption(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root, timing_count=1)
+    timing_path = generated_root / "processed" / "synthetic" / "comsol_solve_timing.json"
+    payload = json.loads(timing_path.read_text(encoding="utf-8"))
+    payload["aggregates"]["mean_s"] += 0.25
+    timing_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="mean_s is not derived"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=tmp_path / "training",
         )
 
 
-def test_merger_rejects_inconsistent_case_shapes(
+def test_failed_build_and_overwrite_refusal_leave_authoritative_targets_intact(tmp_path: Path) -> None:
+    result, generated_root, training_root = _build(tmp_path)
+    original_dataset_hash = _sha256(result["dataset_path"])
+    original_inventory_hash = _sha256(result["metadata_path"] / "metadata_inventory.json")
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=training_root)
+    assert _sha256(result["dataset_path"]) == original_dataset_hash
+    assert _sha256(result["metadata_path"] / "metadata_inventory.json") == original_inventory_hash
+
+
+def test_metadata_inventory_detects_snapshot_tampering(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    sample_snapshot = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
+    sample_snapshot.write_bytes(sample_snapshot.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="hash or size mismatch"):
+        datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
+
+
+def test_metadata_manifest_binding_rejects_inventory_rebound_sample_csv(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
-    case_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """
-    Save two independently valid cases with different spatial shapes.
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    sample_snapshot = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
+    sample_snapshot.write_bytes(sample_snapshot.read_bytes() + b"tampered")
 
-    The merger must reject the batch before stacking or publication because one
-    merged tensor cannot truthfully represent inconsistent grids.
-    """
-    cases_dir = tmp_path / "raw" / "bad_shapes" / "cases"
-    cases_dir.mkdir(parents=True)
-    torch.save(case_payload_factory("case_0000", shape=(2, 3)), cases_dir / "case_0000.pt")
-    torch.save(case_payload_factory("case_0001", shape=(3, 3)), cases_dir / "case_0001.pt")
+    inventory_path = result["metadata_path"] / datasets.metadata.INVENTORY_FILENAME
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    sample_entry = inventory["files"][datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME]
+    sample_entry["sha256"] = _sha256(sample_snapshot)
+    sample_entry["size_bytes"] = sample_snapshot.stat().st_size
+    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="inconsistent tensor shapes"):
-        merge_batch_cases(
-            "bad_shapes",
-            task_id=steady_task.id,
-            data_root=tmp_path,
-            dataset_root=tmp_path / "merged",
+    with pytest.raises(ValueError, match="does not match the source manifest SHA-256"):
+        datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
+
+
+def test_metadata_rejects_mutated_dataset_schema_version(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    provenance_path = result["metadata_path"] / datasets.metadata.PROVENANCE_FILENAME
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["dataset_schema_version"] = datasets.identity.TRAINING_DATASET_SCHEMA_VERSION + 1
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    inventory_path = result["metadata_path"] / datasets.metadata.INVENTORY_FILENAME
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    provenance_entry = inventory["files"][datasets.metadata.PROVENANCE_FILENAME]
+    provenance_entry["sha256"] = _sha256(provenance_path)
+    provenance_entry["size_bytes"] = provenance_path.stat().st_size
+    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dataset_schema_version must be integer 1"):
+        datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, 2])
+def test_publication_transaction_requires_integer_version_one(
+    tmp_path: Path,
+    schema_version: Any,
+) -> None:
+    processed_root = tmp_path / "training" / "processed"
+    staging_root = processed_root / ".synthetic.dataset-build.invalid-version.tmp"
+    staging_root.mkdir(parents=True)
+    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    record = builder_module._publication_transaction_record(
+        dataset_id="synthetic",
+        phase="building",
+        staging_root=staging_root,
+    )
+    record["schema_version"] = schema_version
+    common.serialization.atomic_write_json(transaction_path, record)
+
+    with pytest.raises(RuntimeError, match="invalid identity or scalar fields"):
+        builder_module._load_publication_transaction(
+            transaction_path,
+            training_processed_root=processed_root,
+            dataset_id="synthetic",
+        )
+
+
+@pytest.mark.parametrize("failed_stage", ["metadata", "dataset"])
+def test_direct_builder_publication_failure_leaves_no_authoritative_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_stage: str,
+) -> None:
+    """A staged publication error must not expose either half of the build."""
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root)
+    training_root = tmp_path / "training"
+    dataset_target = training_root / "raw" / "synthetic"
+    metadata_target = training_root / "meta" / "synthetic"
+    original_replace = Path.replace
+
+    def fail_selected_publication(source: Path, target: Path | str) -> Path:
+        target_path = Path(target)
+        should_fail = (failed_stage == "metadata" and target_path == metadata_target) or (failed_stage == "dataset" and target_path == dataset_target)
+        if should_fail:
+            raise OSError(f"injected {failed_stage} publication failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", fail_selected_publication)
+    with pytest.raises(OSError, match=f"injected {failed_stage} publication failure"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=training_root,
+        )
+    assert not dataset_target.exists()
+    assert not metadata_target.exists()
+    assert not list((training_root / "processed").glob(".synthetic.dataset-build.*"))
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["both_staged", "metadata_final", "dataset_final", "both_final"],
+)
+def test_ready_publication_transaction_recovers_every_rename_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    result, generated_root, training_root = _build(tmp_path)
+    dataset_dir = result["dataset_path"].parent
+    metadata_dir = result["metadata_path"]
+    processed_root = training_root / "processed"
+    staging_root = processed_root / ".synthetic.dataset-build.recovery.tmp"
+    staging_root.mkdir()
+    staged_dataset_dir = staging_root / "raw" / "synthetic"
+    staged_metadata_dir = staging_root / "meta" / "synthetic"
+    dataset_sha256 = _sha256(result["dataset_path"])
+    dataset_size = result["dataset_path"].stat().st_size
+    inventory_sha256 = _sha256(metadata_dir / datasets.metadata.INVENTORY_FILENAME)
+
+    if state in {"both_staged", "metadata_final"}:
+        staged_dataset_dir.parent.mkdir(parents=True)
+        dataset_dir.replace(staged_dataset_dir)
+    if state in {"both_staged", "dataset_final"}:
+        staged_metadata_dir.parent.mkdir(parents=True)
+        metadata_dir.replace(staged_metadata_dir)
+
+    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    common.serialization.atomic_write_json(
+        transaction_path,
+        builder_module._publication_transaction_record(
+            dataset_id="synthetic",
+            phase="ready",
+            staging_root=staging_root,
+            dataset_sha256=dataset_sha256,
+            dataset_size=dataset_size,
+            metadata_inventory_sha256=inventory_sha256,
+        ),
+    )
+    raw_source = generated_root / "raw" / "synthetic" / "case_0001.csv"
+    raw_source.write_bytes(raw_source.read_bytes() + b"corrupted after ready transaction")
+
+    def reject_rebuild(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("ready publication recovery rebuilt generated cases")
+
+    monkeypatch.setattr(builder_module, "_interpret_generated_case", reject_rebuild)
+    recovered = build_batch_dataset(
+        "synthetic",
+        generated_data_root=generated_root,
+        model_training_data_root=training_root,
+    )
+
+    assert recovered["status"] == "complete"
+    assert recovered["dataset_fingerprint"] == result["dataset_fingerprint"]
+    assert result["dataset_path"].is_file()
+    assert result["metadata_path"].is_dir()
+    assert not transaction_path.exists()
+    assert not staging_root.exists()
+
+
+def test_private_progress_blocks_ready_transaction_recovery(tmp_path: Path) -> None:
+    result, generated_root, training_root = _build(tmp_path)
+    dataset_dir = result["dataset_path"].parent
+    metadata_dir = result["metadata_path"]
+    processed_root = training_root / "processed"
+    staging_root = processed_root / ".synthetic.dataset-build.progress-recovery.tmp"
+    staging_root.mkdir()
+    staged_dataset_dir = staging_root / "raw" / "synthetic"
+    staged_metadata_dir = staging_root / "meta" / "synthetic"
+    staged_dataset_dir.parent.mkdir(parents=True)
+    staged_metadata_dir.parent.mkdir(parents=True)
+    dataset_dir.replace(staged_dataset_dir)
+    metadata_dir.replace(staged_metadata_dir)
+    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    common.serialization.atomic_write_json(
+        transaction_path,
+        builder_module._publication_transaction_record(
+            dataset_id="synthetic",
+            phase="ready",
+            staging_root=staging_root,
+            dataset_sha256=_sha256(staged_dataset_dir / "synthetic.pt"),
+            dataset_size=(staged_dataset_dir / "synthetic.pt").stat().st_size,
+            metadata_inventory_sha256=_sha256(staged_metadata_dir / datasets.metadata.INVENTORY_FILENAME),
+        ),
+    )
+    _write_private_batch_progress(generated_root / "raw" / "synthetic")
+
+    with pytest.raises(RuntimeError, match="active or interrupted COMSOL progress"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=training_root,
+        )
+
+    assert not dataset_dir.exists()
+    assert not metadata_dir.exists()
+    assert transaction_path.is_file()
+    assert staged_dataset_dir.is_dir()
+    assert staged_metadata_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("source_change", "message"),
+    [
+        ("progress", "active or interrupted COMSOL progress"),
+        ("manifest", "Generation manifest changed"),
+    ],
+)
+def test_source_change_during_ready_recovery_blocks_remaining_renames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_change: str,
+    message: str,
+) -> None:
+    result, generated_root, training_root = _build(tmp_path)
+    dataset_dir = result["dataset_path"].parent
+    metadata_dir = result["metadata_path"]
+    processed_root = training_root / "processed"
+    staging_root = processed_root / ".synthetic.dataset-build.recovery-race.tmp"
+    staging_root.mkdir()
+    staged_dataset_dir = staging_root / "raw" / "synthetic"
+    staged_metadata_dir = staging_root / "meta" / "synthetic"
+    staged_dataset_dir.parent.mkdir(parents=True)
+    staged_metadata_dir.parent.mkdir(parents=True)
+    dataset_dir.replace(staged_dataset_dir)
+    metadata_dir.replace(staged_metadata_dir)
+    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    common.serialization.atomic_write_json(
+        transaction_path,
+        builder_module._publication_transaction_record(
+            dataset_id="synthetic",
+            phase="ready",
+            staging_root=staging_root,
+            dataset_sha256=_sha256(staged_dataset_dir / "synthetic.pt"),
+            dataset_size=(staged_dataset_dir / "synthetic.pt").stat().st_size,
+            metadata_inventory_sha256=_sha256(staged_metadata_dir / datasets.metadata.INVENTORY_FILENAME),
+        ),
+    )
+    raw_dir = generated_root / "raw" / "synthetic"
+    manifest_path = raw_dir / "batch_manifest.json"
+    original_validate = datasets.metadata.validate_dataset_metadata_directory
+    injected = False
+
+    def inject_source_change(*args: Any, **kwargs: Any) -> Any:
+        nonlocal injected
+        package = original_validate(*args, **kwargs)
+        if not injected:
+            injected = True
+            if source_change == "progress":
+                _write_private_batch_progress(raw_dir)
+            else:
+                manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+        return package
+
+    monkeypatch.setattr(datasets.metadata, "validate_dataset_metadata_directory", inject_source_change)
+
+    with pytest.raises(RuntimeError, match=message):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=training_root,
+        )
+
+    assert not dataset_dir.exists()
+    assert not metadata_dir.exists()
+    assert transaction_path.is_file()
+    assert staged_dataset_dir.is_dir()
+    assert staged_metadata_dir.is_dir()
+
+
+def test_building_publication_transaction_is_discarded_before_retry(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root)
+    training_root = tmp_path / "training"
+    processed_root = training_root / "processed"
+    staging_root = processed_root / ".synthetic.dataset-build.interrupted.tmp"
+    staging_root.mkdir(parents=True)
+    (staging_root / "partial.tmp").write_text("incomplete", encoding="utf-8")
+    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    common.serialization.atomic_write_json(
+        transaction_path,
+        builder_module._publication_transaction_record(
+            dataset_id="synthetic",
+            phase="building",
+            staging_root=staging_root,
+        ),
+    )
+
+    result = build_batch_dataset(
+        "synthetic",
+        generated_data_root=generated_root,
+        model_training_data_root=training_root,
+    )
+
+    assert result["status"] == "complete"
+    assert result["dataset_path"].is_file()
+    assert not transaction_path.exists()
+    assert not staging_root.exists()
+
+
+def test_singleton_manifest_case_object_is_normalized_consistently(
+    tmp_path: Path,
+) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, processed_dir = _write_generated_batch(
+        generated_root,
+        case_numbers=(1,),
+        timing_count=1,
+    )
+    manifest_path = raw_dir / "batch_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cases"] = manifest["cases"][0]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    timing_path = processed_dir / "comsol_solve_timing.json"
+    timing = json.loads(timing_path.read_text(encoding="utf-8"))
+    timing["batch_manifest_sha256"] = _sha256(manifest_path)
+    timing_path.write_text(json.dumps(timing), encoding="utf-8")
+
+    result = build_batch_dataset(
+        "synthetic",
+        generated_data_root=generated_root,
+        model_training_data_root=tmp_path / "training",
+    )
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    assert payload["sample_ids"] == ["case_0001"]
+    assert payload["generated_batch_identity"]["scientific_case_sources"][0]["case_id"] == "case_0001"
+
+
+@pytest.mark.parametrize("schema_version", [0, 2, 3])
+def test_batch_manifest_versions_other_than_one_are_rejected(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
+    manifest_path = raw_dir / "batch_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = schema_version
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported batch manifest schema"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=tmp_path / "training",
+        )
+
+
+def test_private_batch_progress_blocks_dataset_construction(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
+    _write_private_batch_progress(raw_dir)
+
+    with pytest.raises(RuntimeError, match="active or interrupted COMSOL progress"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=tmp_path / "training",
+        )
+
+
+@pytest.mark.parametrize("boundary", ["before_ready", "before_rename"])
+def test_progress_appearing_during_build_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
+    training_root = tmp_path / "training"
+    transaction_path = builder_module._publication_transaction_path(training_root / "processed", "synthetic")
+
+    if boundary == "before_ready":
+        original_interpret = builder_module._interpret_generated_case
+        injected = False
+
+        def inject_after_case(*args: Any, **kwargs: Any) -> Any:
+            nonlocal injected
+            interpreted = original_interpret(*args, **kwargs)
+            if not injected:
+                injected = True
+                _write_private_batch_progress(raw_dir)
+            return interpreted
+
+        monkeypatch.setattr(builder_module, "_interpret_generated_case", inject_after_case)
+    else:
+        original_write_json = common.serialization.atomic_write_json
+
+        def inject_after_ready(path: Path, payload: dict[str, Any], *args: Any, **kwargs: Any) -> None:
+            original_write_json(path, payload, *args, **kwargs)
+            if Path(path) == transaction_path and payload.get("phase") == "ready":
+                _write_private_batch_progress(raw_dir)
+
+        monkeypatch.setattr(common.serialization, "atomic_write_json", inject_after_ready)
+
+    with pytest.raises(RuntimeError, match="active or interrupted COMSOL progress"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=training_root,
+        )
+
+    assert not (training_root / "raw" / "synthetic").exists()
+    assert not (training_root / "meta" / "synthetic").exists()
+    assert not transaction_path.exists()
+    assert not list((training_root / "processed").glob(".synthetic.dataset-build.*"))
+
+
+def test_manifest_change_after_ready_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
+    training_root = tmp_path / "training"
+    transaction_path = builder_module._publication_transaction_path(training_root / "processed", "synthetic")
+    manifest_path = raw_dir / "batch_manifest.json"
+    original_write_json = common.serialization.atomic_write_json
+
+    def mutate_after_ready(path: Path, payload: dict[str, Any], *args: Any, **kwargs: Any) -> None:
+        original_write_json(path, payload, *args, **kwargs)
+        if Path(path) == transaction_path and payload.get("phase") == "ready":
+            manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+
+    monkeypatch.setattr(common.serialization, "atomic_write_json", mutate_after_ready)
+
+    with pytest.raises(RuntimeError, match="Generation manifest changed"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=training_root,
+        )
+
+    assert not (training_root / "raw" / "synthetic").exists()
+    assert not (training_root / "meta" / "synthetic").exists()
+    assert not transaction_path.exists()
+    assert not list((training_root / "processed").glob(".synthetic.dataset-build.*"))
+
+
+def test_unversioned_payload_is_rejected(steady_task: domain.tasks.spec.TaskSpec) -> None:
+    with pytest.raises(ValueError, match="Unsupported dataset schema"):
+        datasets.modules.flow.FlowModule(
+            {"inputs": torch.zeros((1, 7, 2, 3)), "outputs": torch.zeros((1, 3, 2, 3))},
+            task=steady_task,
+        )
+
+
+def test_eda_reads_validated_generated_sources_only(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EDA must interpret generated sources without resolving final datasets."""
+    from src import analysis, common
+
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root, case_numbers=(2, 1), timing_count=1)
+
+    def reject_training_dataset(*_args: Any, **_kwargs: Any) -> Path:
+        raise AssertionError("EDA attempted to resolve a model-training dataset")
+
+    monkeypatch.setattr(common.paths, "resolve_dataset_path", reject_training_dataset)
+    frame, logs = analysis.eda.dataframe.generate_eda_dataframe(
+        "synthetic",
+        task=steady_task,
+        generated_data_root=generated_root,
+        max_cases=1,
+    )
+
+    assert list(frame.index) == ["case_0002"]
+    assert list(frame.columns) == [*steady_task.input_names, *steady_task.output_names, "meta"]
+    assert frame.attrs["loaded_case_count"] == 1
+    assert frame.attrs["available_case_count"] == 2
+    assert frame.attrs["generated_batch_identity"]["batch_name"] == "synthetic"
+    assert "dataset_identity" not in frame.attrs
+    assert frame.iloc[0]["meta"]["parameters"] == {"alpha": 0.2}
+    assert any("Generated batch" in message for message in logs)
+    assert not (tmp_path / "training").exists()
+
+
+@pytest.mark.parametrize(("value", "error"), [(0, ValueError), (True, TypeError), (1.5, TypeError)])
+def test_eda_rejects_invalid_case_limits(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+    value: Any,
+    error: type[Exception],
+) -> None:
+    """EDA validates prefix limits before interpreting generated cases."""
+    from src import analysis
+
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root)
+    with pytest.raises(error, match="max_cases"):
+        analysis.eda.dataframe.generate_eda_dataframe(
+            "synthetic",
+            task=steady_task,
+            generated_data_root=generated_root,
+            max_cases=value,
         )

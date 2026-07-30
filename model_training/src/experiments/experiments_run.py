@@ -195,7 +195,7 @@ def seed_process(seed: int, *, device: torch.device) -> None:
     """
     Seed process-global RNGs for one already resolved concrete device.
 
-    Python, legacy NumPy, and Torch CPU state are always mutated. CUDA generators
+    Python, NumPy process-global, and Torch CPU state are always mutated. CUDA generators
     are seeded only for a concrete CUDA resolution, so CPU execution does not
     probe or initialize CUDA. Invalid device objects raise ``TypeError``.
     """
@@ -512,7 +512,8 @@ def read_run_summary(run_dir: Path | str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         msg = f"Run summary must contain a JSON object: {path}"
         raise RunLifecycleError(msg)
-    if payload.get("schema_version") != RUN_SUMMARY_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != RUN_SUMMARY_SCHEMA_VERSION:
         msg = f"Unsupported or missing run summary schema: {path}"
         raise RunLifecycleError(msg)
     return payload
@@ -1342,7 +1343,7 @@ def run_experiment(
     """
     Resolve and execute a fresh or explicit-resume experiment.
 
-    Config, requested device, concrete device, and mixed-precision compatibility
+    Config, requested device, concrete device, and mixed-precision requirements
     are validated before fresh output allocation. Resume acquires the run writer
     lease before reading mutable lifecycle artifacts and restores only the
     identity-validated last checkpoint.

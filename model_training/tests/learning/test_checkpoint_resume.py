@@ -775,6 +775,34 @@ def test_every_missing_checkpoint_field_is_rejected(tmp_path: Path) -> None:
             )
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, 1.0, 2],
+    ids=("boolean-one", "floating-one", "unsupported-integer"),
+)
+def test_checkpoint_requires_integer_version_one(
+    schema_version: object,
+    tmp_path: Path,
+) -> None:
+    """Reject alternate runtime representations and unsupported checkpoint versions."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _run(run_dir, epochs=2, seed=42)
+    payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert payload["schema_version"] == 1
+    payload["schema_version"] = schema_version
+
+    with pytest.raises(ValueError, match="schema_version"):
+        learning.training.checkpoint.validate_checkpoint(
+            payload,
+            expected_identity=_identity(),
+            expected_role="last",
+            scheduler_expected=True,
+            amp_expected=False,
+            require_best=True,
+        )
+
+
 def test_cpu_checkpoint_rejects_amp_scaler_state() -> None:
     """
     Create checkpoint state with AMP enabled, an active scaler, and concrete CPU runtime.

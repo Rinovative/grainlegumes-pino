@@ -2,13 +2,13 @@
 ===============================================================================
 evaluation_case.py
 ===============================================================================
-Load one schema-4 artifact case for every evaluation plot and viewer.
+Load one current-schema artifact case for every evaluation plot and viewer.
 
 Responsibilities:
   - Parse explicit NPZ paths already validated by the artifact service
   - Enforce TaskSpec field order, units, case identity, and finite arrays
   - Expose coordinates, learned outputs, inputs, and steady residuals uniformly
-  - Reject retired selected-continuity arrays and duplicate parsing conventions
+  - Reject every undeclared array and duplicate parsing convention
 
 Design principles:
   - One reader serves static figures, widgets, outliers, and W&B renderers
@@ -35,8 +35,7 @@ import numpy as np
 if TYPE_CHECKING:
     import pandas as pd
 
-_RETIRED_ARRAY_NAMES = frozenset({"Rc", "cont_mse", "continuity_mse"})
-_REQUIRED_ARRAY_NAMES = frozenset(
+_COMMON_ARRAY_NAMES = frozenset(
     {
         "case_index",
         "source_index",
@@ -52,6 +51,19 @@ _REQUIRED_ARRAY_NAMES = frozenset(
         "x_raw",
         "y_raw",
         "meta",
+    }
+)
+_STEADY_ARRAY_NAMES = frozenset(
+    {
+        "kappa_encoded",
+        "kappa",
+        "kappa_names",
+        "p_bc",
+        "coordinates",
+        "Rx",
+        "Ry",
+        "div_u",
+        "div_eps_u",
     }
 )
 _STEADY_RESIDUAL_NAMES = ("Rx", "Ry", "div_u", "div_eps_u")
@@ -245,7 +257,7 @@ def _coordinates(
 
 def _metadata(value: np.ndarray) -> Mapping[str, Any]:
     """
-    Parse one scalar JSON metadata object without authoritative identity aliases.
+    Parse one scalar JSON metadata object without duplicated authoritative identity.
 
     Non-scalar/non-text payloads, invalid JSON, non-object results, and duplicated
     case/source/split identity all fail before constructing :class:`EvaluationCase`.
@@ -271,7 +283,7 @@ def _metadata(value: np.ndarray) -> Mapping[str, Any]:
     return parsed
 
 
-def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:  # noqa: C901, PLR0912
+def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:  # noqa: C901, PLR0912, PLR0915
     """
     Load one NPZ case by deterministic DataFrame row position.
 
@@ -297,7 +309,7 @@ def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:  # noqa
         If the explicitly stored NPZ path is absent.
     KeyError, TypeError, ValueError
         If required arrays, identities, fields, units, shapes, finite values, or
-        numerical relationships violate the schema-4 case contract.
+        numerical relationships violate the current case contract.
 
     Notes
     -----
@@ -322,15 +334,19 @@ def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:  # noqa
         msg = f"Artifact case NPZ does not exist: {path}"
         raise FileNotFoundError(msg)
 
+    task_id = frame.attrs.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        msg = "Evaluation DataFrame must carry one validated task_id attribute."
+        raise ValueError(msg)
+    expected_names = set(_COMMON_ARRAY_NAMES)
+    if task_id == "steady_flow":
+        expected_names.update(_STEADY_ARRAY_NAMES)
     with np.load(path, allow_pickle=False) as stored:
         names = set(stored.files)
-        retired = sorted(names.intersection(_RETIRED_ARRAY_NAMES))
-        if retired:
-            msg = f"Artifact case contains retired ambiguous arrays: {retired}."
-            raise ValueError(msg)
-        missing = sorted(_REQUIRED_ARRAY_NAMES.difference(names))
-        if missing:
-            msg = f"Artifact case is missing required arrays: {missing}."
+        missing = sorted(expected_names.difference(names))
+        unexpected = sorted(names.difference(expected_names))
+        if missing or unexpected:
+            msg = f"Artifact case schema mismatch: missing={missing}, unexpected={unexpected}."
             raise ValueError(msg)
         payload = {name: np.asarray(stored[name]) for name in stored.files}
 

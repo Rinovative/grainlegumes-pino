@@ -196,3 +196,5 @@ jobs:
           python -m src.experiments.cli.cli_train --help
           python -m src.experiments.cli.cli_optuna --help
           python -m src.experiments.cli.cli_build_artifacts --help
+          cd ..
+          PYTHONPATH=model_training python -m data_generation.matlab.build_batch_dataset --help

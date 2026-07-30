@@ -24,6 +24,7 @@ import pytest
 import torch
 from neuralop.models import FNO
 from src import analysis, common, datasets, domain, experiments, learning
+from support.synthetic_task import build_synthetic_generated_batch_identity
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,11 +46,11 @@ class CompletedSmoke:
     config : dict[str, Any]
         Resolved CPU experiment contract used for the run.
     dataset_root : pathlib.Path
-        Temporary root owning the ID and named OOD merged datasets.
+        Temporary raw root owning the ID and named OOD final datasets.
     run_dir : pathlib.Path
         Completed saved-run leaf whose artifacts may be mutated only in copied tests.
     id_payload, ood_payload : dict[str, Any]
-        Original strict merged payloads used for split and normalizer assertions.
+        Original strict final payloads used for split and normalizer assertions.
     completed : dict[str, Any]
         Result of strict completed-run validation after best/last roles diverge.
 
@@ -61,24 +62,20 @@ class CompletedSmoke:
 
     config: dict[str, Any]
     dataset_root: Path
+    metadata_root: Path
     run_dir: Path
     id_payload: dict[str, Any]
     ood_payload: dict[str, Any]
     completed: dict[str, Any]
 
 
-def _case_payload(
+def _case_components(
     task: domain.tasks.spec.TaskSpec,
     *,
     case_id: str,
     offset: float,
-) -> dict[str, Any]:
-    """
-    Build one deterministic nonconstant steady-flow case with every canonical field.
-
-    ``offset`` changes content across samples while preserving grid shape and valid
-    physical domains; values are synthetic and not a Brinkman solution benchmark.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any], str]:
+    """Build deterministic in-memory case tensors and their scientific identity."""
     y_axis = torch.linspace(0.0, 1.0, _SHAPE[0], dtype=torch.float32)
     x_axis = torch.linspace(0.0, 1.0, _SHAPE[1], dtype=torch.float32)
     y, x = torch.meshgrid(y_axis, x_axis, indexing="ij")
@@ -96,66 +93,162 @@ def _case_payload(
         "u": 1.0e-4 * (1.0 + 0.03 * offset + x + 0.2 * y),
         "v": 1.0e-4 * (-0.5 + 0.02 * offset + 0.1 * x - y),
     }
-    return datasets.identity.build_case_payload(
+    inputs = torch.stack([input_fields[name] for name in task.input_names])
+    outputs = torch.stack([output_fields[name] for name in task.output_names])
+    source_identity = {"generator": "synthetic-smoke", "case": case_id}
+    source_metadata = {"offset": offset, "case_id": case_id}
+    fingerprint = datasets.identity.compute_case_fingerprint(
         task=task,
         case_id=case_id,
-        input_fields=input_fields,
-        output_fields=output_fields,
-        source_identity={"generator": "synthetic-smoke", "case": case_id},
-        source_metadata={"offset": offset},
+        source_identity=source_identity,
+        source_metadata=source_metadata,
+        inputs=inputs,
+        outputs=outputs,
     )
+    return inputs, outputs, source_identity, source_metadata, fingerprint
 
 
-def _merged_payload(
+def _training_dataset_payload(
     task: domain.tasks.spec.TaskSpec,
     *,
     dataset_id: str,
     offsets: tuple[float, ...],
 ) -> dict[str, Any]:
-    """
-    Merge independently fingerprinted synthetic cases into one strict payload.
-
-    Case order follows ``offsets`` and is therefore part of merged identity. The
-    helper builds in memory and performs no publication or split selection.
-    """
-    cases = [
-        _case_payload(
-            task,
-            case_id=f"{dataset_id}_case_{index:04d}",
-            offset=offset,
-        )
-        for index, offset in enumerate(offsets)
-    ]
-    validated = [
-        datasets.identity.validate_case_payload(
-            case,
-            task=task,
-            verify_content=True,
-        )
-        for case in cases
-    ]
-    return datasets.identity.build_merged_dataset_payload(
+    """Build one final version-1 synthetic dataset entirely in memory."""
+    sample_ids = [f"case_{index + 1:04d}" for index in range(len(offsets))]
+    cases = [_case_components(task, case_id=case_id, offset=offset) for case_id, offset in zip(sample_ids, offsets, strict=True)]
+    return datasets.identity.build_training_dataset_payload(
         task=task,
         dataset_id=dataset_id,
-        sample_ids=[case.case_id for case in validated],
-        source_identities=[case.source_identity for case in validated],
-        source_metadata=[case.source_metadata for case in validated],
-        case_fingerprints=[case.fingerprint for case in validated],
-        inputs=torch.stack([case.inputs for case in validated]),
-        outputs=torch.stack([case.outputs for case in validated]),
+        sample_ids=sample_ids,
+        generated_batch_identity=build_synthetic_generated_batch_identity(
+            batch_name=dataset_id,
+            sample_ids=sample_ids,
+        ),
+        source_identities=[case[2] for case in cases],
+        source_metadata=[case[3] for case in cases],
+        source_provenance={"batch_manifest_sha256": "2" * 64},
+        case_fingerprints=[case[4] for case in cases],
+        inputs=torch.stack([case[0] for case in cases]),
+        outputs=torch.stack([case[1] for case in cases]),
     )
 
 
-def _save_dataset(root: Path, payload: dict[str, Any]) -> Path:
-    """
-    Atomically publish one merged payload under its logical dataset ID.
-
-    The temporary root is test-owned and the helper never overwrites through an
-    alternate compatibility path; production validation occurs when consumers load it.
-    """
+def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> Path:
+    """Publish one final dataset and its self-contained metadata test package."""
     dataset_id = str(payload["dataset_id"])
+    task = domain.tasks.registry.get_task(str(payload["task"]))
+    metadata_dir = metadata_root / dataset_id
+    metadata_dir.mkdir(parents=True)
+    sample_csv_path = metadata_dir / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
+    sample_csv_path.write_text(
+        "case_id;synthetic_parameter\n" + "\n".join(f"{sample_id};1.0" for sample_id in payload["sample_ids"]) + "\n",
+        encoding="utf-8",
+    )
+    generated_identity = payload["generated_batch_identity"]
+    configuration = {
+        **generated_identity["configuration"],
+        "sample_sha256": common.serialization.file_sha256(sample_csv_path),
+    }
+    manifest_cases = []
+    for source in generated_identity["scientific_case_sources"]:
+        case_id = str(source["case_id"])
+        manifest_cases.append(
+            {
+                "case_id": case_id,
+                "status": "complete",
+                "stage": "simulation",
+                "message": "",
+                "files": {
+                    "raw_csv_sha256": source["raw_csv_sha256"],
+                    "raw_json_sha256": common.serialization.canonical_json_sha256({"batch_name": dataset_id, "case_id": case_id}),
+                    "solution_csv_sha256": source["solution_csv_sha256"],
+                    "solution_model_sha256": source["solution_model_sha256"],
+                },
+            }
+        )
+    manifest = {
+        "schema_kind": datasets.metadata.SOURCE_MANIFEST_SCHEMA_KIND,
+        "schema_version": datasets.metadata.SOURCE_MANIFEST_SCHEMA_VERSION,
+        "batch_name": dataset_id,
+        "status": "complete",
+        "configuration": configuration,
+        "field_schema": generated_identity["field_schema"],
+        "intended_case_ids": list(payload["sample_ids"]),
+        "cases": manifest_cases,
+    }
+    common.serialization.atomic_write_json(metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME, manifest)
+    manifest_path = metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME
+    manifest_sha256 = common.serialization.file_sha256(manifest_path)
+    payload["source_provenance"]["batch_manifest_sha256"] = manifest_sha256
     destination = root / dataset_id / f"{dataset_id}.pt"
     common.serialization.atomic_torch_save(payload, destination)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
+    common.serialization.atomic_write_json(
+        metadata_dir / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME,
+        {
+            "meta": {
+                **generated_identity["sampling"],
+                "timestamp": "synthetic-test-snapshot",
+            },
+            "n_cases": identity.sample_count,
+        },
+    )
+    timing_summary = {"status": "missing", "measured_case_count": 0, "intended_case_count": identity.sample_count}
+    source_batch = {
+        "batch_name": dataset_id,
+        "batch_manifest_sha256": manifest_sha256,
+        "batch_manifest_identity_sha256": str(payload["generated_batch_identity"]["batch_manifest_identity_sha256"]),
+    }
+    common.serialization.atomic_write_json(
+        metadata_dir / datasets.metadata.PROVENANCE_FILENAME,
+        {
+            "schema_kind": datasets.metadata.PROVENANCE_SCHEMA_KIND,
+            "schema_version": datasets.metadata.METADATA_SCHEMA_VERSION,
+            "dataset_id": dataset_id,
+            "dataset_schema_version": datasets.identity.TRAINING_DATASET_SCHEMA_VERSION,
+            "dataset_fingerprint": identity.fingerprint,
+            "task": task.id,
+            "task_contract_digest": task.contract_digest,
+            "source_batch": source_batch,
+            "sample_count": identity.sample_count,
+            "spatial_shape": list(identity.spatial_shape),
+            "timing": timing_summary,
+        },
+    )
+    roles = {
+        datasets.metadata.PROVENANCE_FILENAME: "normalized_dataset_provenance",
+        datasets.metadata.SOURCE_MANIFEST_FILENAME: "validated_generation_manifest",
+        datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME: "validated_parameter_sample_csv",
+        datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME: "validated_parameter_sample_json",
+    }
+    files = {
+        filename: {
+            "sha256": common.serialization.file_sha256(metadata_dir / filename),
+            "size_bytes": (metadata_dir / filename).stat().st_size,
+            "required": True,
+            "role": role,
+        }
+        for filename, role in roles.items()
+    }
+    common.serialization.atomic_write_json(
+        metadata_dir / datasets.metadata.INVENTORY_FILENAME,
+        {
+            "schema_kind": datasets.metadata.INVENTORY_SCHEMA_KIND,
+            "schema_version": datasets.metadata.METADATA_SCHEMA_VERSION,
+            "dataset_id": dataset_id,
+            "dataset_fingerprint": identity.fingerprint,
+            "task": task.id,
+            "task_contract_digest": task.contract_digest,
+            "sample_count": identity.sample_count,
+            "spatial_shape": list(identity.spatial_shape),
+            "source_batch_name": dataset_id,
+            "source_manifest_sha256": manifest_sha256,
+            "files": files,
+            "timing": timing_summary,
+        },
+    )
+    datasets.metadata.validate_dataset_metadata_directory(metadata_dir, dataset_identity=identity)
     return destination
 
 
@@ -315,21 +408,22 @@ def completed_smoke(tmp_path_factory: pytest.TempPathFactory) -> CompletedSmoke:
     It must not be treated as a performance or scientific-accuracy benchmark.
     """
     root = tmp_path_factory.mktemp("steady_flow_lifecycle")
-    dataset_root = root / "datasets"
-    output_root = root / "runs"
+    dataset_root = root / "raw"
+    metadata_root = root / "meta"
+    output_root = root / "processed"
     task = domain.tasks.registry.get_task("steady_flow")
-    id_payload = _merged_payload(
+    id_payload = _training_dataset_payload(
         task,
         dataset_id=_ID_DATASET,
         offsets=(0.0, 1.0, 4.0, 10.0),
     )
-    ood_payload = _merged_payload(
+    ood_payload = _training_dataset_payload(
         task,
         dataset_id=_OOD_DATASET,
         offsets=(20.0, 21.0, 24.0, 30.0),
     )
-    _save_dataset(dataset_root, id_payload)
-    _save_dataset(dataset_root, ood_payload)
+    _save_dataset(dataset_root, metadata_root, id_payload)
+    _save_dataset(dataset_root, metadata_root, ood_payload)
 
     config = _tiny_config(dataset_root=dataset_root, output_root=output_root)
     run_dir = experiments.run.prepare_fresh_run(
@@ -359,6 +453,7 @@ def completed_smoke(tmp_path_factory: pytest.TempPathFactory) -> CompletedSmoke:
     return CompletedSmoke(
         config=config,
         dataset_root=dataset_root,
+        metadata_root=metadata_root,
         run_dir=run_dir,
         id_payload=id_payload,
         ood_payload=ood_payload,
@@ -457,6 +552,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     generated = analysis.artifact_service.build_artifacts(
         runs_root=smoke.run_dir,
         dataset_root=smoke.dataset_root,
+        metadata_root=smoke.metadata_root,
         batch_size=1,
         device_policy="cpu",
     )
@@ -573,6 +669,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     cached = analysis.artifact_service.build_artifacts(
         runs_root=smoke.run_dir,
         dataset_root=smoke.dataset_root,
+        metadata_root=smoke.metadata_root,
         batch_size=1,
         device_policy="cpu",
     )
@@ -591,6 +688,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         batch_size=1,
         device_resolution=learning.device.resolve_device("cpu"),
         dataset_root=smoke.dataset_root,
+        metadata_root=smoke.metadata_root,
     )
     pd.testing.assert_frame_equal(without_runtime, frames["eval"])
     assert not runtime_path.exists()
@@ -607,6 +705,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         batch_size=1,
         device_resolution=learning.device.resolve_device("cpu"),
         dataset_root=smoke.dataset_root,
+        metadata_root=smoke.metadata_root,
     )
     pd.testing.assert_frame_equal(with_incompatible_runtime, frames["eval"])
     assert runtime_path.read_bytes() != valid_runtime
@@ -628,6 +727,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             batch_size=1,
             device_resolution=learning.device.resolve_device("cpu"),
             dataset_root=smoke.dataset_root,
+            metadata_root=smoke.metadata_root,
         )
     assert _artifact_inventory((id_target,)) == incompatible_cache
     provenance_path.write_text(valid_provenance, encoding="utf-8")
@@ -648,6 +748,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             batch_size=1,
             device_resolution=learning.device.resolve_device("cpu"),
             dataset_root=smoke.dataset_root,
+            metadata_root=smoke.metadata_root,
         )
     assert _artifact_inventory((id_target,)) == corrupted_parquet_cache
     parquet_path.write_bytes(valid_parquet)
@@ -667,6 +768,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             batch_size=1,
             device_resolution=learning.device.resolve_device("cpu"),
             dataset_root=smoke.dataset_root,
+            metadata_root=smoke.metadata_root,
         )
     assert _artifact_inventory((id_target,)) == corrupted_cache
 
@@ -676,6 +778,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     rebuilt_artifacts = analysis.artifact_service.build_artifacts(
         runs_root=smoke.run_dir,
         dataset_root=smoke.dataset_root,
+        metadata_root=smoke.metadata_root,
         batch_size=2,
         device_policy="cpu",
         rebuild=True,
@@ -766,7 +869,7 @@ def _mutate_checkpoint_schema(run_dir: Path, dataset_root: Path) -> None:
     del dataset_root
     path = common.paths.resolve_best_checkpoint_file(run_dir)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["schema_version"] = 0
+    payload["schema_version"] = 2
     common.serialization.atomic_torch_save(payload, path)
     _refresh_summary_digest(
         run_dir,

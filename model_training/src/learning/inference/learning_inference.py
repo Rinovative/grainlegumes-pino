@@ -471,7 +471,7 @@ def load_inference_context_with_resolution(
     device_resolution : learning.device.DeviceResolution
         Immutable runtime decision resolved by the inference or artifact boundary.
     dataset_path : str | Path | None, optional
-        Optional exact merged-dataset file. Its fingerprint and ordered sample
+        Optional exact final-dataset file. Its fingerprint and ordered sample
         identity must match the saved split.
     dataset_root : str | Path | None, optional
         Current explicit dataset root used with the saved logical dataset id.
@@ -479,7 +479,7 @@ def load_inference_context_with_resolution(
     split : {"train", "eval", "ood"}, optional
         Saved split role to load. `eval` and `train` use the saved training
         dataset membership; `ood` uses saved OOD membership against the OOD
-        merged dataset recorded by training. Default is `eval`.
+        final dataset recorded by training. Default is `eval`.
     batch_size : int, optional
         Evaluation batch size. Default is 1.
 

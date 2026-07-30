@@ -38,7 +38,7 @@ def test_nonsemantic_implementation_identifiers_fail_clearly() -> None:
     Query class names, display labels, shorthand, capitalization drift, and unknown IDs.
 
     Every nonsemantic family must fail at its owning registry so no undocumented
-    compatibility vocabulary enters persisted configuration.
+    undocumented identifier vocabulary enters persisted configuration.
     """
     for identifier in ("PI-FNO", "PINOLoss", "FNO"):
         with pytest.raises(ValueError, match="Unknown model identifier"):

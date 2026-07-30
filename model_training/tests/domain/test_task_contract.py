@@ -83,6 +83,19 @@ def test_steady_flow_contract_is_exact_and_task_owned() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, 1.0, 2],
+    ids=("boolean-one", "floating-one", "unsupported-integer"),
+)
+def test_task_schema_requires_exact_integer_one(schema_version: object) -> None:
+    """Reject alternate runtime representations and unsupported task versions."""
+    task = domain.tasks.registry.get_task("steady_flow")
+
+    with pytest.raises(ValueError, match="schema_version must be integer 1"):
+        replace(task, schema_version=schema_version)  # type: ignore[arg-type]
+
+
 def test_task_contract_is_immutable() -> None:
     """
     Attempt scalar and tuple-item mutation on the registered frozen task.
@@ -121,10 +134,10 @@ def test_ordered_contract_validator_rejects_drift(actual: tuple[str, ...]) -> No
 
 def test_public_domain_exports_resolve_and_noncanonical_fields_fail() -> None:
     """
-    Resolve the intended domain exports and query retired task/field spellings.
+    Resolve the intended domain exports and query noncanonical task/field names.
 
     Public aliases must reach their canonical objects while noncanonical names
-    fail explicitly, preventing an accidental compatibility API.
+    fail explicitly, keeping the public API limited to canonical names.
     """
     assert domain.tasks.spec.TaskSpec
     assert domain.tasks.registry.get_task

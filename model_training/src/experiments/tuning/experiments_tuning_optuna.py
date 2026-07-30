@@ -20,7 +20,7 @@ Design principles:
 This module does NOT:
   - Parse search-space schemas; ``experiments.tuning.search_space`` owns admission
   - Execute training epochs; ``learning.training.loop`` owns model optimization
-  - Clean repository or historical run state
+  - Clean repository or run state
 ===============================================================================
 """
 
@@ -753,10 +753,12 @@ def describe_optuna_study_config(config: OptunaStudyConfig) -> dict[str, Any]:
 
 
 def _study_dir(config: OptunaStudyConfig) -> Path:
-    """Return the study directory under the independent output root."""
-    output_root = Path(config.base_config["paths"]["output_root"])
-    study_name = common.paths.validate_logical_name(config.study["name"], label="study.name")
-    return output_root / config.base_config["task"] / "optuna" / study_name
+    """Return the task-owned study directory under the derived output root."""
+    return common.paths.resolve_study_dir(
+        str(config.base_config["task"]),
+        str(config.study["name"]),
+        output_root=Path(config.base_config["paths"]["output_root"]),
+    )
 
 
 def _build_pruner(study: Mapping[str, Any]) -> Any:
@@ -1017,7 +1019,6 @@ def _write_summary(
         "study_name": context["study_name"],
         "trial_number": context["trial_number"],
         "sampled_parameters": context["overrides"],
-        "trial_outcome_schema_version": TRIAL_LIFECYCLE_SCHEMA_VERSION,
         "objective": objective,
         "best_epoch": result.get("best_epoch", reporter.best_epoch if reporter else None),
         "best_metric": result.get("best_metric", reporter.best_value if reporter else None),
@@ -1639,6 +1640,48 @@ def _validate_existing_study(
     if missing:
         msg = f"Existing Optuna study is missing required semantic metadata: {missing}."
         raise ValueError(msg)
+
+    def require_schema_version(value: Any, expected: int, *, label: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            msg = f"Existing Optuna study {label} must be schema version {expected}."
+            raise ValueError(msg)
+
+    require_schema_version(
+        study.user_attrs[_STUDY_SIGNATURE_SCHEMA_ATTR],
+        STUDY_SIGNATURE_SCHEMA_VERSION,
+        label=_STUDY_SIGNATURE_SCHEMA_ATTR,
+    )
+    actual_payload = study.user_attrs[_STUDY_SIGNATURE_PAYLOAD_ATTR]
+    if not isinstance(actual_payload, Mapping):
+        msg = "Existing Optuna study semantic signature payload must be a mapping."
+        raise TypeError(msg)
+    actual_task = actual_payload.get("task")
+    actual_lifecycle = actual_payload.get("trial_lifecycle")
+    if not isinstance(actual_task, Mapping) or not isinstance(actual_lifecycle, Mapping):
+        msg = "Existing Optuna study semantic signature has invalid task or trial lifecycle metadata."
+        raise TypeError(msg)
+    require_schema_version(
+        actual_payload.get("schema_version"),
+        STUDY_SIGNATURE_SCHEMA_VERSION,
+        label="signature payload",
+    )
+    expected_payload = signature["payload"]
+    require_schema_version(
+        actual_task.get("schema_version"),
+        expected_payload["task"]["schema_version"],
+        label="task contract",
+    )
+    require_schema_version(
+        actual_lifecycle.get("schema_version"),
+        TRIAL_LIFECYCLE_SCHEMA_VERSION,
+        label="trial lifecycle",
+    )
+    require_schema_version(
+        actual_lifecycle.get("run_summary_schema_version"),
+        experiments.run.RUN_SUMMARY_SCHEMA_VERSION,
+        label="run summary",
+    )
+
     mismatched = sorted(key for key, value in required.items() if study.user_attrs.get(key) != value)
     if mismatched:
         msg = f"Existing Optuna study semantic signature mismatch in: {mismatched}."

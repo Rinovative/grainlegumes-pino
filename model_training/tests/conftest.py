@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 from src import datasets, domain
-from support.synthetic_task import build_synthetic_task
+from support.synthetic_task import build_synthetic_generated_batch_identity, build_synthetic_task
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -43,50 +43,10 @@ def synthetic_task() -> domain.tasks.spec.TaskSpec:
 
 
 @pytest.fixture
-def case_payload_factory(
+def training_dataset_payload_factory(
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> Callable[..., dict[str, Any]]:
-    """
-    Return a factory for small content-bound steady-flow case payloads.
-
-    The factory varies identity, values, shape, dtype, and source token while
-    always using production TaskSpec ordering; it does not model COMSOL files.
-    """
-
-    def factory(
-        case_id: str = "case_0000",
-        *,
-        value: float = 0.0,
-        shape: tuple[int, int] = (2, 3),
-        dtype: torch.dtype = torch.float32,
-        source_token: str | None = None,
-    ) -> dict[str, Any]:
-        """Build one strict case with deterministic per-channel constant fields."""
-        input_fields = {name: torch.full(shape, value + index, dtype=dtype) for index, name in enumerate(steady_task.input_names)}
-        output_fields = {name: torch.full(shape, value + 20 + index, dtype=dtype) for index, name in enumerate(steady_task.output_names)}
-        return datasets.identity.build_case_payload(
-            task=steady_task,
-            case_id=case_id,
-            input_fields=input_fields,
-            output_fields=output_fields,
-            source_identity={"token": source_token or case_id},
-            source_metadata={"case_id": case_id},
-        )
-
-    return factory
-
-
-@pytest.fixture
-def merged_payload_factory(
-    steady_task: domain.tasks.spec.TaskSpec,
-    case_payload_factory: Callable[..., dict[str, Any]],
-) -> Callable[..., dict[str, Any]]:
-    """
-    Return a factory for small strict merged-dataset payloads.
-
-    Each member is validated through the production case contract before stacking,
-    so callers can vary membership and dtype without bypassing identity checks.
-    """
+    """Return a factory for small version-1 final training datasets."""
 
     def factory(
         dataset_id: str = "tiny",
@@ -94,28 +54,48 @@ def merged_payload_factory(
         sample_ids: Sequence[str] = ("case_0000", "case_0001", "case_0002", "case_0003"),
         dtype: torch.dtype = torch.float32,
         source_tokens: Sequence[str] | None = None,
+        source_provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build one content-bound merged payload from deterministic strict cases."""
         tokens = tuple(source_tokens or sample_ids)
-        cases = [
-            case_payload_factory(
-                sample_id,
-                value=float(index),
-                dtype=dtype,
-                source_token=tokens[index],
+        inputs = torch.stack(
+            [
+                torch.stack([torch.full((2, 3), float(sample_index + channel), dtype=dtype) for channel in range(steady_task.in_channels)])
+                for sample_index, _sample_id in enumerate(sample_ids)
+            ]
+        )
+        outputs = torch.stack(
+            [
+                torch.stack([torch.full((2, 3), float(sample_index + 20 + channel), dtype=dtype) for channel in range(steady_task.out_channels)])
+                for sample_index, _sample_id in enumerate(sample_ids)
+            ]
+        )
+        identities = [{"case_id": sample_id, "token": tokens[index]} for index, sample_id in enumerate(sample_ids)]
+        metadata = [{"case_id": sample_id, "parameters": {"sample_index": index}} for index, sample_id in enumerate(sample_ids)]
+        fingerprints = [
+            datasets.identity.compute_case_fingerprint(
+                task=steady_task,
+                case_id=sample_id,
+                source_identity=identities[index],
+                source_metadata=metadata[index],
+                inputs=inputs[index],
+                outputs=outputs[index],
             )
             for index, sample_id in enumerate(sample_ids)
         ]
-        validated = [datasets.identity.validate_case_payload(case, task=steady_task) for case in cases]
-        return datasets.identity.build_merged_dataset_payload(
+        return datasets.identity.build_training_dataset_payload(
             task=steady_task,
             dataset_id=dataset_id,
             sample_ids=sample_ids,
-            source_identities=[case.source_identity for case in validated],
-            source_metadata=[case.source_metadata for case in validated],
-            case_fingerprints=[case.fingerprint for case in validated],
-            inputs=torch.stack([case.inputs for case in validated]),
-            outputs=torch.stack([case.outputs for case in validated]),
+            generated_batch_identity=build_synthetic_generated_batch_identity(
+                batch_name="synthetic_source",
+                sample_ids=sample_ids,
+            ),
+            source_identities=identities,
+            source_metadata=metadata,
+            source_provenance=source_provenance or {"batch_manifest_sha256": "2" * 64},
+            case_fingerprints=fingerprints,
+            inputs=inputs,
+            outputs=outputs,
         )
 
     return factory

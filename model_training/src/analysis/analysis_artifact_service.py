@@ -114,11 +114,11 @@ class ArtifactRequest:
     Parameters
     ----------
     provenance : dict[str, Any]
-        Canonical schema-3 run, model, dataset, evaluator, physics, selection,
+        Canonical run, model, dataset, evaluator, physics, selection,
         generation, and runtime request evidence. Generated aggregate/results
         are deliberately absent until artifact publication.
     source_indices : tuple[int, ...]
-        Exact ordered merged-dataset indices selected from the saved split.
+        Exact ordered final-dataset indices selected from the saved split.
 
     Notes
     -----
@@ -130,7 +130,7 @@ class ArtifactRequest:
     provenance: dict[str, Any]
     source_indices: tuple[int, ...]
     case_ids: tuple[str, ...] = ()
-    source_batch_manifest: dict[str, Any] | None = None
+    dataset_metadata: datasets.metadata.DatasetMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -490,38 +490,29 @@ def _indices_sha256(indices: Iterable[int]) -> str:
     return artifacts.ordered_indices_sha256(indices)
 
 
-def _selected_source_batch_manifest(
+def _load_bound_dataset_metadata(
     source_dataset: Any,
-    source_indices: Iterable[int],
-) -> dict[str, Any] | None:
-    """Return one common producer manifest, or None when comparison is unsafe."""
-    manifests: list[dict[str, Any]] = []
-    data = getattr(source_dataset, "data", None)
-    case_files = getattr(source_dataset, "case_files", None)
-    try:
-        for source_index in source_indices:
-            source_identity: Any
-            if isinstance(data, Mapping):
-                identities = data.get("source_identities")
-                if not isinstance(identities, (list, tuple)):
-                    return None
-                source_identity = identities[source_index]
-            elif isinstance(case_files, list) and source_index < len(case_files):
-                case_payload = torch.load(case_files[source_index], map_location="cpu", weights_only=False)
-                source_identity = case_payload.get("source_identity") if isinstance(case_payload, Mapping) else None
-            else:
-                return None
-            if not isinstance(source_identity, Mapping):
-                return None
-            manifest = source_identity.get("batch_manifest")
-            if not isinstance(manifest, Mapping):
-                return None
-            manifests.append(dict(manifest))
-    except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError):
-        return None
-    if not manifests or any(manifest != manifests[0] for manifest in manifests[1:]):
-        return None
-    return manifests[0]
+    *,
+    dataset_name: str,
+    dataset_identity: datasets.identity.DatasetIdentity,
+    metadata_root: Path,
+) -> datasets.metadata.DatasetMetadata:
+    """Load metadata and bind its exact manifest digest to the final payload."""
+    package = datasets.metadata.load_dataset_metadata(
+        dataset_name,
+        dataset_identity=dataset_identity,
+        metadata_root=metadata_root,
+    )
+    source_payload = getattr(source_dataset, "data", None)
+    source_provenance = source_payload.get("source_provenance") if isinstance(source_payload, Mapping) else None
+    source_batch = package.provenance.get("source_batch")
+    if not isinstance(source_provenance, Mapping) or not isinstance(source_batch, Mapping):
+        msg = "Final dataset and metadata package must expose source-batch provenance."
+        raise TypeError(msg)
+    if source_provenance.get("batch_manifest_sha256") != source_batch.get("batch_manifest_sha256"):
+        msg = "Dataset metadata source manifest does not match the final dataset's operational provenance."
+        raise ValueError(msg)
+    return package
 
 
 def _build_artifact_request(
@@ -533,6 +524,7 @@ def _build_artifact_request(
     batch_size: int,
     device_resolution: learning.device.DeviceResolution,
     dataset_root: Path,
+    metadata_root: Path,
 ) -> ArtifactRequest:
     """
     Build and validate the complete semantic request for one artifact cache.
@@ -559,6 +551,8 @@ def _build_artifact_request(
         Already resolved execution-device decision.
     dataset_root : pathlib.Path
         Root used only to resolve and validate the source dataset.
+    metadata_root : pathlib.Path
+        Root containing the dataset's validated provenance and timing snapshots.
 
     Returns
     -------
@@ -635,7 +629,12 @@ def _build_artifact_request(
     effective_count = len(full_source_indices) if max_cases is None else min(len(full_source_indices), max_cases)
     effective_source_indices = full_source_indices[:effective_count]
     effective_case_ids = tuple(expected_identity.sample_ids[index] for index in effective_source_indices)
-    source_batch_manifest = _selected_source_batch_manifest(source_dataset, effective_source_indices)
+    dataset_metadata = _load_bound_dataset_metadata(
+        source_dataset,
+        dataset_name=dataset_name,
+        dataset_identity=expected_identity,
+        metadata_root=metadata_root,
+    )
     membership_digests = metadata.get("membership_digests")
     if not isinstance(membership_digests, Mapping):
         msg = "split_indices.pt metadata.membership_digests must be a mapping."
@@ -806,7 +805,7 @@ def _build_artifact_request(
         provenance=provenance,
         source_indices=effective_source_indices,
         case_ids=effective_case_ids,
-        source_batch_manifest=source_batch_manifest,
+        dataset_metadata=dataset_metadata,
     )
 
 
@@ -846,13 +845,19 @@ def _scientific_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _require_current_provenance_schema(provenance: Mapping[str, Any]) -> None:
-    """Fail closed for every old or intermediate artifact schema."""
-    if provenance.get("provenance_schema_version") != artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION:
-        msg = "Artifact provenance has an unsupported provenance schema version."
-        raise ArtifactCacheError(msg)
-    if provenance.get("artifact_schema_version") != artifacts.ARTIFACT_SCHEMA_VERSION:
-        msg = "Artifact provenance has an unsupported artifact schema version."
-        raise ArtifactCacheError(msg)
+    """Require the exact current artifact and provenance schema versions."""
+    versions = (
+        (
+            "provenance_schema_version",
+            artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+        ),
+        ("artifact_schema_version", artifacts.ARTIFACT_SCHEMA_VERSION),
+    )
+    for field, expected in versions:
+        value = provenance.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            msg = f"Artifact provenance has an unsupported {field}."
+            raise ArtifactCacheError(msg)
 
 
 def _runtime_identities(request: ArtifactRequest) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -905,38 +910,29 @@ def _validate_runtime_comparison_request(
 def _resolve_comsol_timing(
     request: ArtifactRequest,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    """Bind the raw scientific manifest to its processed operational timing sidecar."""
-    source_manifest = request.source_batch_manifest
-    if source_manifest is None:
-        return None, None, "selected cases have no single COMSOL batch-manifest provenance"
-    batch_name = source_manifest.get("batch_name")
-    if not isinstance(batch_name, str) or not batch_name:
-        return None, None, "dataset batch-manifest provenance has no batch_name"
-    try:
-        raw_dir = common.paths.resolve_generated_batch_dir(batch_name, stage="raw")
-        timing_path = timing.comsol_solve_timing_path(batch_name)
-    except (TypeError, ValueError) as error:
-        return None, None, f"COMSOL timing path cannot be resolved: {error}"
-    manifest_path = raw_dir / "batch_manifest.json"
-    if not manifest_path.is_file() or not timing_path.is_file():
-        return None, None, "authoritative raw COMSOL manifest or processed solve timing is unavailable"
-    try:
-        current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        timing_payload = json.loads(timing_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        return None, None, f"COMSOL timing provenance is unreadable: {error}"
-    if current_manifest != source_manifest:
-        return None, None, "current COMSOL manifest differs from dataset source provenance"
-    try:
-        manifest_sha256 = common.serialization.file_sha256(manifest_path)
-    except OSError as error:
-        return None, None, f"COMSOL batch manifest cannot be hashed: {error}"
+    """Return timing only from the validated model-training metadata snapshot."""
+    package = request.dataset_metadata
+    if package is None:
+        return None, None, "validated model-training dataset metadata is unavailable"
+    source_batch = package.provenance.get("source_batch")
+    if not isinstance(source_batch, Mapping):
+        return None, None, "dataset metadata has no source-batch provenance"
+    manifest_sha256 = source_batch.get("batch_manifest_sha256")
+    if not isinstance(manifest_sha256, str):
+        return None, None, "dataset metadata has no source-manifest digest"
+    timing_payload = package.timing
+    if timing_payload is None:
+        coverage = package.provenance.get("timing")
+        status = coverage.get("status") if isinstance(coverage, Mapping) else "missing"
+        return None, None, f"validated model-training COMSOL timing snapshot is {status}"
     try:
         validated = timing.validate_comsol_solve_timing(timing_payload)
     except (TypeError, ValueError) as error:
-        return None, None, f"COMSOL solve timing is incompatible: {error}"
+        return None, None, f"COMSOL timing snapshot is incompatible: {error}"
     if validated["batch_manifest_sha256"] != manifest_sha256:
-        return None, None, "COMSOL solve timing does not bind the current batch manifest"
+        return None, None, "COMSOL timing snapshot does not bind the dataset metadata manifest"
+    if not validated["cases"]:
+        return None, None, "validated model-training COMSOL timing snapshot is missing"
     return validated, manifest_sha256, None
 
 
@@ -1680,6 +1676,7 @@ def _run_or_load_artifacts_locked(
     batch_size: int,
     device_resolution: learning.device.DeviceResolution,
     dataset_root: Path,
+    metadata_root: Path,
     rebuild: bool = False,
 ) -> pd.DataFrame:
     """
@@ -1705,7 +1702,9 @@ def _run_or_load_artifacts_locked(
     device_resolution : learning.device.DeviceResolution
         Immutable device decision resolved once at the artifact boundary.
     dataset_root : Path
-        Current independent dataset root.
+        Current final-dataset root.
+    metadata_root : Path
+        Current validated dataset-metadata root.
     rebuild : bool, optional
         Force staged regeneration and atomically replace only this target.
 
@@ -1739,6 +1738,7 @@ def _run_or_load_artifacts_locked(
         batch_size=batch_size,
         device_resolution=device_resolution,
         dataset_root=dataset_root,
+        metadata_root=metadata_root,
     )
     task = experiments.config.loader.validate_resolved_task_contract(_load_run_config(run_dir))
 
@@ -1979,6 +1979,7 @@ def run_or_load_artifacts(
     batch_size: int,
     device_resolution: learning.device.DeviceResolution,
     dataset_root: Path,
+    metadata_root: Path,
     rebuild: bool = False,
 ) -> pd.DataFrame:
     """
@@ -1999,7 +2000,9 @@ def run_or_load_artifacts(
     device_resolution : learning.device.DeviceResolution
         Device decision resolved once before any inference allocation.
     dataset_root : pathlib.Path
-        Independent merged-dataset root.
+        Final training-dataset root.
+    metadata_root : pathlib.Path
+        Validated dataset provenance and timing root.
     rebuild : bool, optional
         Replace only the observed target. A concurrent newer publication wins and
         is validated instead of being deleted.
@@ -2014,7 +2017,7 @@ def run_or_load_artifacts(
     ArtifactCacheError
         If existing schema, identity, aggregate, or payload evidence is invalid.
     FileNotFoundError
-        If a required completed-run or merged-dataset artifact is absent.
+        If a required completed-run or final-dataset artifact is absent.
     TypeError, ValueError, RuntimeError
         If request semantics, saved membership, device resolution, or generated
         payloads violate the current contract.
@@ -2049,6 +2052,7 @@ def run_or_load_artifacts(
             batch_size=batch_size,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
+            metadata_root=metadata_root,
             rebuild=effective_rebuild,
         )
 
@@ -2190,6 +2194,7 @@ def build_artifacts(
     *,
     runs_root: Path,
     dataset_root: Path,
+    metadata_root: Path | None = None,
     run_names: Iterable[str] | None = None,
     max_cases: int | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
@@ -2204,7 +2209,9 @@ def build_artifacts(
     runs_root : Path
         One completed run or a container of run directories.
     dataset_root : Path
-        Independent root containing immutable task datasets.
+        Derived raw root containing immutable final task datasets.
+    metadata_root : Path | None, optional
+        Bounded validated metadata-root override; defaults to training ``meta``.
     run_names : Iterable[str] | None, optional
         Explicit run names under ``runs_root``.
     max_cases : int | None, optional
@@ -2241,6 +2248,7 @@ def build_artifacts(
         device_policy,
         path="device_policy",
     )
+    resolved_metadata_root = Path(metadata_root) if metadata_root is not None else common.paths.get_training_meta_root()
     results: dict[str, dict[str, pd.DataFrame]] = {}
     for run_dir in iter_run_dirs(runs_root, run_names=run_names):
         plan = load_run_artifact_plan(run_dir)
@@ -2252,6 +2260,7 @@ def build_artifacts(
             batch_size=batch_size,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
+            metadata_root=resolved_metadata_root,
             rebuild=rebuild,
         )
         ood_frame = run_or_load_artifacts(
@@ -2262,6 +2271,7 @@ def build_artifacts(
             batch_size=batch_size,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
+            metadata_root=resolved_metadata_root,
             rebuild=rebuild,
         )
         results[run_dir.name] = {"eval": id_frame, "ood": ood_frame}

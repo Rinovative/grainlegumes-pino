@@ -21,10 +21,15 @@ this_file  = mfilename('fullpath');
 script_dir = fileparts(this_file);
 project_root = fullfile(script_dir, '..', '..', '..');
 project_root = char(java.io.File(project_root).getCanonicalPath());
+generated_data_root = getenv('GENERATED_DATA_ROOT');
+if isempty(generated_data_root)
+    generated_data_root = fullfile(project_root, 'data');
+end
+generated_data_root = char(java.io.File(generated_data_root).getCanonicalPath());
 
-raw_dir   = fullfile(project_root, 'data', 'raw', 'test');
+raw_dir   = fullfile(generated_data_root, 'raw', 'test');
 template_path = fullfile(project_root, 'comsol', 'template_brinkman.mph');
-output_dir    = fullfile(project_root, 'data', 'processed', 'test');
+output_dir    = fullfile(generated_data_root, 'processed', 'test');
 addpath(genpath(fullfile(project_root, 'matlab', 'functions')));
 
 %% --- Existenz prüfen ---

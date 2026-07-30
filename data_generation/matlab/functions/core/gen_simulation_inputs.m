@@ -25,12 +25,7 @@ if ~isfield(opts,'save_dir')
     if isempty(generated_data_root)
         generation_root = fullfile(this_dir, '..', '..', '..');
         generation_root = char(java.io.File(generation_root).getCanonicalPath());
-        storage_root = getenv('STORAGE_ROOT');
-        if isempty(storage_root)
-            repository_root = fileparts(generation_root);
-            storage_root = fullfile(fileparts(repository_root), 'storage');
-        end
-        generated_data_root = fullfile(storage_root, 'data_generation');
+        generated_data_root = fullfile(generation_root, 'data');
     end
     opts.save_dir = fullfile(generated_data_root, 'raw', 'test');
 end

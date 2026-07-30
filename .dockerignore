@@ -52,10 +52,8 @@ OneDrive*/
 # -------------------------------
 # 📊 PROJECT DATA
 # -------------------------------
-/data/
 /data_generation/data/
 /model_training/data/
-/logs/
 /outputs/
 /results/
 wandb/

@@ -162,7 +162,7 @@ def _validate_train_eval_partition(train_indices: Tensor, eval_indices: Tensor, 
 
 def _identity_from_mapping(value: Any, *, label: str) -> identity.DatasetIdentity:
     """
-    Reconstruct one exact persisted dataset identity without compatibility keys.
+    Reconstruct one exact persisted dataset identity without additional keys.
 
     The mapping must contain only logical identity, task/digest, fingerprint,
     ordered unique sample IDs, count, and positive spatial shape. String and
@@ -288,7 +288,8 @@ def validate_split_info(
     if missing or unexpected:
         msg = f"split_indices.pt schema keys do not match. Missing: {missing}; unexpected: {unexpected}."
         raise ValueError(msg)
-    if split_info.get("schema_version") != identity.SPLIT_SCHEMA_VERSION:
+    schema_version = split_info.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != identity.SPLIT_SCHEMA_VERSION:
         msg = f"split_indices.pt schema_version must be the current value {identity.SPLIT_SCHEMA_VERSION}."
         raise ValueError(msg)
 

@@ -16,7 +16,7 @@ Design principles:
   - Dataset comparisons never combine physical fields with incompatible units
 
 This module does NOT:
-  - Materialize merged datasets or infer undeclared task fields
+  - Load model-training datasets or infer undeclared task fields
   - Compare model predictions with references or inspect model activations
 ===============================================================================
 """

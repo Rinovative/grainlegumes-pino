@@ -1,12 +1,5 @@
 # ruff: noqa: S101
-"""
-Verify the semantic root API maps onto the established physical storage stages.
-
-Environment-isolated tests keep case preparation, merged datasets, generated
-sources, and outputs independent; they also reject traversal components and show
-output overrides cannot move inputs. Docker/cluster environment propagation is
-covered by ``test_cluster_queue_scripts``; no external storage is modified.
-"""
+"""Verify the two public data domains and their derived lifecycle paths."""
 
 from __future__ import annotations
 
@@ -16,51 +9,79 @@ import pytest
 from src import common, experiments
 
 
-def test_central_roots_are_independent(
+def test_two_public_domains_derive_owned_lifecycle_stages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Four distinct temporary roots are exported through their canonical variables.
-
-    Every getter and representative resolver must stay within its owned stage,
-    proving case preparation cannot collapse into merged inputs or run outputs.
-    """
-    data_root = tmp_path / "case-data"
-    dataset_root = tmp_path / "datasets"
-    generated_root = tmp_path / "generated"
-    output_root = tmp_path / "outputs"
-    monkeypatch.setenv("DATA_ROOT", str(data_root))
-    monkeypatch.setenv("DATASET_ROOT", str(dataset_root))
+    """Every generated and training path remains below exactly one public root."""
+    generated_root = tmp_path / "generated domain"
+    training_root = tmp_path / "training domain"
     monkeypatch.setenv("GENERATED_DATA_ROOT", str(generated_root))
-    monkeypatch.setenv("OUTPUT_ROOT", str(output_root))
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
 
-    assert common.paths.get_data_root() == data_root
-    assert common.paths.get_dataset_root() == dataset_root
     assert common.paths.get_generated_data_root() == generated_root
-    assert common.paths.get_output_root() == output_root
+    assert common.paths.get_generation_meta_root() == generated_root / "meta"
+    assert common.paths.get_generation_raw_root() == generated_root / "raw"
+    assert common.paths.get_generation_processed_root() == generated_root / "processed"
+    assert common.paths.get_model_training_data_root() == training_root
+    assert common.paths.get_training_meta_root() == training_root / "meta"
+    assert common.paths.get_training_raw_root() == training_root / "raw"
+    assert common.paths.get_training_processed_root() == training_root / "processed"
+    assert common.paths.get_dataset_root() == training_root / "raw"
+    assert common.paths.get_output_root() == training_root / "processed"
+
     assert common.paths.resolve_generated_batch_dir("tiny", stage="raw") == generated_root / "raw" / "tiny"
     assert common.paths.resolve_generated_batch_dir("tiny", stage="processed") == generated_root / "processed" / "tiny"
-    assert common.paths.resolve_case_dataset_dir("tiny") == data_root / "raw" / "tiny"
-    assert common.paths.resolve_dataset_path("tiny") == dataset_root / "tiny" / "tiny.pt"
-    assert common.paths.resolve_run_output_dir("steady_flow", "run") == (output_root / "steady_flow" / "runs" / "run")
+    assert common.paths.resolve_dataset_path("tiny") == training_root / "raw" / "tiny" / "tiny.pt"
+    assert common.paths.resolve_dataset_metadata_dir("tiny") == training_root / "meta" / "tiny"
+    assert common.paths.resolve_run_output_dir("steady_flow", "run") == (training_root / "processed" / "steady_flow" / "runs" / "run")
+    assert common.paths.resolve_study_dir("steady_flow", "study") == (training_root / "processed" / "steady_flow" / "studies" / "study")
+
+
+def test_repository_local_defaults_do_not_depend_on_host_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset domain overrides resolve only from the repository-local contract."""
+    project_root = tmp_path / "repository"
+    monkeypatch.setenv("PROJECT_ROOT", str(project_root))
+    monkeypatch.delenv("GENERATED_DATA_ROOT", raising=False)
+    monkeypatch.delenv("MODEL_TRAINING_DATA_ROOT", raising=False)
+
+    assert common.paths.get_generated_data_root() == project_root / "data_generation" / "data"
+    assert common.paths.get_model_training_data_root() == project_root / "model_training" / "data"
+
+
+def test_resolved_training_config_records_only_training_domain_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Training provenance resolves only its self-contained model-training domain."""
+    generated_root = tmp_path / "generated"
+    training_root = tmp_path / "training"
+    monkeypatch.setenv("GENERATED_DATA_ROOT", str(generated_root))
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
+    config = experiments.config.loader.load_and_resolve_config(
+        Path("model_training/configs/experiments/steady_flow_fno.yaml"),
+    )
+
+    assert config["paths"] == {
+        "project_root": str(common.paths.get_project_root()),
+        "model_training_data_root": str(training_root),
+        "training_meta_root": str(training_root / "meta"),
+        "dataset_root": str(training_root / "raw"),
+        "output_root": str(training_root / "processed"),
+    }
 
 
 def test_output_override_cannot_relocate_dataset_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Change only the resolved output root around one fixed experiment config.
-
-    Run paths must move while dataset paths remain byte-for-byte equal, protecting
-    the ownership boundary between saved outputs and immutable training inputs.
-    """
-    dataset_root = tmp_path / "datasets"
-    first_output_root = tmp_path / "outputs-a"
-    second_output_root = tmp_path / "outputs-b"
-    monkeypatch.setenv("DATASET_ROOT", str(dataset_root))
-    monkeypatch.setenv("OUTPUT_ROOT", str(first_output_root))
+    """A bounded output override moves runs but not immutable dataset inputs."""
+    training_root = tmp_path / "training"
+    second_output_root = tmp_path / "bounded outputs"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
     config = experiments.config.loader.load_and_resolve_config(
         Path("model_training/configs/experiments/steady_flow_fno.yaml"),
     )
@@ -87,7 +108,7 @@ def test_output_override_cannot_relocate_dataset_inputs(
 
     assert dataset_before == dataset_after
     assert run_before != run_after
-    assert dataset_after.is_relative_to(dataset_root)
+    assert dataset_after.is_relative_to(training_root / "raw")
     assert run_after.is_relative_to(second_output_root)
 
 
@@ -104,29 +125,19 @@ _INVALID_LOGICAL_NAMES = (
 
 
 def test_logical_name_validator_rejects_unsafe_components() -> None:
-    """
-    Pass empty, dot, traversal, separator, absolute, and whitespace-prefixed names.
-
-    Every hazard must fail as a logical component so callers cannot escape an
-    owning semantic root through an apparently ordinary identifier.
-    """
+    """Empty, traversal, separator, absolute, and untrimmed names are rejected."""
     for invalid_name in _INVALID_LOGICAL_NAMES:
         with pytest.raises(ValueError, match="single non-empty path component"):
             common.paths.validate_logical_name(invalid_name, label="logical name")
 
 
 def test_owned_path_resolvers_apply_logical_name_validation(tmp_path: Path) -> None:
-    """
-    Send the same traversal component through every owned path resolver.
-
-    Each boundary must reject it, proving central validation is not bypassed by
-    case, dataset, generated, run, study, or analysis path construction.
-    """
+    """Every public resolver rejects traversal at its ownership boundary."""
     invalid_name = "../escape"
     with pytest.raises(ValueError, match="single non-empty path component"):
-        common.paths.resolve_case_dataset_dir(invalid_name, data_root=tmp_path)
-    with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_dataset_path(invalid_name, dataset_root=tmp_path)
+    with pytest.raises(ValueError, match="single non-empty path component"):
+        common.paths.resolve_dataset_metadata_dir(invalid_name, metadata_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_generated_batch_dir(invalid_name, stage="raw", generated_data_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):

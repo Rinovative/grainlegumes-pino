@@ -18,7 +18,6 @@ import torch
 from src import common
 
 COMSOL_SOLVE_TIMING_FILENAME = "comsol_solve_timing.json"
-COMSOL_SOLVE_TIMING_STAGE = "processed"
 RUNTIME_COMPARISON_FILENAME = "runtime_comparison.json"
 COMSOL_SOLVE_SCHEMA_KIND = "comsol_solve_timing"
 RUNTIME_COMPARISON_SCHEMA_KIND = "comsol_neural_operator_runtime_comparison"
@@ -27,22 +26,6 @@ WARMUP_PASSES = 1
 MEASUREMENT_CLOCK = "time.perf_counter_ns"
 _SHA256_HEX_LENGTH = 64
 _SUMMARY_FIELDS = {"count", "mean", "median", "p10", "p90"}
-
-
-def comsol_solve_timing_path(
-    batch_name: str,
-    *,
-    generated_data_root: Path | str | None = None,
-) -> Path:
-    """Return the authoritative sidecar beside one batch's processed COMSOL results."""
-    return (
-        common.paths.resolve_generated_batch_dir(
-            batch_name,
-            stage=COMSOL_SOLVE_TIMING_STAGE,
-            generated_data_root=generated_data_root,
-        )
-        / COMSOL_SOLVE_TIMING_FILENAME
-    )
 
 
 def _is_schema_version(value: Any) -> bool:
@@ -280,8 +263,8 @@ def validate_comsol_solve_timing(value: Any) -> dict[str, Any]:
         duration = _duration(value_case.get("comsol_solve_s"), label=f"COMSOL case {position} solve duration")
         case_ids.append(case_id)
         cases.append({"case_id": case_id, "comsol_solve_s": duration})
-    if case_ids != sorted(case_ids) or len(case_ids) != len(set(case_ids)):
-        msg = "COMSOL solve timing case IDs must be unique and sorted."
+    if len(case_ids) != len(set(case_ids)):
+        msg = "COMSOL solve timing case IDs must be unique."
         raise ValueError(msg)
     summary = _summary([case["comsol_solve_s"] for case in cases])
 
@@ -295,9 +278,29 @@ def validate_comsol_solve_timing(value: Any) -> dict[str, Any]:
         "p10_s": matlab_optional(summary["p10"]),
         "p90_s": matlab_optional(summary["p90"]),
     }
-    if not isinstance(payload.get("aggregates"), Mapping) or dict(payload["aggregates"]) != expected_aggregates:
+    aggregates = payload.get("aggregates")
+    if not isinstance(aggregates, Mapping) or set(aggregates) != set(expected_aggregates):
         msg = "COMSOL solve aggregates must be derived from valid case records."
         raise ValueError(msg)
+    if aggregates["measured_case_count"] != expected_aggregates["measured_case_count"]:
+        msg = "COMSOL solve aggregates must be derived from valid case records."
+        raise ValueError(msg)
+    for field in ("mean_s", "median_s", "p10_s", "p90_s"):
+        actual = aggregates[field]
+        expected_value = expected_aggregates[field]
+        if isinstance(expected_value, list):
+            valid = actual == []
+        else:
+            valid = (
+                isinstance(expected_value, Real)
+                and not isinstance(actual, bool)
+                and isinstance(actual, Real)
+                and math.isfinite(float(actual))
+                and math.isclose(float(actual), float(expected_value), rel_tol=1e-12, abs_tol=1e-12)
+            )
+        if not valid:
+            msg = "COMSOL solve aggregates must be derived from valid case records."
+            raise ValueError(msg)
     return payload
 
 

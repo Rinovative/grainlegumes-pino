@@ -7,7 +7,7 @@ Enforce repository-specific notebook lifecycle and cleared-state contracts.
 Responsibilities:
   - Require the exact maintained and archived notebook inventory
   - Require maintained notebooks to contain cleared runnable code cells
-  - Require retired workflows to remain Markdown-only archive notices
+  - Require notice-only notebooks to remain Markdown-only
   - Parse notebook-format-4 JSON without executing or rewriting notebooks
 
 Design principles:
@@ -44,7 +44,7 @@ NotebookRole = Literal["maintained", "archived"]
 
 def _notebook_cells(path: Path) -> Sequence[Mapping[str, Any]]:
     """
-    Return structurally usable version-4 cells from one notebook JSON file.
+    Return structurally usable nbformat-4 cells from one notebook JSON file.
 
     Parameters
     ----------

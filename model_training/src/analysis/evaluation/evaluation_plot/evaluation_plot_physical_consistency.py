@@ -5,7 +5,7 @@ evaluation_plot_physical_consistency.py
 Compare steady-flow momentum, dual-continuity, and pressure-boundary evidence.
 
 Responsibilities:
-  - Plot scalar residual distributions from current schema-4 artifact tables
+  - Plot scalar residual distributions from current artifact tables
   - Render full-grid ``Rx``, ``Ry``, ``div_u``, and ``div_eps_u`` fields
   - Keep inlet MSE and squared per-sample outlet-mean pressure distinguishable
   - Annotate, but never substitute, the continuity selected during training

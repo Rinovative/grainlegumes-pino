@@ -18,6 +18,12 @@ from typing import Any
 
 _NOTEBOOK_ROOT = Path(__file__).resolve().parents[2] / "notebooks"
 _TRAINING_NOTEBOOK = _NOTEBOOK_ROOT / "training_pipeline.ipynb"
+_MAINTAINED_NOTEBOOKS = (
+    "eda.ipynb",
+    "training_pipeline.ipynb",
+    "eval_single_model.ipynb",
+    "eval_comparison_models.ipynb",
+)
 
 
 def _payload(path: Path) -> dict[str, Any]:
@@ -42,6 +48,70 @@ def _joined_source(payload: dict[str, Any]) -> str:
     code cells available for syntax parsing in the dedicated test.
     """
     return "\n".join("".join(cell.get("source", [])) for cell in payload["cells"])
+
+
+def _notebook_source(name: str) -> str:
+    """Return combined maintained notebook source by declared filename."""
+    return _joined_source(_payload(_NOTEBOOK_ROOT / name))
+
+
+def test_all_maintained_notebooks_are_cleared() -> None:
+    """All maintained notebooks remain executable examples without saved outputs."""
+    for name in _MAINTAINED_NOTEBOOKS:
+        payload = _payload(_NOTEBOOK_ROOT / name)
+        code_cells = [cell for cell in payload["cells"] if cell.get("cell_type") == "code"]
+        assert code_cells
+        assert all(cell.get("execution_count") is None and cell.get("outputs") == [] for cell in code_cells)
+
+
+def test_eda_notebook_reads_only_generated_sources() -> None:
+    """EDA resolves generation meta/raw/processed and never crosses into training data."""
+    source = _notebook_source("eda.ipynb")
+    for required in (
+        "common.paths.get_generated_data_root()",
+        "common.paths.get_generation_meta_root()",
+        "common.paths.get_generation_raw_root()",
+        "common.paths.get_generation_processed_root()",
+        "generated_data_root=GENERATED_DATA_ROOT",
+    ):
+        assert required in source
+    for forbidden in ("get_model_training_data_root", "get_training_", "dataset_root="):
+        assert forbidden not in source
+
+
+def test_training_notebook_uses_training_raw_and_processed_boundaries() -> None:
+    """Training may diagnose both domains but consumes and writes only its owned stages."""
+    source = _notebook_source("training_pipeline.ipynb")
+    for required in (
+        "common.paths.get_generated_data_root()",
+        "common.paths.get_model_training_data_root()",
+        "common.paths.get_training_meta_root()",
+        "common.paths.get_training_raw_root()",
+        "common.paths.get_training_processed_root()",
+        "dataset_root=TRAINING_RAW_ROOT",
+        'TRAINING_PROCESSED_ROOT / task.id / "acceptance"',
+    ):
+        assert required in source
+    for forbidden in ("common.paths.get_dataset_root()", "common.paths.get_output_root()"):
+        assert forbidden not in source
+
+
+def test_evaluation_notebooks_use_only_model_training_data() -> None:
+    """Evaluation resolves metadata, final datasets, and runs without generation access."""
+    for name in ("eval_single_model.ipynb", "eval_comparison_models.ipynb"):
+        source = _notebook_source(name)
+        for required in (
+            "common.paths.get_model_training_data_root()",
+            "common.paths.get_training_meta_root()",
+            "common.paths.get_training_raw_root()",
+            "common.paths.get_training_processed_root()",
+            "metadata_root=TRAINING_META_ROOT",
+            "dataset_root=TRAINING_RAW_ROOT",
+            "output_root=TRAINING_PROCESSED_ROOT",
+        ):
+            assert required in source
+        for forbidden in ("get_generated_data_root", "get_generation_"):
+            assert forbidden not in source
 
 
 def test_training_notebook_is_cleared_and_mutation_safe_by_default() -> None:
@@ -106,12 +176,7 @@ def test_maintained_code_cells_parse_and_sensitivity_stays_archived() -> None:
     Every maintained cell must be valid Python, while sensitivity remains a
     Markdown-only archival notice rather than a second executable workflow.
     """
-    for name in (
-        "eda.ipynb",
-        "training_pipeline.ipynb",
-        "eval_single_model.ipynb",
-        "eval_comparison_models.ipynb",
-    ):
+    for name in _MAINTAINED_NOTEBOOKS:
         payload = _payload(_NOTEBOOK_ROOT / name)
         for index, cell in enumerate(payload["cells"]):
             if cell.get("cell_type") == "code":
