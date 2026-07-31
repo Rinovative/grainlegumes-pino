@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +16,8 @@ import pytest
 import torch
 from src import common, datasets, domain
 
-from data_generation.matlab import build_batch_dataset as builder_module
-from data_generation.matlab.build_batch_dataset import build_batch_dataset
+from data_generation import build_training_dataset as builder_module
+from data_generation.build_training_dataset import build_batch_dataset
 
 _SOLUTION_HEADER = (
     "% Length unit,m\n"
@@ -302,9 +304,69 @@ def test_direct_builder_publishes_one_final_dataset_and_metadata(
     assert "timestamp" not in payload["source_metadata"][0]
     assert loaded[0]["meta"] == payload["source_metadata"][0]
     assert package.timing is not None
-    assert package.provenance["timing"] == {"status": "partial", "measured_case_count": 1, "intended_case_count": 2}
+    assert package.timing_summary == {"status": "partial", "measured_case_count": 1, "intended_case_count": 2}
     assert not list(training_root.rglob("case_*.pt"))
     assert not list(training_root.rglob("meta.pt"))
+    lock_path = common.paths.resolve_dataset_build_lock_path(
+        "synthetic",
+        model_training_data_root=training_root,
+    )
+    transaction_path = common.paths.resolve_dataset_build_transaction_path(
+        "synthetic",
+        model_training_data_root=training_root,
+    )
+    assert lock_path.is_file()
+    assert lock_path.stat().st_size == 0
+    assert not transaction_path.exists()
+    assert not list(transaction_path.parent.iterdir())
+    assert not (training_root / "processed").exists()
+
+
+def test_active_dataset_lock_rejects_builder_and_persistent_anchor_is_harmless(tmp_path: Path) -> None:
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root)
+    training_root = tmp_path / "training"
+    lock_path = common.paths.resolve_dataset_build_lock_path(
+        "synthetic",
+        model_training_data_root=training_root,
+    )
+    acquired = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_lock() -> None:
+        try:
+            with common.locking.exclusive_file_lock(lock_path, blocking=False):
+                acquired.set()
+                release.wait(timeout=10)
+        except (OSError, common.locking.FileLockUnavailableError) as error:
+            errors.append(error)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5)
+        with pytest.raises(common.locking.FileLockUnavailableError, match="already held"):
+            build_batch_dataset(
+                "synthetic",
+                generated_data_root=generated_root,
+                model_training_data_root=training_root,
+            )
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert not holder.is_alive()
+    assert not errors
+    assert lock_path.is_file()
+    assert lock_path.stat().st_size == 0
+
+    result = build_batch_dataset(
+        "synthetic",
+        generated_data_root=generated_root,
+        model_training_data_root=training_root,
+    )
+    assert result["status"] == "complete"
+    assert lock_path.is_file()
 
 
 def test_manifest_order_drives_final_sample_order(tmp_path: Path) -> None:
@@ -513,6 +575,249 @@ def test_builder_validates_parameter_sample_metadata(tmp_path: Path, corruption:
         build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=tmp_path / "training")
 
 
+def _source_sample_contract(root: Path) -> tuple[bytes, bytes, dict[str, Any]]:
+    meta_dir, raw_dir, _processed_dir = _write_generated_batch(root)
+    sample_csv = (meta_dir / "synthetic.csv").read_bytes()
+    sample_json = (meta_dir / "synthetic.json").read_bytes()
+    manifest = json.loads((raw_dir / "batch_manifest.json").read_text(encoding="utf-8"))
+    return sample_csv, sample_json, manifest
+
+
+def test_public_source_sample_boundary_accepts_semantic_agreement(tmp_path: Path) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+
+    semantics = datasets.metadata.validate_source_sample_semantics(
+        sample_csv,
+        sample_json,
+        source_manifest=manifest,
+    )
+
+    assert semantics.case_ids == ("case_0001", "case_0002")
+    assert semantics.parameter_names == ("alpha",)
+    assert semantics.parameter_rows == ({"alpha": 0.1}, {"alpha": 0.2})
+    assert semantics.sampling == {
+        "method": "lhs",
+        "variation": 0.2,
+        "N": 2,
+        "seed": 17,
+        "base": {"alpha": 0.1},
+        "param_names": ["alpha"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("seed", 18, "meta.seed"),
+        ("method", "uniform", "meta.method"),
+        ("variation", 0.3, "meta.variation"),
+    ],
+)
+def test_public_source_sample_boundary_rejects_generation_configuration_mismatch(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+    message: str,
+) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    payload = json.loads(sample_json)
+    payload["meta"][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        datasets.metadata.validate_source_sample_semantics(
+            sample_csv,
+            json.dumps(payload).encode(),
+            source_manifest=manifest,
+        )
+
+
+@pytest.mark.parametrize(("field", "value"), [("N", True), ("seed", False), ("N", 2.0)])
+def test_public_source_sample_boundary_rejects_malformed_integer_fields(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    payload = json.loads(sample_json)
+    payload["meta"][field] = value
+
+    with pytest.raises(ValueError, match=r"must be a (positive|non-negative) integer"):
+        datasets.metadata.validate_source_sample_semantics(
+            sample_csv,
+            json.dumps(payload).encode(),
+            source_manifest=manifest,
+        )
+
+
+def test_public_source_sample_boundary_rejects_case_count_mismatch(tmp_path: Path) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    payload = json.loads(sample_json)
+    payload["n_cases"] = 3
+
+    with pytest.raises(ValueError, match="n_cases"):
+        datasets.metadata.validate_source_sample_semantics(
+            sample_csv,
+            json.dumps(payload).encode(),
+            source_manifest=manifest,
+        )
+
+
+def test_public_source_sample_boundary_rejects_csv_json_row_count_mismatch(tmp_path: Path) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    shortened_csv = ("\n".join(sample_csv.decode().splitlines()[:-1]) + "\n").encode()
+    manifest["configuration"]["sample_sha256"] = hashlib.sha256(shortened_csv).hexdigest()
+
+    with pytest.raises(ValueError, match="row count"):
+        datasets.metadata.validate_source_sample_semantics(
+            shortened_csv,
+            sample_json,
+            source_manifest=manifest,
+        )
+
+
+def test_public_source_sample_boundary_rejects_ordered_sample_id_mismatch(tmp_path: Path) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    lines = sample_csv.decode().splitlines()
+    reordered_csv = ("\n".join([lines[0], lines[2], lines[1]]) + "\n").encode()
+    manifest["configuration"]["sample_sha256"] = hashlib.sha256(reordered_csv).hexdigest()
+
+    with pytest.raises(ValueError, match="ordered sample IDs"):
+        datasets.metadata.validate_source_sample_semantics(
+            reordered_csv,
+            sample_json,
+            source_manifest=manifest,
+        )
+
+
+def test_public_source_sample_boundary_rejects_variable_name_mismatch(tmp_path: Path) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    payload = json.loads(sample_json)
+    payload["meta"]["param_names"] = ["beta"]
+
+    with pytest.raises(ValueError, match="columns"):
+        datasets.metadata.validate_source_sample_semantics(
+            sample_csv,
+            json.dumps(payload).encode(),
+            source_manifest=manifest,
+        )
+
+
+def test_source_sample_timestamp_is_operational_not_scientific_identity(tmp_path: Path) -> None:
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    changed = json.loads(sample_json)
+    changed["meta"]["timestamp"] = "2099-12-31 23:59:59"
+
+    original = datasets.metadata.validate_source_sample_semantics(
+        sample_csv,
+        sample_json,
+        source_manifest=manifest,
+    )
+    updated_semantics = datasets.metadata.validate_source_sample_semantics(
+        sample_csv,
+        json.dumps(changed).encode(),
+        source_manifest=manifest,
+    )
+
+    assert original.generated_batch_identity == updated_semantics.generated_batch_identity
+    assert original.sampling == updated_semantics.sampling
+
+
+def test_metadata_rejects_hash_rebound_json_seed_mismatch(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    sample_path = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME
+    sample = json.loads(sample_path.read_text(encoding="utf-8"))
+    sample["meta"]["seed"] = 18
+    sample_path.write_text(json.dumps(sample), encoding="utf-8")
+    metadata_path = result["metadata_path"] / datasets.metadata.METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    snapshot = metadata["artifacts"]["snapshots"][datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME]
+    snapshot["sha256"] = _sha256(sample_path)
+    snapshot["size_bytes"] = sample_path.stat().st_size
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"meta\.seed"):
+        datasets.metadata.validate_dataset_metadata_directory(
+            result["metadata_path"],
+            dataset_identity=identity,
+        )
+
+
+def test_metadata_rejects_hash_rebound_sampling_base_mismatch_with_final_identity(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    sample_path = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME
+    sample = json.loads(sample_path.read_text(encoding="utf-8"))
+    sample["meta"]["base"]["alpha"] = 0.2
+    sample_path.write_text(json.dumps(sample), encoding="utf-8")
+    metadata_path = result["metadata_path"] / datasets.metadata.METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    snapshot = metadata["artifacts"]["snapshots"][datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME]
+    snapshot["sha256"] = _sha256(sample_path)
+    snapshot["size_bytes"] = sample_path.stat().st_size
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="final generated-batch scientific identity"):
+        datasets.metadata.validate_dataset_metadata_directory(
+            result["metadata_path"],
+            dataset_identity=identity,
+        )
+
+
+def test_source_sample_values_are_bound_to_final_payload_metadata(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    assert identity.source_metadata is not None
+    source_metadata = [dict(value) for value in identity.source_metadata]
+    source_metadata[0] = {**source_metadata[0], "parameters": {"alpha": 9.9}}
+    inconsistent_identity = replace(identity, source_metadata=tuple(source_metadata))
+
+    with pytest.raises(ValueError, match=r"parameters.alpha.*source-sample CSV"):
+        datasets.metadata.validate_dataset_metadata_directory(
+            result["metadata_path"],
+            dataset_identity=inconsistent_identity,
+        )
+
+
+@pytest.mark.parametrize("dataset_id", ["lhs_var80_seed3001", "lhs_var120_seed4001"])
+def test_current_production_metadata_package_passes_read_only_cross_binding(dataset_id: str) -> None:
+    model_training_root = Path(__file__).parents[2]
+    metadata_dir = model_training_root / "data/meta" / dataset_id
+    metadata = json.loads((metadata_dir / datasets.metadata.METADATA_FILENAME).read_text(encoding="utf-8"))
+    manifest = json.loads((metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    scientific = metadata["scientific_identity"]
+    identity = datasets.identity.DatasetIdentity(
+        dataset_id=dataset_id,
+        task=scientific["task_id"],
+        task_contract_digest=scientific["task_contract_digest"],
+        fingerprint=scientific["dataset_fingerprint"],
+        sample_ids=tuple(manifest["intended_case_ids"]),
+        sample_count=scientific["sample_count"],
+        spatial_shape=tuple(scientific["spatial_shape"]),
+        generated_batch_identity_sha256=scientific["generated_batch_identity_sha256"],
+    )
+
+    package = datasets.metadata.validate_dataset_metadata_directory(
+        metadata_dir,
+        dataset_identity=identity,
+    )
+
+    assert package.source_manifest["intended_case_ids"] == manifest["intended_case_ids"]
+    assert package.metadata["scientific_identity"]["generated_batch_identity_sha256"] == scientific["generated_batch_identity_sha256"]
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -663,24 +968,91 @@ def test_direct_builder_rejects_timing_aggregate_corruption(tmp_path: Path) -> N
 def test_failed_build_and_overwrite_refusal_leave_authoritative_targets_intact(tmp_path: Path) -> None:
     result, generated_root, training_root = _build(tmp_path)
     original_dataset_hash = _sha256(result["dataset_path"])
-    original_inventory_hash = _sha256(result["metadata_path"] / "metadata_inventory.json")
+    original_metadata_hash = _sha256(result["metadata_path"] / datasets.metadata.METADATA_FILENAME)
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=training_root)
     assert _sha256(result["dataset_path"]) == original_dataset_hash
-    assert _sha256(result["metadata_path"] / "metadata_inventory.json") == original_inventory_hash
+    assert _sha256(result["metadata_path"] / datasets.metadata.METADATA_FILENAME) == original_metadata_hash
 
 
-def test_metadata_inventory_detects_snapshot_tampering(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
+def test_consolidated_metadata_package_has_exact_owned_membership(tmp_path: Path) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    assert {path.name for path in result["metadata_path"].iterdir()} == {
+        datasets.metadata.METADATA_FILENAME,
+        datasets.metadata.SOURCE_MANIFEST_FILENAME,
+        datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME,
+        datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME,
+        datasets.metadata.COMSOL_TIMING_FILENAME,
+    }
+    metadata = json.loads((result["metadata_path"] / datasets.metadata.METADATA_FILENAME).read_text(encoding="utf-8"))
+    assert metadata["schema_kind"] == datasets.metadata.METADATA_SCHEMA_KIND
+    assert metadata["schema_version"] == 1
+    assert metadata["artifacts"]["dataset"] == {
+        "filename": "synthetic.pt",
+        "sha256": _sha256(result["dataset_path"]),
+        "size_bytes": result["dataset_path"].stat().st_size,
+    }
+    assert set(metadata["artifacts"]["snapshots"]) == {
+        datasets.metadata.SOURCE_MANIFEST_FILENAME,
+        datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME,
+        datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME,
+        datasets.metadata.COMSOL_TIMING_FILENAME,
+    }
+
+
+def test_incomplete_metadata_package_is_rejected(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    (result["metadata_path"] / datasets.metadata.METADATA_FILENAME).unlink()
+    with pytest.raises(ValueError, match=r"missing=.*dataset_metadata\.json"):
+        datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
+
+
+def test_metadata_generated_batch_digest_is_bound_to_final_dataset(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    metadata_path = result["metadata_path"] / datasets.metadata.METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["scientific_identity"]["generated_batch_identity_sha256"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="scientific identity does not match"):
+        datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
+
+
+def test_dataset_artifact_hash_binding_detects_file_mutation(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
+    result, _generated_root, _training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
+    result["dataset_path"].write_bytes(result["dataset_path"].read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="does not match dataset metadata SHA-256 and size"):
+        datasets.metadata.validate_dataset_metadata_directory(
+            result["metadata_path"],
+            dataset_identity=identity,
+            dataset_path=result["dataset_path"],
+        )
+
+
+def test_dataset_metadata_detects_snapshot_tampering(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
     sample_snapshot = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
     sample_snapshot.write_bytes(sample_snapshot.read_bytes() + b"tampered")
     with pytest.raises(ValueError, match="hash or size mismatch"):
-        datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
+        datasets.metadata.validate_dataset_metadata_directory(
+            result["metadata_path"],
+            dataset_identity=identity,
+            dataset_path=result["dataset_path"],
+        )
 
 
-def test_metadata_manifest_binding_rejects_inventory_rebound_sample_csv(
+def test_metadata_manifest_binding_rejects_rebound_sample_csv(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
@@ -690,12 +1062,12 @@ def test_metadata_manifest_binding_rejects_inventory_rebound_sample_csv(
     sample_snapshot = result["metadata_path"] / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
     sample_snapshot.write_bytes(sample_snapshot.read_bytes() + b"tampered")
 
-    inventory_path = result["metadata_path"] / datasets.metadata.INVENTORY_FILENAME
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-    sample_entry = inventory["files"][datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME]
+    metadata_path = result["metadata_path"] / datasets.metadata.METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    sample_entry = metadata["artifacts"]["snapshots"][datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME]
     sample_entry["sha256"] = _sha256(sample_snapshot)
     sample_entry["size_bytes"] = sample_snapshot.stat().st_size
-    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     with pytest.raises(ValueError, match="does not match the source manifest SHA-256"):
         datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
@@ -708,17 +1080,10 @@ def test_metadata_rejects_mutated_dataset_schema_version(
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
-    provenance_path = result["metadata_path"] / datasets.metadata.PROVENANCE_FILENAME
-    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-    provenance["dataset_schema_version"] = datasets.identity.TRAINING_DATASET_SCHEMA_VERSION + 1
-    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
-
-    inventory_path = result["metadata_path"] / datasets.metadata.INVENTORY_FILENAME
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-    provenance_entry = inventory["files"][datasets.metadata.PROVENANCE_FILENAME]
-    provenance_entry["sha256"] = _sha256(provenance_path)
-    provenance_entry["size_bytes"] = provenance_path.stat().st_size
-    inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+    metadata_path = result["metadata_path"] / datasets.metadata.METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["scientific_identity"]["dataset_schema_version"] = datasets.identity.TRAINING_DATASET_SCHEMA_VERSION + 1
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     with pytest.raises(ValueError, match="dataset_schema_version must be integer 1"):
         datasets.metadata.validate_dataset_metadata_directory(result["metadata_path"], dataset_identity=identity)
@@ -729,10 +1094,10 @@ def test_publication_transaction_requires_integer_version_one(
     tmp_path: Path,
     schema_version: Any,
 ) -> None:
-    processed_root = tmp_path / "training" / "processed"
-    staging_root = processed_root / ".synthetic.dataset-build.invalid-version.tmp"
+    training_root = tmp_path / "training"
+    staging_root = training_root / ".synthetic.dataset-build.invalid-version.tmp"
     staging_root.mkdir(parents=True)
-    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
     record = builder_module._publication_transaction_record(
         dataset_id="synthetic",
         phase="building",
@@ -744,7 +1109,7 @@ def test_publication_transaction_requires_integer_version_one(
     with pytest.raises(RuntimeError, match="invalid identity or scalar fields"):
         builder_module._load_publication_transaction(
             transaction_path,
-            training_processed_root=processed_root,
+            training_root=training_root,
             dataset_id="synthetic",
         )
 
@@ -761,6 +1126,10 @@ def test_direct_builder_publication_failure_leaves_no_authoritative_target(
     training_root = tmp_path / "training"
     dataset_target = training_root / "raw" / "synthetic"
     metadata_target = training_root / "meta" / "synthetic"
+    transaction_path = common.paths.resolve_dataset_build_transaction_path(
+        "synthetic",
+        model_training_data_root=training_root,
+    )
     original_replace = Path.replace
 
     def fail_selected_publication(source: Path, target: Path | str) -> Path:
@@ -779,7 +1148,13 @@ def test_direct_builder_publication_failure_leaves_no_authoritative_target(
         )
     assert not dataset_target.exists()
     assert not metadata_target.exists()
-    assert not list((training_root / "processed").glob(".synthetic.dataset-build.*"))
+    assert transaction_path.is_file()
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    assert transaction["phase"] == "ready"
+    staging_root = Path(transaction["staging_root"])
+    assert (staging_root / "raw" / "synthetic" / "synthetic.pt").is_file()
+    assert (staging_root / "meta" / "synthetic" / datasets.metadata.METADATA_FILENAME).is_file()
+    assert not (training_root / "processed").exists()
 
 
 @pytest.mark.parametrize(
@@ -794,14 +1169,13 @@ def test_ready_publication_transaction_recovers_every_rename_boundary(
     result, generated_root, training_root = _build(tmp_path)
     dataset_dir = result["dataset_path"].parent
     metadata_dir = result["metadata_path"]
-    processed_root = training_root / "processed"
-    staging_root = processed_root / ".synthetic.dataset-build.recovery.tmp"
+    staging_root = training_root / ".synthetic.dataset-build.recovery.tmp"
     staging_root.mkdir()
     staged_dataset_dir = staging_root / "raw" / "synthetic"
     staged_metadata_dir = staging_root / "meta" / "synthetic"
     dataset_sha256 = _sha256(result["dataset_path"])
     dataset_size = result["dataset_path"].stat().st_size
-    inventory_sha256 = _sha256(metadata_dir / datasets.metadata.INVENTORY_FILENAME)
+    metadata_sha256 = _sha256(metadata_dir / datasets.metadata.METADATA_FILENAME)
 
     if state in {"both_staged", "metadata_final"}:
         staged_dataset_dir.parent.mkdir(parents=True)
@@ -810,7 +1184,7 @@ def test_ready_publication_transaction_recovers_every_rename_boundary(
         staged_metadata_dir.parent.mkdir(parents=True)
         metadata_dir.replace(staged_metadata_dir)
 
-    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
     common.serialization.atomic_write_json(
         transaction_path,
         builder_module._publication_transaction_record(
@@ -819,7 +1193,7 @@ def test_ready_publication_transaction_recovers_every_rename_boundary(
             staging_root=staging_root,
             dataset_sha256=dataset_sha256,
             dataset_size=dataset_size,
-            metadata_inventory_sha256=inventory_sha256,
+            dataset_metadata_sha256=metadata_sha256,
         ),
     )
     raw_source = generated_root / "raw" / "synthetic" / "case_0001.csv"
@@ -847,8 +1221,7 @@ def test_private_progress_blocks_ready_transaction_recovery(tmp_path: Path) -> N
     result, generated_root, training_root = _build(tmp_path)
     dataset_dir = result["dataset_path"].parent
     metadata_dir = result["metadata_path"]
-    processed_root = training_root / "processed"
-    staging_root = processed_root / ".synthetic.dataset-build.progress-recovery.tmp"
+    staging_root = training_root / ".synthetic.dataset-build.progress-recovery.tmp"
     staging_root.mkdir()
     staged_dataset_dir = staging_root / "raw" / "synthetic"
     staged_metadata_dir = staging_root / "meta" / "synthetic"
@@ -856,7 +1229,7 @@ def test_private_progress_blocks_ready_transaction_recovery(tmp_path: Path) -> N
     staged_metadata_dir.parent.mkdir(parents=True)
     dataset_dir.replace(staged_dataset_dir)
     metadata_dir.replace(staged_metadata_dir)
-    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
     common.serialization.atomic_write_json(
         transaction_path,
         builder_module._publication_transaction_record(
@@ -865,7 +1238,7 @@ def test_private_progress_blocks_ready_transaction_recovery(tmp_path: Path) -> N
             staging_root=staging_root,
             dataset_sha256=_sha256(staged_dataset_dir / "synthetic.pt"),
             dataset_size=(staged_dataset_dir / "synthetic.pt").stat().st_size,
-            metadata_inventory_sha256=_sha256(staged_metadata_dir / datasets.metadata.INVENTORY_FILENAME),
+            dataset_metadata_sha256=_sha256(staged_metadata_dir / datasets.metadata.METADATA_FILENAME),
         ),
     )
     _write_private_batch_progress(generated_root / "raw" / "synthetic")
@@ -900,8 +1273,7 @@ def test_source_change_during_ready_recovery_blocks_remaining_renames(
     result, generated_root, training_root = _build(tmp_path)
     dataset_dir = result["dataset_path"].parent
     metadata_dir = result["metadata_path"]
-    processed_root = training_root / "processed"
-    staging_root = processed_root / ".synthetic.dataset-build.recovery-race.tmp"
+    staging_root = training_root / ".synthetic.dataset-build.recovery-race.tmp"
     staging_root.mkdir()
     staged_dataset_dir = staging_root / "raw" / "synthetic"
     staged_metadata_dir = staging_root / "meta" / "synthetic"
@@ -909,7 +1281,7 @@ def test_source_change_during_ready_recovery_blocks_remaining_renames(
     staged_metadata_dir.parent.mkdir(parents=True)
     dataset_dir.replace(staged_dataset_dir)
     metadata_dir.replace(staged_metadata_dir)
-    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
     common.serialization.atomic_write_json(
         transaction_path,
         builder_module._publication_transaction_record(
@@ -918,7 +1290,7 @@ def test_source_change_during_ready_recovery_blocks_remaining_renames(
             staging_root=staging_root,
             dataset_sha256=_sha256(staged_dataset_dir / "synthetic.pt"),
             dataset_size=(staged_dataset_dir / "synthetic.pt").stat().st_size,
-            metadata_inventory_sha256=_sha256(staged_metadata_dir / datasets.metadata.INVENTORY_FILENAME),
+            dataset_metadata_sha256=_sha256(staged_metadata_dir / datasets.metadata.METADATA_FILENAME),
         ),
     )
     raw_dir = generated_root / "raw" / "synthetic"
@@ -953,15 +1325,60 @@ def test_source_change_during_ready_recovery_blocks_remaining_renames(
     assert staged_metadata_dir.is_dir()
 
 
+def test_interrupted_build_retains_inspectable_transaction_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated_root = tmp_path / "generated"
+    _write_generated_batch(generated_root)
+    training_root = tmp_path / "training"
+    transaction_path = common.paths.resolve_dataset_build_transaction_path(
+        "synthetic",
+        model_training_data_root=training_root,
+    )
+    original_interpret = builder_module._interpret_generated_case
+    interrupted = False
+
+    def interrupt_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("injected interruption")
+        return original_interpret(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "_interpret_generated_case", interrupt_once)
+    with pytest.raises(RuntimeError, match="injected interruption"):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=training_root,
+        )
+
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    staging_root = Path(transaction["staging_root"])
+    assert transaction["phase"] == "building"
+    assert staging_root.is_dir()
+    assert not (training_root / "raw/synthetic").exists()
+    assert not (training_root / "meta/synthetic").exists()
+
+    result = build_batch_dataset(
+        "synthetic",
+        generated_data_root=generated_root,
+        model_training_data_root=training_root,
+    )
+    assert result["status"] == "complete"
+    assert not transaction_path.exists()
+    assert not staging_root.exists()
+
+
 def test_building_publication_transaction_is_discarded_before_retry(tmp_path: Path) -> None:
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
-    processed_root = training_root / "processed"
-    staging_root = processed_root / ".synthetic.dataset-build.interrupted.tmp"
+    staging_root = training_root / ".synthetic.dataset-build.interrupted.tmp"
     staging_root.mkdir(parents=True)
     (staging_root / "partial.tmp").write_text("incomplete", encoding="utf-8")
-    transaction_path = builder_module._publication_transaction_path(processed_root, "synthetic")
+    transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
     common.serialization.atomic_write_json(
         transaction_path,
         builder_module._publication_transaction_record(
@@ -1053,7 +1470,7 @@ def test_progress_appearing_during_build_prevents_publication(
     generated_root = tmp_path / "generated"
     _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
-    transaction_path = builder_module._publication_transaction_path(training_root / "processed", "synthetic")
+    transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
 
     if boundary == "before_ready":
         original_interpret = builder_module._interpret_generated_case
@@ -1087,8 +1504,11 @@ def test_progress_appearing_during_build_prevents_publication(
 
     assert not (training_root / "raw" / "synthetic").exists()
     assert not (training_root / "meta" / "synthetic").exists()
-    assert not transaction_path.exists()
-    assert not list((training_root / "processed").glob(".synthetic.dataset-build.*"))
+    assert transaction_path.is_file()
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    assert transaction["phase"] == ("building" if boundary == "before_ready" else "ready")
+    assert Path(transaction["staging_root"]).is_dir()
+    assert not (training_root / "processed").exists()
 
 
 def test_manifest_change_after_ready_prevents_publication(
@@ -1098,7 +1518,7 @@ def test_manifest_change_after_ready_prevents_publication(
     generated_root = tmp_path / "generated"
     _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
-    transaction_path = builder_module._publication_transaction_path(training_root / "processed", "synthetic")
+    transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
     manifest_path = raw_dir / "batch_manifest.json"
     original_write_json = common.serialization.atomic_write_json
 
@@ -1118,8 +1538,11 @@ def test_manifest_change_after_ready_prevents_publication(
 
     assert not (training_root / "raw" / "synthetic").exists()
     assert not (training_root / "meta" / "synthetic").exists()
-    assert not transaction_path.exists()
-    assert not list((training_root / "processed").glob(".synthetic.dataset-build.*"))
+    assert transaction_path.is_file()
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    assert transaction["phase"] == "ready"
+    assert Path(transaction["staging_root"]).is_dir()
+    assert not (training_root / "processed").exists()
 
 
 def test_unversioned_payload_is_rejected(steady_task: domain.tasks.spec.TaskSpec) -> None:

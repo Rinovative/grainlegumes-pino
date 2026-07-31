@@ -76,7 +76,6 @@ _TRANSITIONS: dict[str | None, frozenset[str]] = {
 _SEED_LABELS = ("process", "model_init", "split", "loader", "worker", "tuner")
 _MISSING = object()
 _MAX_CONFIG_DIFFERENCES = 12
-_RUN_WRITER_LOCKS_DIRNAME = ".run-writer-locks"
 
 
 class RunLifecycleError(RuntimeError):
@@ -90,9 +89,8 @@ class RunLifecycleError(RuntimeError):
 
 
 def _run_writer_lock_path(run_dir: Path | str) -> Path:
-    """Return the persistent sibling lock path for one canonical run leaf."""
-    path = Path(run_dir).expanduser().resolve(strict=False)
-    return path.parent / _RUN_WRITER_LOCKS_DIRNAME / f"{path.name}.lock"
+    """Return the centralized persistent lock path for one canonical run leaf."""
+    return common.paths.resolve_run_lock_path(run_dir)
 
 
 @contextmanager
@@ -104,8 +102,8 @@ def run_writer_lease(
     """
     Hold the exclusive writer lease for one run lifecycle.
 
-    The lock file is a sibling of the run directory so fresh allocation and
-    resume prevalidation can use the same lease before touching run contents.
+    The lock file lives below ``MODEL_TRAINING_DATA_ROOT/.state/runs/locks`` so
+    fresh allocation and resume prevalidation can use the same lease before touching run contents.
     Training fails fast by default; coordinated artifact readers may wait for
     the current run writer by setting ``blocking=True``.
 
@@ -128,8 +126,8 @@ def run_writer_lease(
 
     Notes
     -----
-    The persistent sibling lock is not run content and is not removed when the
-    lease closes; the underlying OS lock, rather than file existence, owns exclusion.
+    The persistent state-root anchor is not run content and is not removed when
+    the lease closes; the underlying OS lock, rather than file existence, owns exclusion.
 
     """
     path = Path(run_dir).expanduser().resolve(strict=False)

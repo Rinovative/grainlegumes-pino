@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -99,6 +99,10 @@ class DatasetIdentity:
     sample_ids: tuple[str, ...]
     sample_count: int
     spatial_shape: tuple[int, ...]
+    generated_batch_identity_sha256: str | None = field(default=None, compare=False, repr=False)
+    generated_batch_identity: dict[str, Any] | None = field(default=None, compare=False, repr=False)
+    source_metadata: tuple[dict[str, Any], ...] | None = field(default=None, compare=False, repr=False)
+    source_provenance: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
     def as_dict(self) -> dict[str, Any]:
         """Return the JSON-compatible representation used by split identity."""
@@ -428,6 +432,57 @@ def _validate_generated_batch_identity(
     return identity
 
 
+def build_generated_batch_identity(
+    source_manifest: Mapping[str, Any],
+    *,
+    sampling: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build and validate the version-1 scientific identity from admitted sources."""
+    manifest = _require_mapping(source_manifest, label="Source manifest")
+    configuration = _require_mapping(
+        manifest.get("configuration"),
+        label="Source manifest.configuration",
+    )
+    intended = _require_string_sequence(
+        manifest.get("intended_case_ids"),
+        label="Source manifest.intended_case_ids",
+        unique=True,
+    )
+    records = manifest.get("cases")
+    if not isinstance(records, (list, tuple)):
+        msg = "Source manifest.cases must be a list or tuple."
+        raise TypeError(msg)
+    scientific_records: list[dict[str, Any]] = []
+    for index, record_value in enumerate(records):
+        record = _require_mapping(record_value, label=f"Source manifest.cases[{index}]")
+        files = _require_mapping(record.get("files"), label=f"Source manifest.cases[{index}].files")
+        scientific_records.append(
+            {
+                "case_id": record.get("case_id"),
+                "raw_csv_sha256": files.get("raw_csv_sha256"),
+                "solution_csv_sha256": files.get("solution_csv_sha256"),
+                "solution_model_sha256": files.get("solution_model_sha256"),
+            }
+        )
+    scientific_configuration = {key: value for key, value in configuration.items() if key != "sample_sha256"}
+    content = {
+        "schema_version": manifest.get("schema_version"),
+        "batch_name": manifest.get("batch_name"),
+        "configuration": scientific_configuration,
+        "field_schema": manifest.get("field_schema"),
+        "intended_case_ids": list(intended),
+        "scientific_case_sources": scientific_records,
+        "sampling": dict(sampling),
+    }
+    identity = dict(content)
+    identity["batch_manifest_identity_sha256"] = hashlib.sha256(_canonical_json(content, label="Generated batch identity")).hexdigest()
+    return _validate_generated_batch_identity(
+        identity,
+        sample_ids=intended,
+        label="Generated batch identity",
+    )
+
+
 def _require_tensor(value: Any, *, label: str, rank: int) -> Tensor:
     if not isinstance(value, Tensor):
         msg = f"{label} must be a torch.Tensor."
@@ -726,6 +781,10 @@ def validate_training_dataset_payload(
         sample_ids=sample_ids,
         sample_count=sample_count,
         spatial_shape=spatial_shape,
+        generated_batch_identity_sha256=str(generated_batch_identity["batch_manifest_identity_sha256"]),
+        generated_batch_identity=generated_batch_identity,
+        source_metadata=tuple(normalized_metadata),
+        source_provenance=source_provenance,
     )
 
 

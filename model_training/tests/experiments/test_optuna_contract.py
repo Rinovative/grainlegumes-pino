@@ -11,6 +11,7 @@ complete failure taxonomy are covered by ``test_optuna_lifecycle``.
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import optuna
 import pytest
 import torch
-from src import experiments, learning
+from src import datasets, experiments, learning
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -182,13 +183,15 @@ def test_existing_study_requires_type_exact_schema_versions(
         )
 
 
-def test_device_override_is_visible_but_outside_optuna_study_identity() -> None:
-    """
-    Describe one study under ``auto``, ``cuda``, and ``cpu`` runtime overrides.
-
-    Only the visible policy may change; objective, search space, study name, and
-    semantic digest must stay identical because hardware is invocation policy.
-    """
+def test_device_override_is_visible_but_outside_optuna_study_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep runtime device policy visible but outside semantic identity."""
+    monkeypatch.setattr(
+        optuna_runtime,
+        "_describe_dataset_identity",
+        lambda _config, dataset_id: {"dataset_id": dataset_id},
+    )
     study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
     summaries = {
         policy: optuna_runtime.describe_optuna_study_config(
@@ -199,10 +202,86 @@ def test_device_override_is_visible_but_outside_optuna_study_identity() -> None:
 
     assert {summary["device_policy"] for summary in summaries.values()} == {"auto", "cuda", "cpu"}
     assert len({summary["study"]["name"] for summary in summaries.values()}) == 1
+    assert len({summary["storage"] for summary in summaries.values()}) == 1
+    assert len({summary["study_dir"] for summary in summaries.values()}) == 1
+    assert len({summary["trial_root"] for summary in summaries.values()}) == 1
     assert len({repr(summary["objective"]) for summary in summaries.values()}) == 1
     assert len({repr(summary["search_space"]) for summary in summaries.values()}) == 1
     assert len({summary["semantic_signature"]["digest"] for summary in summaries.values()}) == 1
     assert all("cuda_index" not in summary for summary in summaries.values())
+
+
+def test_dry_run_dataset_identity_uses_metadata_without_loading_tensors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind one compact metadata identity and artifact stat without torch.load."""
+    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    config = copy.deepcopy(study.base_config)
+    dataset_id = "tiny_metadata_identity"
+    dataset_root = tmp_path / "raw"
+    metadata_root = tmp_path / "meta"
+    config["paths"]["dataset_root"] = str(dataset_root)
+    config["paths"]["training_meta_root"] = str(metadata_root)
+    dataset_path = dataset_root / dataset_id / f"{dataset_id}.pt"
+    metadata_dir = metadata_root / dataset_id
+    dataset_path.parent.mkdir(parents=True)
+    metadata_dir.mkdir(parents=True)
+    dataset_path.write_bytes(b"tiny")
+    task = experiments.config.loader.validate_resolved_task_contract(config)
+    scientific = {
+        "dataset_fingerprint": "a" * 64,
+        "sample_count": 2,
+        "spatial_shape": [2, 3],
+        "generated_batch_identity_sha256": "b" * 64,
+    }
+    metadata_path = metadata_dir / datasets.metadata.METADATA_FILENAME
+    metadata_path.write_text(
+        json.dumps({"scientific_identity": scientific}),
+        encoding="utf-8",
+    )
+    (metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME).write_text(
+        json.dumps({"intended_case_ids": ["case_0001", "case_0002"]}),
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+
+    def validate_metadata(directory: Path, *, dataset_identity: Any) -> Any:
+        """Record the derived identity and return the validated artifact binding."""
+        captured.update({"directory": directory, "identity": dataset_identity})
+        return SimpleNamespace(
+            metadata={
+                "artifacts": {
+                    "dataset": {
+                        "filename": dataset_path.name,
+                        "size_bytes": 4,
+                    }
+                }
+            }
+        )
+
+    monkeypatch.setattr(datasets.metadata, "validate_dataset_metadata_directory", validate_metadata)
+    monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("dry-run must not load tensors"))
+    summary = optuna_runtime._describe_dataset_identity(config, dataset_id)
+
+    identity = captured["identity"]
+    assert captured["directory"] == metadata_dir
+    assert identity.dataset_id == dataset_id
+    assert identity.task == task.id
+    assert identity.task_contract_digest == task.contract_digest
+    assert identity.sample_ids == ("case_0001", "case_0002")
+    assert summary["validation"] == "metadata_package_and_artifact_stat"
+    assert summary["fingerprint"] == "a" * 64
+
+    dataset_path.write_bytes(b"wrong-size")
+    with pytest.raises(ValueError, match="name or size"):
+        optuna_runtime._describe_dataset_identity(config, dataset_id)
+    metadata_path.unlink()
+    with pytest.raises(FileNotFoundError):
+        optuna_runtime._describe_dataset_identity(config, dataset_id)
+    metadata_path.write_text("{", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        optuna_runtime._describe_dataset_identity(config, dataset_id)
 
 
 def test_sampler_seed_is_a_stable_subseed_of_the_study_seed(

@@ -64,7 +64,7 @@ _PUBLICATION_TRANSACTION_KEYS = frozenset(
         "staging_root",
         "dataset_sha256",
         "dataset_size",
-        "metadata_inventory_sha256",
+        "dataset_metadata_sha256",
     }
 )
 _MANIFEST_FIELD_SCHEMA = {
@@ -86,8 +86,6 @@ _EXPECTED_SOLUTION_HEADER = (
     ("v", "m/s"),
     ("U", "m/s"),
 )
-_SAMPLE_JSON_KEYS = frozenset({"meta", "n_cases"})
-_SAMPLE_META_KEYS = frozenset({"method", "variation", "N", "seed", "base", "param_names", "timestamp"})
 _RAW_METADATA_KEYS = frozenset({"export", "fields_present", "generator", "geometry", "paths", "timestamp"})
 _RAW_EXPORT_KEYS = frozenset({"columns", "delimiter", "file_base"})
 _RAW_FIELDS_PRESENT_KEYS = frozenset({"porosity", "pressure_bc", "tensor"})
@@ -870,7 +868,7 @@ def _load_generation_metadata(
     batch_name: str,
     manifest: dict[str, Any],
 ) -> tuple[Path, Path, pd.DataFrame, dict[str, Any], dict[str, Any], bytes, bytes]:
-    """Validate and snapshot parameter metadata into manifest-aligned rows."""
+    """Validate parameter snapshots through the shared public metadata boundary."""
     csv_path = meta_dir / f"{batch_name}.csv"
     json_path = meta_dir / f"{batch_name}.json"
     if not csv_path.is_file() or not json_path.is_file():
@@ -878,61 +876,22 @@ def _load_generation_metadata(
         raise FileNotFoundError(msg)
     csv_snapshot = csv_path.read_bytes()
     json_snapshot = json_path.read_bytes()
-    expected_sample_sha = manifest["configuration"]["sample_sha256"]
-    if hashlib.sha256(csv_snapshot).hexdigest() != expected_sample_sha:
-        msg = f"Parameter-sample CSV SHA-256 does not match the batch manifest: {csv_path}"
-        raise RuntimeError(msg)
-    try:
-        sample_json = json.loads(json_snapshot.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        msg = f"Parameter-sample JSON is invalid: {json_path}"
-        raise ValueError(msg) from error
-    sample_json = _require_exact_mapping_keys(sample_json, _SAMPLE_JSON_KEYS, label="Parameter-sample JSON")
-    sample_meta = _require_exact_mapping_keys(sample_json["meta"], _SAMPLE_META_KEYS, label="Parameter-sample JSON meta")
-    configuration = manifest["configuration"]
-    for key in ("method", "N", "seed"):
-        if sample_meta[key] != configuration[key]:
-            msg = f"Parameter-sample JSON meta.{key} does not match the batch manifest."
-            raise ValueError(msg)
-    if not math.isclose(float(sample_meta["variation"]), float(configuration["variation"]), rel_tol=0.0, abs_tol=0.0):
-        msg = "Parameter-sample JSON meta.variation does not match the batch manifest."
-        raise ValueError(msg)
-    if sample_json["n_cases"] != configuration["N"]:
-        msg = "Parameter-sample JSON n_cases does not match the batch manifest."
-        raise ValueError(msg)
-    param_names = sample_meta["param_names"]
-    if not isinstance(param_names, list) or not param_names or not all(isinstance(name, str) and name for name in param_names):
-        msg = "Parameter-sample JSON meta.param_names must be a non-empty list of names."
-        raise TypeError(msg)
-    if len(param_names) != len(set(param_names)):
-        msg = "Parameter-sample JSON meta.param_names must be unique."
-        raise ValueError(msg)
-    if not isinstance(sample_meta["base"], dict) or not isinstance(sample_meta["timestamp"], str):
-        msg = "Parameter-sample JSON meta.base/timestamp have invalid types."
-        raise TypeError(msg)
+    semantics = datasets.metadata.validate_source_sample_semantics(
+        csv_snapshot,
+        json_snapshot,
+        source_manifest=manifest,
+    )
     sample_frame = pd.read_csv(io.BytesIO(csv_snapshot), sep=";")
-    if list(sample_frame.columns) != ["case_id", *param_names]:
-        msg = "Parameter-sample CSV columns do not match meta.param_names in exact order."
-        raise ValueError(msg)
-    if len(sample_frame) != configuration["N"]:
-        msg = "Parameter-sample CSV row count does not match manifest configuration.N."
-        raise ValueError(msg)
-    numeric = sample_frame.apply(pd.to_numeric, errors="raise")
-    if not np.isfinite(numeric.to_numpy(dtype=np.float64)).all():
-        msg = "Parameter-sample CSV must contain only finite numeric values."
-        raise ValueError(msg)
-    raw_case_ids = numeric["case_id"].to_numpy(dtype=np.float64)
-    if not np.equal(raw_case_ids, np.floor(raw_case_ids)).all():
-        msg = "Parameter-sample CSV case_id values must be integers."
-        raise ValueError(msg)
-    case_ids = [f"case_{int(value):04d}" for value in raw_case_ids]
-    if case_ids != manifest["intended_case_ids"]:
-        msg = "Parameter-sample CSV membership/order does not match the terminal manifest."
-        raise ValueError(msg)
-    numeric = numeric.copy()
-    numeric.index = case_ids
-    portable_sampling = {key: value for key, value in sample_meta.items() if key != "timestamp"}
-    return csv_path, json_path, numeric, sample_json, portable_sampling, csv_snapshot, json_snapshot
+    sample_frame.index = list(semantics.case_ids)
+    return (
+        csv_path,
+        json_path,
+        sample_frame,
+        semantics.sample_json,
+        semantics.sampling,
+        csv_snapshot,
+        json_snapshot,
+    )
 
 
 def _validate_exact_source_membership(
@@ -1228,39 +1187,6 @@ def _timing_snapshot(
     )
 
 
-def _generated_batch_identity(
-    manifest: dict[str, Any],
-    *,
-    portable_sampling: dict[str, Any],
-) -> tuple[dict[str, Any], str]:
-    """Build the stable scientific identity of one generated batch."""
-    scientific_records = []
-    for record in manifest["cases"]:
-        files = record["files"]
-        scientific_records.append(
-            {
-                "case_id": record["case_id"],
-                "raw_csv_sha256": files["raw_csv_sha256"],
-                "solution_csv_sha256": files["solution_csv_sha256"],
-                "solution_model_sha256": files["solution_model_sha256"],
-            }
-        )
-    scientific_configuration = {key: value for key, value in manifest["configuration"].items() if key != "sample_sha256"}
-    content = {
-        "schema_version": manifest["schema_version"],
-        "batch_name": manifest["batch_name"],
-        "configuration": scientific_configuration,
-        "field_schema": manifest["field_schema"],
-        "intended_case_ids": manifest["intended_case_ids"],
-        "scientific_case_sources": scientific_records,
-        "sampling": portable_sampling,
-    }
-    digest = common.serialization.canonical_json_sha256(content)
-    identity = dict(content)
-    identity["batch_manifest_identity_sha256"] = digest
-    return identity, digest
-
-
 def _source_provenance(manifest: dict[str, Any], *, manifest_sha256: str, sample_json_sha256: str) -> dict[str, Any]:
     """Retain exact operational source hashes outside scientific identity."""
     return {
@@ -1271,7 +1197,8 @@ def _source_provenance(manifest: dict[str, Any], *, manifest_sha256: str, sample
     }
 
 
-def _metadata_inventory_entry(path: Path, *, required: bool, role: str) -> dict[str, Any]:
+def _snapshot_metadata_entry(path: Path, *, required: bool, role: str) -> dict[str, Any]:
+    """Describe one independently hashable metadata snapshot."""
     return {
         "sha256": _sha256_file(path),
         "size_bytes": path.stat().st_size,
@@ -1284,6 +1211,8 @@ def _stage_metadata_package(
     destination: Path,
     *,
     dataset_identity: datasets.identity.DatasetIdentity,
+    dataset_sha256: str,
+    dataset_size: int,
     task: TaskSpec,
     manifest_snapshot: bytes,
     manifest_sha256: str,
@@ -1295,7 +1224,7 @@ def _stage_metadata_package(
     timing_snapshot: bytes | None,
     timing_summary: dict[str, Any],
 ) -> None:
-    """Stage one coherent set of validated small model-training snapshots."""
+    """Stage one coherent set of validated model-training metadata."""
     destination.mkdir(parents=True)
     snapshots = {
         datasets.metadata.SOURCE_MANIFEST_FILENAME: (manifest_snapshot, True, "validated_generation_manifest"),
@@ -1315,45 +1244,51 @@ def _stage_metadata_package(
     if _sha256_file(destination / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME) != sample_json_sha256:
         msg = "Staged parameter-sample JSON does not match its admitted snapshot."
         raise RuntimeError(msg)
-    source_batch = {
-        "batch_name": dataset_identity.dataset_id,
-        "batch_manifest_sha256": manifest_sha256,
-        "batch_manifest_identity_sha256": manifest_identity_sha256,
+    snapshot_artifacts = {
+        filename: _snapshot_metadata_entry(destination / filename, required=required, role=role)
+        for filename, (_snapshot, required, role) in snapshots.items()
     }
-    provenance = {
-        "schema_kind": datasets.metadata.PROVENANCE_SCHEMA_KIND,
-        "schema_version": datasets.metadata.METADATA_SCHEMA_VERSION,
-        "dataset_id": dataset_identity.dataset_id,
+    scientific_identity = {
         "dataset_schema_version": datasets.identity.TRAINING_DATASET_SCHEMA_VERSION,
         "dataset_fingerprint": dataset_identity.fingerprint,
-        "task": task.id,
+        "task_id": task.id,
         "task_contract_digest": task.contract_digest,
-        "source_batch": source_batch,
+        "source_batch_id": dataset_identity.dataset_id,
+        "generated_batch_identity_sha256": manifest_identity_sha256,
         "sample_count": dataset_identity.sample_count,
         "spatial_shape": list(dataset_identity.spatial_shape),
-        "timing": timing_summary,
+        "tensors": {
+            "inputs": {
+                "dtype": "float32",
+                "shape": [dataset_identity.sample_count, task.in_channels, *dataset_identity.spatial_shape],
+            },
+            "outputs": {
+                "dtype": "float32",
+                "shape": [dataset_identity.sample_count, task.out_channels, *dataset_identity.spatial_shape],
+            },
+        },
     }
-    common.serialization.atomic_write_json(destination / datasets.metadata.PROVENANCE_FILENAME, provenance)
-    roles = {filename: (required, role) for filename, (_snapshot, required, role) in snapshots.items()}
-    roles[datasets.metadata.PROVENANCE_FILENAME] = (True, "normalized_dataset_provenance")
-    files = {
-        filename: _metadata_inventory_entry(destination / filename, required=required, role=role) for filename, (required, role) in roles.items()
-    }
-    inventory = {
-        "schema_kind": datasets.metadata.INVENTORY_SCHEMA_KIND,
+    metadata = {
+        "schema_kind": datasets.metadata.METADATA_SCHEMA_KIND,
         "schema_version": datasets.metadata.METADATA_SCHEMA_VERSION,
         "dataset_id": dataset_identity.dataset_id,
-        "dataset_fingerprint": dataset_identity.fingerprint,
-        "task": task.id,
-        "task_contract_digest": task.contract_digest,
-        "sample_count": dataset_identity.sample_count,
-        "spatial_shape": list(dataset_identity.spatial_shape),
-        "source_batch_name": dataset_identity.dataset_id,
-        "source_manifest_sha256": manifest_sha256,
-        "files": files,
-        "timing": timing_summary,
+        "scientific_identity": scientific_identity,
+        "artifacts": {
+            "dataset": {
+                "filename": f"{dataset_identity.dataset_id}.pt",
+                "sha256": dataset_sha256,
+                "size_bytes": dataset_size,
+            },
+            "snapshots": snapshot_artifacts,
+        },
+        "operational_provenance": {
+            "builder_module": datasets.metadata.BUILDER_MODULE,
+            "publication_method": datasets.metadata.PUBLICATION_METHOD,
+            "source_manifest_sha256": manifest_sha256,
+            "timing": timing_summary,
+        },
     }
-    common.serialization.atomic_write_json(destination / datasets.metadata.INVENTORY_FILENAME, inventory)
+    common.serialization.atomic_write_json(destination / datasets.metadata.METADATA_FILENAME, metadata)
 
 
 def load_generated_batch_for_eda(
@@ -1408,9 +1343,9 @@ def load_generated_batch_for_eda(
         msg = "A complete batch manifest must contain exactly configuration.N intended cases."
         raise ValueError(msg)
     selected_case_ids = all_case_ids if max_cases is None else all_case_ids[:max_cases]
-    generated_identity, _manifest_identity_sha256 = _generated_batch_identity(
+    generated_identity = datasets.identity.build_generated_batch_identity(
         manifest,
-        portable_sampling=portable_sampling,
+        sampling=portable_sampling,
     )
     rows: list[dict[str, Any]] = []
     records_by_id = {record["case_id"]: record for record in manifest["cases"]}
@@ -1518,11 +1453,6 @@ def _interpret_generated_case(
     return spatial_shape, case_inputs, case_outputs, normalized_metadata, stable_source, fingerprint
 
 
-def _publication_transaction_path(training_processed_root: Path, dataset_id: str) -> Path:
-    """Return the fixed recovery marker for one logical dataset publication."""
-    return training_processed_root / ".transactions" / f"dataset-{dataset_id}.json"
-
-
 def _publication_transaction_record(
     *,
     dataset_id: str,
@@ -1530,7 +1460,7 @@ def _publication_transaction_record(
     staging_root: Path,
     dataset_sha256: str = "",
     dataset_size: int = 0,
-    metadata_inventory_sha256: str = "",
+    dataset_metadata_sha256: str = "",
 ) -> dict[str, Any]:
     """Build one exact operational transaction marker."""
     if phase not in {"building", "ready"}:
@@ -1544,14 +1474,14 @@ def _publication_transaction_record(
         "staging_root": str(staging_root.resolve(strict=False)),
         "dataset_sha256": dataset_sha256,
         "dataset_size": dataset_size,
-        "metadata_inventory_sha256": metadata_inventory_sha256,
+        "dataset_metadata_sha256": dataset_metadata_sha256,
     }
 
 
 def _load_publication_transaction(
     transaction_path: Path,
     *,
-    training_processed_root: Path,
+    training_root: Path,
     dataset_id: str,
 ) -> tuple[dict[str, Any], Path]:
     """Load and constrain a recovery marker to this builder's staging area."""
@@ -1577,12 +1507,12 @@ def _load_publication_transaction(
         or not isinstance(record["dataset_size"], int)
         or record["dataset_size"] < 0
         or not isinstance(record["dataset_sha256"], str)
-        or not isinstance(record["metadata_inventory_sha256"], str)
+        or not isinstance(record["dataset_metadata_sha256"], str)
     ):
         msg = f"Dataset publication transaction has invalid identity or scalar fields: {transaction_path}"
         raise RuntimeError(msg)
     staging_root = Path(record["staging_root"])
-    expected_parent = training_processed_root.resolve(strict=False)
+    expected_parent = training_root.resolve(strict=False)
     if (
         not staging_root.is_absolute()
         or staging_root.parent.resolve(strict=False) != expected_parent
@@ -1593,14 +1523,14 @@ def _load_publication_transaction(
         msg = f"Dataset publication transaction names an unsafe staging root: {staging_root}"
         raise RuntimeError(msg)
     if record["phase"] == "building":
-        if record["dataset_sha256"] or record["dataset_size"] or record["metadata_inventory_sha256"]:
+        if record["dataset_sha256"] or record["dataset_size"] or record["dataset_metadata_sha256"]:
             msg = "Building publication transaction cannot claim completed staged content."
             raise RuntimeError(msg)
     else:
         _require_sha256(record["dataset_sha256"], label="Dataset publication transaction dataset_sha256")
         _require_sha256(
-            record["metadata_inventory_sha256"],
-            label="Dataset publication transaction metadata_inventory_sha256",
+            record["dataset_metadata_sha256"],
+            label="Dataset publication transaction dataset_metadata_sha256",
         )
         if record["dataset_size"] <= 0:
             msg = "Ready publication transaction dataset_size must be positive."
@@ -1629,7 +1559,7 @@ def _single_publication_component(
 def _recover_interrupted_publication(
     transaction_path: Path,
     *,
-    training_processed_root: Path,
+    training_root: Path,
     destination_dir: Path,
     metadata_destination: Path,
     raw_dir: Path,
@@ -1647,7 +1577,7 @@ def _recover_interrupted_publication(
         return None
     record, staging_root = _load_publication_transaction(
         transaction_path,
-        training_processed_root=training_processed_root,
+        training_root=training_root,
         dataset_id=dataset_id,
     )
     if record["phase"] == "building":
@@ -1687,11 +1617,15 @@ def _recover_interrupted_publication(
     if dataset_identity.dataset_id != dataset_id:
         msg = "Recovered dataset identity does not match its publication transaction."
         raise RuntimeError(msg)
-    inventory_path = metadata_dir / datasets.metadata.INVENTORY_FILENAME
-    if not inventory_path.is_file() or _sha256_file(inventory_path) != record["metadata_inventory_sha256"]:
-        msg = "Recovered metadata inventory does not match its ready transaction digest."
+    metadata_path = metadata_dir / datasets.metadata.METADATA_FILENAME
+    if not metadata_path.is_file() or _sha256_file(metadata_path) != record["dataset_metadata_sha256"]:
+        msg = "Recovered dataset metadata does not match its ready transaction digest."
         raise RuntimeError(msg)
-    datasets.metadata.validate_dataset_metadata_directory(metadata_dir, dataset_identity=dataset_identity)
+    datasets.metadata.validate_dataset_metadata_directory(
+        metadata_dir,
+        dataset_identity=dataset_identity,
+        dataset_path=dataset_path,
+    )
     if not (metadata_is_final and dataset_is_final):
         source_manifest_snapshot = (metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME).read_bytes()
         _assert_generation_snapshot_current(
@@ -1721,6 +1655,7 @@ def _recover_interrupted_publication(
     package = datasets.metadata.validate_dataset_metadata_directory(
         metadata_destination,
         dataset_identity=dataset_identity,
+        dataset_path=final_dataset_path,
     )
     transaction_path.unlink()
     if staging_root.exists():
@@ -1757,19 +1692,24 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
     manifest_path = raw_dir / "batch_manifest.json"
     training_meta_root = training_root / "meta"
     training_raw_root = training_root / "raw"
-    training_processed_root = training_root / "processed"
     destination_dir = training_raw_root / resolved_dataset_id
     destination = destination_dir / f"{resolved_dataset_id}.pt"
     metadata_destination = training_meta_root / resolved_dataset_id
-    lock_path = training_processed_root / ".locks" / f"dataset-{resolved_dataset_id}.lock"
-    transaction_path = _publication_transaction_path(training_processed_root, resolved_dataset_id)
-    training_processed_root.mkdir(parents=True, exist_ok=True)
+    lock_path = common.paths.resolve_dataset_build_lock_path(
+        resolved_dataset_id,
+        model_training_data_root=training_root,
+    )
+    transaction_path = common.paths.resolve_dataset_build_transaction_path(
+        resolved_dataset_id,
+        model_training_data_root=training_root,
+    )
+    training_root.mkdir(parents=True, exist_ok=True)
 
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         _assert_generation_batch_idle(raw_dir)
         recovered = _recover_interrupted_publication(
             transaction_path,
-            training_processed_root=training_processed_root,
+            training_root=training_root,
             destination_dir=destination_dir,
             metadata_destination=metadata_destination,
             raw_dir=raw_dir,
@@ -1786,7 +1726,7 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
                 "case_count": recovered_identity.sample_count,
                 "task": task.id,
                 "task_contract_digest": task.contract_digest,
-                "timing_coverage": recovered_metadata.provenance["timing"],
+                "timing_coverage": recovered_metadata.timing_summary,
                 "dataset_fingerprint": recovered_identity.fingerprint,
                 "status": "complete",
             }
@@ -1837,10 +1777,11 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
             manifest_sha256=manifest_sha256,
             intended_case_ids=case_ids,
         )
-        generated_identity, manifest_identity_sha256 = _generated_batch_identity(
+        generated_identity = datasets.identity.build_generated_batch_identity(
             manifest,
-            portable_sampling=portable_sampling,
+            sampling=portable_sampling,
         )
+        manifest_identity_sha256 = str(generated_identity["batch_manifest_identity_sha256"])
         sample_json_sha256 = hashlib.sha256(sample_json_snapshot).hexdigest()
         provenance = _source_provenance(
             manifest,
@@ -1849,7 +1790,7 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
         )
         records_by_id = {record["case_id"]: record for record in manifest["cases"]}
 
-        staging_root = Path(tempfile.mkdtemp(dir=training_processed_root, prefix=f".{resolved_dataset_id}.dataset-build.", suffix=".tmp"))
+        staging_root = Path(tempfile.mkdtemp(dir=training_root, prefix=f".{resolved_dataset_id}.dataset-build.", suffix=".tmp"))
         stage_dataset_dir = staging_root / "raw" / resolved_dataset_id
         stage_metadata_dir = staging_root / "meta" / resolved_dataset_id
         staged_dataset_path = stage_dataset_dir / f"{resolved_dataset_id}.pt"
@@ -1857,6 +1798,7 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
         dataset_published = False
         publication_complete = False
         transaction_active = False
+        transaction_phase: str | None = None
         inputs: torch.Tensor | None = None
         outputs: torch.Tensor | None = None
         source_identities: list[dict[str, Any]] = []
@@ -1873,6 +1815,7 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
                 ),
             )
             transaction_active = True
+            transaction_phase = "building"
             stage_dataset_dir.mkdir(parents=True)
             for index, case_id in enumerate(tqdm(case_ids, desc=f"Building {batch_name}", unit="case", disable=not verbose)):
                 spatial_shape, case_inputs, case_outputs, normalized_metadata, stable_source, fingerprint = _interpret_generated_case(
@@ -1930,9 +1873,13 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
             staged_identity = datasets.identity.validate_training_dataset_payload(staged_payload, task=task, verify_content=True)
             del staged_payload
             gc.collect()
+            staged_dataset_sha256 = _sha256_file(staged_dataset_path)
+            staged_dataset_size = staged_dataset_path.stat().st_size
             _stage_metadata_package(
                 stage_metadata_dir,
                 dataset_identity=staged_identity,
+                dataset_sha256=staged_dataset_sha256,
+                dataset_size=staged_dataset_size,
                 task=task,
                 manifest_snapshot=manifest_snapshot,
                 manifest_sha256=manifest_sha256,
@@ -1944,10 +1891,12 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
                 timing_snapshot=timing_snapshot,
                 timing_summary=timing_summary,
             )
-            datasets.metadata.validate_dataset_metadata_directory(stage_metadata_dir, dataset_identity=staged_identity)
-            staged_dataset_sha256 = _sha256_file(staged_dataset_path)
-            staged_dataset_size = staged_dataset_path.stat().st_size
-            staged_inventory_sha256 = _sha256_file(stage_metadata_dir / datasets.metadata.INVENTORY_FILENAME)
+            datasets.metadata.validate_dataset_metadata_directory(
+                stage_metadata_dir,
+                dataset_identity=staged_identity,
+                dataset_path=staged_dataset_path,
+            )
+            staged_metadata_sha256 = _sha256_file(stage_metadata_dir / datasets.metadata.METADATA_FILENAME)
             _assert_generation_snapshot_current(raw_dir, manifest_path, manifest_snapshot)
             common.serialization.atomic_write_json(
                 transaction_path,
@@ -1957,9 +1906,10 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
                     staging_root=staging_root,
                     dataset_sha256=staged_dataset_sha256,
                     dataset_size=staged_dataset_size,
-                    metadata_inventory_sha256=staged_inventory_sha256,
+                    dataset_metadata_sha256=staged_metadata_sha256,
                 ),
             )
+            transaction_phase = "ready"
             training_meta_root.mkdir(parents=True, exist_ok=True)
             training_raw_root.mkdir(parents=True, exist_ok=True)
             if destination_dir.exists() or destination_dir.is_symlink() or metadata_destination.exists() or metadata_destination.is_symlink():
@@ -1973,20 +1923,28 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
             datasets.metadata.validate_dataset_metadata_directory(
                 metadata_destination,
                 dataset_identity=staged_identity,
+                dataset_path=destination,
             )
+            if (
+                destination.stat().st_size != staged_dataset_size
+                or _sha256_file(destination) != staged_dataset_sha256
+                or _sha256_file(metadata_destination / datasets.metadata.METADATA_FILENAME) != staged_metadata_sha256
+            ):
+                msg = "Final dataset publication changed after its ready transaction was recorded."
+                raise RuntimeError(msg)
             publication_complete = True
             transaction_path.unlink()
             transaction_active = False
         finally:
             del inputs, outputs
-            if not publication_complete:
-                if dataset_published and destination_dir.is_dir():
-                    shutil.rmtree(destination_dir)
-                if metadata_published and metadata_destination.is_dir():
-                    shutil.rmtree(metadata_destination)
-                if transaction_active:
-                    transaction_path.unlink(missing_ok=True)
-            if staging_root.exists():
+            if not publication_complete and transaction_phase == "ready":
+                if dataset_published and destination_dir.is_dir() and not stage_dataset_dir.exists():
+                    stage_dataset_dir.parent.mkdir(parents=True, exist_ok=True)
+                    destination_dir.replace(stage_dataset_dir)
+                if metadata_published and metadata_destination.is_dir() and not stage_metadata_dir.exists():
+                    stage_metadata_dir.parent.mkdir(parents=True, exist_ok=True)
+                    metadata_destination.replace(stage_metadata_dir)
+            if (publication_complete or not transaction_active) and staging_root.exists():
                 shutil.rmtree(staging_root)
 
     result = {

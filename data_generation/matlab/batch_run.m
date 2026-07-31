@@ -64,7 +64,7 @@ batch_name = sprintf('%s_var%.0f_seed%.0f', ...
 meta_dir      = fullfile(generated_data_root, 'meta');
 raw_dir       = fullfile(generated_data_root, 'raw', batch_name);
 processed_dir = fullfile(generated_data_root, 'processed', batch_name);
-lock_dir      = fullfile(generated_data_root, 'processed', '.locks');
+lock_dir      = fullfile(generated_data_root, '.state', 'locks');
 template_path = fullfile(project_root, 'comsol', 'template_brinkman.mph');
 
 if ~isfolder(meta_dir), mkdir(meta_dir); end

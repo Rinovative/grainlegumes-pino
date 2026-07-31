@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
 import math
 import re
@@ -12,22 +15,23 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 
-from src import common
-from src.datasets.dataset_identity import TRAINING_DATASET_SCHEMA_VERSION
+from src import common, domain
+from src.datasets.dataset_identity import TRAINING_DATASET_SCHEMA_VERSION, build_generated_batch_identity
 
 if TYPE_CHECKING:
     from src.datasets.dataset_identity import DatasetIdentity
 
-PROVENANCE_FILENAME = "dataset_provenance.json"
+METADATA_FILENAME = "dataset_metadata.json"
 SOURCE_MANIFEST_FILENAME = "source_manifest.json"
 SOURCE_SAMPLE_CSV_FILENAME = "source_sample.csv"
 SOURCE_SAMPLE_JSON_FILENAME = "source_sample.json"
 COMSOL_TIMING_FILENAME = "comsol_solve_timing.json"
-INVENTORY_FILENAME = "metadata_inventory.json"
-PROVENANCE_SCHEMA_KIND = "training_dataset_provenance"
-INVENTORY_SCHEMA_KIND = "training_dataset_metadata_inventory"
+METADATA_SCHEMA_KIND = "training_dataset_metadata"
 METADATA_SCHEMA_VERSION = 1
+BUILDER_MODULE = "data_generation.build_training_dataset"
+PUBLICATION_METHOD = "atomic_directory_rename"
 SOURCE_MANIFEST_SCHEMA_KIND = "comsol_batch_manifest"
 SOURCE_MANIFEST_SCHEMA_VERSION = 1
 _SHA256_LENGTH = 64
@@ -83,13 +87,32 @@ _SOURCE_MANIFEST_FIELD_SCHEMA = {
 }
 _REQUIRED_SNAPSHOT_FILES = frozenset(
     {
-        PROVENANCE_FILENAME,
         SOURCE_MANIFEST_FILENAME,
         SOURCE_SAMPLE_CSV_FILENAME,
         SOURCE_SAMPLE_JSON_FILENAME,
     }
 )
-_ALLOWED_SNAPSHOT_FILES = _REQUIRED_SNAPSHOT_FILES | {COMSOL_TIMING_FILENAME, INVENTORY_FILENAME}
+_ALLOWED_PACKAGE_FILES = _REQUIRED_SNAPSHOT_FILES | {COMSOL_TIMING_FILENAME, METADATA_FILENAME}
+_SOURCE_SAMPLE_JSON_KEYS = frozenset({"meta", "n_cases"})
+_SOURCE_SAMPLE_META_KEYS = frozenset({"method", "variation", "N", "seed", "base", "param_names", "timestamp"})
+_SNAPSHOT_ROLES = {
+    SOURCE_MANIFEST_FILENAME: "validated_generation_manifest",
+    SOURCE_SAMPLE_CSV_FILENAME: "validated_parameter_sample_csv",
+    SOURCE_SAMPLE_JSON_FILENAME: "validated_parameter_sample_json",
+    COMSOL_TIMING_FILENAME: "validated_operational_comsol_timing",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SourceSampleSemantics:
+    """Validated portable sampling identity and manifest-aligned CSV values."""
+
+    sample_json: dict[str, Any]
+    sampling: dict[str, Any]
+    case_ids: tuple[str, ...]
+    parameter_names: tuple[str, ...]
+    parameter_rows: tuple[dict[str, int | float], ...]
+    generated_batch_identity: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,10 +120,20 @@ class DatasetMetadata:
     """Validated metadata package bound to one final training dataset."""
 
     directory: Path
-    provenance: dict[str, Any]
-    inventory: dict[str, Any]
+    metadata: dict[str, Any]
     source_manifest: dict[str, Any]
     timing: dict[str, Any] | None
+
+    @property
+    def source_manifest_sha256(self) -> str:
+        """Return the exact validated source-manifest snapshot digest."""
+        snapshots = self.metadata["artifacts"]["snapshots"]
+        return str(snapshots[SOURCE_MANIFEST_FILENAME]["sha256"])
+
+    @property
+    def timing_summary(self) -> dict[str, Any]:
+        """Return the validated optional COMSOL timing coverage summary."""
+        return dict(self.metadata["operational_provenance"]["timing"])
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -331,6 +364,248 @@ def _validate_source_manifest_snapshot(manifest: dict[str, Any]) -> dict[str, An
     return normalized
 
 
+def _parse_source_sample_json(
+    sample_json: bytes,
+    *,
+    configuration: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], tuple[str, ...], int]:
+    """Validate the parameter JSON and return timestamp-free sampling facts."""
+    try:
+        decoded = json.loads(sample_json.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        msg = "Parameter-sample JSON snapshot is not valid UTF-8 JSON."
+        raise ValueError(msg) from error
+    if not isinstance(decoded, dict):
+        msg = "Parameter-sample JSON snapshot must contain an object."
+        raise TypeError(msg)
+    _require_exact_keys(decoded, _SOURCE_SAMPLE_JSON_KEYS, label="Parameter-sample JSON")
+    sample_meta = decoded["meta"]
+    if not isinstance(sample_meta, dict):
+        msg = "Parameter-sample JSON meta must be a mapping."
+        raise TypeError(msg)
+    _require_exact_keys(sample_meta, _SOURCE_SAMPLE_META_KEYS, label="Parameter-sample JSON meta")
+
+    method = sample_meta["method"]
+    if not isinstance(method, str) or not method:
+        msg = "Parameter-sample JSON meta.method must be non-empty text."
+        raise TypeError(msg)
+    if method != configuration["method"]:
+        msg = "Parameter-sample JSON meta.method does not match the source manifest."
+        raise ValueError(msg)
+    variation = _require_manifest_real(
+        sample_meta["variation"],
+        label="Parameter-sample JSON meta.variation",
+        positive=False,
+    )
+    if variation != float(configuration["variation"]):
+        msg = "Parameter-sample JSON meta.variation does not match the source manifest."
+        raise ValueError(msg)
+    count = _require_positive_int(sample_meta["N"], label="Parameter-sample JSON meta.N")
+    seed = _require_nonnegative_int(sample_meta["seed"], label="Parameter-sample JSON meta.seed")
+    if count != configuration["N"]:
+        msg = "Parameter-sample JSON meta.N does not match the source manifest."
+        raise ValueError(msg)
+    if seed != configuration["seed"]:
+        msg = "Parameter-sample JSON meta.seed does not match the source manifest."
+        raise ValueError(msg)
+    n_cases = _require_positive_int(decoded["n_cases"], label="Parameter-sample JSON n_cases")
+    if n_cases != count:
+        msg = "Parameter-sample JSON n_cases does not match meta.N."
+        raise ValueError(msg)
+    if not isinstance(sample_meta["base"], dict):
+        msg = "Parameter-sample JSON meta.base must be a mapping."
+        raise TypeError(msg)
+    parameter_names_value = sample_meta["param_names"]
+    if (
+        not isinstance(parameter_names_value, list)
+        or not parameter_names_value
+        or not all(isinstance(name, str) and name for name in parameter_names_value)
+    ):
+        msg = "Parameter-sample JSON meta.param_names must be a non-empty list of names."
+        raise TypeError(msg)
+    parameter_names = tuple(parameter_names_value)
+    if len(parameter_names) != len(set(parameter_names)) or "case_id" in parameter_names:
+        msg = "Parameter-sample JSON meta.param_names must be unique and exclude case_id."
+        raise ValueError(msg)
+    timestamp = sample_meta["timestamp"]
+    if not isinstance(timestamp, str) or not timestamp:
+        msg = "Parameter-sample JSON meta.timestamp must be non-empty text."
+        raise TypeError(msg)
+    portable_sampling = {key: value for key, value in sample_meta.items() if key != "timestamp"}
+    return decoded, portable_sampling, parameter_names, count
+
+
+def _parse_source_sample_csv(
+    sample_csv: bytes,
+    *,
+    parameter_names: tuple[str, ...],
+    count: int,
+    intended_case_ids: list[str],
+) -> tuple[tuple[str, ...], tuple[dict[str, int | float], ...]]:
+    """Validate exact CSV shape, finite values, and ordered manifest membership."""
+    try:
+        csv_text = sample_csv.decode("utf-8")
+        rows = [row for row in csv.reader(io.StringIO(csv_text, newline=""), delimiter=";", strict=True) if row]
+    except (UnicodeDecodeError, csv.Error) as error:
+        msg = "Parameter-sample CSV snapshot is not valid strict UTF-8 semicolon CSV."
+        raise ValueError(msg) from error
+    expected_header = ["case_id", *parameter_names]
+    if not rows or rows[0] != expected_header:
+        msg = "Parameter-sample CSV columns do not match JSON meta.param_names in exact order."
+        raise ValueError(msg)
+    data_rows = rows[1:]
+    if len(data_rows) != count:
+        msg = "Parameter-sample CSV row count does not match JSON and manifest case count."
+        raise ValueError(msg)
+
+    case_ids: list[str] = []
+    for row_index, row in enumerate(data_rows, start=1):
+        if len(row) != len(expected_header):
+            msg = f"Parameter-sample CSV row {row_index} has the wrong field count."
+            raise ValueError(msg)
+        try:
+            numeric_case_id = float(row[0])
+            values = [float(value) for value in row[1:]]
+        except ValueError as error:
+            msg = f"Parameter-sample CSV row {row_index} must contain only numeric values."
+            raise ValueError(msg) from error
+        if (
+            not math.isfinite(numeric_case_id)
+            or numeric_case_id != math.floor(numeric_case_id)
+            or not 0 <= numeric_case_id <= _MAX_EXACT_MANIFEST_INTEGER
+        ):
+            msg = f"Parameter-sample CSV row {row_index} case_id must be an exact non-negative integer."
+            raise ValueError(msg)
+        if not all(math.isfinite(value) for value in values):
+            msg = f"Parameter-sample CSV row {row_index} parameters must be finite."
+            raise ValueError(msg)
+        case_ids.append(f"case_{int(numeric_case_id):04d}")
+    if len(case_ids) != len(set(case_ids)):
+        msg = "Parameter-sample CSV case IDs must be unique."
+        raise ValueError(msg)
+    if case_ids != intended_case_ids:
+        msg = "Parameter-sample CSV ordered sample IDs do not match the source manifest."
+        raise ValueError(msg)
+
+    try:
+        numeric_frame = pd.read_csv(io.BytesIO(sample_csv), sep=";").apply(pd.to_numeric, errors="raise")
+    except (TypeError, ValueError) as error:
+        msg = "Parameter-sample CSV values are not valid maintained numeric serialization."
+        raise ValueError(msg) from error
+    if not np.isfinite(numeric_frame.to_numpy(dtype=np.float64)).all():
+        msg = "Parameter-sample CSV must contain only finite numeric values."
+        raise ValueError(msg)
+    parameter_rows: list[dict[str, int | float]] = []
+    for row_index in range(count):
+        row = numeric_frame.iloc[row_index]
+        parameter_rows.append({name: value.item() if isinstance((value := row[name]), np.generic) else value for name in parameter_names})
+    return tuple(case_ids), tuple(parameter_rows)
+
+
+def _validate_final_parameter_rows(
+    semantics: SourceSampleSemantics,
+    final_source_metadata: tuple[dict[str, Any], ...],
+) -> None:
+    """Bind sampled CSV values to duplicated final per-case metadata."""
+    if len(final_source_metadata) != len(semantics.parameter_rows):
+        msg = "Final dataset source metadata does not align with source-sample rows."
+        raise ValueError(msg)
+    for index, (case_id, parameters, final_value) in enumerate(zip(semantics.case_ids, semantics.parameter_rows, final_source_metadata, strict=True)):
+        if not isinstance(final_value, Mapping) or final_value.get("case_id") != case_id:
+            msg = f"Final dataset source_metadata[{index}] does not match source-sample membership."
+            raise ValueError(msg)
+        final_parameters = final_value.get("parameters")
+        if not isinstance(final_parameters, Mapping) or set(final_parameters) != set(semantics.parameter_names):
+            msg = f"Final dataset source_metadata[{index}].parameters does not match sampled variable names."
+            raise ValueError(msg)
+        for name, expected_value in parameters.items():
+            actual = final_parameters[name]
+            if isinstance(actual, bool) or not isinstance(actual, Real) or not math.isfinite(float(actual)) or float(actual) != float(expected_value):
+                msg = f"Final dataset source_metadata[{index}].parameters.{name} does not match source-sample CSV."
+                raise ValueError(msg)
+
+
+def _validate_final_source_sample_bindings(
+    semantics: SourceSampleSemantics,
+    *,
+    dataset_identity: DatasetIdentity,
+    csv_sha256: str,
+    json_sha256: str,
+    manifest_sha256: str | None,
+) -> None:
+    """Bind normalized source facts to all facts retained from the final payload."""
+    if tuple(dataset_identity.sample_ids) != semantics.case_ids or dataset_identity.sample_count != len(semantics.case_ids):
+        msg = "Source-sample membership does not match the final dataset identity."
+        raise ValueError(msg)
+    generated_identity = semantics.generated_batch_identity
+    if dataset_identity.generated_batch_identity_sha256 != generated_identity["batch_manifest_identity_sha256"]:
+        msg = "Source-sample semantics do not match the final generated-batch scientific identity."
+        raise ValueError(msg)
+    if dataset_identity.generated_batch_identity is not None and dataset_identity.generated_batch_identity != generated_identity:
+        msg = "Reconstructed generated-batch identity does not match the final dataset payload."
+        raise ValueError(msg)
+    provenance = dataset_identity.source_provenance
+    if provenance is not None:
+        expected_hashes = {
+            "source_sample_csv_sha256": csv_sha256,
+            "source_sample_json_sha256": json_sha256,
+        }
+        if manifest_sha256 is not None:
+            expected_hashes["batch_manifest_sha256"] = manifest_sha256
+        for key, expected_digest in expected_hashes.items():
+            if provenance.get(key) != expected_digest:
+                msg = f"Final dataset source provenance {key} does not match the metadata snapshot."
+                raise ValueError(msg)
+    if dataset_identity.source_metadata is not None:
+        _validate_final_parameter_rows(semantics, dataset_identity.source_metadata)
+
+
+def validate_source_sample_semantics(
+    sample_csv: bytes,
+    sample_json: bytes,
+    *,
+    source_manifest: Mapping[str, Any],
+    dataset_identity: DatasetIdentity | None = None,
+    source_manifest_sha256: str | None = None,
+) -> SourceSampleSemantics:
+    """Cross-bind source-sample snapshots, their manifest, and final identity."""
+    if not isinstance(sample_csv, bytes) or not isinstance(sample_json, bytes):
+        msg = "Source-sample snapshots must be exact bytes."
+        raise TypeError(msg)
+    manifest = _validate_source_manifest_snapshot(dict(source_manifest))
+    csv_sha256 = hashlib.sha256(sample_csv).hexdigest()
+    if csv_sha256 != manifest["configuration"]["sample_sha256"]:
+        msg = "Parameter-sample CSV SHA-256 does not match the source manifest."
+        raise ValueError(msg)
+    decoded_json, sampling, parameter_names, count = _parse_source_sample_json(
+        sample_json,
+        configuration=manifest["configuration"],
+    )
+    case_ids, parameter_rows = _parse_source_sample_csv(
+        sample_csv,
+        parameter_names=parameter_names,
+        count=count,
+        intended_case_ids=manifest["intended_case_ids"],
+    )
+    result = SourceSampleSemantics(
+        sample_json=decoded_json,
+        sampling=sampling,
+        case_ids=case_ids,
+        parameter_names=parameter_names,
+        parameter_rows=parameter_rows,
+        generated_batch_identity=build_generated_batch_identity(manifest, sampling=sampling),
+    )
+    if dataset_identity is not None:
+        _validate_final_source_sample_bindings(
+            result,
+            dataset_identity=dataset_identity,
+            csv_sha256=csv_sha256,
+            json_sha256=hashlib.sha256(sample_json).hexdigest(),
+            manifest_sha256=source_manifest_sha256,
+        )
+    return result
+
+
 def _validate_timing_summary(value: Any, *, intended_count: int, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         msg = f"{label} must be a mapping."
@@ -471,40 +746,107 @@ def validate_comsol_timing_snapshot(
     return normalized
 
 
-def _validate_inventory_files(
+def _validate_tensor_contract(
+    value: Any,
+    *,
+    dataset_identity: DatasetIdentity,
+) -> dict[str, Any]:
+    """Validate compact tensor shapes and dtypes against the registered task."""
+    if not isinstance(value, dict):
+        msg = "Dataset metadata tensors must be a mapping."
+        raise TypeError(msg)
+    _require_exact_keys(value, {"inputs", "outputs"}, label="Dataset metadata tensors")
+    task = domain.tasks.registry.get_task(dataset_identity.task)
+    expected = {
+        "inputs": {
+            "dtype": "float32",
+            "shape": [dataset_identity.sample_count, task.in_channels, *dataset_identity.spatial_shape],
+        },
+        "outputs": {
+            "dtype": "float32",
+            "shape": [dataset_identity.sample_count, task.out_channels, *dataset_identity.spatial_shape],
+        },
+    }
+    if value != expected:
+        msg = "Dataset metadata tensor shapes or dtypes do not match the final dataset contract."
+        raise ValueError(msg)
+    return value
+
+
+def _validate_file_artifact(value: Any, *, label: str) -> dict[str, Any]:
+    """Validate one immutable file name, SHA-256, and size record."""
+    if not isinstance(value, dict):
+        msg = f"{label} must be a mapping."
+        raise TypeError(msg)
+    _require_exact_keys(value, {"filename", "sha256", "size_bytes"}, label=label)
+    filename = value["filename"]
+    if not isinstance(filename, str) or not filename or Path(filename).name != filename:
+        msg = f"{label}.filename must be one non-empty basename."
+        raise ValueError(msg)
+    _require_sha256(value["sha256"], label=f"{label}.sha256")
+    _require_positive_int(value["size_bytes"], label=f"{label}.size_bytes")
+    return value
+
+
+def _validate_snapshot_artifacts(
     root: Path,
     *,
     names: set[str],
-    inventory: dict[str, Any],
-) -> None:
-    """Validate exact metadata file membership, hashes, sizes, and declared roles."""
-    files = inventory["files"]
-    if not isinstance(files, dict):
-        msg = "Metadata inventory files must be a mapping."
+    snapshots: Any,
+) -> dict[str, Any]:
+    """Validate exact snapshot membership, hashes, sizes, and fixed roles."""
+    if not isinstance(snapshots, dict):
+        msg = "Dataset metadata snapshots must be a mapping."
         raise TypeError(msg)
-    expected_inventory_names = names.difference({INVENTORY_FILENAME})
-    if set(files) != expected_inventory_names:
-        msg = "Metadata inventory file membership does not match the package."
+    expected_names = names.difference({METADATA_FILENAME})
+    if set(snapshots) != expected_names:
+        msg = "Dataset metadata snapshot membership does not match the package."
         raise ValueError(msg)
-    for filename, entry in files.items():
+    for filename, entry in snapshots.items():
         if not isinstance(entry, dict):
-            msg = f"Metadata inventory entry {filename!r} must be a mapping."
+            msg = f"Dataset metadata snapshot {filename!r} must be a mapping."
             raise TypeError(msg)
-        _require_exact_keys(entry, {"sha256", "size_bytes", "required", "role"}, label=f"Metadata inventory {filename}")
-        file_path = root / filename
-        expected_sha256 = _require_sha256(entry["sha256"], label=f"Metadata inventory {filename}.sha256")
+        _require_exact_keys(
+            entry,
+            {"sha256", "size_bytes", "required", "role"},
+            label=f"Dataset metadata snapshot {filename}",
+        )
+        expected_required = filename in _REQUIRED_SNAPSHOT_FILES
+        expected_role = _SNAPSHOT_ROLES.get(filename)
+        if entry["required"] is not expected_required or entry["role"] != expected_role:
+            msg = f"Dataset metadata snapshot {filename!r} has invalid ownership metadata."
+            raise ValueError(msg)
+        expected_sha256 = _require_sha256(
+            entry["sha256"],
+            label=f"Dataset metadata snapshot {filename}.sha256",
+        )
         expected_size = _require_nonnegative_int(
             entry["size_bytes"],
-            label=f"Metadata inventory {filename}.size_bytes",
+            label=f"Dataset metadata snapshot {filename}.size_bytes",
         )
+        file_path = root / filename
         if file_path.stat().st_size != expected_size or common.serialization.file_sha256(file_path) != expected_sha256:
             msg = f"Metadata snapshot hash or size mismatch: {file_path}"
             raise ValueError(msg)
-        if not isinstance(entry["required"], bool) or not isinstance(entry["role"], str) or not entry["role"]:
-            msg = f"Metadata inventory {filename} has invalid required/role values."
-            raise ValueError(msg)
-    if not _REQUIRED_SNAPSHOT_FILES.issubset(files):
-        msg = "Metadata inventory omits a required validated snapshot."
+    return snapshots
+
+
+def _validate_generated_batch_digest(
+    value: Any,
+    *,
+    dataset_identity: DatasetIdentity,
+) -> None:
+    """Bind metadata to the generated-batch digest validated inside the dataset."""
+    digest = _require_sha256(
+        value,
+        label="Dataset metadata generated_batch_identity_sha256",
+    )
+    expected = dataset_identity.generated_batch_identity_sha256
+    if expected is None:
+        msg = "Dataset identity does not expose its validated generated-batch scientific digest."
+        raise ValueError(msg)
+    if digest != expected:
+        msg = "Dataset metadata scientific identity does not match the loaded final dataset."
         raise ValueError(msg)
 
 
@@ -512,135 +854,108 @@ def validate_dataset_metadata_directory(
     directory: Path | str,
     *,
     dataset_identity: DatasetIdentity,
+    dataset_path: Path | str | None = None,
 ) -> DatasetMetadata:
-    """Validate one complete metadata package without accessing generation data."""
+    """Validate one consolidated metadata package without generation access."""
     root = Path(directory)
     if not root.is_dir():
         msg = f"Dataset metadata directory does not exist: {root}"
         raise FileNotFoundError(msg)
     names = {path.name for path in root.iterdir() if path.is_file()}
-    unexpected = sorted(names.difference(_ALLOWED_SNAPSHOT_FILES))
-    missing = sorted((_REQUIRED_SNAPSHOT_FILES | {INVENTORY_FILENAME}).difference(names))
+    unexpected = sorted(names.difference(_ALLOWED_PACKAGE_FILES))
+    missing = sorted((_REQUIRED_SNAPSHOT_FILES | {METADATA_FILENAME}).difference(names))
     if missing or unexpected:
         msg = f"Dataset metadata package is incomplete or inconsistent: missing={missing}; unexpected={unexpected}."
         raise ValueError(msg)
-    provenance = _load_json(root / PROVENANCE_FILENAME, label="dataset provenance")
+
+    metadata = _load_json(root / METADATA_FILENAME, label="dataset metadata")
     _require_exact_keys(
-        provenance,
-        {
-            "schema_kind",
-            "schema_version",
-            "dataset_id",
-            "dataset_schema_version",
-            "dataset_fingerprint",
-            "task",
-            "task_contract_digest",
-            "source_batch",
-            "sample_count",
-            "spatial_shape",
-            "timing",
-        },
-        label="Dataset provenance",
+        metadata,
+        {"schema_kind", "schema_version", "dataset_id", "scientific_identity", "artifacts", "operational_provenance"},
+        label="Dataset metadata",
     )
-    if provenance["schema_kind"] != PROVENANCE_SCHEMA_KIND:
-        msg = "Unsupported dataset provenance schema kind."
+    if metadata["schema_kind"] != METADATA_SCHEMA_KIND:
+        msg = "Unsupported dataset metadata schema kind."
         raise ValueError(msg)
     _require_schema_version(
-        provenance["schema_version"],
+        metadata["schema_version"],
         expected=METADATA_SCHEMA_VERSION,
-        label="Dataset provenance schema_version",
+        label="Dataset metadata schema_version",
     )
-    _require_schema_version(
-        provenance["dataset_schema_version"],
-        expected=TRAINING_DATASET_SCHEMA_VERSION,
-        label="Dataset provenance dataset_schema_version",
-    )
-    provenance_sample_count = _require_positive_int(
-        provenance["sample_count"],
-        label="Dataset provenance sample_count",
-    )
-    provenance_spatial_shape = _require_spatial_shape(
-        provenance["spatial_shape"],
-        label="Dataset provenance spatial_shape",
-    )
-    if (
-        provenance["dataset_id"] != dataset_identity.dataset_id
-        or provenance["dataset_fingerprint"] != dataset_identity.fingerprint
-        or provenance["task"] != dataset_identity.task
-        or provenance["task_contract_digest"] != dataset_identity.task_contract_digest
-        or provenance_sample_count != dataset_identity.sample_count
-        or provenance_spatial_shape != list(dataset_identity.spatial_shape)
-    ):
-        msg = "Dataset provenance does not match the loaded final dataset identity."
+    if metadata["dataset_id"] != dataset_identity.dataset_id:
+        msg = "Dataset metadata ID does not match the loaded final dataset."
         raise ValueError(msg)
-    source_batch = provenance["source_batch"]
-    if not isinstance(source_batch, dict):
-        msg = "Dataset provenance source_batch must be a mapping."
+
+    scientific = metadata["scientific_identity"]
+    if not isinstance(scientific, dict):
+        msg = "Dataset metadata scientific_identity must be a mapping."
         raise TypeError(msg)
     _require_exact_keys(
-        source_batch,
-        {"batch_name", "batch_manifest_sha256", "batch_manifest_identity_sha256"},
-        label="Dataset provenance source_batch",
-    )
-    manifest_sha256 = _require_sha256(source_batch["batch_manifest_sha256"], label="batch_manifest_sha256")
-    _require_sha256(source_batch["batch_manifest_identity_sha256"], label="batch_manifest_identity_sha256")
-
-    inventory = _load_json(root / INVENTORY_FILENAME, label="metadata inventory")
-    _require_exact_keys(
-        inventory,
+        scientific,
         {
-            "schema_kind",
-            "schema_version",
-            "dataset_id",
+            "dataset_schema_version",
             "dataset_fingerprint",
-            "task",
+            "task_id",
             "task_contract_digest",
+            "source_batch_id",
+            "generated_batch_identity_sha256",
             "sample_count",
             "spatial_shape",
-            "source_batch_name",
-            "source_manifest_sha256",
-            "files",
-            "timing",
+            "tensors",
         },
-        label="Metadata inventory",
+        label="Dataset metadata scientific_identity",
     )
-    if inventory["schema_kind"] != INVENTORY_SCHEMA_KIND:
-        msg = "Unsupported metadata inventory schema kind."
-        raise ValueError(msg)
     _require_schema_version(
-        inventory["schema_version"],
-        expected=METADATA_SCHEMA_VERSION,
-        label="Metadata inventory schema_version",
+        scientific["dataset_schema_version"],
+        expected=TRAINING_DATASET_SCHEMA_VERSION,
+        label="Dataset metadata dataset_schema_version",
     )
-    inventory_sample_count = _require_positive_int(
-        inventory["sample_count"],
-        label="Metadata inventory sample_count",
+    sample_count = _require_positive_int(scientific["sample_count"], label="Dataset metadata sample_count")
+    spatial_shape = _require_spatial_shape(scientific["spatial_shape"], label="Dataset metadata spatial_shape")
+    _require_sha256(scientific["dataset_fingerprint"], label="Dataset metadata dataset_fingerprint")
+    _require_sha256(scientific["task_contract_digest"], label="Dataset metadata task_contract_digest")
+    _validate_generated_batch_digest(
+        scientific["generated_batch_identity_sha256"],
+        dataset_identity=dataset_identity,
     )
-    inventory_spatial_shape = _require_spatial_shape(
-        inventory["spatial_shape"],
-        label="Metadata inventory spatial_shape",
-    )
-    expected_bindings = (
-        inventory["dataset_id"] == dataset_identity.dataset_id,
-        inventory["dataset_fingerprint"] == dataset_identity.fingerprint,
-        inventory["task"] == dataset_identity.task,
-        inventory["task_contract_digest"] == dataset_identity.task_contract_digest,
-        inventory_sample_count == dataset_identity.sample_count,
-        inventory_spatial_shape == list(dataset_identity.spatial_shape),
-        inventory["source_batch_name"] == source_batch["batch_name"],
-        inventory["source_manifest_sha256"] == manifest_sha256,
-    )
-    if not all(expected_bindings):
-        msg = "Metadata inventory does not match dataset or source-batch identity."
+    if (
+        scientific["dataset_fingerprint"] != dataset_identity.fingerprint
+        or scientific["task_id"] != dataset_identity.task
+        or scientific["task_contract_digest"] != dataset_identity.task_contract_digest
+        or scientific["source_batch_id"] != dataset_identity.dataset_id
+        or sample_count != dataset_identity.sample_count
+        or spatial_shape != list(dataset_identity.spatial_shape)
+    ):
+        msg = "Dataset metadata scientific identity does not match the loaded final dataset."
         raise ValueError(msg)
-    _validate_inventory_files(root, names=names, inventory=inventory)
+    _validate_tensor_contract(scientific["tensors"], dataset_identity=dataset_identity)
+
+    artifacts = metadata["artifacts"]
+    if not isinstance(artifacts, dict):
+        msg = "Dataset metadata artifacts must be a mapping."
+        raise TypeError(msg)
+    _require_exact_keys(artifacts, {"dataset", "snapshots"}, label="Dataset metadata artifacts")
+    dataset_artifact = _validate_file_artifact(artifacts["dataset"], label="Dataset metadata dataset artifact")
+    if dataset_artifact["filename"] != f"{dataset_identity.dataset_id}.pt":
+        msg = "Dataset metadata artifact filename does not match dataset identity."
+        raise ValueError(msg)
+    if dataset_path is not None:
+        resolved_dataset_path = Path(dataset_path)
+        if not resolved_dataset_path.is_file() or resolved_dataset_path.is_symlink():
+            msg = f"Final dataset artifact is not a regular file: {resolved_dataset_path}"
+            raise FileNotFoundError(msg)
+        if (
+            resolved_dataset_path.name != dataset_artifact["filename"]
+            or resolved_dataset_path.stat().st_size != dataset_artifact["size_bytes"]
+            or common.serialization.file_sha256(resolved_dataset_path) != dataset_artifact["sha256"]
+        ):
+            msg = "Final dataset artifact does not match dataset metadata SHA-256 and size."
+            raise ValueError(msg)
+    snapshots = _validate_snapshot_artifacts(root, names=names, snapshots=artifacts["snapshots"])
 
     manifest = _validate_source_manifest_snapshot(_load_json(root / SOURCE_MANIFEST_FILENAME, label="source manifest snapshot"))
-    if common.serialization.file_sha256(root / SOURCE_MANIFEST_FILENAME) != manifest_sha256:
-        msg = "Source manifest snapshot does not match its recorded exact SHA-256."
-        raise ValueError(msg)
-    intended = manifest["intended_case_ids"]
-    if manifest["batch_name"] != source_batch["batch_name"] or intended != list(dataset_identity.sample_ids):
+    manifest_sha256 = snapshots[SOURCE_MANIFEST_FILENAME]["sha256"]
+    if manifest["batch_name"] != scientific["source_batch_id"] or manifest["intended_case_ids"] != list(dataset_identity.sample_ids):
         msg = "Source manifest snapshot membership does not match the final dataset."
         raise ValueError(msg)
     configuration = manifest["configuration"]
@@ -648,15 +963,37 @@ def validate_dataset_metadata_directory(
         configuration.get("sample_sha256"),
         label="source manifest configuration.sample_sha256",
     )
-    if common.serialization.file_sha256(root / SOURCE_SAMPLE_CSV_FILENAME) != expected_sample_csv_sha256:
+    if snapshots[SOURCE_SAMPLE_CSV_FILENAME]["sha256"] != expected_sample_csv_sha256:
         msg = "Parameter-sample CSV snapshot does not match the source manifest SHA-256."
         raise ValueError(msg)
-    _load_json(root / SOURCE_SAMPLE_JSON_FILENAME, label="parameter-sample JSON snapshot")
-    timing_summary = _validate_timing_summary(provenance["timing"], intended_count=len(intended), label="Dataset provenance timing")
-    inventory_summary = _validate_timing_summary(inventory["timing"], intended_count=len(intended), label="Metadata inventory timing")
-    if timing_summary != inventory_summary:
-        msg = "Dataset provenance and metadata inventory timing summaries disagree."
+    validate_source_sample_semantics(
+        (root / SOURCE_SAMPLE_CSV_FILENAME).read_bytes(),
+        (root / SOURCE_SAMPLE_JSON_FILENAME).read_bytes(),
+        source_manifest=manifest,
+        dataset_identity=dataset_identity,
+        source_manifest_sha256=manifest_sha256,
+    )
+
+    operational = metadata["operational_provenance"]
+    if not isinstance(operational, dict):
+        msg = "Dataset metadata operational_provenance must be a mapping."
+        raise TypeError(msg)
+    _require_exact_keys(
+        operational,
+        {"builder_module", "publication_method", "source_manifest_sha256", "timing"},
+        label="Dataset metadata operational_provenance",
+    )
+    if operational["builder_module"] != BUILDER_MODULE or operational["publication_method"] != PUBLICATION_METHOD:
+        msg = "Dataset metadata builder or publication identity is unsupported."
         raise ValueError(msg)
+    if operational["source_manifest_sha256"] != manifest_sha256:
+        msg = "Dataset metadata source-manifest binding does not match its snapshot artifact."
+        raise ValueError(msg)
+    timing_summary = _validate_timing_summary(
+        operational["timing"],
+        intended_count=len(manifest["intended_case_ids"]),
+        label="Dataset metadata timing",
+    )
     timing_path = root / COMSOL_TIMING_FILENAME
     timing = _load_json(timing_path, label="COMSOL timing snapshot") if timing_path.is_file() else None
     if timing is None and timing_summary["measured_case_count"] != 0:
@@ -665,14 +1002,14 @@ def validate_dataset_metadata_directory(
     if timing is not None:
         timing = validate_comsol_timing_snapshot(
             timing,
-            batch_name=source_batch["batch_name"],
+            batch_name=scientific["source_batch_id"],
             manifest_sha256=manifest_sha256,
-            intended_case_ids=intended,
+            intended_case_ids=manifest["intended_case_ids"],
         )
         if len(timing["cases"]) != timing_summary["measured_case_count"]:
             msg = "COMSOL timing snapshot count disagrees with metadata coverage."
             raise ValueError(msg)
-    return DatasetMetadata(root, provenance, inventory, manifest, timing)
+    return DatasetMetadata(root, metadata, manifest, timing)
 
 
 def load_dataset_metadata(
@@ -680,7 +1017,12 @@ def load_dataset_metadata(
     *,
     dataset_identity: DatasetIdentity,
     metadata_root: Path | str | None = None,
+    dataset_path: Path | str | None = None,
 ) -> DatasetMetadata:
     """Resolve and validate one model-training metadata package."""
     directory = common.paths.resolve_dataset_metadata_dir(dataset_id, metadata_root=metadata_root)
-    return validate_dataset_metadata_directory(directory, dataset_identity=dataset_identity)
+    return validate_dataset_metadata_directory(
+        directory,
+        dataset_identity=dataset_identity,
+        dataset_path=dataset_path,
+    )

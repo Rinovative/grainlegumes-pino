@@ -96,7 +96,7 @@ def _case_components(
     inputs = torch.stack([input_fields[name] for name in task.input_names])
     outputs = torch.stack([output_fields[name] for name in task.output_names])
     source_identity = {"generator": "synthetic-smoke", "case": case_id}
-    source_metadata = {"offset": offset, "case_id": case_id}
+    source_metadata = {"offset": offset, "case_id": case_id, "parameters": {"synthetic_parameter": 1.0}}
     fingerprint = datasets.identity.compute_case_fingerprint(
         task=task,
         case_id=case_id,
@@ -142,7 +142,7 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
     metadata_dir.mkdir(parents=True)
     sample_csv_path = metadata_dir / datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME
     sample_csv_path.write_text(
-        "case_id;synthetic_parameter\n" + "\n".join(f"{sample_id};1.0" for sample_id in payload["sample_ids"]) + "\n",
+        "case_id;synthetic_parameter\n" + "\n".join(f"{int(str(sample_id).removeprefix('case_'))};1.0" for sample_id in payload["sample_ids"]) + "\n",
         encoding="utf-8",
     )
     generated_identity = payload["generated_batch_identity"]
@@ -181,74 +181,75 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
     manifest_path = metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME
     manifest_sha256 = common.serialization.file_sha256(manifest_path)
     payload["source_provenance"]["batch_manifest_sha256"] = manifest_sha256
-    destination = root / dataset_id / f"{dataset_id}.pt"
-    common.serialization.atomic_torch_save(payload, destination)
-    identity = datasets.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
+    sample_json_path = metadata_dir / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME
     common.serialization.atomic_write_json(
-        metadata_dir / datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME,
+        sample_json_path,
         {
             "meta": {
                 **generated_identity["sampling"],
                 "timestamp": "synthetic-test-snapshot",
             },
-            "n_cases": identity.sample_count,
+            "n_cases": int(payload["sample_count"]),
         },
     )
+    payload["source_provenance"]["source_sample_csv_sha256"] = common.serialization.file_sha256(sample_csv_path)
+    payload["source_provenance"]["source_sample_json_sha256"] = common.serialization.file_sha256(sample_json_path)
+    destination = root / dataset_id / f"{dataset_id}.pt"
+    common.serialization.atomic_torch_save(payload, destination)
+    identity = datasets.identity.validate_training_dataset_payload(payload, task=task, verify_content=True)
     timing_summary = {"status": "missing", "measured_case_count": 0, "intended_case_count": identity.sample_count}
-    source_batch = {
-        "batch_name": dataset_id,
-        "batch_manifest_sha256": manifest_sha256,
-        "batch_manifest_identity_sha256": str(payload["generated_batch_identity"]["batch_manifest_identity_sha256"]),
-    }
-    common.serialization.atomic_write_json(
-        metadata_dir / datasets.metadata.PROVENANCE_FILENAME,
-        {
-            "schema_kind": datasets.metadata.PROVENANCE_SCHEMA_KIND,
-            "schema_version": datasets.metadata.METADATA_SCHEMA_VERSION,
-            "dataset_id": dataset_id,
-            "dataset_schema_version": datasets.identity.TRAINING_DATASET_SCHEMA_VERSION,
-            "dataset_fingerprint": identity.fingerprint,
-            "task": task.id,
-            "task_contract_digest": task.contract_digest,
-            "source_batch": source_batch,
-            "sample_count": identity.sample_count,
-            "spatial_shape": list(identity.spatial_shape),
-            "timing": timing_summary,
-        },
-    )
-    roles = {
-        datasets.metadata.PROVENANCE_FILENAME: "normalized_dataset_provenance",
+    snapshot_roles = {
         datasets.metadata.SOURCE_MANIFEST_FILENAME: "validated_generation_manifest",
         datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME: "validated_parameter_sample_csv",
         datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME: "validated_parameter_sample_json",
     }
-    files = {
+    snapshots = {
         filename: {
             "sha256": common.serialization.file_sha256(metadata_dir / filename),
             "size_bytes": (metadata_dir / filename).stat().st_size,
             "required": True,
             "role": role,
         }
-        for filename, role in roles.items()
+        for filename, role in snapshot_roles.items()
     }
     common.serialization.atomic_write_json(
-        metadata_dir / datasets.metadata.INVENTORY_FILENAME,
+        metadata_dir / datasets.metadata.METADATA_FILENAME,
         {
-            "schema_kind": datasets.metadata.INVENTORY_SCHEMA_KIND,
+            "schema_kind": datasets.metadata.METADATA_SCHEMA_KIND,
             "schema_version": datasets.metadata.METADATA_SCHEMA_VERSION,
             "dataset_id": dataset_id,
-            "dataset_fingerprint": identity.fingerprint,
-            "task": task.id,
-            "task_contract_digest": task.contract_digest,
-            "sample_count": identity.sample_count,
-            "spatial_shape": list(identity.spatial_shape),
-            "source_batch_name": dataset_id,
-            "source_manifest_sha256": manifest_sha256,
-            "files": files,
-            "timing": timing_summary,
+            "scientific_identity": {
+                "dataset_schema_version": datasets.identity.TRAINING_DATASET_SCHEMA_VERSION,
+                "dataset_fingerprint": identity.fingerprint,
+                "task_id": task.id,
+                "task_contract_digest": task.contract_digest,
+                "source_batch_id": dataset_id,
+                "generated_batch_identity_sha256": str(payload["generated_batch_identity"]["batch_manifest_identity_sha256"]),
+                "sample_count": identity.sample_count,
+                "spatial_shape": list(identity.spatial_shape),
+                "tensors": payload["tensor_metadata"],
+            },
+            "artifacts": {
+                "dataset": {
+                    "filename": destination.name,
+                    "sha256": common.serialization.file_sha256(destination),
+                    "size_bytes": destination.stat().st_size,
+                },
+                "snapshots": snapshots,
+            },
+            "operational_provenance": {
+                "builder_module": datasets.metadata.BUILDER_MODULE,
+                "publication_method": datasets.metadata.PUBLICATION_METHOD,
+                "source_manifest_sha256": manifest_sha256,
+                "timing": timing_summary,
+            },
         },
     )
-    datasets.metadata.validate_dataset_metadata_directory(metadata_dir, dataset_identity=identity)
+    datasets.metadata.validate_dataset_metadata_directory(
+        metadata_dir,
+        dataset_identity=identity,
+        dataset_path=destination,
+    )
     return destination
 
 
@@ -613,6 +614,10 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     targets = (id_target, ood_target)
     assert (id_target / f"{_ID_DATASET}.parquet").is_file()
     assert (ood_target / f"{_OOD_DATASET}.parquet").is_file()
+    loaded_id = analysis.evaluation.dataframe.load_evaluation_artifact(id_target)
+    assert loaded_id.attrs["provenance_complete"] is True
+    assert loaded_id.attrs["artifact_root"] == str(id_target.resolve())
+    assert loaded_id["source_index"].tolist() == split["eval_indices"].tolist()
     for role, target in zip(("eval", "ood"), targets, strict=True):
         stored_provenance = json.loads((target / analysis.artifacts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
         assert stored_provenance["outputs"] == analysis.artifacts.artifact_output_manifest(target)

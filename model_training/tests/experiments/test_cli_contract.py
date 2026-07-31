@@ -10,6 +10,7 @@ their lifecycle semantics are tested in dedicated modules.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -195,15 +196,28 @@ def test_artifact_cli_forwards_device_override(
 def test_optuna_dry_run_applies_device_override_without_side_effects(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Execute an Optuna CPU dry-run against a deliberately absent output root.
-
-    Output must expose the policy and semantic signature while leaving all study,
-    trial, and tracking storage absent, preserving dry-run as read-only validation.
-    """
+    """Print a fully resolved CPU plan without SDK, training, tracking, or writes."""
     config_path = Path(__file__).parents[2] / "configs/optuna/steady_flow_fno_search.yaml"
     output_root = tmp_path / "must-not-exist"
+    described_datasets: list[str] = []
+
+    def describe_dataset(_config: object, dataset_id: str) -> dict[str, object]:
+        """Return a bounded identity summary while recording both configured roles."""
+        described_datasets.append(dataset_id)
+        return {"dataset_id": dataset_id, "fingerprint": dataset_id + "-fingerprint"}
+
+    def reject_side_effect(*_args: object, **_kwargs: object) -> object:
+        """Fail if dry-run reaches an SDK, run allocator, or W&B initializer."""
+        pytest.fail("dry-run reached a side-effecting runtime boundary")
+
+    optuna_runtime = experiments.tuning.optuna
+    monkeypatch.setattr(optuna_runtime, "_describe_dataset_identity", describe_dataset)
+    monkeypatch.setattr(optuna_runtime, "_optuna_module", reject_side_effect)
+    monkeypatch.setattr(experiments.run, "prepare_fresh_run", reject_side_effect)
+    monkeypatch.setattr(experiments.tracking, "initialize_wandb", reject_side_effect)
+
     assert (
         cli_optuna.main(
             [
@@ -217,9 +231,50 @@ def test_optuna_dry_run_applies_device_override_without_side_effects(
         )
         == 0
     )
-    output = capsys.readouterr().out
-    assert '"device_policy": "cpu"' in output
-    assert '"semantic_signature"' in output
+    plan = json.loads(capsys.readouterr().out)
+    study_dir = output_root / "steady_flow/studies/steady_flow_fno_search"
+    assert plan["device_policy"] == "cpu"
+    assert plan["study_dir"] == str(study_dir)
+    assert plan["trial_root"] == str(study_dir / "trials")
+    assert plan["storage"] == f"sqlite:///{study_dir / 'steady_flow_fno_search.db'}"
+    assert plan["task"] == "steady_flow"
+    assert plan["model_kind"] == "fno"
+    assert plan["dataset_roles"]["id"]["dataset_id"] == "lhs_var80_seed3001"
+    assert plan["dataset_roles"]["ood"][0]["dataset_id"] == "lhs_var120_seed4001"
+    assert described_datasets == ["lhs_var80_seed3001", "lhs_var120_seed4001"]
+    assert "semantic_signature" in plan
+    assert not output_root.exists()
+
+
+def test_optuna_dry_run_dataset_failure_is_nonzero_without_output(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject one missing configured dataset before creating study state."""
+    config_path = Path(__file__).parents[2] / "configs/optuna/steady_flow_fno_search.yaml"
+    output_root = tmp_path / "must-not-exist"
+
+    def reject_dataset(_config: object, dataset_id: str) -> dict[str, object]:
+        """Stand in for metadata admission of an absent configured dataset."""
+        msg = f"configured dataset missing: {dataset_id}"
+        raise FileNotFoundError(msg)
+
+    monkeypatch.setattr(experiments.tuning.optuna, "_describe_dataset_identity", reject_dataset)
+    assert (
+        cli_optuna.main(
+            [
+                str(config_path),
+                "--dry-run",
+                "--device",
+                "cpu",
+                "--output-root",
+                str(output_root),
+            ]
+        )
+        == 1
+    )
+    assert "configured dataset missing: lhs_var80_seed3001" in capsys.readouterr().err
     assert not output_root.exists()
 
 

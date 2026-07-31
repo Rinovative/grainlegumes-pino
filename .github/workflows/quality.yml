@@ -37,11 +37,11 @@ jobs:
 
       - name: Lint
         shell: bash -l {0}
-        run: ruff check model_training/src model_training/tests data_generation/matlab scripts/check_notebooks.py
+        run: ruff check model_training/src model_training/tests data_generation scripts/check_notebooks.py
 
       - name: Check formatting
         shell: bash -l {0}
-        run: ruff format --check model_training/src model_training/tests data_generation/matlab scripts/check_notebooks.py --exclude '*.ipynb'
+        run: ruff format --check model_training/src model_training/tests data_generation scripts/check_notebooks.py --exclude '*.ipynb'
 
       - name: Validate maintained notebooks and archive notices
         shell: bash -l {0}
@@ -51,7 +51,7 @@ jobs:
 
       - name: Type-check with Mypy
         shell: bash -l {0}
-        run: PYTHONPATH=model_training mypy model_training/src data_generation/matlab
+        run: PYTHONPATH=model_training mypy model_training/src data_generation
 
       - name: Type-check with BasedPyright
         shell: bash -l {0}
@@ -96,7 +96,7 @@ jobs:
                   "-j",
                   "model_training/src",
                   "model_training/tests",
-                  "data_generation/matlab",
+                  "data_generation",
                   "scripts/check_notebooks.py",
               ],
               capture_output=True,
@@ -182,7 +182,7 @@ jobs:
           EOF
       - name: Compile maintained Python
         shell: bash -l {0}
-        run: python -m compileall -q model_training/src data_generation/matlab scripts/check_notebooks.py
+        run: python -m compileall -q model_training/src data_generation scripts/check_notebooks.py
 
       - name: Run CPU tests
         shell: bash -l {0}
@@ -197,4 +197,4 @@ jobs:
           python -m src.experiments.cli.cli_optuna --help
           python -m src.experiments.cli.cli_build_artifacts --help
           cd ..
-          PYTHONPATH=model_training python -m data_generation.matlab.build_batch_dataset --help
+          PYTHONPATH=model_training python -m data_generation.build_training_dataset --help

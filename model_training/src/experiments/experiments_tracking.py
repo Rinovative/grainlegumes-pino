@@ -736,11 +736,12 @@ class WandbSession:
             candidate = Path(path)
             self._validate_run_file(kind, candidate)
 
-            def upload_candidate(candidate: Path = candidate) -> None:
-                """Upload one prevalidated file relative to the current run only."""
+            def upload_candidate(candidate: Path = candidate, kind: str = kind) -> None:
+                """Upload one prevalidated file without colliding with W&B-owned names."""
+                base_path = self.run_dir.parent if kind == "config" else self.run_dir
                 save(
                     str(candidate),
-                    base_path=str(self.run_dir),
+                    base_path=str(base_path),
                     policy="now",
                 )
 

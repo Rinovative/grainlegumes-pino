@@ -593,13 +593,22 @@ def load_evaluation_artifact(artifact_root: str | Path) -> pd.DataFrame:
         msg = "Artifact provenance must contain one JSON object."
         raise TypeError(msg)
     outputs = _mapping(provenance.get("outputs"), label="provenance.outputs")
-    parquet_names = [name for name in outputs if isinstance(name, str) and Path(name).suffix == ".parquet"]
-    if len(parquet_names) != 1:
-        msg = f"Artifact output manifest must declare exactly one Parquet table, found {parquet_names}."
+    parquet = _mapping(outputs.get("parquet"), label="provenance.outputs.parquet")
+    parquet_name = parquet.get("path")
+    if not isinstance(parquet_name, str) or not parquet_name or Path(parquet_name).suffix != ".parquet":
+        msg = "Artifact output manifest must declare one Parquet path."
         raise ValueError(msg)
-    parquet_path = (root / parquet_names[0]).resolve()
+    parquet_path = (root / parquet_name).resolve()
     if not parquet_path.is_relative_to(root) or not parquet_path.is_file():
         msg = "Declared artifact Parquet payload is missing or escapes its root."
+        raise ValueError(msg)
+    try:
+        computed_outputs = artifacts.artifact_output_manifest(root)
+    except (OSError, RuntimeError) as error:
+        msg = f"Artifact output manifest cannot be recomputed for {root}: {error}"
+        raise ValueError(msg) from error
+    if dict(outputs) != computed_outputs:
+        msg = "Artifact output manifest does not match the current payload files."
         raise ValueError(msg)
     frame_raw = pd.read_parquet(parquet_path)
     frame_raw.attrs["artifact_root"] = str(root)

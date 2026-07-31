@@ -24,6 +24,7 @@ This module does NOT:
 ===============================================================================
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -122,6 +123,69 @@ def get_training_raw_root() -> Path:
 def get_training_processed_root() -> Path:
     """Return the stage owning runs, studies, logs, and acceptance outputs."""
     return get_model_training_data_root() / "processed"
+
+
+def get_training_state_root(*, model_training_data_root: Path | str | None = None) -> Path:
+    """Return the hidden root for transient model-training coordination state."""
+    root = Path(model_training_data_root).expanduser() if model_training_data_root is not None else get_model_training_data_root()
+    return root / ".state"
+
+
+def get_dataset_build_locks_root(*, model_training_data_root: Path | str | None = None) -> Path:
+    """Return the persistent OS-lock-anchor root for dataset publication."""
+    return get_training_state_root(model_training_data_root=model_training_data_root) / "dataset-builds" / "locks"
+
+
+def get_dataset_build_transactions_root(*, model_training_data_root: Path | str | None = None) -> Path:
+    """Return the recoverable dataset-publication transaction registry."""
+    return get_training_state_root(model_training_data_root=model_training_data_root) / "dataset-builds" / "transactions"
+
+
+def get_run_locks_root(*, model_training_data_root: Path | str | None = None) -> Path:
+    """Return the persistent OS-lock-anchor root for saved-run writers."""
+    return get_training_state_root(model_training_data_root=model_training_data_root) / "runs" / "locks"
+
+
+def resolve_dataset_build_lock_path(
+    dataset_id: str,
+    *,
+    model_training_data_root: Path | str | None = None,
+) -> Path:
+    """Resolve one dataset builder's persistent advisory-lock anchor."""
+    dataset_id = validate_logical_name(dataset_id, label="dataset_id")
+    return get_dataset_build_locks_root(model_training_data_root=model_training_data_root) / f"dataset-{dataset_id}.lock"
+
+
+def resolve_dataset_build_transaction_path(
+    dataset_id: str,
+    *,
+    model_training_data_root: Path | str | None = None,
+) -> Path:
+    """Resolve one dataset builder's durable recovery marker."""
+    dataset_id = validate_logical_name(dataset_id, label="dataset_id")
+    return get_dataset_build_transactions_root(model_training_data_root=model_training_data_root) / f"dataset-{dataset_id}.json"
+
+
+def resolve_run_lock_path(
+    run_dir: Path | str,
+    *,
+    model_training_data_root: Path | str | None = None,
+) -> Path:
+    """Resolve one path-qualified saved-run writer lock below hidden state."""
+    canonical_run = Path(run_dir).expanduser().resolve(strict=False)
+    digest = hashlib.sha256(os.fsencode(canonical_run)).hexdigest()
+    return get_run_locks_root(model_training_data_root=model_training_data_root) / f"run-{digest}.lock"
+
+
+def resolve_artifact_lock_path(
+    artifact_dir: Path | str,
+    *,
+    model_training_data_root: Path | str | None = None,
+) -> Path:
+    """Resolve one path-qualified analysis-artifact lock below hidden run state."""
+    canonical_artifact = Path(artifact_dir).expanduser().resolve(strict=False)
+    digest = hashlib.sha256(os.fsencode(canonical_artifact)).hexdigest()
+    return get_run_locks_root(model_training_data_root=model_training_data_root) / f"artifact-{digest}.lock"
 
 
 def get_dataset_root() -> Path:

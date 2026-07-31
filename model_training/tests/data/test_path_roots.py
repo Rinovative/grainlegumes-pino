@@ -27,6 +27,10 @@ def test_two_public_domains_derive_owned_lifecycle_stages(
     assert common.paths.get_training_meta_root() == training_root / "meta"
     assert common.paths.get_training_raw_root() == training_root / "raw"
     assert common.paths.get_training_processed_root() == training_root / "processed"
+    assert common.paths.get_training_state_root() == training_root / ".state"
+    assert common.paths.get_dataset_build_locks_root() == training_root / ".state" / "dataset-builds" / "locks"
+    assert common.paths.get_dataset_build_transactions_root() == training_root / ".state" / "dataset-builds" / "transactions"
+    assert common.paths.get_run_locks_root() == training_root / ".state" / "runs" / "locks"
     assert common.paths.get_dataset_root() == training_root / "raw"
     assert common.paths.get_output_root() == training_root / "processed"
 
@@ -34,6 +38,14 @@ def test_two_public_domains_derive_owned_lifecycle_stages(
     assert common.paths.resolve_generated_batch_dir("tiny", stage="processed") == generated_root / "processed" / "tiny"
     assert common.paths.resolve_dataset_path("tiny") == training_root / "raw" / "tiny" / "tiny.pt"
     assert common.paths.resolve_dataset_metadata_dir("tiny") == training_root / "meta" / "tiny"
+    assert common.paths.resolve_dataset_build_lock_path("tiny") == training_root / ".state/dataset-builds/locks/dataset-tiny.lock"
+    assert common.paths.resolve_dataset_build_transaction_path("tiny") == training_root / ".state/dataset-builds/transactions/dataset-tiny.json"
+    run_lock = common.paths.resolve_run_lock_path(training_root / "processed/steady_flow/runs/run")
+    artifact_lock = common.paths.resolve_artifact_lock_path(training_root / "processed/steady_flow/runs/run/analysis/id")
+    assert run_lock.parent == training_root / ".state/runs/locks"
+    assert run_lock.name.startswith("run-") and run_lock.suffix == ".lock"
+    assert artifact_lock.parent == training_root / ".state/runs/locks"
+    assert artifact_lock.name.startswith("artifact-") and artifact_lock.suffix == ".lock"
     assert common.paths.resolve_run_output_dir("steady_flow", "run") == (training_root / "processed" / "steady_flow" / "runs" / "run")
     assert common.paths.resolve_study_dir("steady_flow", "study") == (training_root / "processed" / "steady_flow" / "studies" / "study")
 
@@ -138,6 +150,10 @@ def test_owned_path_resolvers_apply_logical_name_validation(tmp_path: Path) -> N
         common.paths.resolve_dataset_path(invalid_name, dataset_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_dataset_metadata_dir(invalid_name, metadata_root=tmp_path)
+    with pytest.raises(ValueError, match="single non-empty path component"):
+        common.paths.resolve_dataset_build_lock_path(invalid_name, model_training_data_root=tmp_path)
+    with pytest.raises(ValueError, match="single non-empty path component"):
+        common.paths.resolve_dataset_build_transaction_path(invalid_name, model_training_data_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_generated_batch_dir(invalid_name, stage="raw", generated_data_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):

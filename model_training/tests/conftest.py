@@ -17,7 +17,33 @@ from src import datasets, domain
 from support.synthetic_task import build_synthetic_generated_batch_identity, build_synthetic_task
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
+    from pathlib import Path
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_session_application_data_roots(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Fence module- and session-scoped fixtures away from production data roots."""
+    root = tmp_path_factory.mktemp("application-data-roots")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("GENERATED_DATA_ROOT", str(root / "generated-data"))
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(root / "model-training-data"))
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
+
+
+@pytest.fixture(autouse=True)
+def isolate_application_data_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep every test's implicit data and coordination paths out of production roots."""
+    monkeypatch.setenv("GENERATED_DATA_ROOT", str(tmp_path / "generated-data"))
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(tmp_path / "model-training-data"))
 
 
 @pytest.fixture

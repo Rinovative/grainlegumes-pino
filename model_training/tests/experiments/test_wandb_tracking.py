@@ -478,6 +478,12 @@ def test_epoch_history_and_terminal_summary_mirror_local_values(
         "config.yaml",
         "summary.json",
     }
+    saved_by_name = {Path(path).name: (path, base_path, policy) for path, base_path, policy in run.saved}
+    assert Path(saved_by_name["config.yaml"][0]).relative_to(saved_by_name["config.yaml"][1]).parts == (
+        tmp_path.name,
+        "config.yaml",
+    )
+    assert saved_by_name["summary.json"][1] == str(tmp_path)
     assert state["last_logged_epoch"] == 5
     assert state["status"] == "finished"
     assert run.exit_codes == [0]

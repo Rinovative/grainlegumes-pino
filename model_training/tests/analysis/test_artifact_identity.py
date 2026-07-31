@@ -393,6 +393,10 @@ def test_unrelated_artifact_targets_use_independent_locks(tmp_path: Path) -> Non
     ood_target = common.paths.resolve_ood_analysis_dir(run_dir, "other")
     id_lock = analysis.artifact_service._artifact_lock_path(run_dir=run_dir, save_root=id_target)
     ood_lock = analysis.artifact_service._artifact_lock_path(run_dir=run_dir, save_root=ood_target)
+    assert id_lock.parent == common.paths.get_run_locks_root()
+    assert ood_lock.parent == common.paths.get_run_locks_root()
+    assert id_lock != ood_lock
+    assert not (common.paths.resolve_analysis_root(run_dir) / ".locks").exists()
     acquired = threading.Event()
 
     def acquire_ood() -> None:
@@ -406,6 +410,10 @@ def test_unrelated_artifact_targets_use_independent_locks(tmp_path: Path) -> Non
         assert acquired.wait(timeout=1)
     worker.join(timeout=5)
     assert not worker.is_alive()
+    assert id_lock.is_file()
+    assert ood_lock.is_file()
+    assert id_lock.stat().st_size == 0
+    assert ood_lock.stat().st_size == 0
 
 
 def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
@@ -802,6 +810,7 @@ def test_artifact_operation_waits_for_the_active_run_writer(
     A worker may observe request identity before blocking, but its locked body
     must execute only after the resume/training writer releases ownership.
     """
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(tmp_path / "training"))
     run_dir = tmp_path / "run"
     observed = threading.Event()
     executed = threading.Event()

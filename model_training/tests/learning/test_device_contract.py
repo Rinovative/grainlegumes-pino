@@ -229,6 +229,8 @@ def test_strict_cuda_does_not_mutate_an_existing_resume_run(
     resolution precedes every mutation of an existing run.
     """
     _hide_cuda(monkeypatch)
+    training_root = tmp_path / "training"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
     run_dir = tmp_path / "resume"
     run_dir.mkdir()
     (run_dir / "marker.bin").write_bytes(b"unchanged")
@@ -242,7 +244,8 @@ def test_strict_cuda_does_not_mutate_an_existing_resume_run(
         )
 
     assert _file_inventory(run_dir) == before
-    assert not (tmp_path / ".run-writer-locks").exists()
+    assert not (training_root / ".state").exists()
+    assert not list(run_dir.rglob("*.lock"))
 
 
 def test_inference_strict_cuda_fails_before_saved_run_admission(

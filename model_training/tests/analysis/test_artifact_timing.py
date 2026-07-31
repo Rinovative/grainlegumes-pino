@@ -112,6 +112,34 @@ def _comparison(*, comsol: bool = True) -> dict[str, Any]:
     )
 
 
+def _metadata_package(
+    *,
+    digest: str,
+    timing: dict[str, Any] | None,
+    status: str,
+) -> DatasetMetadata:
+    measured = 0 if timing is None else len(timing["cases"])
+    return DatasetMetadata(
+        directory=Path(),
+        metadata={
+            "artifacts": {
+                "snapshots": {
+                    "source_manifest.json": {"sha256": digest},
+                },
+            },
+            "operational_provenance": {
+                "timing": {
+                    "status": status,
+                    "measured_case_count": measured,
+                    "intended_case_count": 3,
+                },
+            },
+        },
+        source_manifest={},
+        timing=timing,
+    )
+
+
 def test_comsol_timing_resolution_uses_only_validated_training_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -119,16 +147,7 @@ def test_comsol_timing_resolution_uses_only_validated_training_metadata(
     """Runtime comparison must not resolve or inspect generation storage."""
     digest = "a" * 64
     comsol_payload = _comsol_payload(digest=digest)
-    package = DatasetMetadata(
-        directory=tmp_path,
-        provenance={
-            "source_batch": {"batch_manifest_sha256": digest},
-            "timing": {"status": "partial", "measured_case_count": 2, "intended_case_count": 3},
-        },
-        inventory={},
-        source_manifest={},
-        timing=comsol_payload,
-    )
+    package = _metadata_package(digest=digest, timing=comsol_payload, status="partial")
     request = analysis.artifact_service.ArtifactRequest(
         provenance={},
         source_indices=(),
@@ -145,16 +164,7 @@ def test_comsol_timing_resolution_uses_only_validated_training_metadata(
 
 
 def test_missing_training_timing_snapshot_is_nonfatal() -> None:
-    package = DatasetMetadata(
-        directory=Path(),
-        provenance={
-            "source_batch": {"batch_manifest_sha256": "a" * 64},
-            "timing": {"status": "missing", "measured_case_count": 0, "intended_case_count": 3},
-        },
-        inventory={},
-        source_manifest={},
-        timing=None,
-    )
+    package = _metadata_package(digest="a" * 64, timing=None, status="missing")
     request = analysis.artifact_service.ArtifactRequest(
         provenance={},
         source_indices=(),
@@ -176,16 +186,7 @@ def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
         "p10_s": [],
         "p90_s": [],
     }
-    package = DatasetMetadata(
-        directory=Path(),
-        provenance={
-            "source_batch": {"batch_manifest_sha256": "a" * 64},
-            "timing": {"status": "missing", "measured_case_count": 0, "intended_case_count": 3},
-        },
-        inventory={},
-        source_manifest={},
-        timing=comsol_payload,
-    )
+    package = _metadata_package(digest="a" * 64, timing=comsol_payload, status="missing")
     request = analysis.artifact_service.ArtifactRequest(
         provenance={},
         source_indices=(),

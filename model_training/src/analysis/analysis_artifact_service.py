@@ -49,7 +49,6 @@ from . import analysis_artifacts as artifacts
 from . import analysis_timing as timing
 
 DEFAULT_BATCH_SIZE = 1
-_ARTIFACT_LOCKS_DIRNAME = ".locks"
 
 ArtifactSplit = Literal["eval", "ood"]
 _SPLIT_INDEX_KEYS: dict[ArtifactSplit, str] = {
@@ -461,10 +460,9 @@ def _validated_artifact_target(*, run_dir: Path, save_root: Path) -> tuple[Path,
 
 
 def _artifact_lock_path(*, run_dir: Path, save_root: Path) -> Path:
-    """Return one lock path outside an exact deletable artifact target."""
-    analysis_root, target = _validated_artifact_target(run_dir=run_dir, save_root=save_root)
-    relative = target.relative_to(analysis_root)
-    return analysis_root / _ARTIFACT_LOCKS_DIRNAME / relative.parent / f"{relative.name}.lock"
+    """Return one centralized lock path outside an exact deletable artifact target."""
+    _analysis_root, target = _validated_artifact_target(run_dir=run_dir, save_root=save_root)
+    return common.paths.resolve_artifact_lock_path(target)
 
 
 def _completion_marker_identity(path: Path) -> tuple[int, int, int, int] | None:
@@ -502,14 +500,14 @@ def _load_bound_dataset_metadata(
         dataset_name,
         dataset_identity=dataset_identity,
         metadata_root=metadata_root,
+        dataset_path=source_dataset.path,
     )
     source_payload = getattr(source_dataset, "data", None)
     source_provenance = source_payload.get("source_provenance") if isinstance(source_payload, Mapping) else None
-    source_batch = package.provenance.get("source_batch")
-    if not isinstance(source_provenance, Mapping) or not isinstance(source_batch, Mapping):
-        msg = "Final dataset and metadata package must expose source-batch provenance."
+    if not isinstance(source_provenance, Mapping):
+        msg = "Final dataset must expose source-batch provenance."
         raise TypeError(msg)
-    if source_provenance.get("batch_manifest_sha256") != source_batch.get("batch_manifest_sha256"):
+    if source_provenance.get("batch_manifest_sha256") != package.source_manifest_sha256:
         msg = "Dataset metadata source manifest does not match the final dataset's operational provenance."
         raise ValueError(msg)
     return package
@@ -914,16 +912,10 @@ def _resolve_comsol_timing(
     package = request.dataset_metadata
     if package is None:
         return None, None, "validated model-training dataset metadata is unavailable"
-    source_batch = package.provenance.get("source_batch")
-    if not isinstance(source_batch, Mapping):
-        return None, None, "dataset metadata has no source-batch provenance"
-    manifest_sha256 = source_batch.get("batch_manifest_sha256")
-    if not isinstance(manifest_sha256, str):
-        return None, None, "dataset metadata has no source-manifest digest"
+    manifest_sha256 = package.source_manifest_sha256
     timing_payload = package.timing
     if timing_payload is None:
-        coverage = package.provenance.get("timing")
-        status = coverage.get("status") if isinstance(coverage, Mapping) else "missing"
+        status = package.timing_summary["status"]
         return None, None, f"validated model-training COMSOL timing snapshot is {status}"
     try:
         validated = timing.validate_comsol_solve_timing(timing_payload)

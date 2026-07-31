@@ -428,6 +428,8 @@ def test_resume_prevalidation_rejects_a_second_process_writer(
     if "fork" not in mp.get_all_start_methods():
         pytest.skip("POSIX fork context is required for process lease coverage")
     context = mp.get_context("fork")
+    training_root = tmp_path / "training"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     acquired = context.Event()
@@ -457,3 +459,8 @@ def test_resume_prevalidation_rejects_a_second_process_writer(
 
     assert holder.exitcode == 0
     assert outcomes.get(timeout=5) == "released"
+    lock_path = common.paths.resolve_run_lock_path(run_dir)
+    assert lock_path.parent == training_root / ".state/runs/locks"
+    assert lock_path.is_file()
+    assert lock_path.stat().st_size == 0
+    assert not list(run_dir.rglob("*.lock"))

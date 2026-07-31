@@ -35,4 +35,4 @@ dependencies:
   - pip:
       - neuraloperator==2.0.*
       - optuna
-      - wandb
+      - wandb == 0.28.1

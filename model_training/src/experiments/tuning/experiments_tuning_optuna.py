@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import gc
 import importlib
+import json
 import math
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -40,7 +41,7 @@ from typing import Any, Protocol, cast
 
 import torch
 
-from src import common, experiments, learning
+from src import common, datasets, experiments, learning
 
 from . import experiments_tuning_search_space as search_space
 
@@ -155,6 +156,16 @@ class OptunaStudyConfig:
     base_experiment: dict[str, Any]
     base_config: dict[str, Any]
     search_space: tuple[search_space.SearchSpaceParameter, ...]
+
+
+@dataclass(frozen=True)
+class _OptunaStudyPaths:
+    """Pure resolved study paths shared by dry-run planning and execution."""
+
+    study_dir: Path
+    trial_root: Path
+    storage: str
+    local_storage_path: Path | None
 
 
 @dataclass
@@ -720,32 +731,38 @@ def describe_optuna_study_config(config: OptunaStudyConfig) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Serializable source, study, task/model/objective, device policy, search
-        space, and complete semantic signature for dry-run output.
+        Serializable source, study, paths, dataset/task/model identities, device
+        policy, search space, objective, and complete semantic signature.
 
     Raises
     ------
     TypeError
-        If an in-memory study component has an invalid exact type.
+        If an in-memory study or compact dataset-metadata component is invalid.
     ValueError
-        If study policy, resolved science, reporting, or search semantics have
-        drifted since loading.
+        If study policy, resolved science, dataset identity, reporting, or search
+        semantics have drifted since loading.
 
     Notes
     -----
-    Description is read-only: it does not resolve hardware, create output paths,
-    open storage, allocate trials, or import the Optuna SDK.
+    Description reads compact model-training metadata but does not load dataset
+    tensors, resolve hardware, create paths, open storage, allocate trials,
+    initialize W&B, or import the Optuna SDK.
 
     """
     validated, objective = _validate_study_contract(config)
     signature = build_study_signature(validated)
+    study_paths = _resolve_study_paths(validated)
     return {
         "path": str(validated.path),
         "study": validated.study,
         "base_run_name": validated.base_config["run"]["name"],
         "device_policy": validated.base_config["run"]["device"],
+        "storage": study_paths.storage,
+        "study_dir": str(study_paths.study_dir),
+        "trial_root": str(study_paths.trial_root),
         "task": validated.base_config["task"],
         "model_kind": validated.base_config["model"]["kind"],
+        "dataset_roles": _configured_dataset_identities(validated.base_config),
         "objective": objective,
         "search_space": search_space.search_space_summary(validated.search_space),
         "semantic_signature": signature,
@@ -759,6 +776,77 @@ def _study_dir(config: OptunaStudyConfig) -> Path:
         str(config.study["name"]),
         output_root=Path(config.base_config["paths"]["output_root"]),
     )
+
+
+def _resolve_study_paths(config: OptunaStudyConfig) -> _OptunaStudyPaths:
+    """Resolve storage, study, and trial roots without creating any path."""
+    study_name = common.paths.validate_logical_name(config.study["name"], label="study.name")
+    study_dir = _study_dir(config)
+    configured_storage = config.study.get("storage")
+    local_storage_path = None if configured_storage is not None else study_dir / f"{study_name}.db"
+    storage = str(configured_storage) if configured_storage is not None else f"sqlite:///{local_storage_path}"
+    return _OptunaStudyPaths(study_dir, study_dir / "trials", storage, local_storage_path)
+
+
+def _describe_dataset_identity(config: Mapping[str, Any], dataset_id: str) -> dict[str, Any]:
+    """Validate one configured dataset through its compact metadata package."""
+    task = experiments.config.loader.validate_resolved_task_contract(config)
+    paths = _as_mapping(config.get("paths"), label="experiment.paths")
+    dataset_path = common.paths.resolve_dataset_path(dataset_id, dataset_root=Path(paths["dataset_root"]))
+    metadata_dir = common.paths.resolve_dataset_metadata_dir(dataset_id, metadata_root=Path(paths["training_meta_root"]))
+    if not dataset_path.is_file() or dataset_path.is_symlink():
+        msg = f"Configured training dataset is not a regular file: {dataset_path}"
+        raise FileNotFoundError(msg)
+
+    metadata = _as_mapping(
+        json.loads((metadata_dir / datasets.metadata.METADATA_FILENAME).read_text(encoding="utf-8")),
+        label="dataset metadata",
+    )
+    manifest = _as_mapping(
+        json.loads((metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME).read_text(encoding="utf-8")),
+        label="source manifest snapshot",
+    )
+    scientific = _as_mapping(metadata.get("scientific_identity"), label="dataset metadata scientific_identity")
+    identity = datasets.identity.DatasetIdentity(
+        dataset_id=dataset_id,
+        task=task.id,
+        task_contract_digest=task.contract_digest,
+        fingerprint=scientific["dataset_fingerprint"],
+        sample_ids=tuple(manifest["intended_case_ids"]),
+        sample_count=scientific["sample_count"],
+        spatial_shape=tuple(scientific["spatial_shape"]),
+        generated_batch_identity_sha256=scientific["generated_batch_identity_sha256"],
+    )
+    package = datasets.metadata.validate_dataset_metadata_directory(metadata_dir, dataset_identity=identity)
+    artifact = package.metadata["artifacts"]["dataset"]
+    if dataset_path.name != artifact["filename"] or dataset_path.stat().st_size != artifact["size_bytes"]:
+        msg = "Configured training dataset name or size does not match its metadata package."
+        raise ValueError(msg)
+    return {
+        "dataset_id": identity.dataset_id,
+        "dataset_path": str(dataset_path),
+        "metadata_dir": str(metadata_dir),
+        "validation": "metadata_package_and_artifact_stat",
+        "task": identity.task,
+        "task_contract_digest": identity.task_contract_digest,
+        "fingerprint": identity.fingerprint,
+        "sample_count": identity.sample_count,
+    }
+
+
+def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and summarize the exact configured ID and OOD dataset roles."""
+    data = _as_mapping(config.get("data"), label="experiment.data")
+    train_dataset = _require_nonempty_string(data.get("train_dataset"), label="data.train_dataset")
+    raw_ood = data.get("ood_datasets")
+    if not isinstance(raw_ood, list) or len(raw_ood) != 1:
+        msg = "data.ood_datasets must contain exactly one configured dataset id."
+        raise ValueError(msg)
+    ood_dataset = _require_nonempty_string(raw_ood[0], label="data.ood_datasets[0]")
+    return {
+        "id": _describe_dataset_identity(config, train_dataset),
+        "ood": [_describe_dataset_identity(config, ood_dataset)],
+    }
 
 
 def _build_pruner(study: Mapping[str, Any]) -> Any:
@@ -1779,17 +1867,13 @@ def run_optuna_study(
         msg = f"Optuna n_trials must be positive, got {trial_count}."
         raise ValueError(msg)
 
+    study_paths = _resolve_study_paths(study_config)
     optuna = _optuna_module()
     pruner = _build_pruner(study_config.study)
     sampler = _build_sampler(study_config.study)
     study_name = common.paths.validate_logical_name(study_config.study["name"], label="study.name")
-    configured_storage = study_config.study.get("storage")
-    if configured_storage:
-        storage = str(configured_storage)
-    else:
-        study_dir = _study_dir(study_config)
-        study_dir.mkdir(parents=True, exist_ok=True)
-        storage = f"sqlite:///{study_dir / (study_name + '.db')}"
+    if study_paths.local_storage_path is not None:
+        study_paths.study_dir.mkdir(parents=True, exist_ok=True)
 
     study, reopened = _create_or_load_study(
         optuna=optuna,
@@ -1797,7 +1881,7 @@ def run_optuna_study(
         direction=str(objective["direction"]),
         pruner=pruner,
         sampler=sampler,
-        storage=storage,
+        storage=study_paths.storage,
     )
     if reopened:
         _validate_existing_study(study, signature=signature, objective=objective)

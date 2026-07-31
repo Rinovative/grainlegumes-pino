@@ -869,6 +869,7 @@ def test_development_launcher_uses_same_two_domain_mount_contract(tmp_path: Path
     assert f"{storage_root / '.docker_home' / 'passwd'}:/etc/passwd:ro" in docker
     assert f"{storage_root / '.docker_home' / 'group'}:/etc/group:ro" in docker
     assert f"{storage_root}:/workspace/storage:rw" not in docker
+    assert not any(".state" in argument for argument in docker)
     assert (harness.repository / "data_generation" / "data").is_dir()
     assert (harness.repository / "model_training" / "data").is_dir()
 
@@ -891,8 +892,17 @@ def test_dockerfile_exports_only_two_application_data_roots() -> None:
     dockerfile = (_REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "ENV GENERATED_DATA_ROOT=/workspace/repo/data_generation/data" in dockerfile
     assert "ENV MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data" in dockerfile
-    for forbidden in ("ENV STORAGE_ROOT=", "ENV DATA_ROOT=", "ENV DATASET_ROOT=", "ENV OUTPUT_ROOT="):
+    for forbidden in (
+        "ENV STORAGE_ROOT=",
+        "ENV DATA_ROOT=",
+        "ENV DATASET_ROOT=",
+        "ENV OUTPUT_ROOT=",
+        "ENV TRAINING_STATE_ROOT=",
+        "ENV DATASET_LOCK_ROOT=",
+        "ENV RUN_LOCK_ROOT=",
+    ):
         assert forbidden not in dockerfile
+    assert ".state" not in dockerfile
 
 
 def test_two_data_domains_are_excluded_from_git_and_docker_context() -> None:

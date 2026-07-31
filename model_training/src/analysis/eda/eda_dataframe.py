@@ -34,7 +34,7 @@ def generate_eda_dataframe(
     and task field ordering as the final dataset builder. No model-training path
     is resolved or opened.
     """
-    from data_generation.matlab import build_batch_dataset as generated  # noqa: PLC0415
+    from data_generation import build_training_dataset as generated  # noqa: PLC0415
 
     loaded: dict[str, Any] = generated.load_generated_batch_for_eda(
         batch_name,
