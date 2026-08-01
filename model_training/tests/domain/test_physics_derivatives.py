@@ -1,4 +1,4 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, PLR2004
 """
 Verify reusable physical and spectral derivative operators on analytic fields.
 
@@ -103,6 +103,54 @@ def test_uniform_spacing_rejects_invalid_coordinate_grids() -> None:
     noncartesian[1] += 0.1
     with pytest.raises(ValueError, match="constant along the y-axis"):
         domain.physics.derivatives.infer_uniform_spacing(noncartesian, y_grid)
+
+
+def test_uniform_spacing_accepts_float32_quantized_cartesian_grid() -> None:
+    """Admit the real-grid geometry after ordinary float32 coordinate quantization."""
+    x_values = torch.linspace(0.0, 1.2, 401, dtype=torch.float32)
+    y_values = torch.linspace(0.0, 0.75, 251, dtype=torch.float32)
+    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
+    x_differences = torch.diff(x_grid.to(torch.float64), dim=-1)
+    y_differences = torch.diff(y_grid.to(torch.float64), dim=-2)
+    x_relative_only = ((x_differences - x_differences.mean()).abs() / x_differences.mean()).amax()
+    y_relative_only = ((y_differences - y_differences.mean()).abs() / y_differences.mean()).amax()
+
+    assert x_relative_only.item() > 1e-5
+    assert y_relative_only.item() > 1e-5
+    spacing_x, spacing_y = domain.physics.derivatives.infer_uniform_spacing(x_grid, y_grid)
+    assert spacing_x.dtype == torch.float32
+    assert spacing_y.dtype == torch.float32
+    assert spacing_x.item() == pytest.approx(0.003, rel=1e-6)
+    assert spacing_y.item() == pytest.approx(0.003, rel=1e-6)
+
+
+def test_uniform_spacing_still_rejects_material_float32_nonuniformity() -> None:
+    """Reject a localized 0.1% spacing change well above dtype roundoff."""
+    x_values = torch.linspace(0.0, 1.2, 401, dtype=torch.float32)
+    y_values = torch.linspace(0.0, 0.75, 251, dtype=torch.float32)
+    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
+    nonuniform = x_grid.clone()
+    nonuniform[:, 200:] += 3e-6
+
+    with pytest.raises(ValueError, match="not uniform"):
+        domain.physics.derivatives.infer_uniform_spacing(nonuniform, y_grid)
+
+
+def test_reflect_extension_uses_validated_unpadded_spacing() -> None:
+    """Differentiate on reflected fields without treating reflected coordinates as one axis."""
+    x_values = torch.linspace(0.0, 1.2, 401, dtype=torch.float32)
+    y_values = torch.linspace(0.0, 0.75, 251, dtype=torch.float32)
+    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
+    spacing_x, spacing_y = domain.physics.derivatives.infer_uniform_spacing(x_grid, y_grid)
+    field = (torch.cos(torch.pi * x_grid / 1.2) + torch.cos(torch.pi * y_grid / 0.75)).unsqueeze(0)
+    operator = domain.physics.derivatives.SpectralDerivatives(extension="reflect")
+
+    derivative_x, derivative_y = operator.gradient(field, spacing_x, spacing_y)
+
+    assert derivative_x.shape == field.shape
+    assert derivative_y.shape == field.shape
+    assert torch.isfinite(derivative_x).all()
+    assert torch.isfinite(derivative_y).all()
 
 
 def test_derivative_semantics_fail_clearly() -> None:

@@ -38,6 +38,7 @@ _MIN_SPATIAL_POINTS = 2
 _SPATIAL_AXIS_COUNT = 2
 _DEFAULT_UNIFORM_TOLERANCE = 1e-5
 _RECTILINEAR_EPSILON_FACTOR = 32.0
+_UNIFORM_ROUNDOFF_FACTOR = 4.0
 
 
 class DerivativeOperator(Protocol):
@@ -184,7 +185,9 @@ def infer_uniform_spacing(
     axes : tuple[int, int], optional
         ``(y_axis, x_axis)`` in the coordinate tensors.
     uniform_tolerance : float, optional
-        Maximum finite non-negative relative deviation from mean spacing.
+        Maximum finite non-negative scientific relative deviation from mean
+        spacing, applied together with a dtype- and coordinate-scale-aware
+        floating-point roundoff allowance.
 
     Returns
     -------
@@ -204,8 +207,11 @@ def infer_uniform_spacing(
     Notes
     -----
     Cross-axis coordinate variation is admitted only at a small dtype-scaled
-    roundoff tolerance. Uniformity is then measured as maximum relative
-    deviation from mean positive spacing independently along x and y.
+    roundoff tolerance. Along each varying axis, strict monotonicity remains
+    mandatory. Uniformity admits the configured relative deviation plus four
+    source-dtype epsilons at the coordinate scale, which covers subtraction of
+    independently rounded coordinate endpoints and mean-spacing reduction
+    without treating materially nonuniform grids as Cartesian.
 
     """
     y_axis, x_axis = _validate_field(x_coordinate, axes)
@@ -236,22 +242,40 @@ def infer_uniform_spacing(
         msg = "y-coordinate must be constant along the x-axis on a Cartesian grid."
         raise ValueError(msg)
 
-    x_differences = torch.diff(x_coordinate, dim=x_axis)
-    y_differences = torch.diff(y_coordinate, dim=y_axis)
+    # Validate in float64 so the admission decision measures quantization in the
+    # persisted source coordinates rather than adding float32 reduction error.
+    # The source dtype still determines the permitted roundoff allowance.
+    x_work = x_coordinate.to(torch.float64)
+    y_work = y_coordinate.to(torch.float64)
+    x_differences = torch.diff(x_work, dim=x_axis)
+    y_differences = torch.diff(y_work, dim=y_axis)
     if not bool((x_differences > 0).all().item()):
         msg = "x-coordinate must be strictly increasing along the x-axis."
         raise ValueError(msg)
     if not bool((y_differences > 0).all().item()):
         msg = "y-coordinate must be strictly increasing along the y-axis."
         raise ValueError(msg)
-    dx = x_differences.mean()
-    dy = y_differences.mean()
-    for label, differences, mean in (("x", x_differences, dx), ("y", y_differences, dy)):
-        relative_deviation = ((differences - mean).abs() / mean).amax()
-        if float(relative_deviation.detach().cpu().item()) > tolerance:
-            msg = f"{label}-coordinate spacing is not uniform within tolerance {tolerance}."
+    dx_work = x_differences.mean()
+    dy_work = y_differences.mean()
+    for label, coordinate, differences, mean in (
+        ("x", x_coordinate, x_differences, dx_work),
+        ("y", y_coordinate, y_differences, dy_work),
+    ):
+        source_epsilon = torch.finfo(coordinate.dtype).eps
+        coordinate_scale = coordinate.detach().to(torch.float64).abs().amax().clamp_min(mean.abs())
+        roundoff_allowance = _UNIFORM_ROUNDOFF_FACTOR * source_epsilon * coordinate_scale
+        relative_allowance = tolerance * mean.abs()
+        maximum_deviation = (differences - mean).abs().amax()
+        allowed_deviation = relative_allowance + roundoff_allowance
+        if bool((maximum_deviation > allowed_deviation).item()):
+            msg = (
+                f"{label}-coordinate spacing is not uniform: maximum absolute deviation "
+                f"{float(maximum_deviation.detach().cpu().item()):.12g} exceeds the combined "
+                f"relative ({tolerance:.12g}) and {coordinate.dtype} roundoff allowance "
+                f"{float(allowed_deviation.detach().cpu().item()):.12g}."
+            )
             raise ValueError(msg)
-    return dx, dy
+    return dx_work.to(dtype=x_coordinate.dtype), dy_work.to(dtype=y_coordinate.dtype)
 
 
 def crop_interior(field: Tensor, crop: int, *, axes: SpatialAxes = (-2, -1)) -> Tensor:

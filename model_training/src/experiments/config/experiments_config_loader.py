@@ -140,7 +140,7 @@ def _reject_unknown(mapping: Mapping[str, Any], allowed: frozenset[str], *, path
         raise ConfigError(msg)
 
 
-def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C901, PLR0912
+def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C901
     """
     Reject noncanonical task-fixed overrides and unknown nested keys.
 
@@ -221,31 +221,24 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                 wandb,
                 frozenset(
                     {
-                        "enabled",
-                        "project",
-                        "entity",
-                        "group",
-                        "tags",
                         "mode",
+                        "workflow",
+                        "study",
                         "monitor",
-                        "training_images",
                         "upload",
                     }
                 ),
                 path="tracking.wandb",
             )
-            for key in ("monitor", "training_images"):
-                if key not in wandb:
-                    continue
-                settings = _as_mapping(
-                    wandb[key],
-                    path=f"tracking.wandb.{key}",
+            if "monitor" in wandb:
+                monitor = _as_mapping(
+                    wandb["monitor"],
+                    path="tracking.wandb.monitor",
                 )
-                allowed = frozenset({"enabled", "interval", "max_cases"}) if key == "monitor" else frozenset({"enabled", "interval", "max_snapshots"})
                 _reject_unknown(
-                    settings,
-                    allowed,
-                    path=f"tracking.wandb.{key}",
+                    monitor,
+                    frozenset({"enabled", "interval", "max_cases"}),
+                    path="tracking.wandb.monitor",
                 )
             if "upload" in wandb:
                 upload = _as_mapping(
@@ -254,14 +247,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                 )
                 _reject_unknown(
                     upload,
-                    frozenset(
-                        {
-                            "config",
-                            "summary",
-                            "provenance",
-                            "best_checkpoint",
-                        }
-                    ),
+                    frozenset({"evaluation_artifacts"}),
                     path="tracking.wandb.upload",
                 )
 
@@ -682,15 +668,64 @@ def _single_ood_dataset(data: Mapping[str, Any], *, path: str) -> str:
         raise ConfigError(str(error)) from error
 
 
-def _validate_tracking(config: dict[str, Any]) -> None:
-    """
-    Validate and canonicalize optional W&B policy without credential access.
+def _model_variant(config: Mapping[str, Any]) -> str:
+    """Return the exact human-facing network/loss variant."""
+    model = _as_mapping(config.get("model"), path="model")
+    model_kind = common.paths.validate_logical_name(model.get("kind"), label="model.kind")
+    loss = _as_mapping(config.get("loss"), path="loss")
+    physics = _as_mapping(loss.get("physics"), path="loss.physics")
+    return f"pi-{model_kind}" if bool(physics.get("enabled")) else model_kind
 
-    The complete observer schema, monitor/image cadence, upload allowlist, mode,
-    tags, and identifiers are checked using exact types. This helper performs no
-    SDK import, authentication, network access, directory creation, or run
-    initialization.
-    """
+
+def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive the canonical project, optional study, and minimal base tags."""
+    tracking = _as_mapping(config.get("tracking"), path="tracking")
+    wandb = _as_mapping(tracking.get("wandb"), path="tracking.wandb")
+    workflow = wandb.get("workflow")
+    if workflow not in config_defaults.WANDB_WORKFLOWS:
+        msg = f"tracking.wandb.workflow must be one of {list(config_defaults.WANDB_WORKFLOWS)}, got {workflow!r}."
+        raise ConfigError(msg)
+
+    common.paths.validate_logical_name(config.get("task"), label="task")
+    variant = _model_variant(config)
+    raw_study = wandb.get("study")
+    if raw_study is not None:
+        try:
+            study = common.paths.validate_logical_name(raw_study, label="tracking.wandb.study")
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+    else:
+        study = None
+
+    if workflow == "train":
+        if study is not None:
+            msg = "tracking.wandb.study is valid only for workflow='optuna_trial'."
+            raise ConfigError(msg)
+        tags = [variant]
+    elif workflow == "optuna_trial":
+        if study is None:
+            msg = "tracking.wandb.study is required for workflow='optuna_trial'."
+            raise ConfigError(msg)
+        tags = [variant, "optuna"]
+    else:
+        if study is not None:
+            msg = "Acceptance workflows do not accept tracking.wandb.study."
+            raise ConfigError(msg)
+        tags = []
+
+    if len(tags) > config_defaults.WANDB_MAX_TAGS or len(tags) != len(set(tags)):
+        msg = f"Derived W&B tags must be unique and contain at most {config_defaults.WANDB_MAX_TAGS} values."
+        raise ConfigError(msg)
+    return {
+        "project": config_defaults.WANDB_PROJECT,
+        "entity": config_defaults.WANDB_ENTITY,
+        "study": study,
+        "tags": tags,
+    }
+
+
+def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None:
+    """Validate one central W&B mode and canonical derived organization."""
     tracking = _as_mapping(config["tracking"], path="tracking")
     _reject_unknown(tracking, frozenset({"wandb"}), path="tracking")
     wandb = _as_mapping(tracking.get("wandb"), path="tracking.wandb")
@@ -698,52 +733,25 @@ def _validate_tracking(config: dict[str, Any]) -> None:
         wandb,
         frozenset(
             {
-                "enabled",
+                "mode",
+                "workflow",
+                "study",
                 "project",
                 "entity",
-                "group",
                 "tags",
-                "mode",
                 "monitor",
-                "training_images",
                 "upload",
             }
         ),
         path="tracking.wandb",
     )
-    enabled = wandb.get("enabled")
-    if not isinstance(enabled, bool):
-        msg = "tracking.wandb.enabled must be boolean."
-        raise ConfigError(msg)
-    project = wandb.get("project")
-    if not isinstance(project, str) or not project or project.strip() != project:
-        msg = "tracking.wandb.project must be a non-empty trimmed string."
-        raise ConfigError(msg)
-    for key in ("entity", "group"):
-        value = wandb.get(key)
-        if value is not None and (not isinstance(value, str) or not value or value.strip() != value):
-            msg = f"tracking.wandb.{key} must be null or a non-empty trimmed string."
-            raise ConfigError(msg)
-    tags = wandb.get("tags")
-    if not isinstance(tags, list) or any(not isinstance(tag, str) or not tag or tag.strip() != tag for tag in tags):
-        msg = "tracking.wandb.tags must be a list of non-empty trimmed strings."
-        raise ConfigError(msg)
-    if len(tags) != len(set(tags)):
-        msg = "tracking.wandb.tags must be unique."
-        raise ConfigError(msg)
     mode = wandb.get("mode")
-    if mode not in {"online", "offline"}:
-        msg = "tracking.wandb.mode must be 'online' or 'offline'."
+    if mode not in {"online", "offline", "disabled"}:
+        msg = "tracking.wandb.mode must be 'online', 'offline', or 'disabled'."
         raise ConfigError(msg)
-    monitor = _as_mapping(
-        wandb.get("monitor"),
-        path="tracking.wandb.monitor",
-    )
-    _reject_unknown(
-        monitor,
-        frozenset({"enabled", "interval", "max_cases"}),
-        path="tracking.wandb.monitor",
-    )
+
+    monitor = _as_mapping(wandb.get("monitor"), path="tracking.wandb.monitor")
+    _reject_unknown(monitor, frozenset({"enabled", "interval", "max_cases"}), path="tracking.wandb.monitor")
     if type(monitor.get("enabled")) is not bool:
         msg = "tracking.wandb.monitor.enabled must be boolean."
         raise ConfigError(msg)
@@ -752,51 +760,28 @@ def _validate_tracking(config: dict[str, Any]) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             msg = f"tracking.wandb.monitor.{key} must be a positive integer."
             raise ConfigError(msg)
-    training_images = _as_mapping(
-        wandb.get("training_images"),
-        path="tracking.wandb.training_images",
-    )
-    _reject_unknown(
-        training_images,
-        frozenset({"enabled", "interval", "max_snapshots"}),
-        path="tracking.wandb.training_images",
-    )
-    if type(training_images.get("enabled")) is not bool:
-        msg = "tracking.wandb.training_images.enabled must be boolean."
+
+    upload = _as_mapping(wandb.get("upload"), path="tracking.wandb.upload")
+    _reject_unknown(upload, frozenset({"evaluation_artifacts"}), path="tracking.wandb.upload")
+    if type(upload.get("evaluation_artifacts")) is not bool:
+        msg = "tracking.wandb.upload.evaluation_artifacts must be boolean."
         raise ConfigError(msg)
-    for key in ("interval", "max_snapshots"):
-        value = training_images.get(key)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            msg = f"tracking.wandb.training_images.{key} must be a positive integer."
+
+    expected = derive_wandb_organization({**config, "tracking": {"wandb": wandb}})
+    if require_derived:
+        differences = sorted(key for key, value in expected.items() if wandb.get(key) != value)
+        if differences:
+            msg = f"Resolved W&B organization is noncanonical at key(s): {differences}."
             raise ConfigError(msg)
-    upload = _as_mapping(
-        wandb.get("upload"),
-        path="tracking.wandb.upload",
-    )
-    _reject_unknown(
-        upload,
-        frozenset(
-            {
-                "config",
-                "summary",
-                "provenance",
-                "best_checkpoint",
-            }
-        ),
-        path="tracking.wandb.upload",
-    )
-    for key, value in upload.items():
-        if type(value) is not bool:
-            msg = f"tracking.wandb.upload.{key} must be boolean."
-            raise ConfigError(msg)
+    else:
+        wandb.update(expected)
     wandb["monitor"] = monitor
-    wandb["training_images"] = training_images
     wandb["upload"] = upload
     tracking["wandb"] = wandb
     config["tracking"] = tracking
 
 
-def _validate_runtime_sections(config: dict[str, Any]) -> None:
+def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracking: bool) -> None:
     """
     Validate all generic runtime sections after semantic resolution.
 
@@ -841,7 +826,7 @@ def _validate_runtime_sections(config: dict[str, Any]) -> None:
         raise ConfigError(str(error)) from error
     _single_ood_dataset(data, path="data")
 
-    _validate_tracking(config)
+    _validate_tracking(config, require_derived=require_derived_tracking)
 
     run = _as_mapping(config["run"], path="run")
     device_module = importlib.import_module("src.learning.learning_device")
@@ -888,18 +873,19 @@ def generate_run_name(config: dict[str, Any]) -> str:
     params = _as_mapping(model["params"], path="model.params")
     run = _as_mapping(config["run"], path="run")
 
+    variant = _model_variant(config)
     if kind == "fno":
         modes = params["n_modes"]
-        model_key = f"fno_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
+        model_key = f"{variant}_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
     elif kind == "uno":
-        model_key = f"uno_h{params['hidden_channels']}_l{params['n_layers']}"
+        mode_ratio = format(float(params["mode_ratio"]), ".8g").replace(".", "p")
+        model_key = f"{variant}_m{params['modes_x']}x{params['modes_y']}_h{params['hidden_channels']}_l{params['n_layers']}_r{mode_ratio}"
     else:
         domain.tasks.registry.get_task(task)
         msg = f"Unknown model identifier {kind!r} while generating a run name."
         raise ConfigError(msg)
 
-    loss_mode = "physics" if bool(config["loss"]["physics"]["enabled"]) else "data"
-    parts = [task, model_key, loss_mode, f"s{run['seed']}"]
+    parts = [task, model_key, f"s{run['seed']}"]
     if run.get("prefix"):
         parts.insert(0, str(run["prefix"]))
     if run.get("suffix"):
@@ -987,7 +973,7 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
 
     _validate_loss(effective, task=task)
     _validate_evaluation(effective, task=task)
-    _validate_runtime_sections(effective)
+    _validate_runtime_sections(effective, require_derived_tracking=False)
 
     effective["task_contract"] = task.resolved_contract()
     effective["paths"] = {
@@ -1117,7 +1103,7 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _validate_loss(effective, task=task)
     _validate_resolved_metric_keys(effective)
     _validate_evaluation(effective, task=task)
-    _validate_runtime_sections(effective)
+    _validate_runtime_sections(effective, require_derived_tracking=True)
     get_resolved_objective(effective)
     paths = _as_mapping(effective["paths"], path="paths")
     missing_paths = sorted(_RESOLVED_PATH_KEYS.difference(paths))

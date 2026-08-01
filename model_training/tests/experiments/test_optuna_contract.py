@@ -135,6 +135,24 @@ def test_every_optuna_yaml_resolves_one_complete_objective(path: Path) -> None:
     assert "seed" not in config.study["sampler"]
 
 
+@pytest.mark.parametrize("path", _OPTUNA_CONFIGS, ids=lambda path: path.stem)
+def test_trial_analysis_config_contains_only_named_nonfixed_sampled_parameters(path: Path) -> None:
+    """Expose clean analysis axes while retaining path-qualified local overrides."""
+    study = optuna_runtime.load_optuna_study_config(path)
+    trial = _Trial()
+    config, context = optuna_runtime._prepare_trial_config(study, trial)
+    expected_names = {parameter.name for parameter in study.search_space if parameter.kind != "fixed"}
+
+    assert set(context["analysis_parameters"]) == expected_names
+    assert set(context["overrides"]) == {parameter.path for parameter in study.search_space}
+    assert config["tracking"]["wandb"]["tags"] == [
+        experiments.config.loader._model_variant(config),
+        "optuna",
+    ]
+    assert "group" not in config["tracking"]["wandb"]
+    assert "job_type" not in config["tracking"]["wandb"]
+
+
 @pytest.mark.parametrize(
     ("target", "invalid_version"),
     [
@@ -726,8 +744,8 @@ def test_reporter_tracks_every_evaluation_in_both_directions(
         direction=direction,
     )
 
-    reporter(1, {"objective": values[0]})
-    reporter(2, {"objective": values[1]})
+    reporter(1, {"id/objective": values[0]})
+    reporter(2, {"id/objective": values[1]})
 
     assert reporter.best_epoch == best_epoch
     assert reporter.best_value == best_value
@@ -750,7 +768,7 @@ def test_reporter_prunes_non_finite_objectives_explicitly() -> None:
     )
 
     with pytest.raises(optuna_runtime.NonFiniteTrialError, match="Non-finite Optuna objective"):
-        reporter(1, {"objective": float("nan")})
+        reporter(1, {"id/objective": float("nan")})
 
 
 @pytest.mark.parametrize(
@@ -775,6 +793,9 @@ def test_run_trial_classifies_floating_point_failures_by_lifecycle(
     """
     study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
     study = optuna_runtime.with_runtime_overrides(study, device="cpu")
+    tracking_disabled_base = copy.deepcopy(study.base_config)
+    tracking_disabled_base["tracking"]["wandb"]["mode"] = "disabled"
+    study = replace(study, base_config=tracking_disabled_base)
     statuses: list[str] = []
     transitions: list[str] = []
     runtime_devices: list[torch.device] = []
@@ -794,6 +815,7 @@ def test_run_trial_classifies_floating_point_failures_by_lifecycle(
             "split_indices": {},
             "train": object(),
             "eval": object(),
+            "ood": object(),
         }
 
     def fail_training(**kwargs: Any) -> None:

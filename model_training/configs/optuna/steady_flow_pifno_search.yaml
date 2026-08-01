@@ -119,9 +119,6 @@ experiment:
     num_workers: 0
     pin_memory: true
     persistent_workers: false
-  tracking:
-    wandb:
-      enabled: false
 search_space:
   model.params.n_modes.0:
     name: modes_x

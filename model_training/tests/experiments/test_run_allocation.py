@@ -226,7 +226,6 @@ def test_tracking_runtime_updates_are_atomic_and_session_scoped(
             started_at=first_started,
             session_id="first-session",
             tracking_state={
-                "enabled": True,
                 "requested_mode": "online",
                 "status": "active",
             },
@@ -238,7 +237,8 @@ def test_tracking_runtime_updates_are_atomic_and_session_scoped(
         {
             "wandb_run_id": "opaque-run-id",
             "last_logged_epoch": 2,
-            "status": "degraded",
+            "status": "failed",
+            "failed_operation": "history",
         },
     )
     first_session = copy.deepcopy(updated["runtime_sessions"][0])
@@ -250,7 +250,6 @@ def test_tracking_runtime_updates_are_atomic_and_session_scoped(
         started_at=datetime(2025, 1, 2, 5, 6, tzinfo=UTC),
         session_id="resume-session",
         tracking_state={
-            "enabled": True,
             "requested_mode": "online",
             "wandb_run_id": "opaque-run-id",
             "session_kind": "resume",
@@ -261,9 +260,10 @@ def test_tracking_runtime_updates_are_atomic_and_session_scoped(
     assert appended["status"] == "running"
     assert appended["status_history"] == history
     assert appended["runtime_sessions"][0] == first_session
-    assert first_session["tracking"]["enabled"] is True
+    assert first_session["tracking"]["requested_mode"] == "online"
     assert first_session["tracking"]["wandb_run_id"] == "opaque-run-id"
-    assert first_session["tracking"]["status"] == "degraded"
+    assert first_session["tracking"]["status"] == "failed"
+    assert first_session["tracking"]["failed_operation"] == "history"
     assert appended["runtime_sessions"][1]["tracking"]["session_kind"] == "resume"
 
 

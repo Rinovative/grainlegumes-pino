@@ -1953,7 +1953,7 @@ def upload_completed_artifact(
         run_dir=run_dir,
         artifact_root=artifact_root,
     )
-    if bool(session.upload_settings["provenance"]):
+    if bool(session.upload_settings["evaluation_artifacts"]):
         session.upload_files({"artifact_provenance": artifacts.artifact_provenance_path(artifact_root)})
     session.upload_post_artifact(
         artifact_root=artifact_root,
@@ -2056,32 +2056,14 @@ def _upload_published_artifacts(
     id_frame: pd.DataFrame,
     ood_frame: pd.DataFrame,
 ) -> None:
-    """
-    Upload already published artifacts through the run's persisted W&B identity.
-
-    Upload is an optional observer: it first validates both ID and OOD publication
-    roots, records observer state in a new runtime session, then uploads requested
-    provenance plus a temporary curated-analysis bundle. Online initialization
-    failure degrades the observer without invalidating locally completed artifacts;
-    stricter configured modes propagate their initialization failure.
-
-    Parameters
-    ----------
-    plan : RunArtifactPlan
-        Validated completed-run and dataset selection.
-    device_resolution : learning.device.DeviceResolution
-        Runtime decision recorded for this upload session.
-    id_frame, ood_frame : pandas.DataFrame
-        Validated tables used to render the curated comparison bundle.
-
-    """
+    """Upload only explicitly enabled evaluation provenance and curated media."""
     config = _load_run_config(plan.run_dir)
     settings = config.get("tracking", {}).get("wandb")
     if not isinstance(settings, Mapping):
         msg = "Completed run config must contain tracking.wandb."
         raise TypeError(msg)
     upload = settings.get("upload")
-    if not bool(settings.get("enabled")) or not isinstance(upload, Mapping) or not bool(upload.get("provenance")):
+    if settings.get("mode") == "disabled" or not isinstance(upload, Mapping) or not bool(upload.get("evaluation_artifacts")):
         return
 
     started_at = datetime.now(UTC)
@@ -2097,61 +2079,43 @@ def _upload_published_artifacts(
     persisted_run_id, last_logged_epoch = experiments.tracking.persisted_wandb_identity(summary)
 
     def state_updater(updates: Mapping[str, Any]) -> None:
-        """
-        Persist observer-only updates in the runtime session created for upload.
-
-        Updates never rewrite the completed run result or local artifact evidence.
-        """
+        """Persist observer-only facts in this artifact-upload runtime session."""
         experiments.run.update_runtime_session(
             plan.run_dir,
             runtime_session_id,
             updates,
         )
 
-    try:
-        session = experiments.tracking.initialize_wandb(
-            config,
-            run_dir=plan.run_dir,
-            semantic_config={},
-            resume=True,
-            persisted_run_id=persisted_run_id,
-            previous_last_logged_epoch=last_logged_epoch,
-            state_updater=state_updater,
-            job_type="artifact-upload",
-        )
-    except experiments.tracking.TrackingInitializationError as error:
-        if settings.get("mode") == "online":
-            state_updater(
-                {
-                    "status": "degraded",
-                    "degraded_operation": "artifact_initialization",
-                    "error_class": type(error).__name__,
-                    "error_message": str(error)[:600],
-                }
-            )
-            return
-        raise
-
-    artifact_specs: tuple[tuple[ArtifactSplit, str], ...] = (
-        ("eval", plan.id_dataset_name),
-        ("ood", plan.ood_dataset_name),
+    session = experiments.tracking.initialize_wandb(
+        config,
+        run_dir=plan.run_dir,
+        semantic_config={},
+        resume=True,
+        persisted_run_id=persisted_run_id,
+        previous_last_logged_epoch=last_logged_epoch,
+        state_updater=state_updater,
     )
-    artifact_roots = {
-        split: _artifact_save_root(
-            run_dir=plan.run_dir,
-            dataset_name=dataset_name,
-            split=split,
+    upload_error: BaseException | None = None
+    try:
+        artifact_specs: tuple[tuple[ArtifactSplit, str], ...] = (
+            ("eval", plan.id_dataset_name),
+            ("ood", plan.ood_dataset_name),
         )
-        for split, dataset_name in artifact_specs
-    }
-    for artifact_root in artifact_roots.values():
-        validate_artifact_upload_source(run_dir=plan.run_dir, artifact_root=artifact_root)
-        if bool(session.upload_settings["provenance"]):
+        artifact_roots = {
+            split: _artifact_save_root(
+                run_dir=plan.run_dir,
+                dataset_name=dataset_name,
+                split=split,
+            )
+            for split, dataset_name in artifact_specs
+        }
+        for artifact_root in artifact_roots.values():
+            validate_artifact_upload_source(
+                run_dir=plan.run_dir,
+                artifact_root=artifact_root,
+            )
             session.upload_files({"artifact_provenance": artifacts.artifact_provenance_path(artifact_root)})
-        if session.degraded:
-            break
 
-    if not session.degraded:
         from src.analysis import analysis_curated_renderer as curated_renderer  # noqa: PLC0415
         from src.analysis.evaluation import evaluation_dataframe  # noqa: PLC0415
 
@@ -2169,17 +2133,34 @@ def _upload_published_artifacts(
                 media_files=bundle.media_files,
                 tables=bundle.tables,
             )
-    local_summary = experiments.run.read_run_summary(plan.run_dir)
-    session.finish(
-        status=str(local_summary["status"]),
-        result={
-            "best_epoch": local_summary.get("best_epoch"),
-            "best_metric": local_summary.get("best_metric"),
-            "completed_epoch": local_summary.get("completed_epoch"),
-            "global_step": local_summary.get("global_step"),
-        },
-        local_summary=local_summary,
-    )
+    except BaseException as error:
+        upload_error = error
+        raise
+    finally:
+        local_summary: Mapping[str, Any] | None = None
+        with suppress(Exception):
+            local_summary = experiments.run.read_run_summary(plan.run_dir)
+        status = str(local_summary.get("status", "completed")) if local_summary is not None else "completed"
+        result = None
+        if local_summary is not None:
+            result = {
+                "completed_epoch": local_summary.get("completed_epoch"),
+                "global_step": local_summary.get("global_step"),
+                "selected_epoch": local_summary.get("selected_epoch"),
+                "selected_metrics": local_summary.get("selected_metrics", {}),
+                "terminal_epoch": local_summary.get("terminal_epoch"),
+                "terminal_metrics": local_summary.get("terminal_metrics", {}),
+            }
+        try:
+            session.finish(
+                status=status,
+                result=result,
+                local_summary=local_summary,
+                error=upload_error,
+            )
+        except experiments.tracking.TrackingError:
+            if upload_error is None:
+                raise
 
 
 def build_artifacts(
@@ -2231,9 +2212,9 @@ def build_artifacts(
     Notes
     -----
     Each run's ID and OOD caches are locally authoritative. When persisted W&B
-    settings request provenance upload, the function appends an observer runtime
-    session and uploads only after both local targets validate; online observer
-    initialization may degrade without invalidating completed local artifacts.
+    settings explicitly request evaluation-artifact upload, the function appends
+    an observer runtime session and uploads only after both local targets validate.
+    Any requested online or offline observer failure propagates.
 
     """
     device_resolution = learning.device.resolve_device(

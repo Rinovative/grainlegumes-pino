@@ -47,6 +47,22 @@ from . import experiments_tracking as tracking
 from .config import experiments_config_loader as config_loader
 
 RUN_SUMMARY_SCHEMA_VERSION = 1
+RUN_DURATION_CONTRACT: dict[str, Any] = {
+    "clock": "cumulative_wall_seconds",
+    "cumulative_across_resume": True,
+    "includes": [
+        "run_admission",
+        "dataset_loading",
+        "normalizer_fit_or_restore",
+        "model_and_optimizer_construction",
+        "wandb_initialization",
+        "training",
+        "scheduled_id_ood_evaluation",
+        "checkpoint_publication",
+        "selected_checkpoint_evaluation",
+    ],
+    "excludes": ["wandb_finalization"],
+}
 RUN_STATUSES = frozenset(
     {
         "initializing",
@@ -391,22 +407,22 @@ def initial_tracking_state(config: Mapping[str, Any]) -> dict[str, Any]:
     """
     Build safe initial observer facts before any SDK import or initialization.
 
-    The result records configured identity, mode, tags, and active/disabled
+    The result records configured project, local workflow, mode, tags, and status
     status only. It performs no credential access, network operation, W&B import,
     or mutation of the resolved config.
     """
     settings = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["tracking"])["wandb"])
-    enabled = bool(settings["enabled"])
+    mode = str(settings["mode"])
     raw_tags = settings.get("tags", [])
     tags = list(cast("list[str]", raw_tags)) if isinstance(raw_tags, list) else []
+    status = "disabled" if mode == "disabled" else ("offline" if mode == "offline" else "active")
     return {
-        "enabled": enabled,
-        "requested_mode": settings.get("mode", "online"),
+        "requested_mode": mode,
+        "workflow": settings.get("workflow"),
         "project": settings.get("project"),
         "entity": settings.get("entity"),
-        "group": settings.get("group"),
         "tags": tags,
-        "status": "active" if enabled else "disabled",
+        "status": status,
     }
 
 
@@ -884,7 +900,7 @@ def _execute_prepared_run_locked(
 
     Authoritative data, split, normalizer, model, objective and device identity
     are admitted before optional W&B initialization. Local files and checkpoint
-    state remain valid when an online observer degrades.
+    state remain authoritative when a requested observer fails closed.
 
     Fresh execution atomically publishes fitted normalizer and split artifacts;
     resume requires object-identical processor reuse and unchanged membership.
@@ -899,11 +915,13 @@ def _execute_prepared_run_locked(
     tracking_result: Mapping[str, Any] | None = None
     tracking_error: BaseException | None = None
     tracking_initialization_attempted = False
-    tracking_enabled = bool(config["tracking"]["wandb"]["enabled"])
+    tracking_enabled = config["tracking"]["wandb"]["mode"] != "disabled"
     try:
         device = _validated_runtime_device(config, device_resolution)
         amp_enabled = bool(config["training"]["mixed_precision"])
         seed_plan = build_seed_plan(int(config["run"]["seed"]))
+        previous_summary = read_run_summary(run_dir)
+        prior_elapsed_seconds = float(previous_summary.get("elapsed_seconds", 0.0)) if resume_from is not None else 0.0
         transition_run_status(
             run_dir,
             "running",
@@ -991,10 +1009,12 @@ def _execute_prepared_run_locked(
             semantic_config = tracking.build_semantic_config(
                 config,
                 split_indices=split_indices,
+                split_indices_sha256=common.serialization.file_sha256(common.paths.resolve_split_indices_path(run_dir)),
                 normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
                 checkpoint_identity=identity,
                 model=model,
                 device_metadata=device_resolution.as_dict(),
+                duration_contract=RUN_DURATION_CONTRACT,
             )
             monitor_settings = config["tracking"]["wandb"]["monitor"]
             if bool(monitor_settings["enabled"]):
@@ -1034,6 +1054,7 @@ def _execute_prepared_run_locked(
             eval_loader=dataloaders["eval"],
             train_loss=train_loss,
             eval_metrics=eval_metrics,
+            ood_loader=dataloaders["ood"],
             data_processor=data_processor,
             scheduler=scheduler,
             save_dir=run_dir,
@@ -1047,18 +1068,35 @@ def _execute_prepared_run_locked(
         )
         objective = config_loader.get_resolved_objective(config)
         _validate_training_result_objective(result, objective)
+        selected = learning.training.loop.evaluate_selected_checkpoint(
+            config=config,
+            model=model,
+            train_loss=train_loss,
+            eval_loader=dataloaders["eval"],
+            ood_loader=dataloaders["ood"],
+            eval_metrics=eval_metrics,
+            device=device,
+            data_processor=data_processor,
+            checkpoint_identity=identity,
+            best_checkpoint_path=result["best_checkpoint_path"],
+            scheduler_expected=scheduler is not None,
+            amp_expected=amp_enabled,
+            max_physics_cases=int(config["tracking"]["wandb"]["monitor"]["max_cases"]),
+        )
+        result.update(selected)
         end_time = datetime.now(UTC)
         completed_updates = {
             "task": config["task"],
             "run_name": config["run"]["name"],
             "model_kind": config["model"]["kind"],
-            "model_parameter_counts": {
-                "total": sum(parameter.numel() for parameter in model.parameters()),
-                "trainable": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
-            },
+            "model_parameter_counts": tracking.model_parameter_counts(model),
             "objective": objective,
             "best_epoch": result["best_epoch"],
             "best_metric": result["best_metric"],
+            "selected_epoch": result["selected_epoch"],
+            "selected_metrics": copy.deepcopy(result["selected_metrics"]),
+            "terminal_epoch": result["terminal_epoch"],
+            "terminal_metrics": copy.deepcopy(result["terminal_metrics"]),
             "completed_epoch": result["completed_epoch"],
             "global_step": result["global_step"],
             "best_checkpoint": "best_checkpoint.pt",
@@ -1069,7 +1107,8 @@ def _execute_prepared_run_locked(
             "best_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_best_checkpoint_file(run_dir)),
             "last_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_last_checkpoint_file(run_dir)),
             "effective_config_digest": identity["effective_config_digest"],
-            "elapsed_seconds": (end_time - start_time).total_seconds(),
+            "elapsed_seconds": prior_elapsed_seconds + (end_time - start_time).total_seconds(),
+            "duration_contract": copy.deepcopy(RUN_DURATION_CONTRACT),
             "ended_at": end_time.isoformat(),
             "error": None,
             "error_type": None,
@@ -1160,8 +1199,8 @@ def execute_prepared_run(
         Validated ``last_checkpoint.pt`` continuation source. ``None`` starts a
         fresh training state.
     epoch_end_callback : Callable[[int, dict[str, float]], None] | None, optional
-        Local authoritative callback invoked at completed evaluation epochs
-        before the optional tracking observer.
+        Local authoritative callback invoked after every completed epoch,
+        before the optional tracking observer; evaluation keys follow cadence.
     summary_extra : Mapping[str, Any] | None, optional
         Caller-owned facts merged into lifecycle publications.
     device_resolution : learning.device.DeviceResolution
@@ -1186,9 +1225,9 @@ def execute_prepared_run(
     Fresh execution atomically publishes split and normalizer state before model
     construction. Resume reuses those immutable artifacts and restores only the
     last checkpoint; the best checkpoint remains the selected inference source.
-    Local summary/checkpoint publication is authoritative. Online W&B transport
-    may degrade without changing it, while requested offline record failures
-    follow the tracking contract and propagate.
+    Local summary/checkpoint publication is authoritative. Any failure in an
+    explicitly requested online or offline W&B session follows the tracking
+    contract and propagates.
 
     This is a lower-level service for callers that already prepared lifecycle
     state. Normal CLI/notebook launches should prefer :func:`run_experiment`.
@@ -1394,10 +1433,9 @@ def run_experiment(
     source.
 
     Training or admission failures publish failed/interrupted state best-effort
-    before the original exception propagates. Local lifecycle files are
-    authoritative: optional online W&B failures may degrade observation, whereas
-    requested offline-record failures follow the tracking contract and can fail
-    the operation after local evidence has been published.
+    before the original exception propagates. Local lifecycle files remain
+    authoritative, while any failure in an explicitly requested online or offline
+    W&B session fails the operation after durable local evidence is published.
 
     """
     raw_requested = config_loader.load_yaml(config_path)

@@ -186,7 +186,7 @@ jobs:
 
       - name: Run CPU tests
         shell: bash -l {0}
-        run: PYTHONPATH=model_training python -m pytest -q model_training/tests
+        run: PYTHONPATH=model_training python -m pytest -q -m "not real_data" model_training/tests
 
       - name: Smoke-test imports and command-line interfaces
         shell: bash -l {0}

@@ -368,7 +368,12 @@ def test_retained_eda_spectral_questions_render() -> None:
     rows = [{"x": x_values, "y": y_values, "p": np.sin((index + 1) * np.pi * x_values), "meta": {}} for index in range(3)]
     datasets: dict[str, pd.DataFrame] = {}
     for label, scale in (("ID", 1.0), ("OOD", 1.2)):
-        frame = pd.DataFrame([{**row, "p": scale * row["p"]} for row in rows])
+        scaled_rows: list[dict[str, object]] = []
+        for row in rows:
+            pressure = row["p"]
+            assert isinstance(pressure, np.ndarray)
+            scaled_rows.append({**row, "p": scale * pressure})
+        frame = pd.DataFrame(scaled_rows)
         frame.attrs.update(
             {
                 "task_id": "steady_flow",

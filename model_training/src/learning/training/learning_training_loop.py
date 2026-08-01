@@ -48,6 +48,10 @@ TensorBatch = dict[str, torch.Tensor]
 EpochEndCallback = Callable[[int, dict[str, float]], None]
 
 
+class PhysicsMonitorEvaluationError(RuntimeError):
+    """Identify a failure owned by bounded scientific physics evaluation."""
+
+
 def _move_batch_to_device(batch: Any, device: torch.device) -> TensorBatch:
     """Move an existing dataset batch to the target device."""
     if not isinstance(batch, dict):
@@ -220,9 +224,9 @@ def train_one_epoch(
             raise RuntimeError(msg)
         result.update(
             {
-                "train/loss_momentum": averaged["momentum"],
-                "train/loss_boundary": averaged["boundary"],
-                f"train/loss_continuity_{continuity}": averaged[continuity_component],
+                "physics/train/loss_momentum": averaged["momentum"],
+                "physics/train/loss_boundary": averaged["boundary"],
+                f"physics/train/loss_continuity_{continuity}": averaged[continuity_component],
             }
         )
         telemetry_state = getattr(loss_fn, "telemetry_state", None)
@@ -230,9 +234,18 @@ def train_one_epoch(
             msg = "Physics-informed loss does not expose applied weight telemetry."
             raise RuntimeError(msg)
         telemetry = cast("Mapping[str, float]", telemetry_state())
-        for name, value in telemetry.items():
-            result[f"train/{name}"] = float(value)
+        result["physics/train/residual_weight"] = float(telemetry["weight_physics"])
+        result["physics/train/boundary_weight"] = float(telemetry["weight_boundary"])
     return result
+
+
+def _finite_physics_monitor_scalar(name: str, value: torch.Tensor) -> float:
+    """Return one finite detached diagnostic scalar or reject it scientifically."""
+    scalar = float(value.detach().item())
+    if not math.isfinite(scalar):
+        msg = f"Physics monitor {name!r} is non-finite: {scalar}."
+        raise FloatingPointError(msg)
+    return scalar
 
 
 def evaluate_physics_monitor(
@@ -277,8 +290,9 @@ def evaluate_physics_monitor(
         If batches or the diagnostic interface violate their contracts.
     ValueError
         If ``max_cases`` is not a positive exact integer.
-    FloatingPointError
-        If a diagnostic scalar is non-finite.
+    PhysicsMonitorEvaluationError
+        If model prediction, physics diagnostics, or finite-value validation fails;
+        the originating exception is retained as the direct cause.
     RuntimeError
         If the selected membership produces no samples.
 
@@ -296,10 +310,10 @@ def evaluate_physics_monitor(
         raise TypeError(msg)
 
     totals = {
-        "monitor/momentum_residual_mse": 0.0,
-        "monitor/div_velocity_mse": 0.0,
-        "monitor/div_eps_velocity_mse": 0.0,
-        "monitor/pressure_boundary_mse": 0.0,
+        "physics/id/momentum_residual_mse": 0.0,
+        "physics/id/continuity_div_velocity_mse": 0.0,
+        "physics/id/continuity_div_eps_velocity_mse": 0.0,
+        "physics/id/pressure_boundary_mse": 0.0,
     }
     sample_count = 0
     was_training = model.training
@@ -325,20 +339,20 @@ def evaluate_physics_monitor(
                     data_processor,
                     training=False,
                 )
-                pred = model(batch["x"])
-                diagnostics = cast("Any", compute(pred, x=batch["x"]))
-                values = {
-                    "monitor/momentum_residual_mse": diagnostics.momentum_residual_mse,
-                    "monitor/div_velocity_mse": diagnostics.div_velocity_mse,
-                    "monitor/div_eps_velocity_mse": diagnostics.div_eps_velocity_mse,
-                    "monitor/pressure_boundary_mse": diagnostics.boundary_mse,
-                }
-                for name, value in values.items():
-                    scalar = float(value.detach().item())
-                    if not math.isfinite(scalar):
-                        msg = f"Physics monitor {name!r} is non-finite: {scalar}."
-                        raise FloatingPointError(msg)
-                    totals[name] += scalar * take
+                try:
+                    pred = model(batch["x"])
+                    diagnostics = cast("Any", compute(pred, x=batch["x"]))
+                    values = {
+                        "physics/id/momentum_residual_mse": diagnostics.momentum_residual_mse,
+                        "physics/id/continuity_div_velocity_mse": diagnostics.div_velocity_mse,
+                        "physics/id/continuity_div_eps_velocity_mse": diagnostics.div_eps_velocity_mse,
+                        "physics/id/pressure_boundary_mse": diagnostics.boundary_mse,
+                    }
+                    for name, value in values.items():
+                        totals[name] += _finite_physics_monitor_scalar(name, value) * take
+                except Exception as error:
+                    msg = f"Bounded physics-monitor scientific evaluation failed after model-input preparation: {type(error).__name__}: {error}"
+                    raise PhysicsMonitorEvaluationError(msg) from error
                 sample_count += take
     finally:
         model.train(was_training)
@@ -455,6 +469,79 @@ def eval_one_epoch(
     return {metric_id: metric.compute() for metric_id, metric in eval_metrics.items()}
 
 
+def evaluate_selected_checkpoint(
+    *,
+    config: Mapping[str, Any],
+    model: nn.Module,
+    train_loss: nn.Module,
+    eval_loader: DataLoader,
+    ood_loader: DataLoader,
+    eval_metrics: dict[str, Any],
+    device: torch.device,
+    data_processor: Any | None,
+    checkpoint_identity: Mapping[str, Any],
+    best_checkpoint_path: Path | str,
+    scheduler_expected: bool,
+    amp_expected: bool,
+    max_physics_cases: int,
+) -> dict[str, Any]:
+    """Load and evaluate the authoritative best checkpoint on one shared science state."""
+    payload = checkpoints.load_checkpoint(
+        best_checkpoint_path,
+        expected_identity=checkpoint_identity,
+        expected_role="best",
+        scheduler_expected=scheduler_expected,
+        amp_expected=amp_expected,
+        require_best=True,
+    )
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    train_loss.load_state_dict(payload["loss_state_dict"], strict=True)
+
+    selected_epoch = int(payload["completed_epoch"])
+    if selected_epoch != int(payload["best_epoch"]):
+        msg = "Selected best checkpoint epoch disagrees with its best-objective epoch."
+        raise RuntimeError(msg)
+    id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
+    ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+    objective_id = str(cast("Mapping[str, Any]", config["evaluation"])["objective"]["id"])
+    if objective_id not in id_metrics or objective_id not in ood_metrics:
+        msg = f"Selected checkpoint evaluation did not produce objective {objective_id!r} for both ID and OOD."
+        raise KeyError(msg)
+
+    selected: dict[str, float] = {f"selected/id/{name}": float(value) for name, value in id_metrics.items()}
+    selected.update({f"selected/ood/{name}": float(value) for name, value in ood_metrics.items()})
+    selected["selected/generalization/objective_gap"] = float(ood_metrics[objective_id]) - float(id_metrics[objective_id])
+    physics = evaluate_physics_monitor(
+        model,
+        eval_loader,
+        train_loss,
+        device,
+        data_processor,
+        max_cases=max_physics_cases,
+    )
+    for history_key, value in physics.items():
+        suffix = history_key.removeprefix("physics/id/")
+        selected[f"selected/physics/{suffix}"] = float(value)
+
+    physics_config = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["physics"])
+    telemetry = getattr(train_loss, "telemetry_state", None)
+    if bool(physics_config["enabled"]) and callable(telemetry):
+        weights = cast("Mapping[str, float]", telemetry(epoch=selected_epoch - 1))
+        residual = cast("Mapping[str, Any]", physics_config["residual_weight"])
+        boundary = cast("Mapping[str, Any]", physics_config["boundary_weight"])
+        residual_warmup = cast("Mapping[str, Any]", residual["warmup"])
+        boundary_warmup = cast("Mapping[str, Any]", boundary["warmup"])
+        dynamic = int(residual_warmup["epochs"]) > 0 or int(boundary_warmup["epochs"]) > 0
+        residual_value = float(weights["weight_physics"])
+        boundary_value = float(weights["weight_boundary"])
+        differs_from_terminal = residual_value != float(residual["target"]) or boundary_value != float(boundary["target"])
+        if dynamic and differs_from_terminal:
+            selected["selected/training/residual_weight"] = residual_value
+            selected["selected/training/boundary_weight"] = boundary_value
+
+    return {"selected_epoch": selected_epoch, "selected_metrics": selected}
+
+
 def train_loop(  # noqa: C901, PLR0912, PLR0915
     config: dict[str, Any],
     device: torch.device,
@@ -464,6 +551,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     eval_loader: DataLoader,
     train_loss: nn.Module,
     eval_metrics: dict[str, Any],
+    ood_loader: DataLoader | None = None,
     data_processor: Any | None = None,
     scheduler: ReduceLROnPlateau | None = None,
     save_dir: Path | str | None = None,
@@ -485,6 +573,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     model, optimizer, train_loader, eval_loader, train_loss, eval_metrics : Any
         Already constructed runtime components. Fresh-run seeding must occur
         before their construction.
+    ood_loader : torch.utils.data.DataLoader | None, optional
+        Saved OOD membership evaluated at the same cadence for diagnostics only.
     data_processor : Any | None, optional
         Saved/fitted normalization processor.
     scheduler : ReduceLROnPlateau | None, optional
@@ -570,6 +660,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     best_metric: float | None = None
     best_epoch: int | None = None
     objective_history: list[dict[str, Any]] = []
+    terminal_epoch_metrics: dict[str, float] = {}
     global_step = 0
     start_epoch_index = 0
 
@@ -637,17 +728,26 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         global_step += optimizer_steps
 
         evaluated: dict[str, float] = {}
+        id_metrics: dict[str, float] = {}
+        ood_metrics: dict[str, float] = {}
         should_evaluate = completed_epoch % eval_interval == 0 or completed_epoch == n_epochs
         if should_evaluate:
-            evaluated = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
-            current_metric = evaluated.get(objective_id)
+            id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
+            if ood_loader is not None:
+                ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+            current_metric = id_metrics.get(objective_id)
             if current_metric is None:
-                msg = f"Configured evaluation objective {objective_id!r} was not produced by evaluation metrics."
+                msg = f"Configured evaluation objective {objective_id!r} was not produced by ID evaluation metrics."
                 raise KeyError(msg)
             current_metric = float(current_metric)
             if not math.isfinite(current_metric):
-                msg = f"Evaluation objective {objective_id!r} is non-finite at epoch {completed_epoch}: {current_metric}."
+                msg = f"ID evaluation objective {objective_id!r} is non-finite at epoch {completed_epoch}: {current_metric}."
                 raise FloatingPointError(msg)
+            evaluated.update({f"id/{name}": value for name, value in id_metrics.items()})
+            evaluated.update({f"ood/{name}": value for name, value in ood_metrics.items()})
+            ood_objective = ood_metrics.get(objective_id)
+            if ood_objective is not None:
+                evaluated["generalization/objective_gap"] = float(ood_objective) - current_metric
             objective_history.append(
                 {
                     "epoch": completed_epoch,
@@ -702,16 +802,22 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         checkpoints.save_checkpoint(last_payload, last_path)
 
         train_metrics["global_step"] = float(global_step)
-        train_metrics["train/learning_rate"] = epoch_learning_rate
-        train_metrics["train/epoch_duration_seconds"] = time.perf_counter() - epoch_started
+        train_metrics["optimization/learning_rate"] = epoch_learning_rate
+        epoch_duration = time.perf_counter() - epoch_started
+        if not math.isfinite(epoch_duration) or epoch_duration <= 0.0:
+            msg = f"Completed epoch {completed_epoch} has invalid duration {epoch_duration}."
+            raise RuntimeError(msg)
+        train_metrics["system/epoch_duration_seconds"] = epoch_duration
         if device.type == "cuda":
-            train_metrics["train/cuda_peak_memory_allocated_bytes"] = float(torch.cuda.max_memory_allocated(device))
-            train_metrics["train/cuda_peak_memory_reserved_bytes"] = float(torch.cuda.max_memory_reserved(device))
+            train_metrics["system/cuda_peak_memory_allocated_bytes"] = float(torch.cuda.max_memory_allocated(device))
 
+        terminal_epoch_metrics = {**train_metrics, **evaluated}
         if epoch_end_callback is not None:
-            epoch_end_callback(completed_epoch, {**train_metrics, **evaluated})
+            epoch_end_callback(completed_epoch, terminal_epoch_metrics)
         if should_evaluate and (completed_epoch % (eval_interval * 10) == 0 or completed_epoch in {1, n_epochs}):
-            print(f"Epoch {completed_epoch:3d} | train_loss: {train_metrics['train/loss_total']:.4f} | {objective_id}: {evaluated[objective_id]:.4f}")
+            print(
+                f"Epoch {completed_epoch:3d} | train_loss: {train_metrics['train/loss_total']:.4f} | {objective_id}: {id_metrics[objective_id]:.4f}"
+            )
 
     if best_metric is None or best_epoch is None:
         msg = "Training produced no finite objective and cannot be marked completed."
@@ -747,6 +853,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         "best_metric": best_metric,
         "objective": dict(objective),
         "objective_history": objective_history,
+        "terminal_epoch": n_epochs,
+        "terminal_metrics": {key: value for key, value in terminal_epoch_metrics.items() if key.startswith("train/")},
         "checkpoint_path": str(best_path),
         "best_checkpoint_path": str(best_path),
         "last_checkpoint_path": str(last_path),

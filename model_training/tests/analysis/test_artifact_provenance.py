@@ -10,7 +10,9 @@ reserved metadata rejection. Cache locking and rebuild races belong to
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -441,10 +443,12 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
 
     invalid_npz_path = Path(frames[0].iloc[0]["npz_path"])
     with np.load(invalid_npz_path, allow_pickle=False) as stored:
-        invalid_payload = {name: np.asarray(stored[name]) for name in stored.files}
-    invalid_payload["unexpected_array"] = invalid_payload["div_eps_u"]
-    with invalid_npz_path.open("wb") as stream:
-        np.savez_compressed(stream, **invalid_payload)  # pyright: ignore[reportArgumentType]
+        unexpected_array = np.asarray(stored["div_eps_u"])
+    with io.BytesIO() as stream:
+        np.save(stream, unexpected_array, allow_pickle=False)
+        unexpected_payload = stream.getvalue()
+    with zipfile.ZipFile(invalid_npz_path, mode="a", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("unexpected_array.npy", unexpected_payload)
     contract = analysis.artifact_service._EvaluatorArtifactContract(
         task_id=task.id,
         input_fields=task.input_names,

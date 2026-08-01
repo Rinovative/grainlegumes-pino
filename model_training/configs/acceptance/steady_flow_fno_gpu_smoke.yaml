@@ -92,6 +92,11 @@ scheduler:
   patience: 20
 
 training:
-  epochs: 1
+  epochs: 10
   evaluation_interval: 1
   mixed_precision: false
+
+tracking:
+  wandb:
+    mode: online
+    workflow: gpu_smoke

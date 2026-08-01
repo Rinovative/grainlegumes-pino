@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 from src import datasets, domain
+from support import real_data
 from support.synthetic_task import build_synthetic_generated_batch_identity, build_synthetic_task
 
 if TYPE_CHECKING:
@@ -26,6 +27,9 @@ def isolate_session_application_data_roots(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[None]:
     """Fence module- and session-scoped fixtures away from production data roots."""
+    if real_data.real_data_tests_enabled():
+        yield
+        return
     root = tmp_path_factory.mktemp("application-data-roots")
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setenv("GENERATED_DATA_ROOT", str(root / "generated-data"))
@@ -40,8 +44,11 @@ def isolate_session_application_data_roots(
 def isolate_application_data_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
-    """Keep every test's implicit data and coordination paths out of production roots."""
+    """Keep generic tests' implicit data and coordination paths out of production roots."""
+    if request.node.get_closest_marker("real_data") is not None:
+        return
     monkeypatch.setenv("GENERATED_DATA_ROOT", str(tmp_path / "generated-data"))
     monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(tmp_path / "model-training-data"))
 

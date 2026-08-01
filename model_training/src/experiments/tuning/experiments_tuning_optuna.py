@@ -47,6 +47,7 @@ from . import experiments_tuning_search_space as search_space
 
 STUDY_SIGNATURE_SCHEMA_VERSION = 1
 TRIAL_LIFECYCLE_SCHEMA_VERSION = 1
+_STUDY_NAME_SHORT_LIMIT = 32
 _STUDY_SIGNATURE_ATTR = "semantic_signature"
 _STUDY_SIGNATURE_PAYLOAD_ATTR = "semantic_signature_payload"
 _STUDY_SIGNATURE_SCHEMA_ATTR = "semantic_signature_schema_version"
@@ -230,10 +231,11 @@ class OptunaEpochReporter:
         if epoch != expected_epoch:
             msg = f"Optuna reports must be continuous actual epochs; expected {expected_epoch}, got {epoch}."
             raise ValueError(msg)
-        if self.objective_id not in metrics:
-            msg = f"Held-out Optuna objective {self.objective_id!r} is missing at completed epoch {epoch}."
+        metric_key = f"id/{self.objective_id}"
+        if metric_key not in metrics:
+            msg = f"Held-out Optuna objective {metric_key!r} is missing at completed epoch {epoch}."
             raise KeyError(msg)
-        value = float(metrics[self.objective_id])
+        value = float(metrics[metric_key])
         if not math.isfinite(value):
             self.trial.set_user_attr("nonfinite_epoch", epoch)
             msg = f"Non-finite Optuna objective {self.objective_id} at epoch {epoch}: {value}"
@@ -547,6 +549,11 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
     base_experiment = dict(copy.deepcopy(_as_mapping(raw_mapping["experiment"], label="experiment")))
     base_config = experiments.config.loader.resolve_config(base_experiment)
     study = _normalise_study(_as_mapping(raw_mapping.get("study", {}), label="study"), base_config, source_path)
+    wandb_settings = base_config["tracking"]["wandb"]
+    wandb_settings["workflow"] = "optuna_trial"
+    wandb_settings["study"] = str(study["name"])
+    wandb_settings.update(experiments.config.loader.derive_wandb_organization(base_config))
+    base_config = experiments.config.loader.validate_resolved_config(base_config)
     search_parameters = search_space.parse_search_space(raw_mapping["search_space"])
     search_space.validate_search_space_paths(base_config, search_parameters)
     _validate_search_space_choices(base_config, search_parameters)
@@ -901,6 +908,15 @@ def _build_sampler(study: Mapping[str, Any]) -> Any:
     raise ValueError(msg)
 
 
+def _study_name_short(study_name: str) -> str:
+    """Return a bounded, recognizable study slug for trial run names."""
+    slug = study_name.replace("_", "-")
+    if len(slug) <= _STUDY_NAME_SHORT_LIMIT:
+        return slug
+    digest = common.serialization.canonical_json_sha256({"study_name": study_name})[:7]
+    return f"{slug[:24].rstrip('-')}-{digest}"
+
+
 def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Sample, identify, and fully validate one fresh trial config.
@@ -916,6 +932,10 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
         int(study_config.study["seed"]),
         f"trial-{trial.number}",
     )
+    wandb_settings = config["tracking"]["wandb"]
+    wandb_settings["workflow"] = "optuna_trial"
+    wandb_settings["study"] = str(study_config.study["name"])
+    wandb_settings.update(experiments.config.loader.derive_wandb_organization(config))
     config = experiments.config.loader.validate_resolved_config(config)
 
     base_objective = experiments.config.loader.get_resolved_objective(study_config.base_config)
@@ -924,14 +944,20 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
         msg = "Sampled trial objective does not match the resolved study objective."
         raise ValueError(msg)
 
+    config["run"]["prefix"] = f"optuna-{_study_name_short(str(study_config.study['name']))}"
     config["run"]["suffix"] = f"trial{trial.number:04d}"
     config["run"].pop("name", None)
     config["run"]["name"] = experiments.config.loader.generate_run_name(config)
     config = experiments.config.loader.validate_resolved_config(config)
+    analysis_parameters = {
+        parameter.name: copy.deepcopy(overrides[parameter.path]) for parameter in study_config.search_space if parameter.kind != "fixed"
+    }
     context = {
         "study_name": str(study_config.study["name"]),
         "trial_number": int(trial.number),
         "overrides": overrides,
+        "analysis_parameters": analysis_parameters,
+        "search_signature": build_study_signature(study_config)["digest"],
     }
 
     trial.set_user_attr("run_name", config["run"]["name"])
@@ -1107,6 +1133,7 @@ def _write_summary(
         "study_name": context["study_name"],
         "trial_number": context["trial_number"],
         "sampled_parameters": context["overrides"],
+        "search_signature": context["search_signature"],
         "objective": objective,
         "best_epoch": result.get("best_epoch", reporter.best_epoch if reporter else None),
         "best_metric": result.get("best_metric", reporter.best_value if reporter else None),
@@ -1130,6 +1157,11 @@ def _write_summary(
                 "run_name": config["run"]["name"],
                 "completed_epoch": result.get("completed_epoch"),
                 "global_step": result.get("global_step"),
+                "selected_epoch": result.get("selected_epoch"),
+                "selected_metrics": copy.deepcopy(result.get("selected_metrics", {})),
+                "terminal_epoch": result.get("terminal_epoch"),
+                "terminal_metrics": copy.deepcopy(result.get("terminal_metrics", {})),
+                "duration_contract": copy.deepcopy(experiments.run.RUN_DURATION_CONTRACT),
                 "best_checkpoint": "best_checkpoint.pt",
                 "last_checkpoint": "last_checkpoint.pt",
                 "config_sha256": common.serialization.file_sha256(common.paths.resolve_run_config_path(run_dir)),
@@ -1311,16 +1343,24 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             state_updater({"monitor": monitor_membership})
         semantic_config: Mapping[str, Any] | None = None
         monitor_settings = config["tracking"]["wandb"]["monitor"]
-        if bool(config["tracking"]["wandb"]["enabled"]):
+        if config["tracking"]["wandb"]["mode"] != "disabled":
             semantic_config = experiments.tracking.build_semantic_config(
                 config,
                 split_indices=dataloaders["split_indices"],
+                split_indices_sha256=common.serialization.file_sha256(common.paths.resolve_split_indices_path(run_dir)),
                 normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
                 checkpoint_identity=checkpoint_identity,
                 model=model,
                 device_metadata=device_resolution.as_dict(),
+                duration_contract=experiments.run.RUN_DURATION_CONTRACT,
+                tuning_context={
+                    "study_name": context["study_name"],
+                    "trial_number": context["trial_number"],
+                    "search_signature": context["search_signature"],
+                    "sampled_parameters": copy.deepcopy(context["analysis_parameters"]),
+                },
             )
-        if bool(config["tracking"]["wandb"]["enabled"]) and bool(monitor_settings["enabled"]):
+        if config["tracking"]["wandb"]["mode"] != "disabled" and bool(monitor_settings["enabled"]):
             max_monitor_cases = int(monitor_settings["max_cases"])
 
             def evaluate_monitor() -> Mapping[str, float]:
@@ -1363,6 +1403,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             eval_loader=dataloaders["eval"],
             train_loss=train_loss,
             eval_metrics=eval_metrics,
+            ood_loader=dataloaders["ood"],
             data_processor=data_processor,
             scheduler=scheduler,
             save_dir=run_dir,
@@ -1370,6 +1411,22 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             epoch_end_callback=trial_epoch_callback,
             checkpoint_identity=checkpoint_identity,
         )
+        selected = learning.training.loop.evaluate_selected_checkpoint(
+            config=config,
+            model=model,
+            train_loss=train_loss,
+            eval_loader=dataloaders["eval"],
+            ood_loader=dataloaders["ood"],
+            eval_metrics=eval_metrics,
+            device=device,
+            data_processor=data_processor,
+            checkpoint_identity=checkpoint_identity,
+            best_checkpoint_path=result["best_checkpoint_path"],
+            scheduler_expected=scheduler is not None,
+            amp_expected=amp_enabled,
+            max_physics_cases=int(monitor_settings["max_cases"]),
+        )
+        result.update(selected)
         objective_value = _finite_objective_value(result, objective)
         _validate_completed_reporting(reporter, result)
         tracking_status = "completed"
@@ -1421,10 +1478,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         )
         pruning_epoch = reporter.last_reported_epoch
         if wandb_epoch_callback is not None and reporter.last_metrics is not None and pruning_epoch is not None:
-            try:
-                wandb_epoch_callback(pruning_epoch, reporter.last_metrics)
-            except experiments.tracking.TrackingError as mirror_error:
-                trial.set_user_attr("wandb_prune_mirror_error", str(mirror_error))
+            wandb_epoch_callback(pruning_epoch, reporter.last_metrics)
         raise
     except FloatingPointError as error:
         tracking_error = error
@@ -1594,10 +1648,20 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             local_summary: Mapping[str, Any] | None = None
             with suppress(Exception):
                 local_summary = experiments.run.read_run_summary(run_dir)
+            terminal_tracking_result = tracking_result
+            if terminal_tracking_result is None and reporter.last_reported_epoch is not None:
+                terminal_tracking_result = {
+                    "best_metric": reporter.best_value,
+                    "best_epoch": reporter.best_epoch,
+                    "completed_epoch": reporter.last_reported_epoch,
+                    "global_step": reporter.last_global_step,
+                    "terminal_epoch": reporter.last_reported_epoch,
+                    "terminal_metrics": {key: value for key, value in (reporter.last_metrics or {}).items() if key.startswith("train/")},
+                }
             try:
                 tracker.finish(
                     status=tracking_status,
-                    result=tracking_result,
+                    result=terminal_tracking_result,
                     local_summary=local_summary,
                     error=tracking_error,
                 )

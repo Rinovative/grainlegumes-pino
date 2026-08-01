@@ -84,29 +84,36 @@ TRAINING_DEFAULTS: dict[str, Any] = {
     "mixed_precision": False,
 }
 
+WANDB_ENTITY = "Rinovative-Hub"
+WANDB_REPOSITORY_PROJECTS = {
+    "airflow": "grainlegumes-pino-airflow",
+    "drying": "grainlegumes-pino-drying",
+}
+WANDB_PROJECT = WANDB_REPOSITORY_PROJECTS["airflow"]
+WANDB_MAX_TAGS = 2
+WANDB_WORKFLOWS = (
+    "train",
+    "optuna_trial",
+    "gpu_smoke",
+    "cpu_acceptance",
+    "tracking_validation",
+)
+
 TRACKING_DEFAULTS: dict[str, Any] = {
     "wandb": {
-        "enabled": False,
-        "project": "grainlegumes-pino-airflow",
-        "entity": None,
-        "group": None,
-        "tags": [],
         "mode": "online",
+        "workflow": "train",
+        "study": None,
+        "project": WANDB_PROJECT,
+        "entity": WANDB_ENTITY,
+        "tags": [],
         "monitor": {
             "enabled": True,
             "interval": 50,
             "max_cases": 4,
         },
-        "training_images": {
-            "enabled": False,
-            "interval": 50,
-            "max_snapshots": 4,
-        },
         "upload": {
-            "config": True,
-            "summary": True,
-            "provenance": True,
-            "best_checkpoint": False,
+            "evaluation_artifacts": False,
         },
     }
 }

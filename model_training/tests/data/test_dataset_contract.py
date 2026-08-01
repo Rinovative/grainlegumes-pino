@@ -791,33 +791,6 @@ def test_source_sample_values_are_bound_to_final_payload_metadata(
         )
 
 
-@pytest.mark.parametrize("dataset_id", ["lhs_var80_seed3001", "lhs_var120_seed4001"])
-def test_current_production_metadata_package_passes_read_only_cross_binding(dataset_id: str) -> None:
-    model_training_root = Path(__file__).parents[2]
-    metadata_dir = model_training_root / "data/meta" / dataset_id
-    metadata = json.loads((metadata_dir / datasets.metadata.METADATA_FILENAME).read_text(encoding="utf-8"))
-    manifest = json.loads((metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    scientific = metadata["scientific_identity"]
-    identity = datasets.identity.DatasetIdentity(
-        dataset_id=dataset_id,
-        task=scientific["task_id"],
-        task_contract_digest=scientific["task_contract_digest"],
-        fingerprint=scientific["dataset_fingerprint"],
-        sample_ids=tuple(manifest["intended_case_ids"]),
-        sample_count=scientific["sample_count"],
-        spatial_shape=tuple(scientific["spatial_shape"]),
-        generated_batch_identity_sha256=scientific["generated_batch_identity_sha256"],
-    )
-
-    package = datasets.metadata.validate_dataset_metadata_directory(
-        metadata_dir,
-        dataset_identity=identity,
-    )
-
-    assert package.source_manifest["intended_case_ids"] == manifest["intended_case_ids"]
-    assert package.metadata["scientific_identity"]["generated_batch_identity_sha256"] == scientific["generated_batch_identity_sha256"]
-
-
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

@@ -139,8 +139,8 @@ def test_public_domain_exports_resolve_and_noncanonical_fields_fail() -> None:
     Public aliases must reach their canonical objects while noncanonical names
     fail explicitly, keeping the public API limited to canonical names.
     """
-    assert domain.tasks.spec.TaskSpec
-    assert domain.tasks.registry.get_task
+    assert domain.tasks.spec.TaskSpec is type(domain.tasks.steady_flow.STEADY_FLOW)
+    assert domain.tasks.registry.get_task("steady_flow") is domain.tasks.steady_flow.STEADY_FLOW
     assert domain.tasks.steady_flow.STEADY_FLOW.id == "steady_flow"
     assert domain.fields.require_known_field("eps") == "eps"
     with pytest.raises(ValueError, match="Unknown task"):

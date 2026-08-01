@@ -366,17 +366,15 @@ def test_epoch_loss_components_are_weighted_by_actual_sample_count() -> None:
     assert set(physics_values) == {
         "train/loss_total",
         "train/loss_data",
-        "train/loss_momentum",
-        "train/loss_boundary",
-        "train/loss_continuity_div_velocity",
-        "train/weight_physics",
-        "train/weight_boundary",
-        "train/warmup_physics_fraction",
-        "train/warmup_boundary_fraction",
+        "physics/train/loss_momentum",
+        "physics/train/loss_boundary",
+        "physics/train/loss_continuity_div_velocity",
+        "physics/train/residual_weight",
+        "physics/train/boundary_weight",
         "optimizer_steps",
     }
-    assert physics_values["train/weight_physics"] == 0.25
-    assert "train/loss_continuity_div_eps_velocity" not in physics_values
+    assert physics_values["physics/train/residual_weight"] == 0.25
+    assert "physics/train/loss_continuity_div_eps_velocity" not in physics_values
 
 
 class _ManufacturedMonitorModel(torch.nn.Module):
@@ -393,14 +391,23 @@ class _ManufacturedMonitorModel(torch.nn.Module):
         return torch.stack((zeros, 1e-5 * inputs[:, 0], zeros), dim=1)
 
 
-def test_physics_monitor_is_bounded_and_reports_both_continuities() -> None:
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "steady_flow_fno.yaml",
+        "steady_flow_uno.yaml",
+        "steady_flow_pifno.yaml",
+        "steady_flow_piuno.yaml",
+    ],
+)
+def test_physics_monitor_is_bounded_and_reports_both_continuities(filename: str) -> None:
     """
     Evaluate the shared domain diagnostics on only a fixed evaluation prefix.
 
     The monitor must consume exactly the bound and report both continuity metrics
     plus momentum/boundary values, without introducing a second physics formula.
     """
-    config = _physics_config()
+    config = _physics_config(filename=filename)
     loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
     normalizer = IdentityNormalizer()
     loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
@@ -420,10 +427,43 @@ def test_physics_monitor_is_bounded_and_reports_both_continuities() -> None:
 
     assert model.samples_seen == 2
     assert set(values) == {
-        "monitor/momentum_residual_mse",
-        "monitor/div_velocity_mse",
-        "monitor/div_eps_velocity_mse",
-        "monitor/pressure_boundary_mse",
+        "physics/id/momentum_residual_mse",
+        "physics/id/continuity_div_velocity_mse",
+        "physics/id/continuity_div_eps_velocity_mse",
+        "physics/id/pressure_boundary_mse",
     }
     assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
-    assert values["monitor/div_velocity_mse"] != values["monitor/div_eps_velocity_mse"]
+    assert values["physics/id/continuity_div_velocity_mse"] != values["physics/id/continuity_div_eps_velocity_mse"]
+
+
+class _FailingMonitorLoss(torch.nn.Module):
+    """Inject the demonstrated spacing owner below the monitor boundary."""
+
+    def compute_physics_diagnostics(self, _pred: torch.Tensor, *, x: torch.Tensor) -> None:
+        del x
+        msg = "x-coordinate spacing is not uniform within tolerance"
+        raise ValueError(msg)
+
+
+def test_physics_monitor_wraps_numerics_as_scientific_evaluation_with_cause() -> None:
+    """Keep numerical monitor failures scientific and restore model state."""
+    inputs, _pred, target = _manufactured_batch()
+    loader = DataLoader(
+        _ListMappingDataset([{"x": inputs[0], "y": target[0]}]),
+        batch_size=1,
+        shuffle=False,
+    )
+    model = _ManufacturedMonitorModel()
+    model.train()
+    with pytest.raises(learning.training.loop.PhysicsMonitorEvaluationError) as captured:
+        learning.training.loop.evaluate_physics_monitor(
+            model,
+            loader,
+            _FailingMonitorLoss(),
+            torch.device("cpu"),
+            data_processor=None,
+            max_cases=1,
+        )
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert "x-coordinate spacing" in str(captured.value.__cause__)
+    assert model.training

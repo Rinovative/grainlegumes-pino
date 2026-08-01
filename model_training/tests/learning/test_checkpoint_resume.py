@@ -26,6 +26,8 @@ from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch.optim.optimizer import Optimizer
 
 
@@ -167,6 +169,18 @@ class _StatefulLoss(nn.Module):
         return torch.mean((pred - target).square())
 
 
+class _WarmupStatefulLoss(_StatefulLoss):
+    """Expose deterministic selected-epoch weights without changing train semantics."""
+
+    def telemetry_state(self, *, epoch: int | None = None) -> dict[str, float]:
+        position = int(self.epoch_index.item()) if epoch is None else epoch
+        fraction = min(float(position) / 10.0, 1.0)
+        return {
+            "weight_physics": fraction,
+            "weight_boundary": 2.0 * fraction,
+        }
+
+
 class _NonFiniteTrainingLoss(nn.Module):
     """
     Return one prescribed non-finite value while retaining an autograd path.
@@ -271,6 +285,7 @@ def _run(
     epochs: int,
     seed: int,
     resume_from: Path | None = None,
+    epoch_end_callback: Callable[[int, dict[str, float]], None] | None = None,
 ) -> tuple[dict[str, Any], nn.Module, Optimizer, Any, nn.Module, DataLoader[Any]]:
     """
     Execute one synthetic training segment, optionally from ``last_checkpoint.pt``.
@@ -291,6 +306,7 @@ def _run(
         scheduler=scheduler,
         save_dir=run_dir,
         resume_from=resume_from,
+        epoch_end_callback=epoch_end_callback,
         checkpoint_identity=_identity(),
     )
     return result, model, optimizer, scheduler, loss, train_loader
@@ -331,14 +347,27 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
     resumed_dir.mkdir()
 
     full_result, full_model, full_optimizer, full_scheduler, full_loss, full_loader = _run(full_dir, epochs=4, seed=151)
-    _run(resumed_dir, epochs=2, seed=151)
+    resume_observations: list[tuple[int, float]] = []
+
+    def capture_resume_epoch(epoch: int, values: dict[str, float]) -> None:
+        resume_observations.append((epoch, values["system/epoch_duration_seconds"]))
+
+    _run(
+        resumed_dir,
+        epochs=2,
+        seed=151,
+        epoch_end_callback=capture_resume_epoch,
+    )
     resumed_result, resumed_model, resumed_optimizer, resumed_scheduler, resumed_loss, resumed_loader = _run(
         resumed_dir,
         epochs=4,
         seed=999,
         resume_from=resumed_dir / "last_checkpoint.pt",
+        epoch_end_callback=capture_resume_epoch,
     )
 
+    assert [epoch for epoch, _duration in resume_observations] == [1, 2, 3, 4]
+    assert all(math.isfinite(duration) and duration > 0.0 for _epoch, duration in resume_observations)
     assert resumed_result == full_result | {
         "checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "best_checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
@@ -729,7 +758,7 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
         train_loss=loss,
         eval_metrics={"mse": _ObjectiveStreamMetric(values)},
         save_dir=run_dir,
-        epoch_end_callback=lambda _epoch, metrics: observed_learning_rates.append(metrics["train/learning_rate"]),
+        epoch_end_callback=lambda _epoch, metrics: observed_learning_rates.append(metrics["optimization/learning_rate"]),
         checkpoint_identity=identity,
     )
 
@@ -873,11 +902,189 @@ def test_completed_epoch_callback_preserves_evaluation_cadence(
 
     assert [epoch for epoch, _values in observed] == [1, 2, 3]
     assert "mse" not in observed[0][1]
-    assert "mse" in observed[1][1]
-    assert "mse" in observed[2][1]
+    assert "id/mse" in observed[1][1]
+    assert "id/mse" in observed[2][1]
     assert all("train/loss_total" in values for _epoch, values in observed)
     assert all("global_step" in values for _epoch, values in observed)
     assert [entry["epoch"] for entry in result["objective_history"]] == [2, 3]
+
+
+def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) -> None:
+    """Evaluate ID then OOD while retaining ID as the sole objective source."""
+    run_dir = tmp_path / "id-ood-selection"
+    run_dir.mkdir()
+    model, optimizer, scheduler, loss, train_loader, eval_loader = _components(41)
+    observed: list[dict[str, float]] = []
+    result = learning.training.loop.train_loop(
+        config=_config(2, evaluation_interval=1),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        ood_loader=eval_loader,
+        train_loss=loss,
+        eval_metrics={"mse": _ObjectiveStreamMetric([0.4, 0.1, 0.3, 0.9])},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        epoch_end_callback=lambda _epoch, values: observed.append(dict(values)),
+        checkpoint_identity=_identity("id-ood-selection"),
+    )
+
+    assert [entry["value"] for entry in result["objective_history"]] == [0.4, 0.3]
+    assert result["best_epoch"] == 2
+    assert result["best_metric"] == 0.3
+    assert [values["id/mse"] for values in observed] == [0.4, 0.3]
+    assert [values["ood/mse"] for values in observed] == [0.1, 0.9]
+    assert [values["generalization/objective_gap"] for values in observed] == pytest.approx([-0.3, 0.6])
+    assert result["terminal_epoch"] == 2
+    assert set(result["terminal_metrics"]) == {"train/loss_total", "train/loss_data"}
+
+
+def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reload best_checkpoint.pt before ID, OOD, physics, and selected weights."""
+    run_dir = tmp_path / "selected-best"
+    run_dir.mkdir()
+    model, optimizer, scheduler, _loss, train_loader, eval_loader = _components(43)
+    train_loss = _WarmupStatefulLoss()
+    result = learning.training.loop.train_loop(
+        config=_config(2, evaluation_interval=1),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=train_loss,
+        eval_metrics={"mse": _ObjectiveStreamMetric([0.1, 0.9])},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        checkpoint_identity=_identity("selected-best"),
+    )
+    assert result["best_epoch"] == 1
+    best = learning.training.checkpoint.load_checkpoint(
+        run_dir / "best_checkpoint.pt",
+        expected_identity=_identity("selected-best"),
+        expected_role="best",
+        scheduler_expected=True,
+        amp_expected=False,
+        require_best=True,
+    )
+    best_state = best["model_state_dict"]
+    ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
+    science_metric_ids = (
+        "normalized_macro_rmse",
+        "normalized_rmse",
+        "normalized_rmse_p",
+        "normalized_rmse_u",
+        "normalized_rmse_v",
+        "normalized_relative_l2",
+        "normalized_relative_h1",
+        "physical_rmse_p",
+        "physical_rmse_u",
+        "physical_rmse_v",
+    )
+    id_science_metrics = {metric_id: 0.11 + 0.01 * index for index, metric_id in enumerate(science_metric_ids)}
+    ood_science_metrics = {metric_id: 0.51 + 0.01 * index for index, metric_id in enumerate(science_metric_ids)}
+
+    def assert_best_state(current: nn.Module) -> None:
+        for name, value in current.state_dict().items():
+            assert torch.equal(value.cpu(), best_state[name])
+
+    def selected_eval(
+        current: nn.Module,
+        loader: DataLoader[Any],
+        _metrics: dict[str, Any],
+        _device: torch.device,
+        _processor: Any,
+    ) -> dict[str, float]:
+        assert_best_state(current)
+        if loader is eval_loader:
+            return {"mse": 0.2, **id_science_metrics}
+        return {"mse": 0.6, **ood_science_metrics}
+
+    def selected_physics(
+        current: nn.Module,
+        loader: DataLoader[Any],
+        _loss_fn: nn.Module,
+        _device: torch.device,
+        _processor: Any,
+        *,
+        max_cases: int,
+    ) -> dict[str, float]:
+        assert_best_state(current)
+        assert loader is eval_loader
+        assert max_cases == 2
+        return {
+            "physics/id/momentum_residual_mse": 1.0,
+            "physics/id/continuity_div_velocity_mse": 2.0,
+            "physics/id/continuity_div_eps_velocity_mse": 3.0,
+            "physics/id/pressure_boundary_mse": 4.0,
+        }
+
+    monkeypatch.setattr(learning.training.loop, "eval_one_epoch", selected_eval)
+    monkeypatch.setattr(learning.training.loop, "evaluate_physics_monitor", selected_physics)
+    selected_config = _config(2, evaluation_interval=1)
+    selected_config["loss"] = {
+        "physics": {
+            "enabled": True,
+            "residual_weight": {"target": 1.0, "warmup": {"epochs": 10}},
+            "boundary_weight": {"target": 2.0, "warmup": {"epochs": 10}},
+        }
+    }
+    selected = learning.training.loop.evaluate_selected_checkpoint(
+        config=selected_config,
+        model=model,
+        train_loss=train_loss,
+        eval_loader=eval_loader,
+        ood_loader=ood_loader,
+        eval_metrics={
+            "mse": _DatasetMSE(),
+            **{metric_id: _DatasetMSE() for metric_id in science_metric_ids},
+        },
+        device=torch.device("cpu"),
+        data_processor=None,
+        checkpoint_identity=_identity("selected-best"),
+        best_checkpoint_path=run_dir / "best_checkpoint.pt",
+        scheduler_expected=True,
+        amp_expected=False,
+        max_physics_cases=2,
+    )
+    assert selected["selected_epoch"] == 1
+    metrics = selected["selected_metrics"]
+    assert metrics["selected/id/mse"] == 0.2
+    assert metrics["selected/ood/mse"] == 0.6
+    assert {metric_id: metrics[f"selected/id/{metric_id}"] for metric_id in science_metric_ids} == id_science_metrics
+    assert {metric_id: metrics[f"selected/ood/{metric_id}"] for metric_id in science_metric_ids} == ood_science_metrics
+    assert metrics["selected/generalization/objective_gap"] == pytest.approx(0.4)
+    assert metrics["selected/physics/continuity_div_velocity_mse"] == 2.0
+    assert metrics["selected/physics/continuity_div_eps_velocity_mse"] == 3.0
+    assert metrics["selected/training/residual_weight"] == 0.0
+    assert metrics["selected/training/boundary_weight"] == 0.0
+
+    settled_config = copy.deepcopy(selected_config)
+    settled_config["loss"]["physics"]["residual_weight"]["warmup"]["epochs"] = 0
+    settled_config["loss"]["physics"]["boundary_weight"]["warmup"]["epochs"] = 0
+    settled = learning.training.loop.evaluate_selected_checkpoint(
+        config=settled_config,
+        model=model,
+        train_loss=train_loss,
+        eval_loader=eval_loader,
+        ood_loader=ood_loader,
+        eval_metrics={"mse": _DatasetMSE()},
+        device=torch.device("cpu"),
+        data_processor=None,
+        checkpoint_identity=_identity("selected-best"),
+        best_checkpoint_path=run_dir / "best_checkpoint.pt",
+        scheduler_expected=True,
+        amp_expected=False,
+        max_physics_cases=2,
+    )
+    settled_metrics = settled["selected_metrics"]
+    assert "selected/training/residual_weight" not in settled_metrics
+    assert "selected/training/boundary_weight" not in settled_metrics
 
 
 def test_final_epoch_is_evaluated_when_interval_is_larger(tmp_path: Path) -> None:

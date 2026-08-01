@@ -83,7 +83,7 @@ def test_dataframe_reader_rejects_every_unexpected_column() -> None:
     [True, 1.0, 2],
     ids=("boolean-one", "floating-one", "unsupported-integer"),
 )
-def test_dataframe_reader_requires_integer_artifact_version_one(schema_version: object) -> None:
+def test_dataframe_reader_requires_integer_artifact_version_one(schema_version: bool | float) -> None:
     """Reject alternate representations and unsupported Parquet schema versions."""
     frame = _current_generic_frame(metadata="{}")
     frame["artifact_schema_version"] = schema_version  # pyright: ignore[reportCallIssue, reportArgumentType]
@@ -230,9 +230,11 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
     ]
     for keys, replacement in mutations:
         changed = copy.deepcopy(provenance)
-        target = changed
+        target: object = changed
         for key in keys[:-1]:
+            assert isinstance(target, dict)
             target = target[key]
+        assert isinstance(target, dict)
         target[keys[-1]] = replacement
         assert analysis.artifact_service._scientific_provenance(changed) != baseline
 

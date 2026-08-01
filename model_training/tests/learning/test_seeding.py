@@ -103,7 +103,7 @@ def test_model_subseed_is_applied_immediately_before_construction(
         "task": "synthetic",
         "run": {"name": "run", "seed": 23, "deterministic": True, "device": "cpu"},
         "training": {"epochs": 1, "mixed_precision": False},
-        "tracking": {"wandb": {"enabled": False}},
+        "tracking": {"wandb": {"mode": "disabled"}},
         "evaluation": {
             "objective": {
                 "id": "objective",

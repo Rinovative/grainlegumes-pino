@@ -43,9 +43,11 @@ def test_two_public_domains_derive_owned_lifecycle_stages(
     run_lock = common.paths.resolve_run_lock_path(training_root / "processed/steady_flow/runs/run")
     artifact_lock = common.paths.resolve_artifact_lock_path(training_root / "processed/steady_flow/runs/run/analysis/id")
     assert run_lock.parent == training_root / ".state/runs/locks"
-    assert run_lock.name.startswith("run-") and run_lock.suffix == ".lock"
+    assert run_lock.name.startswith("run-")
+    assert run_lock.suffix == ".lock"
     assert artifact_lock.parent == training_root / ".state/runs/locks"
-    assert artifact_lock.name.startswith("artifact-") and artifact_lock.suffix == ".lock"
+    assert artifact_lock.name.startswith("artifact-")
+    assert artifact_lock.suffix == ".lock"
     assert common.paths.resolve_run_output_dir("steady_flow", "run") == (training_root / "processed" / "steady_flow" / "runs" / "run")
     assert common.paths.resolve_study_dir("steady_flow", "study") == (training_root / "processed" / "steady_flow" / "studies" / "study")
 

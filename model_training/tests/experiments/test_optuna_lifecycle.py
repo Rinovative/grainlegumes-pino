@@ -107,8 +107,11 @@ class _Trial:
 
 
 def _load(name: str = "steady_flow_fno_search.yaml") -> optuna_runtime.OptunaStudyConfig:
-    """Load one maintained study recipe through the public semantic loader."""
-    return optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / name)
+    """Load a recipe with external tracking disabled for local lifecycle tests."""
+    config = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / name)
+    base_config = copy.deepcopy(config.base_config)
+    base_config["tracking"]["wandb"]["mode"] = "disabled"
+    return replace(config, base_config=base_config)
 
 
 def test_exact_four_recipes_are_safe_complete_and_small() -> None:
@@ -166,8 +169,8 @@ def test_signature_excludes_invocation_and_tracking_but_covers_science(tmp_path:
     operational_base = copy.deepcopy(config.base_config)
     operational_base["run"]["device"] = "cpu"
     operational_base["paths"]["output_root"] = str(tmp_path / "elsewhere")
-    operational_base["tracking"]["wandb"]["enabled"] = True
-    operational_base["tracking"]["wandb"]["project"] = "different-observer"
+    operational_base["tracking"]["wandb"]["mode"] = "offline"
+    operational_base["tracking"]["wandb"]["monitor"]["interval"] += 1
     operational_study = copy.deepcopy(config.study)
     operational_study.update({"name": "display_name_changed", "n_trials": 97, "storage": "sqlite:///elsewhere.db"})
     operational = replace(config, base_config=operational_base, study=operational_study)
@@ -214,12 +217,12 @@ def test_reporter_requires_held_out_metric_continuity_and_prunes_immediately() -
 
     discontinuous = optuna_runtime.OptunaEpochReporter(trial=_Trial(), objective_id="normalized_macro_rmse", direction="minimize")
     with pytest.raises(ValueError, match="expected 1, got 2"):
-        discontinuous(2, {"normalized_macro_rmse": 0.5})
+        discontinuous(2, {"id/normalized_macro_rmse": 0.5})
 
     trial = _Trial(prune=True)
     reporter = optuna_runtime.OptunaEpochReporter(trial=trial, objective_id="normalized_macro_rmse", direction="minimize")
     with pytest.raises(optuna.TrialPruned, match="completed epoch 1"):
-        reporter(1, {"normalized_macro_rmse": 0.5, "global_step": 7.0})
+        reporter(1, {"id/normalized_macro_rmse": 0.5, "global_step": 7.0})
     assert trial.reports == [(0.5, 1)]
     assert trial.attrs["last_reported_epoch"] == 1
     assert trial.attrs["last_global_step"] == _EXPECTED_GLOBAL_STEP
@@ -324,7 +327,7 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
             )
             values = (0.10, 0.09) if trial.number == 0 else (1.0, 0.9)
             for epoch, value in enumerate(values, start=1):
-                reporter(epoch, {"normalized_macro_rmse": value, "global_step": float(epoch)})
+                reporter(epoch, {"id/normalized_macro_rmse": value, "global_step": float(epoch)})
             assert reporter.best_value is not None
             return reporter.best_value
 
@@ -413,6 +416,7 @@ def _install_running_failure_harness(
             "split_indices": {},
             "train": object(),
             "eval": object(),
+            "ood": object(),
         },
     )
 
@@ -475,7 +479,7 @@ def test_pruned_wandb_objective_is_mirrored_only_after_local_publication(
     def prune_training(**kwargs: Any) -> Any:
         """Invoke one epoch callback that must prune before training can continue."""
         callback = kwargs["epoch_end_callback"]
-        callback(1, {"normalized_macro_rmse": 0.5, "global_step": 3.0})
+        callback(1, {"id/normalized_macro_rmse": 0.5, "global_step": 3.0})
         pytest.fail("pruning callback must stop training immediately")
 
     def epoch_callback(_session: Any) -> Callable[[int, dict[str, float]], None]:

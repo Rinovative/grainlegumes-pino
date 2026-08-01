@@ -7,14 +7,14 @@ Mirror authoritative local experiment state to optional W&B observability.
 Responsibilities:
   - Keep disabled tracking free of SDK imports and tracking side effects
   - Persist opaque fresh identities and exact-resume identities locally first
-  - Publish bounded semantic config, epoch history, summaries, files and media
-  - Degrade online transport failures without invalidating local correctness
-  - Surface requested offline-record I/O failures as local operation failures
+  - Publish bounded semantic config, epoch history, summaries, and curated media
+  - Fail closed on requested online or offline observer failures
+  - Keep built-in system telemetry secondary to scientific metrics
 
 Design principles:
   - Local config, split, normalizer, checkpoints, summaries and artifacts win
   - W&B observes training and artifacts but never chooses or reconstructs them
-  - Fresh and exact-resume sessions have distinct fail-closed identity semantics
+  - Fresh and exact-resume sessions have strict fail-closed identity semantics
   - Secrets, arbitrary environment state and incidental absolute paths are absent
 
 This module does NOT:
@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import copy
 import importlib
+import importlib.metadata
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -59,6 +61,209 @@ POST_ARTIFACT_MEDIA_KEYS = frozenset(
 _POST_ARTIFACT_FILE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".html", ".pdf"})
 _SECRET_KEY_PATTERN = re.compile(r"(?i)(WANDB_API_KEY|api[_-]?key|password|secret|token)(\s*[:=]\s*)([^\s,;]+)")
 _MAX_SAFE_ERROR_LENGTH = 600
+AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
+    "Overview",
+    "Accuracy",
+    "Physics",
+    "Diagnostics",
+)
+ACCURACY_HISTORY_METRIC_IDS = (
+    "normalized_rmse_p",
+    "normalized_rmse_u",
+    "normalized_rmse_v",
+    "normalized_relative_l2",
+    "normalized_relative_h1",
+    "physical_rmse_p",
+    "physical_rmse_u",
+    "physical_rmse_v",
+)
+_PHYSICS_ID_SOURCE_KEYS = (
+    "physics/id/momentum_residual_mse",
+    "physics/id/continuity_div_velocity_mse",
+    "physics/id/continuity_div_eps_velocity_mse",
+    "physics/id/pressure_boundary_mse",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryMetricDefinition:
+    """Document one authoritative source-to-W&B history mapping."""
+
+    source_key: str
+    wandb_key: str
+    owner: str
+    computation_cost: str
+    scientific_question: str
+
+
+def _definition(
+    source_key: str,
+    wandb_key: str,
+    *,
+    owner: str,
+    computation_cost: str,
+    scientific_question: str,
+) -> HistoryMetricDefinition:
+    """Build one compact immutable history definition."""
+    return HistoryMetricDefinition(
+        source_key=source_key,
+        wandb_key=wandb_key,
+        owner=owner,
+        computation_cost=computation_cost,
+        scientific_question=scientific_question,
+    )
+
+
+def automatic_history_metric_definitions(
+    evaluation_metric_ids: Sequence[str],
+    *,
+    physics_training_enabled: bool,
+    continuity: str,
+    physics_monitor_enabled: bool,
+    cuda_enabled: bool,
+) -> tuple[HistoryMetricDefinition, ...]:
+    """
+    Return the ordered automatic-personal-workspace history contract.
+
+    The source keys are authoritative local training-loop telemetry. Only this
+    observer boundary renames them for W&B. Definitions follow the intended
+    Overview, Accuracy/ID, Accuracy/OOD, Physics/ID, Physics/Training, and
+    Diagnostics registration order. W&B itself does not guarantee that a
+    personal workspace will preserve registration order in its UI.
+    """
+    metric_ids = frozenset(evaluation_metric_ids)
+    definitions: list[HistoryMetricDefinition] = []
+    evaluation_owner = "src.learning.training.learning_training_loop.eval_one_epoch"
+    training_owner = "src.learning.training.learning_training_loop.train_one_epoch"
+    loop_owner = "src.learning.training.learning_training_loop.train_loop"
+    monitor_owner = "src.learning.training.learning_training_loop.evaluate_physics_monitor"
+
+    if "normalized_macro_rmse" in metric_ids:
+        definitions.extend(
+            (
+                _definition(
+                    "id/normalized_macro_rmse",
+                    "Overview/ID/normalized_macro_rmse",
+                    owner=evaluation_owner,
+                    computation_cost="existing ID evaluation pass",
+                    scientific_question="Is authoritative in-distribution performance improving?",
+                ),
+                _definition(
+                    "ood/normalized_macro_rmse",
+                    "Overview/OOD/normalized_macro_rmse",
+                    owner=evaluation_owner,
+                    computation_cost="existing OOD diagnostic pass",
+                    scientific_question="Is out-of-distribution generalization improving or degrading?",
+                ),
+                _definition(
+                    "generalization/objective_gap",
+                    "Overview/generalization_gap",
+                    owner=loop_owner,
+                    computation_cost="one scalar subtraction",
+                    scientific_question="How far does OOD error separate from ID error?",
+                ),
+            )
+        )
+    definitions.extend(
+        (
+            _definition(
+                "train/loss_total",
+                "Overview/train_loss_total",
+                owner=training_owner,
+                computation_cost="existing training reduction",
+                scientific_question="Is the complete optimization objective converging?",
+            ),
+            _definition(
+                "train/loss_data",
+                "Overview/train_loss_data",
+                owner=training_owner,
+                computation_cost="existing training reduction",
+                scientific_question="Is supervised fit improving independently of PI contributions?",
+            ),
+            _definition(
+                "optimization/learning_rate",
+                "Overview/learning_rate",
+                owner=loop_owner,
+                computation_cost="existing optimizer scalar",
+                scientific_question="When and how does the scheduler react?",
+            ),
+        )
+    )
+
+    for role in ("ID", "OOD"):
+        source_role = role.lower()
+        pass_cost = "existing ID evaluation pass" if role == "ID" else "existing OOD diagnostic pass"
+        for metric_id in ACCURACY_HISTORY_METRIC_IDS:
+            if metric_id not in metric_ids:
+                continue
+            definitions.append(
+                _definition(
+                    f"{source_role}/{metric_id}",
+                    f"Accuracy/{role}/{metric_id}",
+                    owner=evaluation_owner,
+                    computation_cost=pass_cost,
+                    scientific_question=f"What does {metric_id} reveal for {role} predictive accuracy?",
+                )
+            )
+
+    if physics_monitor_enabled:
+        for source_key in _PHYSICS_ID_SOURCE_KEYS:
+            suffix = source_key.removeprefix("physics/id/")
+            definitions.append(
+                _definition(
+                    source_key,
+                    f"Physics/ID/{suffix}",
+                    owner=monitor_owner,
+                    computation_cost="existing bounded configured monitor pass",
+                    scientific_question=f"Does the ID prediction satisfy {suffix}?",
+                )
+            )
+
+    if physics_training_enabled:
+        training_physics = (
+            ("loss_momentum", "Does the weighted momentum contribution converge?"),
+            ("loss_boundary", "Does the weighted pressure-boundary contribution converge?"),
+            (f"loss_continuity_{continuity}", "Does the configured weighted continuity contribution converge?"),
+            ("residual_weight", "What residual weight is actually applied during warmup?"),
+            ("boundary_weight", "What boundary weight is actually applied during warmup?"),
+        )
+        for suffix, question in training_physics:
+            definitions.append(
+                _definition(
+                    f"physics/train/{suffix}",
+                    f"Physics/Training/{suffix}",
+                    owner=training_owner,
+                    computation_cost="existing PI loss telemetry",
+                    scientific_question=question,
+                )
+            )
+
+    definitions.append(
+        _definition(
+            "system/epoch_duration_seconds",
+            "Diagnostics/epoch_duration_seconds",
+            owner=loop_owner,
+            computation_cost="one monotonic-clock subtraction",
+            scientific_question="How long does each completed epoch take?",
+        )
+    )
+    if cuda_enabled:
+        definitions.append(
+            _definition(
+                "system/cuda_peak_memory_allocated_bytes",
+                "Diagnostics/cuda_peak_memory_allocated_bytes",
+                owner=loop_owner,
+                computation_cost="existing CUDA allocator counter",
+                scientific_question="What is the peak allocated CUDA memory per epoch?",
+            )
+        )
+
+    source_keys = [definition.source_key for definition in definitions]
+    wandb_keys = [definition.wandb_key for definition in definitions]
+    if len(source_keys) != len(set(source_keys)) or len(wandb_keys) != len(set(wandb_keys)):
+        msg = "Automatic W&B history definitions must have unique source and destination keys."
+        raise RuntimeError(msg)
+    return tuple(definitions)
 
 
 class TrackingError(RuntimeError):
@@ -80,12 +285,11 @@ class TrackingInitializationError(TrackingError):
 
 
 class TrackingIOError(TrackingError):
-    """
-    Represent loss of required local records in requested offline mode.
+    """Represent loss of records in an explicitly requested tracking mode."""
 
-    Unlike an online transport failure, this cannot degrade silently because
-    local W&B persistence is the explicitly requested observer destination.
-    """
+
+class TrackingCallbackError(TrackingError):
+    """Represent a callback payload or orchestration contract violation."""
 
 
 class TrackingUploadError(TrackingError):
@@ -101,6 +305,10 @@ class _WandbRun(Protocol):
     """Describe the SDK run surface used by the lifecycle adapter."""
 
     summary: MutableMapping[str, Any]
+    tags: Sequence[str] | None
+
+    def define_metric(self, name: str, **kwargs: Any) -> Any:
+        """Define one supported metric family and its epoch step contract."""
 
     def log(self, data: Mapping[str, Any], *, step: int) -> None:
         """Log one completed epoch."""
@@ -124,13 +332,11 @@ class _WandbInitKwargs(TypedDict):
 
     project: str
     entity: str | None
-    group: str | None
-    tags: list[str]
+    tags: list[str] | None
     mode: str
     name: str
     id: str
     resume: str | None
-    job_type: str
     dir: str
     config: Mapping[str, Any]
     save_code: bool
@@ -254,48 +460,46 @@ def _git_metadata() -> dict[str, Any]:
     }
 
 
+TRACKING_INTEGRATION_VERSION = 2
+
+
+def model_parameter_counts(model: Any) -> dict[str, int]:
+    """Count the exact instantiated total and trainable model parameters."""
+    return {
+        "total": sum(int(parameter.numel()) for parameter in model.parameters()),
+        "trainable": sum(int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad),
+    }
+
+
+def _package_versions() -> dict[str, str | None]:
+    """Return a bounded reproducibility package inventory without SDK imports."""
+    versions: dict[str, str | None] = {"python": platform.python_version()}
+    for label, distribution in (
+        ("numpy", "numpy"),
+        ("neuraloperator", "neuraloperator"),
+        ("optuna", "optuna"),
+        ("wandb", "wandb"),
+    ):
+        try:
+            versions[label] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            versions[label] = None
+    return versions
+
+
 def build_semantic_config(
     config: Mapping[str, Any],
     *,
     split_indices: Mapping[str, Any],
+    split_indices_sha256: str,
     normalizer_sha256: str,
     checkpoint_identity: Mapping[str, Any],
     model: Any,
     device_metadata: Mapping[str, Any],
+    duration_contract: Mapping[str, Any],
+    tuning_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Build the bounded semantic W&B configuration after local admission.
-
-    The payload contains scientific identities and an absolute-path-free
-    effective config. Dataset tensors, split tensors, normalizer tensors,
-    arbitrary environment variables and secrets are never included.
-
-    Parameters
-    ----------
-    config : Mapping[str, Any]
-        Locally admitted resolved experiment config.
-    split_indices : Mapping[str, Any]
-        Saved split identity and membership metadata.
-    normalizer_sha256 : str
-        Digest of the authoritative local normalizer artifact.
-    checkpoint_identity : Mapping[str, Any]
-        Immutable run identity shared by best and last checkpoints.
-    model : Any
-        Constructed model used only for bounded parameter counts.
-    device_metadata : Mapping[str, Any]
-        Serialization-safe requested and resolved runtime facts.
-
-    Returns
-    -------
-    dict[str, Any]
-        Sanitized JSON-like semantic observer configuration.
-
-    Raises
-    ------
-    TypeError
-        If required identity mappings or payload values violate the bounded schema.
-
-    """
+    """Build one complete, nested, path-free scientific W&B configuration."""
     task_contract = config.get("task_contract")
     split_metadata = split_indices.get("metadata")
     if not isinstance(task_contract, Mapping) or not isinstance(split_metadata, Mapping):
@@ -308,11 +512,12 @@ def build_semantic_config(
         raise TypeError(msg)
 
     dataset_payload: dict[str, Any] = {}
-    for role, raw_identity in datasets.items():
+    for saved_role, tracked_role in (("train", "id"), ("ood", "ood")):
+        raw_identity = datasets.get(saved_role)
         if not isinstance(raw_identity, Mapping):
-            msg = f"split_indices metadata dataset {role!r} must be a mapping."
+            msg = f"split_indices metadata dataset {saved_role!r} must be a mapping."
             raise TypeError(msg)
-        dataset_payload[str(role)] = {
+        dataset_payload[tracked_role] = {
             key: copy.deepcopy(raw_identity.get(key))
             for key in (
                 "dataset_id",
@@ -323,52 +528,85 @@ def build_semantic_config(
             )
         }
 
-    effective_config = copy.deepcopy(dict(config))
-    effective_config.pop("paths", None)
-    parameter_counts = {
-        "total": sum(int(parameter.numel()) for parameter in model.parameters()),
-        "trainable": sum(int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad),
+    data_config = cast("Mapping[str, Any]", config["data"])
+    loader_keys = ("batch_size", "num_workers", "pin_memory", "persistent_workers")
+    split_keys = (
+        "n_train_full",
+        "n_train",
+        "n_eval",
+        "n_ood_full",
+        "n_ood",
+        "train_ratio",
+        "ood_fraction",
+        "split_seed",
+    )
+    preprocessing = task_contract.get("preprocessing")
+    if not isinstance(preprocessing, Mapping):
+        msg = "Semantic tracking config requires task preprocessing semantics."
+        raise TypeError(msg)
+
+    parameter_counts = model_parameter_counts(model)
+    model_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", config["model"])))
+    physics_enabled = bool(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["physics"])["enabled"])
+    model_kind = str(model_payload["kind"])
+    model_payload["variant"] = f"pi-{model_kind}" if physics_enabled else model_kind
+    model_payload["parameter_counts"] = parameter_counts
+    evaluation_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", config["evaluation"])))
+    evaluation_payload["roles"] = {
+        "selection": "id",
+        "diagnostic": "ood",
+        "cadence": "same_evaluation_interval",
     }
-    physics = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["physics"])
-    payload = {
+    source = _git_metadata()
+    payload: dict[str, Any] = {
         "task": {
             "id": config["task"],
-            "schema_version": task_contract.get("schema_version"),
             "contract_digest": task_contract.get("digest"),
-            "inputs": task_contract.get("inputs"),
-            "outputs": task_contract.get("outputs"),
+            "contract": copy.deepcopy(dict(task_contract)),
         },
-        "effective_config": effective_config,
-        "effective_config_digest": checkpoint_identity.get("effective_config_digest"),
-        "model": {
-            "kind": cast("Mapping[str, Any]", config["model"]).get("kind"),
-            "architecture": cast("Mapping[str, Any]", config["model"]).get("params"),
-            "parameter_counts": parameter_counts,
+        "data": {
+            "datasets": dataset_payload,
+            "loader": {key: copy.deepcopy(data_config.get(key)) for key in loader_keys},
+            "split": {
+                "schema_version": split_indices.get("schema_version"),
+                "artifact": "split_indices.pt",
+                "artifact_sha256": split_indices_sha256,
+                **{key: copy.deepcopy(split_metadata.get(key)) for key in split_keys},
+                "membership_digests": copy.deepcopy(dict(membership)),
+            },
+            "normalization": {
+                **copy.deepcopy(dict(preprocessing)),
+                "artifact": "normalizer.pt",
+                "artifact_sha256": normalizer_sha256,
+            },
         },
-        "datasets": dataset_payload,
-        "split_membership_digests": copy.deepcopy(dict(membership)),
-        "normalizer": {
-            "identity": "saved_run_normalizer.pt",
-            "sha256": normalizer_sha256,
-            "fit_split": cast("Mapping[str, Any]", task_contract.get("preprocessing", {})).get("fit_split"),
+        "model": model_payload,
+        "loss": copy.deepcopy(dict(cast("Mapping[str, Any]", config["loss"]))),
+        "evaluation": evaluation_payload,
+        "optimizer": copy.deepcopy(dict(cast("Mapping[str, Any]", config["optimizer"]))),
+        "scheduler": copy.deepcopy(config.get("scheduler")),
+        "training": copy.deepcopy(dict(cast("Mapping[str, Any]", config["training"]))),
+        "run": copy.deepcopy(dict(cast("Mapping[str, Any]", config["run"]))),
+        "provenance": {
+            "repository": source,
+            "config_digest": checkpoint_identity.get("effective_config_digest"),
+            "task_contract_digest": task_contract.get("digest"),
+            "dataset_fingerprints": {role: identity.get("fingerprint") for role, identity in dataset_payload.items()},
+            "schema_versions": {
+                "run": 1,
+                "checkpoint": 1,
+                "split": split_indices.get("schema_version"),
+                "tracking_integration": TRACKING_INTEGRATION_VERSION,
+            },
         },
-        "objective": copy.deepcopy(cast("Mapping[str, Any]", config["evaluation"])["objective"]),
-        "training_loss": copy.deepcopy(cast("Mapping[str, Any]", config["loss"])["data"]),
-        "physics": {
-            "enabled": physics.get("enabled"),
-            "continuity": physics.get("continuity"),
-            "derivatives": physics.get("derivatives"),
-            "interior_crop": physics.get("interior_crop"),
-            "residual_weight": physics.get("residual_weight"),
-            "boundary_weight": physics.get("boundary_weight"),
+        "runtime": {
+            "device": copy.deepcopy(dict(device_metadata)),
+            "packages": {**_package_versions(), "pytorch": device_metadata.get("pytorch_version")},
+            "duration_contract": copy.deepcopy(dict(duration_contract)),
         },
-        "reproducibility": {
-            "seed": cast("Mapping[str, Any]", config["run"]).get("seed"),
-            "deterministic": cast("Mapping[str, Any]", config["run"]).get("deterministic"),
-        },
-        "device": copy.deepcopy(dict(device_metadata)),
-        "source": _git_metadata(),
     }
+    if tuning_context is not None:
+        payload["tuning"] = copy.deepcopy(dict(tuning_context))
     return cast("dict[str, Any]", _sanitize_semantic_value(payload))
 
 
@@ -399,7 +637,7 @@ def build_monitor_membership(
     """
     settings = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["tracking"])["wandb"])
     monitor = cast("Mapping[str, Any]", settings["monitor"])
-    if not bool(settings["enabled"]) or not bool(monitor["enabled"]):
+    if settings["mode"] == "disabled" or not bool(monitor["enabled"]):
         return None
     raw_indices = split_indices.get("eval_indices")
     metadata = split_indices.get("metadata")
@@ -482,37 +720,7 @@ def persisted_wandb_identity(summary: Mapping[str, Any]) -> tuple[str, int | Non
 
 @dataclass(slots=True)
 class WandbSession:
-    """
-    Own one optional W&B mirror while keeping local run state authoritative.
-
-    The session accepts completed-epoch telemetry, a fixed physics monitor, an
-    allowlisted file set, and the exact curated post-artifact bundle. Disabled
-    sessions are inert. Online write failures transition once to ``degraded`` and
-    stop remote mutation; offline persistence failures raise ``TrackingIOError``.
-
-    Attributes
-    ----------
-    objective_id, objective_direction : str
-        Resolved metric identity and model-selection direction mirrored remotely.
-    evaluation_metric_ids : frozenset[str]
-        Exact evaluation keys admitted into epoch history.
-    mode : str
-        ``online``, ``offline``, or inert ``disabled`` observer mode.
-    run_id : str | None
-        Opaque W&B identity persisted locally for exact resume.
-    run_dir : pathlib.Path
-        Authoritative local run leaf constraining every file upload.
-    state_updater : TrackingStateUpdater | None
-        Callback that atomically persists observer-only session facts.
-
-    Notes
-    -----
-    Construction is owned by :func:`initialize_wandb`. ``state_updater`` never
-    changes checkpoint selection, scheduler input, Optuna input, saved split
-    membership, or the run's scientific result. The session is mutable and
-    single-lifecycle; it is not thread-safe and ``finish`` is idempotent.
-
-    """
+    """Own one optional, fail-closed W&B mirror of authoritative local state."""
 
     _run: _WandbRun | None
     _wandb: Any | None
@@ -526,13 +734,16 @@ class WandbSession:
     task_id: str
     upload_settings: Mapping[str, Any]
     semantic_config: Mapping[str, Any] = field(default_factory=dict)
+    history_metric_definitions: tuple[HistoryMetricDefinition, ...] = ()
     state_updater: TrackingStateUpdater | None = None
     monitor_evaluator: MonitorEvaluator | None = None
     monitor_interval: int = 1
     terminal_epoch: int = 1
     _last_logged_epoch: int | None = None
-    _degraded: bool = False
     _finished: bool = False
+    _observer_failed: bool = False
+    _callback_failed: bool = False
+    _failed_operation: str | None = None
     _uploaded_media: list[str] = field(default_factory=list)
 
     @property
@@ -541,125 +752,91 @@ class WandbSession:
         return self._run is not None
 
     @property
-    def degraded(self) -> bool:
-        """Return whether online remote writes have been disabled."""
-        return self._degraded
+    def history_destination_by_source(self) -> dict[str, str]:
+        """Return the unique admitted local-to-W&B history mapping."""
+        return {definition.source_key: definition.wandb_key for definition in self.history_metric_definitions}
 
     def _persist(self, updates: Mapping[str, Any]) -> None:
-        """Mirror observer-only facts into the authoritative local runtime session."""
+        """Persist bounded observer state through the authoritative local writer."""
         if self.state_updater is not None:
-            self.state_updater(updates)
+            self.state_updater(copy.deepcopy(dict(updates)))
 
-    def _degrade(self, error: BaseException, *, operation: str) -> None:
-        """
-        Enter online degraded mode once and persist sanitized failure context.
+    def _operation_failure(self, error: BaseException, *, operation: str) -> TrackingIOError:
+        """Persist sanitized context and return one fail-closed tracking error."""
+        context = _safe_error(error)
+        self._observer_failed = True
+        self._failed_operation = operation
+        self._persist({"status": "failed", "failed_operation": operation, **context})
+        msg = f"Requested {self.mode} W&B {operation} failed: {context['error_class']}: {context['error_message']}"
+        return TrackingIOError(msg)
 
-        Subsequent remote mutations become no-ops. Local training correctness
-        and authoritative files remain untouched.
-        """
-        if self._degraded:
-            return
-        self._degraded = True
+    def _record_callback_failure(
+        self,
+        error: BaseException,
+        *,
+        operation: str,
+        owner: str,
+    ) -> None:
+        """Persist a non-I/O callback failure without changing its exception type."""
+        context = _safe_error(error)
+        self._callback_failed = True
+        self._failed_operation = operation
         self._persist(
             {
-                "status": "degraded",
-                "degraded_operation": operation,
-                **_safe_error(error),
+                "status": "failed",
+                "failed_operation": operation,
+                "failure_owner": owner,
+                **context,
             }
         )
 
-    def _offline_failure(self, error: BaseException, *, operation: str) -> TrackingIOError:
-        """
-        Convert an offline persistence loss into a recorded ``TrackingIOError``.
-
-        Sanitized context is written through ``state_updater`` before the error
-        is returned for exception chaining by the caller.
-        """
-        context = _safe_error(error)
-        self._persist({"status": "failed", "failed_operation": operation, **context})
-        msg = f"Requested offline W&B {operation} failed: {context['error_class']}: {context['error_message']}"
-        return TrackingIOError(msg)
-
     def _run_operation(self, operation: str, action: Callable[[], None]) -> bool:
-        """
-        Apply online-degrade or offline-fail policy around one SDK mutation.
-
-        Returns whether the action completed. Disabled, finished, or already
-        degraded sessions return false without invoking ``action``.
-        """
-        if self._run is None or self._finished or self._degraded:
+        """Apply one SDK mutation or fail the explicitly requested observer."""
+        if self._run is None or self._finished:
             return False
         try:
             action()
         except Exception as error:
-            if self.mode == "online":
-                self._degrade(error, operation=operation)
-                return False
-            raise self._offline_failure(error, operation=operation) from error
+            raise self._operation_failure(error, operation=operation) from error
         return True
 
     def log_epoch(self, epoch: int, metrics: Mapping[str, float]) -> None:
-        """
-        Log one strictly increasing completed epoch with stable semantic keys.
-
-        Parameters
-        ----------
-        epoch : int
-            Actual one-based completed epoch used as the W&B step.
-        metrics : Mapping[str, float]
-            Sample-weighted training values and declared evaluation metric IDs.
-
-        Raises
-        ------
-        TrackingError
-            If an epoch would rewrite or move behind the last successful step.
-
-        Notes
-        -----
-        The fixed physics monitor runs only on its interval and terminal epoch.
-        Unsupported monitor keys degrade the online observer rather than changing
-        local training state.
-
-        """
-        if self._run is None or self._finished or self._degraded:
+        """Log one strictly increasing completed epoch with only approved keys."""
+        if self._run is None or self._finished:
             return
         if self._last_logged_epoch is not None and epoch <= self._last_logged_epoch:
-            msg = f"W&B completed-epoch history cannot rewrite step {epoch}; last successful epoch is {self._last_logged_epoch}."
+            msg = f"W&B completed-epoch history cannot rewrite epoch {epoch}; last successful epoch is {self._last_logged_epoch}."
             raise TrackingError(msg)
 
         payload: dict[str, float | int] = {"epoch": epoch}
-        global_step = metrics.get("global_step")
-        if global_step is not None:
-            payload["global_step"] = int(global_step)
+        destination_by_source = self.history_destination_by_source
         for key, value in metrics.items():
-            if key.startswith(("train/", "monitor/")):
-                payload[key] = float(value)
-            elif key in self.evaluation_metric_ids:
-                payload[f"eval/{key}"] = float(value)
-        if self.objective_id in metrics:
-            objective_value = float(metrics[self.objective_id])
-            payload["eval/objective_value"] = objective_value
-            payload["objective/value"] = objective_value
+            destination = destination_by_source.get(key)
+            if destination is not None:
+                payload[destination] = float(value)
 
         should_monitor = self.monitor_evaluator is not None and (epoch % self.monitor_interval == 0 or epoch == self.terminal_epoch)
         if should_monitor:
             monitor_evaluator = cast("MonitorEvaluator", self.monitor_evaluator)
             try:
                 monitor_values = monitor_evaluator()
-            except Exception as error:  # noqa: BLE001 -- observer failures must never escape online
-                self._degrade(error, operation="physics_monitor")
-                return
-            for key, value in monitor_values.items():
-                if key not in {
-                    "monitor/momentum_residual_mse",
-                    "monitor/div_velocity_mse",
-                    "monitor/div_eps_velocity_mse",
-                    "monitor/pressure_boundary_mse",
-                }:
-                    msg = f"Physics monitor produced unsupported key {key!r}."
-                    self._degrade(ValueError(msg), operation="physics_monitor")
-                    return
-                payload[key] = float(value)
+            except Exception as monitor_error:
+                self._record_callback_failure(
+                    monitor_error,
+                    operation="physics_monitor",
+                    owner="scientific_evaluation",
+                )
+                raise
+            unsupported = sorted(set(monitor_values).difference(_PHYSICS_ID_SOURCE_KEYS))
+            if unsupported:
+                unsupported_error = TrackingCallbackError(f"Physics monitor produced unsupported key(s): {unsupported}.")
+                self._record_callback_failure(
+                    unsupported_error,
+                    operation="physics_monitor",
+                    owner="callback_orchestration",
+                )
+                raise unsupported_error
+            payload.update({destination_by_source[key]: float(value) for key, value in monitor_values.items()})
 
         if self._run_operation(
             "history",
@@ -669,87 +846,55 @@ class WandbSession:
             self._persist({"last_logged_epoch": epoch})
 
     def _validate_run_file(self, kind: str, path: Path) -> None:
-        """
-        Admit one complete run-owned file against the explicit upload allowlist.
-
-        Core config/summary/checkpoint paths must be exact; provenance must be
-        the named file below this run's analysis root. No glob, directory, or
-        cross-run path is accepted.
-        """
-        resolved = path.resolve()
-        expected = {
-            "config": self.run_dir / "config.yaml",
-            "summary": self.run_dir / "summary.json",
-            "best_checkpoint": self.run_dir / "best_checkpoint.pt",
-        }
-        if kind in expected and resolved != expected[kind].resolve():
-            msg = f"Upload kind {kind!r} requires exactly {expected[kind].name}."
-            raise TrackingUploadError(msg)
-        if kind == "artifact_provenance":
-            try:
-                resolved.relative_to((self.run_dir / "analysis").resolve())
-            except ValueError as error:
-                msg = "Artifact provenance must be inside the current run analysis root."
-                raise TrackingUploadError(msg) from error
-            if resolved.name != "artifact_provenance.json":
-                msg = "Artifact provenance upload requires artifact_provenance.json."
-                raise TrackingUploadError(msg)
-        if kind not in {*expected, "artifact_provenance"}:
+        """Admit only one completed artifact-provenance file under this run."""
+        if kind != "artifact_provenance":
             msg = f"Unsupported tracked file kind {kind!r}."
             raise TrackingUploadError(msg)
-        if kind == "best_checkpoint" and not bool(self.upload_settings["best_checkpoint"]):
-            msg = "best_checkpoint.pt upload is disabled by configuration."
+        resolved = path.resolve()
+        try:
+            resolved.relative_to((self.run_dir / "analysis").resolve())
+        except ValueError as error:
+            msg = "Artifact provenance must be inside the current run analysis root."
+            raise TrackingUploadError(msg) from error
+        if resolved.name != "artifact_provenance.json":
+            msg = "Artifact provenance upload requires artifact_provenance.json."
             raise TrackingUploadError(msg)
         if not resolved.is_file():
             msg = f"Tracked file is not complete: {resolved}"
             raise FileNotFoundError(msg)
 
     def upload_files(self, files: Mapping[str, Path]) -> None:
-        """
-        Upload only explicit, validated run-owned files without directory globs.
-
-        Parameters
-        ----------
-        files : Mapping[str, pathlib.Path]
-            Allowlisted semantic kind to exact complete file. Supported kinds are
-            config, summary, optional best checkpoint, and artifact provenance.
-
-        Raises
-        ------
-        TrackingUploadError
-            If a kind/path is not allowlisted or checkpoint upload is disabled.
-        FileNotFoundError
-            If an admitted path is not a complete file.
-
-        """
-        if self._run is None or self._finished or self._degraded:
+        """Upload only explicitly selected evaluation provenance files."""
+        if self._run is None or self._finished or not files:
             return
+        if not bool(self.upload_settings["evaluation_artifacts"]):
+            msg = "Evaluation-artifact upload is disabled by configuration."
+            raise TrackingUploadError(msg)
+        candidates = [(kind, Path(path)) for kind, path in files.items()]
+        for kind, candidate in candidates:
+            self._validate_run_file(kind, candidate)
         raw_save = getattr(self._run, "save", None)
         if not callable(raw_save):
             error = TrackingUploadError("The active W&B run does not expose bounded file upload.")
-            if self.mode == "online":
-                self._degrade(error, operation="file_upload")
-                return
-            raise self._offline_failure(error, operation="file_upload") from error
+            raise self._operation_failure(error, operation="evaluation_provenance_upload")
         save = cast("Callable[..., Any]", raw_save)
-        for kind, path in files.items():
-            candidate = Path(path)
-            self._validate_run_file(kind, candidate)
+        for _kind, candidate in candidates:
 
-            def upload_candidate(candidate: Path = candidate, kind: str = kind) -> None:
-                """Upload one prevalidated file without colliding with W&B-owned names."""
-                base_path = self.run_dir.parent if kind == "config" else self.run_dir
+            def upload_candidate(candidate: Path = candidate) -> None:
+                """Upload one prevalidated evaluation provenance file."""
                 save(
                     str(candidate),
-                    base_path=str(base_path),
+                    base_path=str(self.run_dir),
                     policy="now",
                 )
 
-            self._run_operation(f"{kind}_upload", upload_candidate)
-            if self._degraded:
-                return
-        if files:
-            self._persist({"uploaded_file_kinds": sorted(files)})
+            self._run_operation(
+                "evaluation_provenance_upload",
+                upload_candidate,
+            )
+        self._persist(
+            {"uploaded_provenance_files": sorted(str(candidate.resolve().relative_to(self.run_dir.resolve())) for _kind, candidate in candidates)}
+        )
 
     def upload_post_artifact(
         self,
@@ -758,41 +903,20 @@ class WandbSession:
         media_files: Mapping[str, Path] | None = None,
         tables: Mapping[str, Any] | None = None,
     ) -> None:
-        """
-        Upload one explicit curated post-artifact bundle without plot rendering.
-
-        The artifact service must validate ``artifact_root`` immediately before
-        this call. Only the fixed curated scientific inventory is accepted, and
-        no directory is scanned by this adapter.
-
-        Parameters
-        ----------
-        artifact_root : pathlib.Path
-            Immutable artifact-cache root; rendered upload files must be outside it.
-        media_files : Mapping[str, pathlib.Path] | None, optional
-            Curated semantic keys mapped to complete rendered files.
-        tables : Mapping[str, Any] | None, optional
-            Optional prebuilt or neutral ``run_summary_table`` payload.
-
-        Raises
-        ------
-        TrackingUploadError
-            If inventory, ownership, suffix, table schema, or SDK capability is invalid.
-        TrackingIOError
-            If requested offline artifact persistence fails.
-
-        Notes
-        -----
-        Online SDK failures degrade the observer and return without invalidating
-        the locally validated artifact cache.
-
-        """
+        """Upload the exact curated evaluation bundle without scanning a directory."""
         files = dict(media_files or {})
         table_values = dict(tables or {})
         names = set(files).union(table_values)
         unsupported = sorted(names.difference(POST_ARTIFACT_MEDIA_KEYS))
         if unsupported:
             msg = f"Unsupported post-artifact media key(s): {unsupported}."
+            raise TrackingUploadError(msg)
+        if names and not bool(self.upload_settings["evaluation_artifacts"]):
+            msg = "Evaluation-artifact upload is disabled by configuration."
+            raise TrackingUploadError(msg)
+        missing = sorted(POST_ARTIFACT_MEDIA_KEYS.difference(names))
+        if names and missing:
+            msg = f"Curated evaluation artifact is missing required key(s): {missing}."
             raise TrackingUploadError(msg)
         if set(files).intersection(table_values):
             msg = "Post-artifact keys cannot identify both a file and a table."
@@ -803,12 +927,11 @@ class WandbSession:
         if any(name != "run_summary_table" for name in table_values):
             msg = "Only run_summary_table accepts a table object."
             raise TrackingUploadError(msg)
-        if not names:
-            return
-        if self._run is None or self._finished or self._degraded:
+        if not names or self._run is None or self._finished:
             return
 
         root = Path(artifact_root).resolve()
+        resolved_files: dict[str, Path] = {}
         for name, raw_path in files.items():
             candidate = Path(raw_path).resolve()
             if candidate.is_relative_to(root):
@@ -817,24 +940,9 @@ class WandbSession:
             if candidate.suffix.lower() not in _POST_ARTIFACT_FILE_SUFFIXES or not candidate.is_file():
                 msg = f"Curated media {name!r} is not an allowed complete rendered file."
                 raise TrackingUploadError(msg)
+            resolved_files[name] = candidate
 
-        raw_artifact_factory = getattr(self._wandb, "Artifact", None)
-        raw_log_artifact = getattr(self._run, "log_artifact", None)
-        if not callable(raw_artifact_factory) or not callable(raw_log_artifact):
-            capability_error = TrackingUploadError("The active W&B SDK does not expose artifact media upload.")
-            if self.mode == "online":
-                self._degrade(capability_error, operation="post_artifact_media")
-                return
-            raise self._offline_failure(capability_error, operation="post_artifact_media") from capability_error
-        artifact_factory = cast("Callable[..., _WandbArtifact]", raw_artifact_factory)
-        log_artifact = cast("Callable[..., None]", raw_log_artifact)
-        bundle = artifact_factory(
-            name=f"{self.task_id}-{self.run_name}-curated-media",
-            type="evaluation",
-            metadata={"wandb_run_id": self.run_id, "inventory": sorted(names)},
-        )
-        for name, path in files.items():
-            bundle.add_file(str(path), name=f"{name}{path.suffix.lower()}")
+        normalized_tables: dict[str, Any] = {}
         for name, table in table_values.items():
             value = table
             if isinstance(table, Mapping) and set(table) == {"columns", "data"}:
@@ -851,18 +959,37 @@ class WandbSession:
                     raise TrackingUploadError(msg)
                 table_factory = getattr(self._wandb, "Table", None)
                 if not callable(table_factory):
-                    msg = "The active W&B SDK cannot serialize the neutral run summary table."
-                    raise TrackingUploadError(msg)
+                    error = TrackingUploadError("The active W&B SDK cannot serialize the run summary table.")
+                    raise self._operation_failure(error, operation="evaluation_artifact_upload")
                 value = table_factory(columns=list(columns), data=list(data))
-            bundle.add(value, name)
-        if self._run_operation(
-            "post_artifact_media",
-            lambda: log_artifact(bundle, aliases=["latest"]),
-        ):
+            normalized_tables[name] = value
+
+        raw_artifact_factory = getattr(self._wandb, "Artifact", None)
+        raw_log_artifact = getattr(self._run, "log_artifact", None)
+        if not callable(raw_artifact_factory) or not callable(raw_log_artifact):
+            error = TrackingUploadError("The active W&B SDK does not expose evaluation artifact upload.")
+            raise self._operation_failure(error, operation="evaluation_artifact_upload")
+        artifact_factory = cast("Callable[..., _WandbArtifact]", raw_artifact_factory)
+        log_artifact = cast("Callable[..., None]", raw_log_artifact)
+
+        def upload_bundle() -> None:
+            """Create and publish the prevalidated bounded evaluation artifact."""
+            bundle = artifact_factory(
+                name=f"{self.task_id}-{self.run_name}-curated-media",
+                type="evaluation",
+                metadata={"wandb_run_id": self.run_id, "inventory": sorted(names)},
+            )
+            for name, path in resolved_files.items():
+                bundle.add_file(str(path), name=f"{name}{path.suffix.lower()}")
+            for name, table in normalized_tables.items():
+                bundle.add(table, name)
+            log_artifact(bundle, aliases=["latest"])
+
+        if self._run_operation("evaluation_artifact_upload", upload_bundle):
             self._uploaded_media = sorted(names)
             self._persist({"uploaded_media": self._uploaded_media})
 
-    def _terminal_summary(
+    def _terminal_summary(  # noqa: C901, PLR0912
         self,
         *,
         status: str,
@@ -870,63 +997,97 @@ class WandbSession:
         local_summary: Mapping[str, Any] | None,
         error: BaseException | str | None,
     ) -> dict[str, Any]:
-        """
-        Build remote terminal facts exclusively from admitted local identities.
-
-        Scientific identity comes from the sanitized semantic config and the
-        authoritative local summary. Training results contribute only bounded
-        progress/objective fields, device facts stay operational, and any error
-        is redacted through :func:`_safe_error` before SDK publication.
-        """
+        """Build one concise terminal summary from authoritative local facts."""
         summary: dict[str, Any] = {
             "run/status": status,
+            "run/name": self.run_name,
             "objective/id": self.objective_id,
             "objective/direction": self.objective_direction,
-            "tracking/status": "finished",
+            "tracking/status": "failed" if self._observer_failed or self._callback_failed else "finished",
             "tracking/mode": self.mode,
             "tracking/run_id": self.run_id,
-            "run/local_role": f"{self.task_id}/runs/{self.run_name}",
         }
+        if self._failed_operation is not None:
+            summary["tracking/failed_operation"] = self._failed_operation
         task = self.semantic_config.get("task")
         if isinstance(task, Mapping):
             summary["task/id"] = task.get("id")
             summary["task/contract_digest"] = task.get("contract_digest")
-        datasets = self.semantic_config.get("datasets")
-        if isinstance(datasets, Mapping):
-            summary["data/identities"] = copy.deepcopy(dict(datasets))
-        membership = self.semantic_config.get("split_membership_digests")
-        if isinstance(membership, Mapping):
-            summary["split/membership_digests"] = copy.deepcopy(dict(membership))
-        normalizer = self.semantic_config.get("normalizer")
-        if isinstance(normalizer, Mapping):
-            summary["normalizer/identity"] = normalizer.get("identity")
-            summary["normalizer/sha256"] = normalizer.get("sha256")
-        physics = self.semantic_config.get("physics")
-        if isinstance(physics, Mapping):
-            summary["physics/continuity"] = physics.get("continuity")
+        provenance = self.semantic_config.get("provenance")
+        if isinstance(provenance, Mapping):
+            summary["config/digest"] = provenance.get("config_digest")
+        model = self.semantic_config.get("model")
+        if isinstance(model, Mapping) and isinstance(model.get("parameter_counts"), Mapping):
+            counts = cast("Mapping[str, Any]", model["parameter_counts"])
+            summary["model/variant"] = model.get("variant")
+            summary["model/parameters_total"] = counts.get("total")
+            summary["model/parameters_trainable"] = counts.get("trainable")
+        data = self.semantic_config.get("data")
+        if isinstance(data, Mapping):
+            datasets = data.get("datasets")
+            if isinstance(datasets, Mapping):
+                for role in ("id", "ood"):
+                    identity = datasets.get(role)
+                    if isinstance(identity, Mapping):
+                        summary[f"data/{role}/dataset_id"] = identity.get("dataset_id")
+                        summary[f"data/{role}/fingerprint"] = identity.get("fingerprint")
+            split = data.get("split")
+            if isinstance(split, Mapping):
+                summary["data/split_sha256"] = split.get("artifact_sha256")
+            normalization = data.get("normalization")
+            if isinstance(normalization, Mapping):
+                summary["data/normalizer_sha256"] = normalization.get("artifact_sha256")
+        tuning = self.semantic_config.get("tuning")
+        if isinstance(tuning, Mapping):
+            for source, target in (
+                ("study_name", "tuning/study_name"),
+                ("trial_number", "tuning/trial_number"),
+                ("search_signature", "tuning/search_signature"),
+                ("sampled_parameters", "tuning/sampled_parameters"),
+            ):
+                if source in tuning:
+                    summary[target] = copy.deepcopy(tuning[source])
+            summary["tuning/final_state"] = status
+
         if result is not None:
-            mapping = {
-                "best_metric": "objective/best_value",
-                "best_epoch": "objective/best_epoch",
-                "completed_epoch": "training/completed_epoch",
-                "global_step": "training/global_step",
-            }
-            for source, target in mapping.items():
+            for source, target in (
+                ("completed_epoch", "run/completed_epoch"),
+                ("global_step", "run/global_step"),
+                ("selected_epoch", "selected/epoch"),
+                ("terminal_epoch", "terminal/epoch"),
+            ):
                 if source in result:
                     summary[target] = result[source]
+            selected_metrics = result.get("selected_metrics")
+            if isinstance(selected_metrics, Mapping):
+                summary.update({key: value for key, value in selected_metrics.items() if isinstance(key, str) and key.startswith("selected/")})
+            terminal_metrics = result.get("terminal_metrics")
+            if isinstance(terminal_metrics, Mapping):
+                for key, value in terminal_metrics.items():
+                    if isinstance(key, str) and key.startswith("train/"):
+                        summary[f"terminal/{key}"] = value
         if local_summary is not None:
             for source, target in (
-                ("task", "task/id"),
                 ("effective_config_digest", "config/digest"),
-                ("normalizer_sha256", "normalizer/sha256"),
-                ("split_indices_sha256", "split/artifact_sha256"),
+                ("split_indices_sha256", "data/split_sha256"),
+                ("normalizer_sha256", "data/normalizer_sha256"),
+                ("elapsed_seconds", "run/duration_seconds"),
             ):
                 if source in local_summary:
                     summary[target] = local_summary[source]
-            runtime_device = local_summary.get("runtime_device")
-            if isinstance(runtime_device, Mapping):
-                summary["device/requested"] = runtime_device.get("requested_policy")
-                summary["device/resolved"] = runtime_device.get("resolved_device")
+            checkpoint_digest = local_summary.get("best_checkpoint_sha256")
+            if isinstance(checkpoint_digest, str):
+                summary["selected/checkpoint_sha256_short"] = checkpoint_digest[:16]
+            sessions = local_summary.get("runtime_sessions")
+            if isinstance(sessions, list):
+                resume_count = 0
+                for session in sessions:
+                    if not isinstance(session, Mapping):
+                        continue
+                    state = session.get("tracking")
+                    if isinstance(state, Mapping) and state.get("session_kind") == "resume":
+                        resume_count += 1
+                summary["run/resume_count"] = resume_count
         if error is not None:
             context = _safe_error(error if isinstance(error, BaseException) else RuntimeError(error))
             summary["run/error_class"] = context["error_class"]
@@ -941,35 +1102,10 @@ class WandbSession:
         local_summary: Mapping[str, Any] | None = None,
         error: BaseException | str | None = None,
     ) -> None:
-        """
-        Mirror terminal local facts and finish the SDK session exactly once.
-
-        Parameters
-        ----------
-        status : str
-            Authoritative local terminal status.
-        result : Mapping[str, Any] | None, optional
-            Completed training objective/epoch/global-step facts.
-        local_summary : Mapping[str, Any] | None, optional
-            Validated local digests and device resolution.
-        error : BaseException | str | None, optional
-            Sanitized terminal failure context.
-
-        Notes
-        -----
-        Online finish/upload errors degrade and close best-effort. Requested
-        offline failures raise after being recorded locally.
-
-        """
+        """Publish terminal facts and finish exactly once, failing closed."""
         if self._run is None or self._finished:
             return
         exit_code = 0 if status == "completed" else 1
-        if self._degraded:
-            with suppress(Exception):
-                self._run.finish(exit_code=exit_code)
-            self._finished = True
-            return
-
         try:
             terminal = self._terminal_summary(
                 status=status,
@@ -979,33 +1115,13 @@ class WandbSession:
             )
             for key, value in terminal.items():
                 self._run.summary[key] = value
-
-            files: dict[str, Path] = {}
-            if bool(self.upload_settings["config"]):
-                files["config"] = self.run_dir / "config.yaml"
-            if bool(self.upload_settings["summary"]):
-                files["summary"] = self.run_dir / "summary.json"
-            if bool(self.upload_settings["best_checkpoint"]) and (self.run_dir / "best_checkpoint.pt").is_file():
-                files["best_checkpoint"] = self.run_dir / "best_checkpoint.pt"
-            self.upload_files(files)
-            if self._degraded:
-                with suppress(Exception):
-                    self._run.finish(exit_code=exit_code)
-                self._finished = True
-                return
             self._run.finish(exit_code=exit_code)
         except Exception as failure:
-            if self.mode == "online":
-                self._degrade(failure, operation="finish")
-                with suppress(Exception):
-                    self._run.finish(exit_code=exit_code)
-                self._finished = True
-                return
             self._finished = True
-            raise self._offline_failure(failure, operation="finish") from failure
-
+            raise self._operation_failure(failure, operation="finish") from failure
         self._finished = True
-        self._persist({"status": "finished", "finished_at": _utc_now()})
+        terminal_tracking_status = "failed" if self._observer_failed or self._callback_failed else "finished"
+        self._persist({"status": terminal_tracking_status, "finished_at": _utc_now()})
 
 
 def initialize_wandb(
@@ -1018,82 +1134,44 @@ def initialize_wandb(
     previous_last_logged_epoch: int | None = None,
     state_updater: TrackingStateUpdater | None = None,
     monitor_evaluator: MonitorEvaluator | None = None,
-    job_type: str = "training",
 ) -> WandbSession:
-    """
-    Initialize W&B only for an explicitly enabled, locally admitted session.
-
-    Fresh online sessions use strict no-resume semantics. Exact online resume
-    uses strict must-resume semantics. W&B 0.26 ignores resume in offline mode,
-    so offline resume uses the same persisted ID with resume omitted and records
-    that narrow same-ID-segment fallback locally.
-
-    Parameters
-    ----------
-    config : Mapping[str, Any]
-        Resolved experiment and validated tracking policy.
-    run_dir : Path | str
-        Locally admitted run leaf used as the SDK working directory.
-    semantic_config : Mapping[str, Any] | None, optional
-        Bounded payload built after local task/data/checkpoint admission.
-    resume : bool, optional
-        Require continuation of ``persisted_run_id`` when true.
-    persisted_run_id : str | None, optional
-        Sole locally recovered W&B identity for exact resume.
-    previous_last_logged_epoch : int | None, optional
-        Latest successful local observer step, preventing history rewrites.
-    state_updater : TrackingStateUpdater | None, optional
-        Atomic local observer-state publisher.
-    monitor_evaluator : MonitorEvaluator | None, optional
-        Fixed-membership physics monitor invoked at configured epochs.
-    job_type : str, optional
-        Bounded SDK job classification.
-
-    Returns
-    -------
-    WandbSession
-        Inert disabled session or initialized mutable observer lifecycle.
-
-    Raises
-    ------
-    TrackingInitializationError
-        If enabled initialization, credentials, local storage, or exact identity fails.
-
-    Notes
-    -----
-    Disabled configuration returns before importing W&B. Enabled failures are
-    sanitized and persisted as ``failed_before_start`` before propagation.
-
-    """
+    """Initialize the configured W&B mode with strict identity and metric rules."""
     objective = cast("Mapping[str, Any]", config["evaluation"])["objective"]
     objective_mapping = cast("Mapping[str, Any]", objective)
     objective_id = str(objective_mapping["id"])
     objective_direction = str(objective_mapping["direction"])
-    evaluation_metrics = cast("Sequence[Mapping[str, Any]]", cast("Mapping[str, Any]", config["evaluation"])["metrics"])
+    evaluation_metrics = cast(
+        "Sequence[Mapping[str, Any]]",
+        cast("Mapping[str, Any]", config["evaluation"])["metrics"],
+    )
     metric_ids = frozenset(str(metric["id"]) for metric in evaluation_metrics)
-    settings = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["tracking"])["wandb"])
+    settings = cast(
+        "Mapping[str, Any]",
+        cast("Mapping[str, Any]", config["tracking"])["wandb"],
+    )
     path = Path(run_dir)
     run_name = str(cast("Mapping[str, Any]", config["run"])["name"])
     task_id = str(config["task"])
     upload_settings = cast("Mapping[str, Any]", settings["upload"])
     monitor_settings = cast("Mapping[str, Any]", settings["monitor"])
+    mode = str(settings["mode"])
 
-    if not bool(settings["enabled"]):
+    if mode == "disabled":
         return WandbSession(
             None,
             None,
             objective_id,
             objective_direction,
             metric_ids,
-            "disabled",
+            mode,
             None,
             path,
             run_name,
             task_id,
             upload_settings,
+            semantic_config=copy.deepcopy(dict(semantic_config or {})),
         )
 
-    mode = str(settings["mode"])
     run_id = persisted_run_id if resume else uuid.uuid4().hex
     if not isinstance(run_id, str) or not run_id:
         msg = "Exact W&B resume requires the previously persisted non-empty run ID."
@@ -1103,17 +1181,15 @@ def initialize_wandb(
     if mode == "offline":
         resume_policy = None
         if resume:
-            offline_fallback = "wandb_0_26_ignores_resume_same_persisted_id_segment"
+            offline_fallback = "offline_same_persisted_id_segment"
     else:
         resume_policy = "must" if resume else "never"
 
-    base_state = {
-        "enabled": True,
+    base_state: dict[str, Any] = {
         "requested_mode": mode,
         "wandb_run_id": run_id,
         "project": settings["project"],
         "entity": settings["entity"],
-        "group": settings["group"],
         "tags": list(cast("list[str]", settings["tags"])),
         "session_started_at": _utc_now(),
         "session_kind": "resume" if resume else "fresh",
@@ -1124,29 +1200,78 @@ def initialize_wandb(
     if state_updater is not None:
         state_updater(base_state)
 
+    if mode == "online" and not os.environ.get("WANDB_API_KEY", "").strip():
+        error = RuntimeError("WANDB_API_KEY is missing or blank; online tracking requires non-interactive environment authentication.")
+        context = _safe_error(error)
+        if state_updater is not None:
+            state_updater(
+                {
+                    "status": "failed_before_start",
+                    "failed_operation": "authentication",
+                    **context,
+                }
+            )
+        message = f"tracking.wandb.mode='online' authentication failed before epoch 1: {context['error_message']}"
+        raise TrackingInitializationError(message) from error
+
+    physics_config = cast(
+        "Mapping[str, Any]",
+        cast("Mapping[str, Any]", config["loss"])["physics"],
+    )
+    runtime_config = semantic_config.get("runtime") if isinstance(semantic_config, Mapping) else None
+    runtime_device = runtime_config.get("device") if isinstance(runtime_config, Mapping) else None
+    resolved_device = runtime_device.get("resolved_device") if isinstance(runtime_device, Mapping) else None
+    requested_device = cast("Mapping[str, Any]", config["run"]).get("device")
+    cuda_enabled = (isinstance(resolved_device, str) and resolved_device.startswith("cuda")) or (
+        resolved_device is None and isinstance(requested_device, str) and requested_device.startswith("cuda")
+    )
+    history_definitions = automatic_history_metric_definitions(
+        tuple(str(metric["id"]) for metric in evaluation_metrics),
+        physics_training_enabled=bool(physics_config["enabled"]),
+        continuity=str(physics_config["continuity"]),
+        physics_monitor_enabled=monitor_evaluator is not None,
+        cuda_enabled=cuda_enabled,
+    )
+
+    sdk_run: _WandbRun | None = None
     try:
         wandb = cast("_WandbModule", importlib.import_module("wandb"))
-        sdk_run = wandb.init(
-            project=str(settings["project"]),
-            entity=cast("str | None", settings["entity"]),
-            group=cast("str | None", settings["group"]),
-            tags=list(cast("list[str]", settings["tags"])),
-            mode=mode,
-            name=run_name,
-            id=run_id,
-            resume=resume_policy,
-            job_type=job_type,
-            dir=str(path),
-            config=copy.deepcopy(dict(semantic_config or {})),
-            save_code=False,
-            settings={
-                "disable_git": True,
-                "disable_code": True,
-                "_disable_stats": True,
-            },
+        sdk_run = _require_initialized_run(
+            wandb.init(
+                project=str(settings["project"]),
+                entity=cast("str | None", settings["entity"]),
+                tags=None if resume and mode == "online" else list(cast("list[str]", settings["tags"])),
+                mode=mode,
+                name=run_name,
+                id=run_id,
+                resume=resume_policy,
+                dir=str(path),
+                config=copy.deepcopy(dict(semantic_config or {})),
+                save_code=False,
+                settings={
+                    "disable_git": True,
+                    "disable_code": True,
+                },
+            )
         )
-        sdk_run = _require_initialized_run(sdk_run)
+        required_tags = tuple(cast("Sequence[str]", settings["tags"]))
+        existing_tags = tuple(str(tag) for tag in (sdk_run.tags or ()))
+        merged_tags = (*existing_tags, *(tag for tag in required_tags if tag not in existing_tags))
+        if merged_tags != existing_tags:
+            sdk_run.tags = merged_tags
+
+        sdk_run.define_metric("epoch", hidden=True, summary="none")
+        for definition in history_definitions:
+            sdk_run.define_metric(
+                definition.wandb_key,
+                step_metric="epoch",
+                step_sync=False,
+                summary="none",
+            )
     except Exception as error:
+        if sdk_run is not None:
+            with suppress(Exception):
+                sdk_run.finish(exit_code=1)
         context = _safe_error(error)
         if state_updater is not None:
             state_updater(
@@ -1159,7 +1284,7 @@ def initialize_wandb(
         message = (
             f"tracking.wandb.mode={mode!r} initialization failed before epoch 1: "
             f"{context['error_class']}: {context['error_message']}. "
-            "Verify W&B installation, local write access, and online WANDB_API_KEY authentication when applicable."
+            "Verify W&B installation, local write access, and online authentication."
         )
         raise TrackingInitializationError(message) from error
 
@@ -1176,6 +1301,7 @@ def initialize_wandb(
         task_id,
         upload_settings,
         semantic_config=copy.deepcopy(dict(semantic_config or {})),
+        history_metric_definitions=history_definitions,
         state_updater=state_updater,
         monitor_evaluator=monitor_evaluator,
         monitor_interval=int(monitor_settings["interval"]),
@@ -1210,12 +1336,12 @@ def epoch_callback(
     def callback(epoch: int, metrics: dict[str, float]) -> None:
         """Add the current optimizer rate and forward one completed-epoch payload."""
         values = dict(metrics)
-        if "train/learning_rate" not in values and optimizer is not None:
+        if "optimization/learning_rate" not in values and optimizer is not None:
             parameter_groups = optimizer.param_groups
             if not parameter_groups:
                 msg = "Cannot log W&B learning rate: optimizer has no parameter groups."
                 raise RuntimeError(msg)
-            values["train/learning_rate"] = float(parameter_groups[0]["lr"])
+            values["optimization/learning_rate"] = float(parameter_groups[0]["lr"])
         session.log_epoch(epoch, values)
 
     return callback

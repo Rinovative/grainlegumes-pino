@@ -1,6 +1,6 @@
 # ruff: noqa: S101, S603, SLF001
 """
-Protect the three thin command modules and their shared public argument contract.
+Protect the three thin command modules and their public argument contracts.
 
 Parser-level tests cover lightweight imports, exact device vocabulary, positive
 artifact batch sizes, override forwarding, required arguments, and material
@@ -25,7 +25,7 @@ _CLI_MODULES = (
     "src.experiments.cli.cli_optuna",
     "src.experiments.cli.cli_build_artifacts",
 )
-_FORBIDDEN_IMPORTS = ("torch", "optuna", "pandas")
+_FORBIDDEN_IMPORTS = ("torch", "optuna", "pandas", "wandb")
 
 
 def _subprocess_environment() -> dict[str, str]:
@@ -35,7 +35,11 @@ def _subprocess_environment() -> dict[str, str]:
     return environment
 
 
-@pytest.mark.parametrize("module_name", _CLI_MODULES, ids=("train", "optuna", "artifacts"))
+@pytest.mark.parametrize(
+    "module_name",
+    _CLI_MODULES,
+    ids=("train", "optuna", "artifacts"),
+)
 def test_cli_module_import_is_lightweight(module_name: str) -> None:
     """
     Import each CLI module in a fresh subprocess with the maintained package path.

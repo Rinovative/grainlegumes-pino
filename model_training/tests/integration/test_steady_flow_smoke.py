@@ -319,6 +319,11 @@ def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
             "evaluation_interval": 1,
             "mixed_precision": False,
         },
+        "tracking": {
+            "wandb": {
+                "mode": "disabled",
+            }
+        },
     }
     config = experiments.config.loader.resolve_config(raw)
     config["paths"]["dataset_root"] = str(dataset_root)
@@ -399,6 +404,16 @@ def _state_dict_equal(
     return _nested_state_equal(left, right)
 
 
+def test_generic_smoke_config_explicitly_disables_wandb(tmp_path: Path) -> None:
+    """Keep the bounded lifecycle fixture independent of keys, accounts, and network."""
+    config = _tiny_config(
+        dataset_root=tmp_path / "raw",
+        output_root=tmp_path / "processed",
+    )
+    assert config["tracking"]["wandb"]["mode"] == "disabled"
+    assert experiments.config.defaults.TRACKING_DEFAULTS["wandb"]["mode"] == "online"
+
+
 @pytest.fixture(scope="module")
 def completed_smoke(tmp_path_factory: pytest.TempPathFactory) -> CompletedSmoke:
     """
@@ -427,16 +442,23 @@ def completed_smoke(tmp_path_factory: pytest.TempPathFactory) -> CompletedSmoke:
     _save_dataset(dataset_root, metadata_root, ood_payload)
 
     config = _tiny_config(dataset_root=dataset_root, output_root=output_root)
+    assert config["tracking"]["wandb"]["mode"] == "disabled"
     run_dir = experiments.run.prepare_fresh_run(
         config,
         run_dir=output_root / _RUN_NAME,
     )
-    experiments.run.execute_prepared_run(
-        config,
-        run_dir=run_dir,
-        persisted_config=config,
-        device_resolution=learning.device.resolve_device("cpu"),
-    )
+    environment = pytest.MonkeyPatch()
+    environment.delenv("WANDB_API_KEY", raising=False)
+    try:
+        experiments.run.execute_prepared_run(
+            config,
+            run_dir=run_dir,
+            persisted_config=config,
+            device_resolution=learning.device.resolve_device("cpu"),
+        )
+    finally:
+        environment.undo()
+    assert not any(candidate.is_dir() for candidate in root.rglob("wandb"))
     experiments.run.validate_completed_run(run_dir)
 
     _make_last_checkpoint_distinct(run_dir)
