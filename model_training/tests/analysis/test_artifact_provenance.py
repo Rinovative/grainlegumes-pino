@@ -123,12 +123,12 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
     task = synthetic_task
     source_indices = [4]
     provenance: dict[str, Any] = {
-        "provenance_schema_version": analysis.artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
         "run": {"name": "synthetic", "task": task.id, "best_checkpoint_sha256": "abc"},
         "selection": {
             "effective_case_count": 1,
-            "effective_ordered_source_indices_sha256": analysis.artifacts.ordered_indices_sha256(source_indices),
+            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256(source_indices),
         },
         "evaluator": {
             "input_fields": list(task.input_names),
@@ -153,7 +153,7 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
     )
     save_root = tmp_path / "analysis" / "id"
 
-    frame, parquet_path = analysis.artifacts.generate_artifacts(
+    frame, parquet_path = analysis.artifacts.generation.generate_artifacts(
         task=task,
         model=_Projection(),
         loader=loader,
@@ -194,12 +194,12 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
         metadata = json.loads(str(payload["meta"].item()))
         assert not {"case_index", "source_index", "split_local_index"}.intersection(metadata)
 
-    stored_provenance = json.loads((save_root / analysis.artifacts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
+    stored_provenance = json.loads((save_root / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
     stored_outputs = stored_provenance.pop("outputs")
     stored_aggregate = stored_provenance.pop("aggregate")
     assert stored_provenance == provenance
-    assert stored_outputs == analysis.artifacts.artifact_output_manifest(save_root)
-    assert stored_aggregate == analysis.artifacts.aggregate_normalized_macro_rmse(
+    assert stored_outputs == analysis.artifacts.contracts.artifact_output_manifest(save_root)
+    assert stored_aggregate == analysis.artifacts.contracts.aggregate_normalized_macro_rmse(
         frame,
         output_fields=task.output_names,
     )
@@ -259,12 +259,12 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
             start = stop
         runtime_values.append(metric.compute())
 
-    rows = analysis.artifacts.normalized_case_statistics(
+    rows = analysis.artifacts.generation.normalized_case_statistics(
         prediction,
         target,
         output_fields=fields,
     )
-    aggregate = analysis.artifacts.aggregate_normalized_macro_rmse(
+    aggregate = analysis.artifacts.contracts.aggregate_normalized_macro_rmse(
         pd.DataFrame(rows),
         output_fields=fields,
     )
@@ -292,12 +292,12 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
     for batch_size in (2, 1):
         root = tmp_path / f"batch-{batch_size}"
         provenance = {
-            "provenance_schema_version": analysis.artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-            "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+            "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+            "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
             "run": {"name": "synthetic", "task": synthetic_task.id},
             "selection": {
                 "effective_case_count": len(source_indices),
-                "effective_ordered_source_indices_sha256": analysis.artifacts.ordered_indices_sha256(source_indices),
+                "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256(source_indices),
             },
             "evaluator": {
                 "input_fields": list(synthetic_task.input_names),
@@ -305,7 +305,7 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
                 "output_units": {field.name: field.unit for field in synthetic_task.outputs},
             },
         }
-        frame, _ = analysis.artifacts.generate_artifacts(
+        frame, _ = analysis.artifacts.generation.generate_artifacts(
             task=synthetic_task,
             model=_Projection(),
             loader=DataLoader(_MappingDataset(samples), batch_size=batch_size, shuffle=False),
@@ -315,7 +315,7 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
             dataset_name="synthetic",
             provenance=provenance,
         )
-        stored = json.loads((root / analysis.artifacts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
+        stored = json.loads((root / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
         artifact_frames.append(frame)
         artifact_values.append(float(stored["aggregate"]["value"]))
 
@@ -331,7 +331,7 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
         artifact_frames[1].drop(columns="npz_path"),
     )
     for field in fields:
-        sse_column, count_column, rmse_column = analysis.artifacts.normalized_statistic_columns(field)
+        sse_column, count_column, rmse_column = analysis.artifacts.contracts.normalized_statistic_columns(field)
         assert artifact_frames[0][sse_column].tolist() == pytest.approx([row[sse_column] for row in rows])
         assert artifact_frames[0][count_column].tolist() == [row[count_column] for row in rows]
         assert artifact_frames[0][rmse_column].tolist() == pytest.approx([row[rmse_column] for row in rows])
@@ -382,12 +382,12 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
     for continuity in ("div_velocity", "div_eps_velocity"):
         root = tmp_path / continuity
         provenance = {
-            "provenance_schema_version": analysis.artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-            "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+            "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+            "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
             "run": {"name": continuity, "task": task.id},
             "selection": {
                 "effective_case_count": 1,
-                "effective_ordered_source_indices_sha256": analysis.artifacts.ordered_indices_sha256([0]),
+                "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
             },
             "evaluator": {
                 "input_fields": list(task.input_names),
@@ -397,7 +397,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
             },
             "physics": {"selected_training_continuity": continuity},
         }
-        frame, _parquet_path = analysis.artifacts.generate_artifacts(
+        frame, _parquet_path = analysis.artifacts.generation.generate_artifacts(
             task=task,
             model=_SteadyProjection(),
             loader=loader,
@@ -424,7 +424,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
                 assert payload[name].shape == (height, width)
                 assert np.issubdtype(payload[name].dtype, np.floating)
                 assert np.isfinite(payload[name]).all()
-            crop = analysis.artifacts.EVAL_PAD
+            crop = analysis.artifacts.contracts.EVAL_PAD
             interior = np.s_[crop:-crop, crop:-crop]
             expected_momentum = float(np.mean(payload["Rx"][interior] ** 2 + payload["Ry"][interior] ** 2))
             assert row["momentum_residual_mse"] == pytest.approx(expected_momentum)
@@ -449,15 +449,15 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         unexpected_payload = stream.getvalue()
     with zipfile.ZipFile(invalid_npz_path, mode="a", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("unexpected_array.npy", unexpected_payload)
-    contract = analysis.artifact_service._EvaluatorArtifactContract(
+    contract = analysis.artifacts.service._EvaluatorArtifactContract(
         task_id=task.id,
         input_fields=task.input_names,
         output_fields=task.output_names,
         output_units=tuple(field.unit for field in task.outputs),
         physics_kind=task.physics.kind,
     )
-    with pytest.raises(analysis.artifact_service.ArtifactCacheError, match=r"unexpected=\['unexpected_array'\]"):
-        analysis.artifact_service._validate_npz_payload(
+    with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match=r"unexpected=\['unexpected_array'\]"):
+        analysis.artifacts.service._validate_npz_payload(
             invalid_npz_path,
             case_index=1,
             source_index=0,
@@ -482,7 +482,7 @@ def test_physical_cross_permeability_is_reconstructed_from_its_ratio() -> None:
     diagonal permeability convention into square metres for artifact consumers.
     """
     encoded = torch.tensor([[[[-2.0]], [[0.25]], [[-4.0]]]])
-    permeability = analysis.artifacts.extract_kappa(
+    permeability = analysis.artifacts.generation.extract_kappa(
         encoded,
         input_fields=["kxx", "kxy", "kyy"],
         kappa_names=["kxx", "kxy", "kyy"],
@@ -506,7 +506,7 @@ def test_generic_artifacts_reject_reserved_source_metadata(
     provenance = {
         "selection": {
             "effective_case_count": 1,
-            "effective_ordered_source_indices_sha256": analysis.artifacts.ordered_indices_sha256([0]),
+            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
         }
     }
     loader = [
@@ -524,7 +524,7 @@ def test_generic_artifacts_reject_reserved_source_metadata(
     )
 
     try:
-        analysis.artifacts.generate_artifacts(
+        analysis.artifacts.generation.generate_artifacts(
             task=task,
             model=_Projection(),
             loader=loader,
@@ -581,7 +581,7 @@ def test_synthetic_task_flows_through_final_dataset_contract(
     assert loaded[0]["meta"] == expected_metadata
 
     batch = next(iter(DataLoader(loaded, batch_size=1, shuffle=False)))
-    artifact_metadata = analysis.artifacts.meta_to_jsonable(batch["meta"])
+    artifact_metadata = analysis.artifacts.generation.meta_to_jsonable(batch["meta"])
     flattened_metadata = analysis.evaluation.dataframe.flatten_meta_scalars(artifact_metadata)
 
     assert loaded.input_fields == list(synthetic_task.input_names)

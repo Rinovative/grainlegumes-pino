@@ -2,8 +2,8 @@
 """
 Protect objective-driven Optuna configuration, search parsing, and trial contracts.
 
-Fake trials/studies exercise exact YAML schemas, sampler subseeds, device/output
-identity exclusion, suggestion application, reporting, pruning, allocation, and
+Fake trials/studies exercise exact YAML schemas, fixed training and sampler seeds,
+device/output identity exclusion, suggestion application, reporting, pruning, allocation, and
 W&B-independent objective consumption. Real tiny SQLite continuation and the
 complete failure taxonomy are covered by ``test_optuna_lifecycle``.
 """
@@ -11,7 +11,6 @@ complete failure taxonomy are covered by ``test_optuna_lifecycle``.
 from __future__ import annotations
 
 import copy
-import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,12 +20,14 @@ import optuna
 import pytest
 import torch
 from src import datasets, experiments, learning
+from support import configs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-_CONFIG_ROOT = Path(__file__).parents[2] / "configs" / "optuna"
-_OPTUNA_CONFIGS = sorted(_CONFIG_ROOT.glob("*.yaml"))
+_OPTUNA_CONFIGS = configs.optuna_config_paths()
+_FNO_CONFIG = configs.optuna_config_path(model_kind="fno", physics_enabled=False)
+_MIN_SMOKE_TRIALS = 2
 _EXPECTED_OBJECTIVE = {
     "id": "normalized_macro_rmse",
     "kind": "macro_rmse",
@@ -101,56 +102,171 @@ class _Trial:
         return self.prune
 
 
-@pytest.mark.parametrize("path", _OPTUNA_CONFIGS, ids=lambda path: path.stem)
-def test_every_optuna_yaml_resolves_one_complete_objective(path: Path) -> None:
-    """
-    Load every maintained study recipe and inspect its raw and resolved forms.
+def test_every_optuna_yaml_resolves_one_complete_objective() -> None:
+    """Validate every wrapper by schema, relationships, bounds, and owned identity."""
+    names_by_role: dict[str, set[str]] = {"production": set(), "smoke": set()}
+    trials_by_role: dict[str, list[int]] = {"production": [], "smoke": []}
+    epochs_by_role: dict[str, list[int]] = {"production": [], "smoke": []}
 
-    Each must derive one complete objective, continuous evaluation cadence, and the
-    shared bounded pruner from experiment semantics rather than duplicate study keys.
-    """
-    config = optuna_runtime.load_optuna_study_config(path)
-    raw = experiments.config.loader.load_yaml(path)
+    for path in _OPTUNA_CONFIGS:
+        config = optuna_runtime.load_optuna_study_config(path)
+        raw = experiments.config.loader.load_yaml(path)
+        base = config.base_config
+        objective = experiments.config.loader.get_resolved_objective(base)
+        raw_study = raw["study"]
+        role = config.study["role"]
+        n_trials = config.study["n_trials"]
+        epochs = base["training"]["epochs"]
+        cadence = base["training"]["evaluation_interval"]
+        pruner = config.study["pruner"]
 
-    assert "objective" not in raw["study"]
-    assert "direction" not in raw["study"]
-    assert "hard_prune_spike" not in raw["study"]
-    assert experiments.config.loader.get_resolved_objective(config.base_config) == _EXPECTED_OBJECTIVE
-    assert config.base_config["run"]["device"] == "auto"
-    assert config.base_config["loss"]["data"]["kind"] == "relative_h1"
-    assert config.study["objective"] == _EXPECTED_OBJECTIVE["id"]
-    assert config.study["direction"] == _EXPECTED_OBJECTIVE["direction"]
-    assert "budgets" not in config.study
-    assert "report_epochs" not in raw["study"]
-    assert "report_epochs" not in config.study
-    assert config.base_config["training"]["evaluation_interval"] == 1
-    assert config.base_config["data"]["num_workers"] == 0
-    assert config.base_config["data"]["persistent_workers"] is False
-    assert config.study["pruner"] == {
-        "kind": "median",
-        "n_startup_trials": 5,
-        "n_warmup_steps": 20,
-        "interval_steps": 1,
-    }
-    assert "seed" not in config.study["sampler"]
+        assert role in names_by_role
+        assert config.study["role"] == raw_study["role"]
+        assert isinstance(config.study["name"], str)
+        assert config.study["name"]
+        assert config.study["name"] not in names_by_role[role]
+        names_by_role[role].add(config.study["name"])
+        trials_by_role[role].append(n_trials)
+        epochs_by_role[role].append(epochs)
+
+        assert tuple(raw) == ("study", "experiment", "search_space")
+        assert tuple(raw["experiment"]) == experiments.config.loader.CANONICAL_EXPERIMENT_SECTION_ORDER
+        assert "objective" not in raw_study
+        assert "direction" not in raw_study
+        assert config.base_experiment == raw["experiment"]
+        assert raw["experiment"]["evaluation"] == {"objective": {"id": objective["id"]}}
+        assert config.study["objective"] == objective["id"]
+        assert config.study["direction"] == objective["direction"]
+
+        training_seed = base["run"]["seed"]
+        sampler_seed = config.study["seed"]
+        assert type(training_seed) is int
+        assert type(sampler_seed) is int
+        assert training_seed == raw["experiment"]["run"]["seed"]
+        assert "prefix" not in raw["experiment"]["run"]
+        assert sampler_seed == raw_study["seed"]
+        assert "seed" not in config.study["sampler"]
+
+        assert type(n_trials) is int
+        assert n_trials > 0
+        assert type(epochs) is int
+        assert epochs > 0
+        assert type(cadence) is int
+        assert cadence > 0
+        assert base["training"]["ood_evaluation_interval"] == cadence
+        assert base["tracking"]["wandb"]["monitor"]["interval"] == cadence
+        assert cadence <= epochs
+        assert base["tracking"]["wandb"]["workflow"] == "optuna_trial"
+        assert base["tracking"]["wandb"]["study"] == config.study["name"]
+        assert "study" not in raw["experiment"]["tracking"]["wandb"]
+
+        assert base["data"]["train_dataset"] == raw["experiment"]["data"]["train_dataset"]
+        assert base["data"]["ood_datasets"] == raw["experiment"]["data"]["ood_datasets"]
+        assert "train_dataset" not in raw_study
+        assert "ood_datasets" not in raw_study
+        assert "data.train_dataset" not in raw["search_space"]
+        assert "data.ood_datasets" not in raw["search_space"]
+
+        if pruner["kind"] == "median":
+            assert 0 <= pruner["n_startup_trials"] <= n_trials
+            assert cadence <= pruner["n_warmup_steps"] <= epochs
+            assert pruner["n_warmup_steps"] % cadence == 0
+            assert pruner["interval_steps"] == cadence
+        else:
+            assert pruner == {"kind": "none"}
+
+        assert config.search_space
+        sampled = [parameter for parameter in config.search_space if parameter.kind != "fixed"]
+        assert sampled
+        assert len({parameter.path for parameter in config.search_space}) == len(config.search_space)
+        assert len({parameter.name for parameter in sampled}) == len(sampled)
+        for parameter in config.search_space:
+            assert parameter.kind in {"categorical", "float", "int", "fixed"}
+            if parameter.kind == "categorical":
+                assert parameter.values
+                assert len(set(parameter.values)) == len(parameter.values)
+            elif parameter.kind in {"float", "int"}:
+                assert parameter.low is not None
+                assert parameter.high is not None
+                assert parameter.low <= parameter.high
+                if parameter.log:
+                    assert parameter.low > 0
+                if parameter.step is not None:
+                    assert parameter.step > 0
+                if parameter.kind == "int":
+                    step = 1 if parameter.step is None else int(parameter.step)
+                    assert (int(parameter.high) - int(parameter.low)) % step == 0
+
+        if role == "smoke":
+            assert n_trials >= _MIN_SMOKE_TRIALS
+            assert base["tracking"]["wandb"]["monitor"]["max_cases"] >= 1
+            assert base["tracking"]["wandb"]["upload"]["evaluation_artifacts"] is False
+
+    assert names_by_role["production"].isdisjoint(names_by_role["smoke"])
+    if trials_by_role["production"] and trials_by_role["smoke"]:
+        assert max(trials_by_role["smoke"]) < min(trials_by_role["production"])
+        assert max(epochs_by_role["smoke"]) < min(epochs_by_role["production"])
 
 
-@pytest.mark.parametrize("path", _OPTUNA_CONFIGS, ids=lambda path: path.stem)
-def test_trial_analysis_config_contains_only_named_nonfixed_sampled_parameters(path: Path) -> None:
-    """Expose clean analysis axes while retaining path-qualified local overrides."""
-    study = optuna_runtime.load_optuna_study_config(path)
-    trial = _Trial()
-    config, context = optuna_runtime._prepare_trial_config(study, trial)
-    expected_names = {parameter.name for parameter in study.search_space if parameter.kind != "fixed"}
+def test_trial_analysis_config_contains_only_named_nonfixed_sampled_parameters() -> None:
+    """Expose clean analysis axes while retaining fixed seed and native trial identity."""
+    for path in _OPTUNA_CONFIGS:
+        study = optuna_runtime.load_optuna_study_config(path)
+        trial = _Trial()
+        config, context = optuna_runtime._prepare_trial_config(study, trial)
+        expected_names = {parameter.name for parameter in study.search_space if parameter.kind != "fixed"}
 
-    assert set(context["analysis_parameters"]) == expected_names
-    assert set(context["overrides"]) == {parameter.path for parameter in study.search_space}
-    assert config["tracking"]["wandb"]["tags"] == [
-        experiments.config.loader._model_variant(config),
-        "optuna",
-    ]
-    assert "group" not in config["tracking"]["wandb"]
-    assert "job_type" not in config["tracking"]["wandb"]
+        assert set(context["analysis_parameters"]) == expected_names
+        assert set(context["overrides"]) == {parameter.path for parameter in study.search_space}
+        training_seed = study.base_config["run"]["seed"]
+        sampler_seed = study.study["seed"]
+        assert context["training_seed"] == training_seed
+        assert context["sampler_seed"] == sampler_seed
+        assert config["tracking"]["wandb"]["tags"] == [
+            experiments.config.loader._model_variant(config),
+            "optuna",
+        ]
+        assert "prefix" not in config["run"]
+        assert config["run"]["seed"] == training_seed
+        assert config["run"]["suffix"] == f"optuna_trial_{trial.number:03d}"
+        assert str(study.study["name"]) not in config["run"]["name"]
+        assert str(config["task"]) not in config["run"]["name"]
+        seed_token = f"s{training_seed}"
+        expected_parts = [experiments.config.loader.resolved_model_variant(config)]
+        scientific_variant = experiments.config.loader.resolved_scientific_variant(config)
+        if scientific_variant is not None:
+            expected_parts.append(scientific_variant)
+        expected_parts.extend([seed_token, f"optuna_trial_{trial.number:03d}"])
+        assert config["run"]["name"].split("__") == expected_parts
+        assert config["run"]["name"].split("__").count(seed_token) == 1
+        assert trial.attrs["run_seed"] == training_seed
+        assert trial.attrs["sampler_seed"] == sampler_seed
+
+
+def test_pi_trial_name_places_automatic_science_before_seed_and_trial_suffix() -> None:
+    """Keep PI trial identity canonical while native trial zero remains final."""
+    study = optuna_runtime.load_optuna_study_config(
+        configs.optuna_config_path(model_kind="fno", physics_enabled=True),
+    )
+    config, _context = optuna_runtime._prepare_trial_config(study, _Trial(number=0))
+
+    assert config["run"]["name"] == ("pi-fno_m64x96_h32_l3__spectral_reflect_div_velocity__s9__optuna_trial_000")
+    assert config["run"]["suffix"] == "optuna_trial_000"
+
+
+@pytest.mark.parametrize("trial_number", [0, 1, 9, 10, 99, 100, 999, 1000])
+def test_trial_names_use_native_zero_based_numbers_with_three_digit_minimum(trial_number: int) -> None:
+    """Preserve Optuna's native number and allow natural expansion beyond three digits."""
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
+    config, context = optuna_runtime._prepare_trial_config(study, _Trial(number=trial_number))
+
+    token = f"optuna_trial_{trial_number:03d}"
+    assert context["trial_number"] == trial_number
+    assert config["run"]["suffix"] == token
+    assert config["run"]["name"].endswith(f"__{token}")
+    seed_token = f"s{study.base_config['run']['seed']}"
+    assert config["run"]["name"].split("__").count(seed_token) == 1
+    assert seed_token not in token.split("__")
 
 
 @pytest.mark.parametrize(
@@ -169,7 +285,7 @@ def test_existing_study_requires_type_exact_schema_versions(
 ) -> None:
     """Reject boolean and floating-point lookalikes in every persisted version field."""
     config = optuna_runtime.load_optuna_study_config(
-        _CONFIG_ROOT / "steady_flow_fno_search.yaml",
+        _FNO_CONFIG,
     )
     signature = optuna_runtime.build_study_signature(config)
     objective = experiments.config.loader.get_resolved_objective(config.base_config)
@@ -205,12 +321,22 @@ def test_device_override_is_visible_but_outside_optuna_study_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep runtime device policy visible but outside semantic identity."""
-    monkeypatch.setattr(
-        optuna_runtime,
-        "_describe_dataset_identity",
-        lambda _config, dataset_id: {"dataset_id": dataset_id},
-    )
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+
+    def summarize(dataset_id: str, *, task: Any, **_paths: Any) -> SimpleNamespace:
+        """Return a stable metadata summary for this device-identity test."""
+        return SimpleNamespace(
+            dataset_id=dataset_id,
+            dataset_path=Path("/datasets") / dataset_id / f"{dataset_id}.pt",
+            metadata_directory=Path("/metadata") / dataset_id,
+            dataset_exists=True,
+            task_id=task.id,
+            task_contract_digest=task.contract_digest,
+            fingerprint="a" * 64,
+            sample_count=2,
+        )
+
+    monkeypatch.setattr(datasets.metadata, "load_dataset_metadata_summary", summarize)
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     summaries = {
         policy: optuna_runtime.describe_optuna_study_config(
             optuna_runtime.with_runtime_overrides(study, device=policy),
@@ -229,92 +355,73 @@ def test_device_override_is_visible_but_outside_optuna_study_identity(
     assert all("cuda_index" not in summary for summary in summaries.values())
 
 
-def test_dry_run_dataset_identity_uses_metadata_without_loading_tensors(
+def test_dry_run_dataset_identity_uses_shared_metadata_summary_without_loading_tensors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bind one compact metadata identity and artifact stat without torch.load."""
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    """Use the shared compact metadata boundary without loading tensor payloads."""
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     config = copy.deepcopy(study.base_config)
-    dataset_id = "tiny_metadata_identity"
     dataset_root = tmp_path / "raw"
     metadata_root = tmp_path / "meta"
     config["paths"]["dataset_root"] = str(dataset_root)
     config["paths"]["training_meta_root"] = str(metadata_root)
-    dataset_path = dataset_root / dataset_id / f"{dataset_id}.pt"
-    metadata_dir = metadata_root / dataset_id
-    dataset_path.parent.mkdir(parents=True)
-    metadata_dir.mkdir(parents=True)
-    dataset_path.write_bytes(b"tiny")
-    task = experiments.config.loader.validate_resolved_task_contract(config)
-    scientific = {
-        "dataset_fingerprint": "a" * 64,
-        "sample_count": 2,
-        "spatial_shape": [2, 3],
-        "generated_batch_identity_sha256": "b" * 64,
-    }
-    metadata_path = metadata_dir / datasets.metadata.METADATA_FILENAME
-    metadata_path.write_text(
-        json.dumps({"scientific_identity": scientific}),
-        encoding="utf-8",
-    )
-    (metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME).write_text(
-        json.dumps({"intended_case_ids": ["case_0001", "case_0002"]}),
-        encoding="utf-8",
-    )
-    captured: dict[str, Any] = {}
+    resolved_task = experiments.config.loader.validate_resolved_task_contract(config)
+    captured: list[dict[str, Any]] = []
+    state = {"exists": True}
 
-    def validate_metadata(directory: Path, *, dataset_identity: Any) -> Any:
-        """Record the derived identity and return the validated artifact binding."""
-        captured.update({"directory": directory, "identity": dataset_identity})
-        return SimpleNamespace(
-            metadata={
-                "artifacts": {
-                    "dataset": {
-                        "filename": dataset_path.name,
-                        "size_bytes": 4,
-                    }
-                }
+    def summarize(
+        dataset_id: str,
+        *,
+        task: Any,
+        dataset_root: Path,
+        metadata_root: Path,
+    ) -> SimpleNamespace:
+        """Record the shared summary request and return compact validated identity."""
+        captured.append(
+            {
+                "dataset_id": dataset_id,
+                "task": task,
+                "dataset_root": dataset_root,
+                "metadata_root": metadata_root,
             }
         )
+        return SimpleNamespace(
+            dataset_id=dataset_id,
+            dataset_path=dataset_root / dataset_id / f"{dataset_id}.pt",
+            metadata_directory=metadata_root / dataset_id,
+            dataset_exists=state["exists"],
+            task_id=task.id,
+            task_contract_digest=task.contract_digest,
+            fingerprint="a" * 64,
+            sample_count=2,
+        )
 
-    monkeypatch.setattr(datasets.metadata, "validate_dataset_metadata_directory", validate_metadata)
+    monkeypatch.setattr(datasets.metadata, "load_dataset_metadata_summary", summarize)
     monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("dry-run must not load tensors"))
-    summary = optuna_runtime._describe_dataset_identity(config, dataset_id)
+    roles = optuna_runtime._configured_dataset_identities(config)
 
-    identity = captured["identity"]
-    assert captured["directory"] == metadata_dir
-    assert identity.dataset_id == dataset_id
-    assert identity.task == task.id
-    assert identity.task_contract_digest == task.contract_digest
-    assert identity.sample_ids == ("case_0001", "case_0002")
-    assert summary["validation"] == "metadata_package_and_artifact_stat"
-    assert summary["fingerprint"] == "a" * 64
+    expected_ids = [config["data"]["train_dataset"], *config["data"]["ood_datasets"]]
+    assert [request["dataset_id"] for request in captured] == expected_ids
+    assert all(request["task"] == resolved_task for request in captured)
+    assert all(request["dataset_root"] == dataset_root for request in captured)
+    assert all(request["metadata_root"] == metadata_root for request in captured)
+    assert roles["id"]["dataset_id"] == expected_ids[0]
+    assert roles["ood"][0]["dataset_id"] == expected_ids[1]
+    assert roles["id"]["validation"] == "metadata_package_and_artifact_stat"
+    assert roles["id"]["fingerprint"] == "a" * 64
 
-    dataset_path.write_bytes(b"wrong-size")
-    with pytest.raises(ValueError, match="name or size"):
-        optuna_runtime._describe_dataset_identity(config, dataset_id)
-    metadata_path.unlink()
-    with pytest.raises(FileNotFoundError):
-        optuna_runtime._describe_dataset_identity(config, dataset_id)
-    metadata_path.write_text("{", encoding="utf-8")
-    with pytest.raises(json.JSONDecodeError):
-        optuna_runtime._describe_dataset_identity(config, dataset_id)
+    state["exists"] = False
+    with pytest.raises(FileNotFoundError, match="not a regular file"):
+        optuna_runtime._configured_dataset_identities(config)
 
 
-def test_sampler_seed_is_a_stable_subseed_of_the_study_seed(
+def test_sampler_seed_is_the_explicit_study_seed_and_is_persisted_separately(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Replace Optuna sampler/study constructors with recorders and run orchestration.
-
-    The sampler must receive the deterministic 32-bit study subseed while external
-    storage avoids local output allocation, preserving reproducible study creation.
-    """
-    study = optuna_runtime.load_optuna_study_config(
-        _CONFIG_ROOT / "steady_flow_fno_search.yaml",
-    )
+    """Pass the configured study seed to Optuna and persist its sampler metadata."""
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     external_settings = copy.deepcopy(study.study)
     external_settings["storage"] = "external://sampler-seed-test"
     study = replace(study, study=external_settings)
@@ -322,7 +429,6 @@ def test_sampler_seed_is_a_stable_subseed_of_the_study_seed(
     captured: dict[str, Any] = {}
 
     def capture_sampler(**settings: Any) -> object:
-        """Record sampler construction without performing any sampling."""
         captured["sampler"] = settings
         return object()
 
@@ -336,7 +442,6 @@ def test_sampler_seed_is_a_stable_subseed_of_the_study_seed(
     )
 
     def create_study(**settings: Any) -> Any:
-        """Record study creation and return the minimal orchestration fake."""
         captured["create_study"] = settings
         return fake_study
 
@@ -344,18 +449,18 @@ def test_sampler_seed_is_a_stable_subseed_of_the_study_seed(
     monkeypatch.setattr(optuna.pruners, "MedianPruner", lambda **_settings: object())
     monkeypatch.setattr(optuna, "create_study", create_study)
 
-    result = optuna_runtime.run_optuna_study(
-        study,
-        n_trials=1,
-        output_root=output_root,
-    )
+    result = optuna_runtime.run_optuna_study(study, n_trials=1, output_root=output_root)
 
     assert result is fake_study
-    assert captured["sampler"]["seed"] == experiments.run.derive_subseed(
-        9,
-        "optuna-sampler",
-    ) % (2**32)
+    sampler_seed = study.study["seed"]
+    assert captured["sampler"]["seed"] == sampler_seed
     assert captured["create_study"]["sampler"] is not None
+    assert user_attrs[optuna_runtime._SAMPLER_METADATA_ATTR] == {
+        "kind": "tpe",
+        "multivariate": False,
+        "seed": sampler_seed,
+    }
+    assert "training_seed" not in user_attrs[optuna_runtime._SAMPLER_METADATA_ATTR]
     assert not output_root.exists()
 
 
@@ -474,7 +579,7 @@ def test_study_scalars_are_type_exact_during_load(monkeypatch: pytest.MonkeyPatc
     Blank names/storage, coerced seeds/counts, and unsupported schedule keys must fail
     during load, keeping runtime orchestration free of YAML truthiness shortcuts.
     """
-    source_path = _CONFIG_ROOT / "steady_flow_fno_search.yaml"
+    source_path = _FNO_CONFIG
     load_yaml = experiments.config.loader.load_yaml
     base_raw = load_yaml(source_path)
     invalid_settings: list[tuple[str, Any, type[Exception], str]] = [
@@ -505,7 +610,7 @@ def test_derived_objective_direction_and_bespoke_spike_are_rejected_as_raw_study
     Every duplicate semantic key must be rejected as unknown because the resolved
     experiment and general pruner alone own objective and pruning behavior.
     """
-    source_path = _CONFIG_ROOT / "steady_flow_fno_search.yaml"
+    source_path = _FNO_CONFIG
     base_raw = experiments.config.loader.load_yaml(source_path)
 
     for key, value in (
@@ -524,6 +629,42 @@ def test_derived_objective_direction_and_bespoke_spike_are_rejected_as_raw_study
             optuna_runtime.load_optuna_study_config(source_path)
 
 
+def test_optuna_tracking_identity_is_projected_only_from_the_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject conflicting workflow or duplicated study identity in an embedded experiment."""
+    source_path = _FNO_CONFIG
+    base_raw = experiments.config.loader.load_yaml(source_path)
+    mutations = (
+        (
+            lambda raw: raw["experiment"].pop("tracking"),
+            TypeError,
+            "experiment.tracking must be a mapping",
+        ),
+        (
+            lambda raw: raw["experiment"]["tracking"]["wandb"].update(
+                {"study": raw["study"]["name"]},
+            ),
+            ValueError,
+            "wrapper-owned",
+        ),
+        (
+            lambda raw: raw["experiment"]["tracking"]["wandb"].update(
+                {"workflow": "train"},
+            ),
+            ValueError,
+            "must be 'optuna_trial'",
+        ),
+    )
+
+    for mutate, error, match in mutations:
+        raw = copy.deepcopy(base_raw)
+        mutate(raw)
+        monkeypatch.setattr(experiments.config.loader, "load_yaml", lambda _path, raw=raw: raw)
+        with pytest.raises(error, match=match):
+            optuna_runtime.load_optuna_study_config(source_path)
+
+
 def test_sampler_and_pruner_semantics_are_validated_during_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -533,7 +674,7 @@ def test_sampler_and_pruner_semantics_are_validated_during_load(
     Every invalid component family must fail at load time, while error context names
     the unsupported kind or inapplicable setting before Optuna construction.
     """
-    source_path = _CONFIG_ROOT / "steady_flow_fno_search.yaml"
+    source_path = _FNO_CONFIG
     load_yaml = experiments.config.loader.load_yaml
     base_raw = load_yaml(source_path)
     invalid_components: list[tuple[str, Any, type[Exception], str]] = [
@@ -572,7 +713,7 @@ def test_storage_none_and_exact_valid_search_specs_remain_supported(
     ``None`` storage and categorical, float, integer, and fixed parameters must remain
     supported, proving strict rejection does not narrow the documented valid surface.
     """
-    source_path = _CONFIG_ROOT / "steady_flow_fno_search.yaml"
+    source_path = _FNO_CONFIG
     raw = experiments.config.loader.load_yaml(source_path)
     raw["study"]["storage"] = None
     monkeypatch.setattr(experiments.config.loader, "load_yaml", lambda _path: raw)
@@ -591,19 +732,12 @@ def test_storage_none_and_exact_valid_search_specs_remain_supported(
     assert [parameter.kind for parameter in parsed] == ["categorical", "float", "int", "fixed"]
 
 
-def test_sampled_trial_config_is_resolved_and_revalidates_continuous_cadence(
+def test_sampled_trial_config_preserves_seed_and_revalidates_shared_cadence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Capture a sampled trial immediately before allocation, then inject invalid cadence.
-
-    The prepared config must be resolved with derived seed/context metadata, while a
-    noncontinuous evaluation interval fails before trial attributes or output exist.
-    """
-    study = optuna_runtime.load_optuna_study_config(
-        _CONFIG_ROOT / "steady_flow_fno_search.yaml",
-    )
+    """Capture prepared metadata, then reject drift among genuine evaluation events."""
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     trial_number = 7
     trial = _Trial(number=trial_number)
     captured: dict[str, Any] = {}
@@ -617,17 +751,12 @@ def test_sampled_trial_config_is_resolved_and_revalidates_continuous_cadence(
         run_dir: Path,
         summary_extra: dict[str, Any],
     ) -> Path:
-        """Capture public preparation inputs, then stop before output allocation."""
         captured["config"] = config
         captured["run_dir"] = run_dir
         captured["context"] = summary_extra
         raise PreparedTrialCaptureError
 
-    monkeypatch.setattr(
-        experiments.run,
-        "prepare_fresh_run",
-        capture_prepared_run,
-    )
+    monkeypatch.setattr(experiments.run, "prepare_fresh_run", capture_prepared_run)
     with pytest.raises(PreparedTrialCaptureError):
         optuna_runtime.run_trial(study, trial)
 
@@ -638,20 +767,20 @@ def test_sampled_trial_config_is_resolved_and_revalidates_continuous_cadence(
     assert experiments.config.loader.get_resolved_objective(config) == _EXPECTED_OBJECTIVE
     assert context["study_name"] == study.study["name"]
     assert context["trial_number"] == trial_number
-    assert config["run"]["seed"] == experiments.run.derive_subseed(
-        9,
-        f"trial-{trial_number}",
-    )
-    assert trial.attrs["run_seed"] == config["run"]["seed"]
+    training_seed = study.base_config["run"]["seed"]
+    sampler_seed = study.study["seed"]
+    assert context["training_seed"] == config["run"]["seed"] == training_seed
+    assert context["sampler_seed"] == sampler_seed
+    assert trial.attrs["run_seed"] == training_seed
     assert "capacity" not in trial.attrs
 
     output_root = tmp_path / "outputs"
     trial_base = copy.deepcopy(study.base_config)
     trial_base["paths"]["output_root"] = str(output_root)
-    trial_base["training"]["evaluation_interval"] = 5
+    trial_base["training"]["evaluation_interval"] = 1
     invalid_cadence = replace(study, base_config=trial_base)
     invalid_trial = _Trial(number=trial_number + 1)
-    with pytest.raises(ValueError, match="evaluation_interval must be 1"):
+    with pytest.raises(ValueError, match="must share one completed-epoch cadence"):
         optuna_runtime.run_trial(invalid_cadence, invalid_trial)
     assert invalid_trial.attrs == {}
     assert not output_root.exists()
@@ -664,7 +793,7 @@ def test_objective_and_derived_search_paths_are_rejected() -> None:
     Every path must fail the explicit search allowlist, preventing a sampled trial
     from changing scientific identity or allocation ownership.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     forbidden = (
         "evaluation.objective.direction",
         "evaluation.metrics.0.kind",
@@ -694,7 +823,7 @@ def test_resolved_metric_drift_is_rejected_even_when_semantically_valid() -> Non
     Resolved validation must still reject it because objective metadata must exactly
     match the selected metric formula, not merely describe a valid metric.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     drifted = copy.deepcopy(study.base_config)
     drifted["evaluation"]["metrics"][0]["kind"] = "rmse"
     drifted["evaluation"]["metrics"][0]["reduction"] = "element_mean"
@@ -710,7 +839,7 @@ def test_resolved_metric_unknown_keys_are_rejected() -> None:
     Validation must reject the noncanonical mapping so signature and telemetry code
     consume one exact semantic schema without hidden extension fields.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     drifted = copy.deepcopy(study.base_config)
     drifted["evaluation"]["metrics"][0]["unexpected"] = "value"
 
@@ -754,6 +883,32 @@ def test_reporter_tracks_every_evaluation_in_both_directions(
     assert trial.attrs["last_reported_epoch"] == expected_terminal_epoch
 
 
+@pytest.mark.parametrize(
+    ("target_epoch", "reported_epochs"),
+    [(10, (5, 10)), (12, (5, 10, 12))],
+)
+def test_reporter_uses_interval_or_terminal_completed_epochs(
+    target_epoch: int,
+    reported_epochs: tuple[int, ...],
+) -> None:
+    """Report genuine sparse events at native completed-epoch steps, including terminal."""
+    trial = _Trial()
+    reporter = optuna_runtime.OptunaEpochReporter(
+        trial=trial,
+        objective_id="objective",
+        direction="minimize",
+        evaluation_interval=5,
+        target_epoch=target_epoch,
+    )
+    for epoch in reported_epochs:
+        reporter(epoch, {"id/objective": float(epoch)})
+
+    assert trial.reports == [(float(epoch), epoch) for epoch in reported_epochs]
+    invalid_epoch = reported_epochs[-2] + 1 if len(reported_epochs) > 1 else 1
+    with pytest.raises(ValueError, match="interval-or-terminal"):
+        reporter(invalid_epoch, {"id/objective": 1.0})
+
+
 def test_reporter_prunes_non_finite_objectives_explicitly() -> None:
     """
     Send a NaN held-out objective through an otherwise valid epoch reporter.
@@ -791,7 +946,7 @@ def test_run_trial_classifies_floating_point_failures_by_lifecycle(
     Setup failure must stay failed while running failure becomes non-finite-pruned;
     every stubbed runtime constructor must receive the resolved CPU device.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     study = optuna_runtime.with_runtime_overrides(study, device="cpu")
     tracking_disabled_base = copy.deepcopy(study.base_config)
     tracking_disabled_base["tracking"]["wandb"]["mode"] = "disabled"
@@ -803,6 +958,7 @@ def test_run_trial_classifies_floating_point_failures_by_lifecycle(
         state_dict=dict,
         in_normalizer=None,
         out_normalizer=None,
+        to=lambda _device: None,
     )
 
     def create_dataloaders(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -885,8 +1041,8 @@ def test_run_trial_classifies_floating_point_failures_by_lifecycle(
         build_runtime_value,
     )
     monkeypatch.setattr(
-        optuna_runtime.learning.losses.factory,
-        "build_eval_metrics",
+        optuna_runtime.learning.metrics.metrics,
+        "build_evaluation_metrics",
         build_runtime_metrics,
     )
     monkeypatch.setattr(
@@ -930,7 +1086,7 @@ def test_strict_cuda_fails_before_optuna_trial_allocation(
     Resolution must raise before trial attributes or output leaves exist, proving a
     strict hardware request never degrades into CPU execution.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     output_root = tmp_path / "outputs"
     study = optuna_runtime.with_runtime_overrides(
         study,
@@ -952,6 +1108,41 @@ def test_strict_cuda_fails_before_optuna_trial_allocation(
     assert not output_root.exists()
 
 
+def test_uno_optuna_strict_determinism_fails_before_trial_allocation_or_tracking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Apply the shared current-UNO CUDA preflight before any trial run mutation."""
+    path = configs.optuna_config_path(model_kind="uno", physics_enabled=True)
+    study = optuna_runtime.load_optuna_study_config(path)
+    output_root = tmp_path / "outputs"
+    study = optuna_runtime.with_runtime_overrides(study, device="cuda", output_root=output_root)
+    base = copy.deepcopy(study.base_config)
+    base["run"]["deterministic"] = True
+    study = replace(study, base_config=base)
+    resolution = SimpleNamespace(
+        requested_policy="cuda",
+        device=torch.device("cuda:0"),
+        device_type="cuda",
+    )
+    monkeypatch.setattr(optuna_runtime.learning.device, "resolve_device", lambda *_args, **_kwargs: resolution)
+    monkeypatch.setattr(
+        experiments.run,
+        "prepare_fresh_run",
+        lambda *_args, **_kwargs: pytest.fail("unsupported UNO trial must not allocate"),
+    )
+    monkeypatch.setattr(
+        experiments.tracking,
+        "initialize_wandb",
+        lambda *_args, **_kwargs: pytest.fail("unsupported UNO trial must not initialize W&B"),
+    )
+
+    with pytest.raises(learning.device.DeviceResolutionError, match=r"Set run\.deterministic: false"):
+        optuna_runtime.run_trial(study, _Trial())
+
+    assert not output_root.exists()
+
+
 def test_run_trial_revalidates_study_and_model_before_output_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -961,7 +1152,7 @@ def test_run_trial_revalidates_study_and_model_before_output_allocation(
     Both direct-call drift families must be revalidated before preparation, leaving
     trial attributes empty and preventing output allocation from invalid semantics.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     invalid_settings = copy.deepcopy(study.study)
     invalid_settings["n_trials"] = 0
     trial = _Trial()
@@ -1004,7 +1195,7 @@ def test_invalid_runtime_study_settings_fail_before_output_allocation(tmp_path: 
     Public study orchestration must reject both before creating its output root, so
     invalid invocation or component policy cannot leave partial study state.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     output_root = tmp_path / "outputs"
 
     with pytest.raises(ValueError, match="n_trials must be positive"):
@@ -1028,7 +1219,7 @@ def test_study_mismatch_fails_before_output_allocation(tmp_path: Path) -> None:
     Orchestration must detect the objective mismatch before creating output, proving
     programmatic callers cannot bypass the same semantic checks as YAML loading.
     """
-    study = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     drifted = copy.deepcopy(study.study)
     drifted["direction"] = "maximize"
     output_root = tmp_path / "outputs"
@@ -1051,7 +1242,7 @@ def test_existing_study_direction_is_checked_before_optimization(
     Direction validation must stop before optimization or local allocation, protecting
     existing external history from reuse under incompatible selection semantics.
     """
-    study_config = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / "steady_flow_fno_search.yaml")
+    study_config = optuna_runtime.load_optuna_study_config(_FNO_CONFIG)
     external_study = copy.deepcopy(study_config.study)
     external_study["storage"] = "external://existing-study"
     study_config = replace(study_config, study=external_study)

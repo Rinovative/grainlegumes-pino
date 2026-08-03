@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 import ipywidgets as widgets
 
 from src import analysis
-from src.analysis import analysis_presentation as presentation
+from src.analysis.presentation import registry as presentation
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -147,7 +147,7 @@ def _build_sections(
         )
 
     entry_builders: dict[str, Callable[[str], tuple[str, Callable[[], Any], str]]] = {
-        "authoritative_run_summary": lambda title: controlled(title, plots.run_summary.plot_run_summary_table),
+        "authoritative_run_summary": lambda title: controlled(title, plots.run_summary.build_run_summary_table),
         "accuracy_physics_pareto": lambda title: controlled(title, plots.run_summary.plot_accuracy_physics_pareto),
         "predictive_error_distributions": lambda title: controlled(
             title,

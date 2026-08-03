@@ -7,13 +7,13 @@ Compare bounded dataset spectra without loading model activations or artifacts.
 Responsibilities:
   - Compute Hann-windowed isotropic and x/y directional power spectra
   - Show cumulative bandwidth with casewise uncertainty over ordered prefixes
-  - Resolve horizontal spectral composition as a function of physical height
-  - Enforce shared task fields, units, and internally identical Cartesian grids
+  - Resolve cross-stream spectral composition along the flow direction
+  - Enforce shared task contracts, stored representations, and Cartesian grids
 
 Design principles:
   - Frequencies use coordinate-derived units of inverse metres
-  - Height-resolved power is normalized within each row before case aggregation
-  - Dataset comparisons never combine physical fields with incompatible units
+  - Flow-position-resolved power is normalized within each row before case aggregation
+  - Dataset comparisons never combine incompatible stored field representations
 
 This module does NOT:
   - Load model-training datasets or infer undeclared task fields
@@ -23,18 +23,70 @@ This module does NOT:
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import pandas as pd
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
-_DEFAULT_CASE_LIMIT = 64
+_DEFAULT_CASE_LIMIT = 100
+_LEGEND_FONT_SIZE = 10
 _MIN_GRID_SIZE = 2
+_CASE_ID_PATTERN = re.compile(r"case_([0-9]{4,})")
+_DIMENSIONLESS_REPRESENTATION_LABELS = {
+    "dimensionless_log10_ratio_to_1_m2": "log10(k / 1 m²)",
+    "dimensionless_cross_component_ratio_to_geometric_mean": "kij / sqrt(kii kjj)",
+}
+_PHYSICAL_VALUE_REPRESENTATIONS = frozenset(
+    {
+        "identity",
+        "identity_before_train_normalization",
+        "derived_speed_magnitude",
+    }
+)
+
+
+def available_case_numbers(frame: pd.DataFrame) -> tuple[int, ...]:
+    """Return authoritative dataset-local case numbers in DataFrame order."""
+    if frame.empty:
+        msg = "EDA case navigation requires a non-empty frame."
+        raise ValueError(msg)
+    numbers: list[int] = []
+    for sample_id in frame.index:
+        match = _CASE_ID_PATTERN.fullmatch(sample_id) if isinstance(sample_id, str) else None
+        if match is None:
+            msg = f"EDA case navigation requires canonical case IDs, got {sample_id!r}."
+            raise ValueError(msg)
+        numbers.append(int(match.group(1)))
+    if len(numbers) != len(set(numbers)):
+        msg = "EDA case navigation requires unique numeric case IDs."
+        raise ValueError(msg)
+    return tuple(numbers)
+
+
+def _case_row(frame: pd.DataFrame, case_number: int) -> pd.Series:
+    """Resolve one exact dataset-local case number without positional clamping."""
+    if isinstance(case_number, bool) or not isinstance(case_number, int):
+        msg = "case_number must be an integer."
+        raise TypeError(msg)
+    numbers = available_case_numbers(frame)
+    for sample_id, number in zip(frame.index, numbers, strict=True):
+        if number == case_number:
+            row = frame.loc[sample_id]
+            if not hasattr(row, "index"):
+                msg = f"Case ID {sample_id!r} did not resolve to one row."
+                raise RuntimeError(msg)
+            return row
+    msg = f"Requested case {case_number} is unavailable in this dataset. Choose a shared case number."
+    raise ValueError(msg)
 
 
 def _field_names(frame: pd.DataFrame) -> tuple[str, ...]:
@@ -64,13 +116,47 @@ def _field_names(frame: pd.DataFrame) -> tuple[str, ...]:
     return fields
 
 
+def _select_datasets(
+    datasets: dict[str, pd.DataFrame],
+    dataset_names: Sequence[str] | None,
+) -> dict[str, pd.DataFrame]:
+    """Select labelled frames in authoritative input order."""
+    if not datasets:
+        msg = "At least one EDA dataset is required."
+        raise ValueError(msg)
+    available = tuple(datasets)
+    requested = available if dataset_names is None else tuple(dataset_names)
+    if not requested:
+        msg = "Select at least one dataset."
+        raise ValueError(msg)
+    if len(requested) != len(set(requested)):
+        msg = "EDA dataset selection cannot contain duplicates."
+        raise ValueError(msg)
+    unknown = tuple(name for name in requested if name not in datasets)
+    if unknown:
+        msg = f"Unknown EDA dataset selection: {unknown!r}."
+        raise ValueError(msg)
+    requested_set = set(requested)
+    return {name: datasets[name] for name in available if name in requested_set}
+
+
+def _ordered_case_text(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> str:
+    """Describe exact included ordered-prefix counts without changing limits."""
+    counts = {label: min(max_cases, len(frame)) for label, frame in datasets.items()}
+    unique_counts = set(counts.values())
+    if len(unique_counts) == 1:
+        return f"first {next(iter(unique_counts))} ordered cases"
+    return ", ".join(f"{label} n={count}" for label, count in counts.items()) + " ordered cases"
+
+
 def _validate_datasets(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> tuple[str, ...]:
     """
     Admit comparable EDA frames and a positive ordered-prefix bound.
 
-    Every label/frame must be non-empty and expose identical task identity,
-    declared spectral fields, and complete physical-unit mappings. Dataset
-    fingerprint equality is not required because this view compares datasets.
+    Every label/frame must be non-empty and expose an identical TaskSpec
+    digest, declared spectral fields, physical-unit mappings, and stored-value
+    representations. Dataset fingerprint equality is not required because this
+    view compares datasets.
     """
     if not datasets:
         msg = "At least one EDA dataset is required."
@@ -80,26 +166,71 @@ def _validate_datasets(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> 
         raise ValueError(msg)
     reference_fields: tuple[str, ...] | None = None
     reference_units: object = None
+    reference_representations: object = None
     reference_task: object = None
+    reference_contract: object = None
     for label, frame in datasets.items():
         if not label or frame.empty:
             msg = "EDA datasets require non-empty labels and frames."
             raise ValueError(msg)
         fields = _field_names(frame)
         units = frame.attrs.get("field_units")
+        representations = frame.attrs.get("field_representations")
         task = frame.attrs.get("task_id")
-        if not isinstance(units, dict) or any(field not in units for field in fields) or not isinstance(task, str):
-            msg = "EDA spectra require task_id and field_units metadata."
+        contract = frame.attrs.get("task_contract_digest")
+        if (
+            not isinstance(units, dict)
+            or any(field not in units for field in fields)
+            or not isinstance(representations, dict)
+            or any(field not in representations for field in fields)
+            or not isinstance(task, str)
+            or not isinstance(contract, str)
+        ):
+            msg = "EDA spectra require task, contract, physical-unit, and stored-representation metadata."
             raise ValueError(msg)
         if reference_fields is None:
-            reference_fields, reference_units, reference_task = fields, units, task
-        elif fields != reference_fields or units != reference_units or task != reference_task:
-            msg = "EDA spectral comparisons require identical task fields and physical units."
+            reference_fields = fields
+            reference_units = units
+            reference_representations = representations
+            reference_task = task
+            reference_contract = contract
+        elif (
+            fields != reference_fields
+            or units != reference_units
+            or representations != reference_representations
+            or task != reference_task
+            or contract != reference_contract
+        ):
+            msg = "EDA spectral comparisons require one TaskSpec contract, field order, physical units, and stored representations."
             raise ValueError(msg)
     if reference_fields is None:
         msg = "EDA dataset validation did not establish field metadata."
         raise RuntimeError(msg)
     return reference_fields
+
+
+def _stored_representation_label(frame: pd.DataFrame, field: str) -> str:
+    """Return one explicit human-readable stored-value representation."""
+    representations = frame.attrs.get("field_representations")
+    raw_representation = representations.get(field) if isinstance(representations, dict) else None
+    if not isinstance(raw_representation, str):
+        msg = f"EDA field {field!r} has no stored-representation metadata."
+        raise TypeError(msg)
+    representation = raw_representation
+    return _DIMENSIONLESS_REPRESENTATION_LABELS.get(representation, representation)
+
+
+def _spectral_power_ylabel(frame: pd.DataFrame, field: str) -> str:
+    """Label spectral power from stored values, not pre-transform physical units."""
+    representations = frame.attrs["field_representations"]
+    representation = representations[field]
+    if representation in _DIMENSIONLESS_REPRESENTATION_LABELS:
+        return f"Mean spectral power [-]\nStored: {_stored_representation_label(frame, field)}"
+    if representation not in _PHYSICAL_VALUE_REPRESENTATIONS:
+        msg = f"EDA field {field!r} has unsupported stored representation {representation!r}."
+        raise ValueError(msg)
+    units = frame.attrs["field_units"]
+    return f"Mean spectral power [({units[field]})²]"
 
 
 def _spacing(row: pd.Series) -> tuple[float, float, str]:
@@ -177,6 +308,15 @@ def _spectra(field: np.ndarray, *, dx: float, dy: float) -> tuple[np.ndarray, np
     return radial_k, radial, x_k, x_energy, y_k, y_energy
 
 
+def _row_spectra(
+    row: pd.Series,
+    field: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
+    """Compute all maintained spectra for one exact EDA case row."""
+    dx, dy, coordinate_unit = _spacing(row)
+    return (*_spectra(np.asarray(row[field], dtype=float), dx=dx, dy=dy), coordinate_unit)
+
+
 def _case_spectra(
     frame: pd.DataFrame,
     field: str,
@@ -195,8 +335,7 @@ def _case_spectra(
     coordinates: list[np.ndarray | None] = [None, None, None]
     coordinate_unit = "m"
     for _index, row in selected.iterrows():
-        dx, dy, coordinate_unit = _spacing(row)
-        radial_k, radial, x_k, x_energy, y_k, y_energy = _spectra(np.asarray(row[field], dtype=float), dx=dx, dy=dy)
+        radial_k, radial, x_k, x_energy, y_k, y_energy, coordinate_unit = _row_spectra(row, field)
         for axis_index, (k_values, energy) in enumerate(((radial_k, radial), (x_k, x_energy), (y_k, y_energy))):
             reference = coordinates[axis_index]
             if reference is None:
@@ -221,55 +360,58 @@ def _case_spectra(
     )
 
 
+def _vertical_case_map(
+    row: pd.Series,
+    field: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Return one case's cross-stream spectral fractions by flow position."""
+    values = np.asarray(row[field], dtype=float)
+    x_grid = np.asarray(row["x"], dtype=float)
+    y_grid = np.asarray(row["y"], dtype=float)
+    if values.ndim != _MIN_GRID_SIZE or x_grid.shape != values.shape or y_grid.shape != values.shape:
+        msg = "Vertical spectral evolution requires field, x, and y arrays on the same 2D grid."
+        raise ValueError(msg)
+    if not np.isfinite(values).all() or not np.isfinite(x_grid).all() or not np.isfinite(y_grid).all():
+        msg = "Vertical spectral evolution requires finite field and coordinate arrays."
+        raise ValueError(msg)
+    x_values = np.median(x_grid, axis=0)
+    y_values = np.median(y_grid, axis=1)
+    if x_values.size < _MIN_GRID_SIZE or y_values.size < _MIN_GRID_SIZE:
+        msg = "Vertical spectral evolution requires at least two grid points per axis."
+        raise ValueError(msg)
+    dx_values = np.diff(x_values)
+    dy_values = np.diff(y_values)
+    if np.any(dx_values <= 0.0) or np.any(dy_values <= 0.0):
+        msg = "Vertical spectral evolution requires increasing rectilinear coordinates."
+        raise ValueError(msg)
+    dx = float(np.median(dx_values))
+    frequency = np.fft.rfftfreq(values.shape[1], d=dx)[1:]
+    centered = values - np.mean(values, axis=1, keepdims=True)
+    transformed = np.fft.rfft(centered * np.hanning(values.shape[1]), axis=1)[:, 1:]
+    power = np.abs(transformed) ** 2 / values.shape[1]
+    totals = np.sum(power, axis=1, keepdims=True)
+    fractions = np.divide(power, totals, out=np.zeros_like(power), where=totals > 0.0)
+    return frequency, y_values, fractions, "m"
+
+
 def _vertical_spectral_map(
     frame: pd.DataFrame,
     field: str,
     *,
     max_cases: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
-    """
-    Return median horizontal spectral fractions resolved by physical height.
-
-    Each horizontal row is mean-centered and Hann-windowed before the real FFT.
-    Power is normalized within that row, so the resulting map describes scale
-    composition rather than mixing the physical units of different task fields.
-    """
+    """Return median cross-stream spectral fractions resolved by flow position."""
     selected = frame.iloc[: min(max_cases, len(frame))]
     spectra: list[np.ndarray] = []
     reference_frequency: np.ndarray | None = None
     reference_height: np.ndarray | None = None
     coordinate_unit = "m"
     for _index, row in selected.iterrows():
-        values = np.asarray(row[field], dtype=float)
-        x_grid = np.asarray(row["x"], dtype=float)
-        y_grid = np.asarray(row["y"], dtype=float)
-        if values.ndim != _MIN_GRID_SIZE or x_grid.shape != values.shape or y_grid.shape != values.shape:
-            msg = "Vertical spectral evolution requires field, x, and y arrays on the same 2D grid."
-            raise ValueError(msg)
-        if not np.isfinite(values).all() or not np.isfinite(x_grid).all() or not np.isfinite(y_grid).all():
-            msg = "Vertical spectral evolution requires finite field and coordinate arrays."
-            raise ValueError(msg)
-        x_values = np.median(x_grid, axis=0)
-        y_values = np.median(y_grid, axis=1)
-        if x_values.size < _MIN_GRID_SIZE or y_values.size < _MIN_GRID_SIZE:
-            msg = "Vertical spectral evolution requires at least two grid points per axis."
-            raise ValueError(msg)
-        dx_values = np.diff(x_values)
-        dy_values = np.diff(y_values)
-        if np.any(dx_values <= 0.0) or np.any(dy_values <= 0.0):
-            msg = "Vertical spectral evolution requires increasing rectilinear coordinates."
-            raise ValueError(msg)
-        dx = float(np.median(dx_values))
-        frequency = np.fft.rfftfreq(values.shape[1], d=dx)[1:]
-        centered = values - np.mean(values, axis=1, keepdims=True)
-        transformed = np.fft.rfft(centered * np.hanning(values.shape[1]), axis=1)[:, 1:]
-        power = np.abs(transformed) ** 2 / values.shape[1]
-        totals = np.sum(power, axis=1, keepdims=True)
-        fractions = np.divide(power, totals, out=np.zeros_like(power), where=totals > 0.0)
+        frequency, height, fractions, coordinate_unit = _vertical_case_map(row, field)
         if reference_frequency is None:
             reference_frequency = frequency
-            reference_height = y_values
-        elif not np.allclose(reference_frequency, frequency) or reference_height is None or not np.allclose(reference_height, y_values):
+            reference_height = height
+        elif not np.allclose(reference_frequency, frequency) or reference_height is None or not np.allclose(reference_height, height):
             msg = "Vertical spectral aggregation requires identical grids within each dataset."
             raise ValueError(msg)
         spectra.append(fractions)
@@ -296,10 +438,19 @@ def _cumulative(energy: np.ndarray) -> np.ndarray:
     return np.divide(cumulative, totals, out=np.zeros_like(cumulative), where=totals > 0.0)
 
 
+def _set_log_frequency_axis(axis: Axes) -> None:
+    """Use readable major log ticks without dense minor-frequency labels."""
+    axis.set_xscale("log")
+    axis.xaxis.set_major_locator(mticker.LogLocator(base=10.0, numticks=5))
+    axis.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=tuple(float(value) for value in np.arange(2, 10) * 0.1), numticks=12))
+    axis.xaxis.set_minor_formatter(mticker.NullFormatter())
+
+
 def plot_isotropic_spectral_summary(
     *,
     datasets: dict[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
+    dataset_names: Sequence[str] | None = None,
 ) -> Figure:
     """
     Compare isotropic field spectra and cumulative bandwidth across datasets.
@@ -310,6 +461,8 @@ def plot_isotropic_spectral_summary(
         Task-compatible EDA frames with physical coordinates, fields, and units.
     max_cases : int, optional
         Positive bound on the stored ordered prefix aggregated per dataset.
+    dataset_names : collections.abc.Sequence[str] | None, optional
+        Explicit dataset labels to compare. Omission preserves all input labels.
 
     Returns
     -------
@@ -325,38 +478,79 @@ def plot_isotropic_spectral_summary(
 
     Notes
     -----
-    Power retains squared field units; cumulative energy is dimensionless. No
-    interpolation is used when within-frame frequency grids differ.
+    Power retains squared stored-value units; transformed dimensionless
+    representations remain dimensionless. Cumulative energy is dimensionless,
+    and no interpolation is used when within-frame frequency grids differ.
 
     """
-    fields = _validate_datasets(datasets, max_cases=max_cases)
+    selected_datasets = _select_datasets(datasets, dataset_names)
+    fields = _validate_datasets(selected_datasets, max_cases=max_cases)
     figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
     colors = plt.get_cmap("tab10")
-    units = next(iter(datasets.values())).attrs["field_units"]
+    reference_frame = next(iter(selected_datasets.values()))
     for field_index, field in enumerate(fields):
-        for dataset_index, (label, frame) in enumerate(datasets.items()):
-            radial_k, radial, _x_k, _x_energy, _y_k, _y_energy, count, coordinate_unit = _case_spectra(frame, field, max_cases=max_cases)
+        for dataset_index, (label, frame) in enumerate(selected_datasets.items()):
+            radial_k, radial, _x_k, _x_energy, _y_k, _y_energy, _count, coordinate_unit = _case_spectra(frame, field, max_cases=max_cases)
             color = colors(dataset_index % colors.N)
-            disclosed = f"{label}, n={count}"
-            _band(axes[field_index, 0], radial_k, radial, label=disclosed, color=color)
+            _band(axes[field_index, 0], radial_k, radial, label=label, color=color)
             cumulative = _cumulative(radial)
             q10, median, q90 = np.quantile(cumulative, (0.1, 0.5, 0.9), axis=0)
-            axes[field_index, 1].plot(radial_k[1:], median, color=color, label=disclosed)
+            axes[field_index, 1].plot(radial_k[1:], median, color=color, label=label)
             axes[field_index, 1].fill_between(radial_k[1:], q10, q90, color=color, alpha=0.18)
-        axes[field_index, 0].set_xscale("log")
+        _set_log_frequency_axis(axes[field_index, 0])
         axes[field_index, 0].set_yscale("log")
-        axes[field_index, 0].set_title(f"{field}: isotropic radial power")
-        axes[field_index, 0].set_xlabel(f"spatial frequency [1/{coordinate_unit}]")
-        axes[field_index, 0].set_ylabel(f"windowed radial mean power [{units[field]}^2]")
-        axes[field_index, 1].set_xscale("log")
+        axes[field_index, 0].set_title(f"{field}: isotropic power")
+        axes[field_index, 0].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
+        axes[field_index, 0].set_ylabel(_spectral_power_ylabel(reference_frame, field))
+        _set_log_frequency_axis(axes[field_index, 1])
         axes[field_index, 1].set_ylim(0.0, 1.02)
-        axes[field_index, 1].set_title(f"{field}: cumulative isotropic energy")
-        axes[field_index, 1].set_xlabel(f"spatial frequency [1/{coordinate_unit}]")
-        axes[field_index, 1].set_ylabel("cumulative energy fraction [1]")
+        axes[field_index, 1].set_title(f"{field}: cumulative energy")
+        axes[field_index, 1].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
+        axes[field_index, 1].set_ylabel("Cumulative energy [-]")
         for axis in axes[field_index]:
             axis.grid(alpha=0.25, which="both")
-            axis.legend(fontsize=7)
-    figure.suptitle(f"Dataset EDA: isotropic spectra and cumulative energy; first <= {max_cases} ordered cases")
+            axis.legend(fontsize=_LEGEND_FONT_SIZE)
+    case_text = _ordered_case_text(selected_datasets, max_cases=max_cases)
+    figure.suptitle(f"Isotropic spectra and cumulative energy — {case_text}")
+    return figure
+
+
+def plot_isotropic_spectral_case(
+    *,
+    datasets: dict[str, pd.DataFrame],
+    case_number: int,
+    dataset_names: Sequence[str] | None = None,
+) -> Figure:
+    """Compare one exact dataset-local case's isotropic spectra."""
+    selected_datasets = _select_datasets(datasets, dataset_names)
+    fields = _validate_datasets(selected_datasets, max_cases=1)
+    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    colors = plt.get_cmap("tab10")
+    reference_frame = next(iter(selected_datasets.values()))
+    for field_index, field in enumerate(fields):
+        coordinate_unit = "m"
+        for dataset_index, (label, frame) in enumerate(selected_datasets.items()):
+            row = _case_row(frame, case_number)
+            radial_k, radial, _x_k, _x_energy, _y_k, _y_energy, coordinate_unit = _row_spectra(row, field)
+            color = colors(dataset_index % colors.N)
+            valid = (radial_k > 0.0) & (radial > 0.0)
+            axes[field_index, 0].plot(radial_k[valid], radial[valid], color=color, label=label)
+            cumulative = _cumulative(radial[np.newaxis, :])[0]
+            axes[field_index, 1].plot(radial_k[1:], cumulative, color=color, label=label)
+        _set_log_frequency_axis(axes[field_index, 0])
+        axes[field_index, 0].set_yscale("log")
+        axes[field_index, 0].set_title(f"{field}: isotropic power")
+        axes[field_index, 0].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
+        axes[field_index, 0].set_ylabel(_spectral_power_ylabel(reference_frame, field))
+        _set_log_frequency_axis(axes[field_index, 1])
+        axes[field_index, 1].set_ylim(0.0, 1.02)
+        axes[field_index, 1].set_title(f"{field}: cumulative energy")
+        axes[field_index, 1].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
+        axes[field_index, 1].set_ylabel("Cumulative energy [-]")
+        for axis in axes[field_index]:
+            axis.grid(alpha=0.25, which="both")
+            axis.legend(fontsize=_LEGEND_FONT_SIZE)
+    figure.suptitle(f"Isotropic spectra and cumulative energy — case {case_number}")
     return figure
 
 
@@ -366,46 +560,69 @@ def _directional_axis(
     datasets: dict[str, pd.DataFrame],
     field: str,
     direction: str,
-    max_cases: int,
+    max_cases: int | None = None,
+    case_number: int | None = None,
 ) -> None:
-    """
-    Plot directional median power and cumulative energy on explicit twin axes.
-
-    The primary axis is log-log physical mean power with q10--q90 bands; the
-    secondary linear axis shows median cumulative non-DC energy. Dataset labels
-    disclose exact prefix counts.
-    """
+    """Plot one physical directional spectrum in aggregate or single-case scope."""
+    if (max_cases is None) == (case_number is None):
+        msg = "Directional spectra require exactly one aggregate bound or case number."
+        raise ValueError(msg)
     colors = plt.get_cmap("tab10")
     cumulative_axis = axis.twinx()
     coordinate_unit = "m"
     for dataset_index, (label, frame) in enumerate(datasets.items()):
-        _radial_k, _radial, x_k, x_energy, y_k, y_energy, count, coordinate_unit = _case_spectra(frame, field, max_cases=max_cases)
-        k_values, energy = (x_k, x_energy) if direction == "x" else (y_k, y_energy)
+        if case_number is None:
+            if max_cases is None:
+                msg = "Aggregate directional scope lost its case bound."
+                raise RuntimeError(msg)
+            _radial_k, _radial, x_k, x_energy, y_k, y_energy, _count, coordinate_unit = _case_spectra(
+                frame,
+                field,
+                max_cases=max_cases,
+            )
+        else:
+            row = _case_row(frame, case_number)
+            _radial_k, _radial, x_k, x_values, y_k, y_values, coordinate_unit = _row_spectra(row, field)
+            x_energy = x_values[np.newaxis, :]
+            y_energy = y_values[np.newaxis, :]
+        if direction == "y":
+            k_values, energy = y_k, y_energy
+        elif direction == "x":
+            k_values, energy = x_k, x_energy
+        else:
+            message = f"Unsupported spectral direction: {direction!r}."
+            raise ValueError(message)
         color = colors(dataset_index % colors.N)
-        disclosed = f"{label}, n={count}"
-        _band(axis, k_values, energy, label=f"{disclosed} power", color=color)
+        if case_number is None:
+            _band(axis, k_values, energy, label=f"{label} power", color=color)
+        else:
+            power = energy[0]
+            valid = (k_values > 0.0) & (power > 0.0)
+            axis.plot(k_values[valid], power[valid], color=color, label=f"{label} power")
         cumulative = _cumulative(energy)
-        median = np.quantile(cumulative, 0.5, axis=0)
-        cumulative_axis.plot(k_values[1:], median, color=color, linestyle="--", label=f"{disclosed} cumulative")
-    axis.set_xscale("log")
+        curve = np.quantile(cumulative, 0.5, axis=0) if case_number is None else cumulative[0]
+        cumulative_axis.plot(k_values[1:], curve, color=color, linestyle="--", label=f"{label} cumulative")
+    _set_log_frequency_axis(axis)
     axis.set_yscale("log")
-    axis.set_xlabel(f"{direction}-direction spatial frequency [1/{coordinate_unit}]")
-    axis.set_ylabel("directional mean power")
+    frequency_name = "ky" if direction == "y" else "kx"
+    axis.set_xlabel(f"Spatial frequency {frequency_name} [1/{coordinate_unit}]")
+    axis.set_ylabel(_spectral_power_ylabel(next(iter(datasets.values())), field))
     cumulative_axis.set_ylim(0.0, 1.02)
-    cumulative_axis.set_ylabel("cumulative energy fraction [1]")
+    cumulative_axis.set_ylabel("Cumulative energy [-]")
     axis.grid(alpha=0.25, which="both")
     handles, labels = axis.get_legend_handles_labels()
     cumulative_handles, cumulative_labels = cumulative_axis.get_legend_handles_labels()
-    axis.legend((*handles, *cumulative_handles), (*labels, *cumulative_labels), fontsize=6)
+    axis.legend((*handles, *cumulative_handles), (*labels, *cumulative_labels), fontsize=_LEGEND_FONT_SIZE)
 
 
 def plot_directional_spectral_summary(
     *,
     datasets: dict[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
+    dataset_names: Sequence[str] | None = None,
 ) -> Figure:
     """
-    Compare x- and y-direction spectral bandwidth across datasets.
+    Compare flow-direction y and cross-stream x spectra across datasets.
 
     Parameters
     ----------
@@ -413,11 +630,13 @@ def plot_directional_spectral_summary(
         Task-compatible EDA frames on internally identical Cartesian grids.
     max_cases : int, optional
         Positive bound on the stored ordered prefix aggregated per dataset.
+    dataset_names : collections.abc.Sequence[str] | None, optional
+        Explicit dataset labels to compare. Omission preserves all input labels.
 
     Returns
     -------
     matplotlib.figure.Figure
-        Separate x/y panels per non-coordinate field, with median directional
+        Separate flow-y/cross-stream-x panels per field, with median directional
         power, q10--q90 bands, cumulative energy, and disclosed case counts.
 
     Raises
@@ -431,19 +650,49 @@ def plot_directional_spectral_summary(
     scalar cross-direction score is calculated.
 
     """
-    fields = _validate_datasets(datasets, max_cases=max_cases)
+    selected_datasets = _select_datasets(datasets, dataset_names)
+    fields = _validate_datasets(selected_datasets, max_cases=max_cases)
     figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
     for field_index, field in enumerate(fields):
-        for axis_index, direction in enumerate(("x", "y")):
+        for axis_index, direction in enumerate(("y", "x")):
             _directional_axis(
                 axes[field_index, axis_index],
-                datasets=datasets,
+                datasets=selected_datasets,
                 field=field,
                 direction=direction,
                 max_cases=max_cases,
             )
-            axes[field_index, axis_index].set_title(f"{field}: {direction}-direction power and cumulative energy")
-    figure.suptitle(f"Dataset EDA: directional spectral bandwidth; first <= {max_cases} ordered cases")
+            title = "flow-direction spectrum (y)" if direction == "y" else "cross-stream spectrum (x)"
+            axes[field_index, axis_index].set_title(f"{field}: {title}")
+    case_text = _ordered_case_text(selected_datasets, max_cases=max_cases)
+    figure.suptitle(f"Directional spectra in flow and cross-stream directions — {case_text}")
+    return figure
+
+
+def plot_directional_spectral_case(
+    *,
+    datasets: dict[str, pd.DataFrame],
+    case_number: int,
+    dataset_names: Sequence[str] | None = None,
+) -> Figure:
+    """Compare one exact case along flow-y and cross-stream-x directions."""
+    selected_datasets = _select_datasets(datasets, dataset_names)
+    fields = _validate_datasets(selected_datasets, max_cases=1)
+    for frame in selected_datasets.values():
+        _case_row(frame, case_number)
+    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    for field_index, field in enumerate(fields):
+        for axis_index, direction in enumerate(("y", "x")):
+            _directional_axis(
+                axes[field_index, axis_index],
+                datasets=selected_datasets,
+                field=field,
+                direction=direction,
+                case_number=case_number,
+            )
+            title = "flow-direction spectrum (y)" if direction == "y" else "cross-stream spectrum (x)"
+            axes[field_index, axis_index].set_title(f"{field}: {title}")
+    figure.suptitle(f"Directional spectra in flow and cross-stream directions — case {case_number}")
     return figure
 
 
@@ -451,9 +700,10 @@ def plot_vertical_spectral_evolution(
     *,
     datasets: dict[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
+    dataset_names: Sequence[str] | None = None,
 ) -> Figure:
     """
-    Plot horizontal spectral composition as a function of physical height.
+    Plot cross-stream spectral composition along the physical flow direction.
 
     Parameters
     ----------
@@ -462,11 +712,13 @@ def plot_vertical_spectral_evolution(
         internally shared increasing Cartesian grid.
     max_cases : int, optional
         Positive bound on the stored ordered prefix aggregated per dataset.
+    dataset_names : collections.abc.Sequence[str] | None, optional
+        Explicit dataset labels to compare. Omission preserves all input labels.
 
     Returns
     -------
     matplotlib.figure.Figure
-        One frequency-height map per dataset and non-coordinate field. Values are
+        One cross-stream-frequency/flow-position map per dataset and field. Values are
         casewise median log10 row-normalized power fractions.
 
     Raises
@@ -482,16 +734,18 @@ def plot_vertical_spectral_evolution(
     it describes scale composition rather than absolute field power.
 
     """
-    fields = _validate_datasets(datasets, max_cases=max_cases)
+    selected_datasets = _select_datasets(datasets, dataset_names)
+    fields = _validate_datasets(selected_datasets, max_cases=max_cases)
+    case_text = _ordered_case_text(selected_datasets, max_cases=max_cases)
     figure, axes = plt.subplots(
         len(fields),
-        len(datasets),
-        figsize=(5.5 * len(datasets), 4.0 * len(fields)),
+        len(selected_datasets),
+        figsize=(5.5 * len(selected_datasets), 4.0 * len(fields)),
         squeeze=False,
         constrained_layout=True,
     )
     for field_index, field in enumerate(fields):
-        for dataset_index, (label, frame) in enumerate(datasets.items()):
+        for dataset_index, (label, frame) in enumerate(selected_datasets.items()):
             frequency, height, fractions, count, coordinate_unit = _vertical_spectral_map(
                 frame,
                 field,
@@ -500,11 +754,46 @@ def plot_vertical_spectral_evolution(
             log_fraction = np.log10(np.maximum(fractions, np.finfo(float).tiny))
             axis = axes[field_index, dataset_index]
             image = axis.pcolormesh(frequency, height, log_fraction, shading="auto", cmap="magma")
-            axis.set_xscale("log")
-            axis.set_title(f"{label}: {field}, n={count}")
-            axis.set_xlabel(f"horizontal spatial frequency [1/{coordinate_unit}]")
-            axis.set_ylabel(f"height [{coordinate_unit}]")
+            _set_log_frequency_axis(axis)
+            representation = _stored_representation_label(frame, field)
+            axis.set_title(f"{label}: {field} ({representation}), n={count}")
+            axis.set_xlabel(f"Cross-stream spatial frequency kx [1/{coordinate_unit}]")
+            axis.set_ylabel(f"Flow-direction position y [{coordinate_unit}]")
             colorbar = figure.colorbar(image, ax=axis)
-            colorbar.set_label("log10 row-normalized power fraction [1]")
-    figure.suptitle(f"Dataset EDA: horizontal spectral evolution with height; first <= {max_cases} ordered cases")
+            colorbar.set_label("log10 row-normalized power fraction [-]")
+    figure.suptitle(f"Cross-stream spectral evolution along the flow direction — {case_text}")
+    return figure
+
+
+def plot_vertical_spectral_case(
+    *,
+    datasets: dict[str, pd.DataFrame],
+    case_number: int,
+    dataset_names: Sequence[str] | None = None,
+) -> Figure:
+    """Compare one case's cross-stream spectral evolution across datasets."""
+    selected_datasets = _select_datasets(datasets, dataset_names)
+    fields = _validate_datasets(selected_datasets, max_cases=1)
+    figure, axes = plt.subplots(
+        len(fields),
+        len(selected_datasets),
+        figsize=(5.5 * len(selected_datasets), 4.0 * len(fields)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for field_index, field in enumerate(fields):
+        for dataset_index, (label, frame) in enumerate(selected_datasets.items()):
+            row = _case_row(frame, case_number)
+            frequency, height, fractions, coordinate_unit = _vertical_case_map(row, field)
+            log_fraction = np.log10(np.maximum(fractions, np.finfo(float).tiny))
+            axis = axes[field_index, dataset_index]
+            image = axis.pcolormesh(frequency, height, log_fraction, shading="auto", cmap="magma")
+            _set_log_frequency_axis(axis)
+            representation = _stored_representation_label(frame, field)
+            axis.set_title(f"{label}: {field} ({representation})")
+            axis.set_xlabel(f"Cross-stream spatial frequency kx [1/{coordinate_unit}]")
+            axis.set_ylabel(f"Flow-direction position y [{coordinate_unit}]")
+            colorbar = figure.colorbar(image, ax=axis)
+            colorbar.set_label("log10 row-normalized power fraction [-]")
+    figure.suptitle(f"Cross-stream spectral evolution along the flow direction — case {case_number}")
     return figure

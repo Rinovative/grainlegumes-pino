@@ -33,7 +33,7 @@ def _current_generic_frame(*, metadata: object, index: int = 0, source_index: in
     return pd.DataFrame(
         [
             {
-                "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+                "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
                 "task_id": "synthetic",
                 "output_fields": ["target"],
                 "output_units": ["1"],
@@ -64,7 +64,7 @@ def test_dataframe_reader_exposes_authoritative_normalized_aggregate() -> None:
     """
     enriched = analysis.evaluation.dataframe.build_eval_df(_current_generic_frame(metadata='{"label": "valid"}'))
 
-    assert enriched.attrs["artifact_schema_version"] == analysis.artifacts.ARTIFACT_SCHEMA_VERSION
+    assert enriched.attrs["artifact_schema_version"] == analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION
     assert enriched.attrs["output_fields"] == ("target",)
     assert enriched.attrs["normalized_macro_rmse"]["value"] == 0.0
 
@@ -184,8 +184,8 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
     provenance, while device, batch size, outputs, and aggregates must not.
     """
     provenance = {
-        "provenance_schema_version": analysis.artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
         "run": {
             "task_contract_digest": "task-a",
             "best_checkpoint_sha256": "checkpoint-a",
@@ -209,7 +209,7 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
         "generation": {"effective_case_limit": None},
         "runtime": {"requested_policy": "cpu", "resolved_device": "cpu", "batch_size": 1},
     }
-    baseline = analysis.artifact_service._scientific_provenance(provenance)
+    baseline = analysis.artifacts.service._scientific_provenance(provenance)
     mutations = [
         (("artifact_schema_version",), 999),
         (("run", "task_contract_digest"), "task-b"),
@@ -221,7 +221,7 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
         (("evaluator", "output_fields"), ["second", "first"]),
         (("physics", "residual_schema_version"), 2),
         (("physics", "selected_training_continuity"), "div_velocity"),
-        (("physics", "derivatives", "kind"), "finite_difference"),
+        (("physics", "derivatives", "kind"), "unsupported"),
         (("physics", "derivatives", "extension"), "none"),
         (("physics", "interior_crop"), 3),
         (("physics", "constants", "dynamic_viscosity_pa_s"), 2.0e-5),
@@ -236,7 +236,7 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
             target = target[key]
         assert isinstance(target, dict)
         target[keys[-1]] = replacement
-        assert analysis.artifact_service._scientific_provenance(changed) != baseline
+        assert analysis.artifacts.service._scientific_provenance(changed) != baseline
 
     operational = copy.deepcopy(provenance)
     operational["runtime"] = {
@@ -246,7 +246,7 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
     }
     operational["outputs"] = {"generated": "digest"}
     operational["aggregate"] = {"value": 123.0}
-    assert analysis.artifact_service._scientific_provenance(operational) == baseline
+    assert analysis.artifacts.service._scientific_provenance(operational) == baseline
 
 
 @pytest.mark.parametrize(
@@ -257,14 +257,14 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
 def test_artifact_provenance_requires_integer_version_one(schema_version: object) -> None:
     """Reject alternate representations in both artifact provenance version fields."""
     current: dict[str, object] = {
-        "provenance_schema_version": analysis.artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
     }
     for field in tuple(current):
         invalid = dict(current)
         invalid[field] = schema_version
-        with pytest.raises(analysis.artifact_service.ArtifactCacheError, match=field):
-            analysis.artifact_service._require_current_provenance_schema(invalid)
+        with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match=field):
+            analysis.artifacts.service._require_current_provenance_schema(invalid)
 
 
 def test_rebuild_removes_only_one_exact_target(tmp_path: Path) -> None:
@@ -282,17 +282,17 @@ def test_rebuild_removes_only_one_exact_target(tmp_path: Path) -> None:
         target.mkdir(parents=True)
         (target / "marker").write_text(target.name, encoding="utf-8")
 
-    analysis.artifact_service.rebuild_artifact_target(run_dir=run_dir, save_root=first_ood)
+    analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=first_ood)
 
     assert not first_ood.exists()
     assert (id_target / "marker").is_file()
     assert (second_ood / "marker").is_file()
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifact_service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis")
+        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis")
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifact_service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis" / "ood")
+        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis" / "ood")
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifact_service.rebuild_artifact_target(run_dir=run_dir, save_root=tmp_path / "outside")
+        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=tmp_path / "outside")
 
 
 def test_upload_gate_requires_an_explicit_complete_current_artifact(
@@ -310,12 +310,12 @@ def test_upload_gate_requires_an_explicit_complete_current_artifact(
     artifact_root.mkdir(parents=True)
     marker = artifact_root / "aggregate.parquet"
     marker.write_bytes(b"complete-local-artifact")
-    provenance_path = analysis.artifacts.artifact_provenance_path(artifact_root)
+    provenance_path = analysis.artifacts.contracts.artifact_provenance_path(artifact_root)
     provenance_path.write_text("{}\n", encoding="utf-8")
     outputs = {"aggregate.parquet": {"sha256": "a" * 64, "size_bytes": 23}}
     provenance = {
-        "provenance_schema_version": analysis.artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.ARTIFACT_SCHEMA_VERSION,
+        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
         "outputs": outputs,
         "run": {
             "name": "run-name",
@@ -335,27 +335,27 @@ def test_upload_gate_requires_an_explicit_complete_current_artifact(
         "config": {"run": {"name": "run-name"}},
     }
     monkeypatch.setattr(
-        analysis.artifact_service,
+        analysis.artifacts.service,
         "_read_artifact_provenance",
         lambda _path: provenance,
     )
     monkeypatch.setattr(
-        analysis.artifact_service,
+        analysis.artifacts.service,
         "_require_current_provenance_schema",
         lambda _provenance: None,
     )
     monkeypatch.setattr(
-        analysis.artifact_service.artifacts,
+        analysis.artifacts.service.contracts,
         "artifact_output_manifest",
         lambda _root: outputs,
     )
     monkeypatch.setattr(
-        analysis.artifact_service.experiments.run,
+        analysis.artifacts.service.experiments.run,
         "validate_completed_run",
         lambda _run_dir: completed,
     )
     monkeypatch.setattr(
-        analysis.artifact_service.experiments.config.loader,
+        analysis.artifacts.service.experiments.config.loader,
         "validate_resolved_task_contract",
         lambda _config: SimpleNamespace(
             id="steady_flow",
@@ -363,7 +363,7 @@ def test_upload_gate_requires_an_explicit_complete_current_artifact(
         ),
     )
 
-    validated = analysis.artifact_service.validate_artifact_upload_source(
+    validated = analysis.artifacts.service.validate_artifact_upload_source(
         run_dir=run_dir,
         artifact_root=artifact_root,
     )
@@ -371,12 +371,12 @@ def test_upload_gate_requires_an_explicit_complete_current_artifact(
     assert validated == provenance
     assert marker.read_bytes() == b"complete-local-artifact"
     monkeypatch.setattr(
-        analysis.artifact_service.artifacts,
+        analysis.artifacts.service.contracts,
         "artifact_output_manifest",
         lambda _root: {"aggregate.parquet": {"sha256": "stale"}},
     )
-    with pytest.raises(analysis.artifact_service.ArtifactCacheError, match="manifest mismatch"):
-        analysis.artifact_service.validate_artifact_upload_source(
+    with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match="manifest mismatch"):
+        analysis.artifacts.service.validate_artifact_upload_source(
             run_dir=run_dir,
             artifact_root=artifact_root,
         )
@@ -393,8 +393,8 @@ def test_unrelated_artifact_targets_use_independent_locks(tmp_path: Path) -> Non
     run_dir = tmp_path / "run"
     id_target = common.paths.resolve_id_analysis_dir(run_dir)
     ood_target = common.paths.resolve_ood_analysis_dir(run_dir, "other")
-    id_lock = analysis.artifact_service._artifact_lock_path(run_dir=run_dir, save_root=id_target)
-    ood_lock = analysis.artifact_service._artifact_lock_path(run_dir=run_dir, save_root=ood_target)
+    id_lock = analysis.artifacts.service._artifact_lock_path(run_dir=run_dir, save_root=id_target)
+    ood_lock = analysis.artifacts.service._artifact_lock_path(run_dir=run_dir, save_root=ood_target)
     assert id_lock.parent == common.paths.get_run_locks_root()
     assert ood_lock.parent == common.paths.get_run_locks_root()
     assert id_lock != ood_lock
@@ -435,7 +435,7 @@ def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
     (run_dir / "analysis").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifact_service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis" / "id")
+        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis" / "id")
 
     assert marker.read_text(encoding="utf-8") == "keep"
 
@@ -443,7 +443,7 @@ def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
     (target_symlink_run / "analysis").mkdir(parents=True)
     (target_symlink_run / "analysis" / "id").symlink_to(outside_target, target_is_directory=True)
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifact_service.rebuild_artifact_target(
+        analysis.artifacts.service.rebuild_artifact_target(
             run_dir=target_symlink_run,
             save_root=target_symlink_run / "analysis" / "id",
         )
@@ -456,7 +456,7 @@ def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
     sibling_marker.write_text("keep", encoding="utf-8")
     (sibling_run / "analysis" / "id").symlink_to(sibling_target, target_is_directory=True)
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifact_service.rebuild_artifact_target(
+        analysis.artifacts.service.rebuild_artifact_target(
             run_dir=sibling_run,
             save_root=sibling_run / "analysis" / "id",
         )
@@ -477,11 +477,11 @@ def test_atomic_publication_rejects_incomplete_stage_without_touching_target(
     target.mkdir(parents=True)
     marker = target / "complete.txt"
     marker.write_text("old", encoding="utf-8")
-    stage = analysis.artifact_service._create_artifact_staging_root(target)
+    stage = analysis.artifacts.service._create_artifact_staging_root(target)
     (stage / "partial.txt").write_text("partial", encoding="utf-8")
 
-    with pytest.raises(analysis.artifact_service.ArtifactCacheError, match="completion marker"):
-        analysis.artifact_service._publish_staged_artifact(
+    with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match="completion marker"):
+        analysis.artifacts.service._publish_staged_artifact(
             run_dir=run_dir,
             save_root=target,
             staging_root=stage,
@@ -506,8 +506,8 @@ def test_atomic_publication_rolls_back_when_replacement_fails(
     target.mkdir(parents=True)
     marker = target / "complete.txt"
     marker.write_text("old", encoding="utf-8")
-    stage = analysis.artifact_service._create_artifact_staging_root(target)
-    analysis.artifacts.artifact_provenance_path(stage).write_text("{}\n", encoding="utf-8")
+    stage = analysis.artifacts.service._create_artifact_staging_root(target)
+    analysis.artifacts.contracts.artifact_provenance_path(stage).write_text("{}\n", encoding="utf-8")
     (stage / "new.txt").write_text("new", encoding="utf-8")
     original_replace = Path.replace
 
@@ -520,7 +520,7 @@ def test_atomic_publication_rolls_back_when_replacement_fails(
 
     monkeypatch.setattr(Path, "replace", fail_stage_replace)
     with pytest.raises(OSError, match="injected publication failure"):
-        analysis.artifact_service._publish_staged_artifact(
+        analysis.artifacts.service._publish_staged_artifact(
             run_dir=run_dir,
             save_root=target,
             staging_root=stage,
@@ -550,21 +550,21 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
     marker.write_text("old", encoding="utf-8")
 
     monkeypatch.setattr(
-        analysis.artifact_service,
+        analysis.artifacts.service,
         "_build_artifact_request",
-        lambda **_kwargs: analysis.artifact_service.ArtifactRequest(
+        lambda **_kwargs: analysis.artifacts.service.ArtifactRequest(
             provenance={"request": "replacement"},
             source_indices=(0,),
         ),
     )
-    monkeypatch.setattr(analysis.artifact_service, "_load_run_config", lambda _run_dir: {})
+    monkeypatch.setattr(analysis.artifacts.service, "_load_run_config", lambda _run_dir: {})
     monkeypatch.setattr(
-        analysis.artifact_service.experiments.config.loader,
+        analysis.artifacts.service.experiments.config.loader,
         "validate_resolved_task_contract",
         lambda _config: object(),
     )
     monkeypatch.setattr(
-        analysis.artifact_service.learning.inference.context,
+        learning.inference.context,
         "load_inference_context_with_resolution",
         lambda **_kwargs: (object(), object(), object(), None),
     )
@@ -574,11 +574,11 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
         message = "injected generation failure"
         raise RuntimeError(message)
 
-    monkeypatch.setattr(analysis.artifact_service.artifacts, "generate_artifacts", fail_generation)
-    monkeypatch.setattr(analysis.artifact_service, "cleanup_runtime", lambda _device: None)
+    monkeypatch.setattr(analysis.artifacts.service.generation, "generate_artifacts", fail_generation)
+    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", lambda _device: None)
 
     with pytest.raises(RuntimeError, match="injected generation failure"):
-        analysis.artifact_service._run_or_load_artifacts_locked(
+        analysis.artifacts.service._run_or_load_artifacts_locked(
             run_dir=run_dir,
             dataset_name="dataset",
             split="eval",
@@ -602,7 +602,7 @@ def test_requested_run_names_cannot_escape_discovery_root(tmp_path: Path) -> Non
     discovery, preventing explicit selection from bypassing containment.
     """
     with pytest.raises(ValueError, match="single non-empty path component"):
-        list(analysis.artifact_service.iter_run_dirs(tmp_path, run_names=["../outside"]))
+        list(analysis.artifacts.service.iter_run_dirs(tmp_path, run_names=["../outside"]))
 
 
 def _require_generation(value: object) -> int:
@@ -626,7 +626,7 @@ def _run_artifact_worker(arguments: dict[str, Any], outcomes: Any) -> None:
     stable type-and-message tuple that the parent process can assert on.
     """
     try:
-        frame = analysis.artifact_service.run_or_load_artifacts(**arguments)
+        frame = analysis.artifacts.service.run_or_load_artifacts(**arguments)
         outcomes.put(("ok", _require_generation(frame.loc[0, "generation"])))
     except Exception as error:
         outcomes.put(("error", f"{type(error).__name__}: {error}"))
@@ -648,7 +648,7 @@ def test_discovery_rejects_every_malformed_child_run_marker(
     (malformed / marker_name).touch()
 
     with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
-        list(analysis.artifact_service.iter_run_dirs(tmp_path))
+        list(analysis.artifacts.service.iter_run_dirs(tmp_path))
 
 
 def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
@@ -672,9 +672,9 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     save_root = common.paths.resolve_id_analysis_dir(run_dir)
-    provenance_path = analysis.artifacts.artifact_provenance_path(save_root)
+    provenance_path = analysis.artifacts.contracts.artifact_provenance_path(save_root)
 
-    original_completion_identity = analysis.artifact_service._completion_marker_identity
+    original_completion_identity = analysis.artifacts.service._completion_marker_identity
     observed_initial_completion = False
 
     def completion_identity(path: Path) -> tuple[int, int, int, int] | None:
@@ -685,9 +685,9 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
             request_barrier.wait(timeout=10)
         return original_completion_identity(path)
 
-    def build_request(**_kwargs: Any) -> analysis.artifact_service.ArtifactRequest:
+    def build_request(**_kwargs: Any) -> analysis.artifacts.service.ArtifactRequest:
         """Return the shared scientific request used by both workers."""
-        return analysis.artifact_service.ArtifactRequest(
+        return analysis.artifacts.service.ArtifactRequest(
             provenance={"request": "shared"},
             source_indices=(0,),
         )
@@ -698,7 +698,7 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
 
     def load_validated_cache(**kwargs: Any) -> pd.DataFrame:
         """Load generation one only after its completion marker is public."""
-        completion = analysis.artifacts.artifact_provenance_path(Path(kwargs["save_root"]))
+        completion = analysis.artifacts.contracts.artifact_provenance_path(Path(kwargs["save_root"]))
         if not completion.is_file():
             msg = "completion marker missing"
             raise RuntimeError(msg)
@@ -718,17 +718,17 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
             raise TimeoutError(msg)
         stage_root = Path(kwargs["save_root"])
         stage_root.mkdir(parents=True, exist_ok=True)
-        analysis.artifacts.artifact_provenance_path(stage_root).write_text("{}\n", encoding="utf-8")
+        analysis.artifacts.contracts.artifact_provenance_path(stage_root).write_text("{}\n", encoding="utf-8")
 
-    monkeypatch.setattr(analysis.artifact_service, "_completion_marker_identity", completion_identity)
-    monkeypatch.setattr(analysis.artifact_service, "_build_artifact_request", build_request)
-    monkeypatch.setattr(analysis.artifact_service, "_cache_has_outputs", cache_has_outputs)
-    monkeypatch.setattr(analysis.artifact_service, "_load_validated_artifact_cache", load_validated_cache)
-    monkeypatch.setattr(analysis.artifact_service, "_load_run_config", lambda _run_dir: {})
-    monkeypatch.setattr(analysis.artifact_service.experiments.config.loader, "validate_resolved_task_contract", lambda _config: object())
-    monkeypatch.setattr(analysis.artifact_service.learning.inference.context, "load_inference_context_with_resolution", load_context)
-    monkeypatch.setattr(analysis.artifact_service.artifacts, "generate_artifacts", generate)
-    monkeypatch.setattr(analysis.artifact_service, "cleanup_runtime", lambda _device: None)
+    monkeypatch.setattr(analysis.artifacts.service, "_completion_marker_identity", completion_identity)
+    monkeypatch.setattr(analysis.artifacts.service, "_build_artifact_request", build_request)
+    monkeypatch.setattr(analysis.artifacts.service, "_cache_has_outputs", cache_has_outputs)
+    monkeypatch.setattr(analysis.artifacts.service, "_load_validated_artifact_cache", load_validated_cache)
+    monkeypatch.setattr(analysis.artifacts.service, "_load_run_config", lambda _run_dir: {})
+    monkeypatch.setattr(analysis.artifacts.service.experiments.config.loader, "validate_resolved_task_contract", lambda _config: object())
+    monkeypatch.setattr(learning.inference.context, "load_inference_context_with_resolution", load_context)
+    monkeypatch.setattr(analysis.artifacts.service.generation, "generate_artifacts", generate)
+    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", lambda _device: None)
 
     arguments = {
         "run_dir": run_dir,
@@ -776,7 +776,7 @@ def test_rebuild_waiter_recovers_after_prior_generator_removed_completion(
     captured: dict[str, bool] = {}
 
     monkeypatch.setattr(
-        analysis.artifact_service,
+        analysis.artifacts.service,
         "_completion_marker_identity",
         lambda _path: next(observations),
     )
@@ -786,8 +786,8 @@ def test_rebuild_waiter_recovers_after_prior_generator_removed_completion(
         captured["rebuild"] = bool(kwargs["rebuild"])
         return pd.DataFrame([{"ok": 1}])
 
-    monkeypatch.setattr(analysis.artifact_service, "_run_or_load_artifacts_locked", run_locked)
-    analysis.artifact_service.run_or_load_artifacts(
+    monkeypatch.setattr(analysis.artifacts.service, "_run_or_load_artifacts_locked", run_locked)
+    analysis.artifacts.service.run_or_load_artifacts(
         run_dir=tmp_path / "run",
         dataset_name="dataset",
         split="eval",
@@ -827,13 +827,13 @@ def test_artifact_operation_waits_for_the_active_run_writer(
         executed.set()
         return pd.DataFrame([{"ok": 1}])
 
-    monkeypatch.setattr(analysis.artifact_service, "_completion_marker_identity", completion_identity)
-    monkeypatch.setattr(analysis.artifact_service, "_run_or_load_artifacts_locked", run_locked)
+    monkeypatch.setattr(analysis.artifacts.service, "_completion_marker_identity", completion_identity)
+    monkeypatch.setattr(analysis.artifacts.service, "_run_or_load_artifacts_locked", run_locked)
 
     def build() -> None:
         """Run the artifact request in a thread and retain unexpected errors."""
         try:
-            analysis.artifact_service.run_or_load_artifacts(
+            analysis.artifacts.service.run_or_load_artifacts(
                 run_dir=run_dir,
                 dataset_name="dataset",
                 split="eval",

@@ -12,7 +12,7 @@ Responsibilities:
 Design principles:
   - Task-fixed semantics have one immutable source of truth
   - Physical units remain distinct from stored/model representations
-  - Channel counts, objective identity, and contract digests are deterministic
+  - Channel counts, metric identities, and contract digests are deterministic
 
 This module does NOT:
   - Register tasks or declare a concrete task's fields and defaults
@@ -116,14 +116,14 @@ class FieldSpec:
 @dataclass(frozen=True, slots=True)
 class DatasetDefaults:
     """
-    Describe logical dataset identifiers selected by a task.
+    Describe fallback dataset identifiers for configs that omit selection.
 
     Attributes
     ----------
     train : str
-        Default training dataset identifier.
+        Fallback training dataset identifier.
     ood : tuple[str, ...]
-        Ordered default out-of-distribution dataset identifiers.
+        Ordered fallback out-of-distribution dataset identifiers.
 
     Raises
     ------
@@ -225,7 +225,7 @@ class MetricSpec:
     Attributes
     ----------
     id : str
-        Unique objective/reporting identifier within the task config.
+        Unique metric/reporting identifier within the task config.
     kind : str
         Semantic metric implementation identifier.
     space : MetricSpace
@@ -394,13 +394,13 @@ class TaskSpec:
     normalization_axes : tuple[int, ...]
         Axes used to fit per-channel normalization.
     default_datasets : DatasetDefaults
-        Logical default train and OOD datasets.
+        Fallback train and OOD datasets used when a config omits selection.
     preprocessing : PreprocessingSpec
         Task-owned preprocessing assumptions.
     data_losses : tuple[str, ...]
         Allowed semantic data-loss kinds.
     default_metrics : tuple[MetricSpec, ...]
-        Default semantic evaluation metrics and objective ordering.
+        Default semantic evaluation metrics. Declaration order has no model-selection meaning.
     physics : PhysicsSpec
         Task-owned physics selector.
 
@@ -415,9 +415,9 @@ class TaskSpec:
 
     Notes
     -----
-    The first ``default_metrics`` entry is the default objective. Contract
-    payloads and SHA-256 digests preserve declaration order and contain no
-    mutable runtime state.
+    Contract payloads and SHA-256 digests preserve metric declaration order and
+    contain no mutable runtime state. Executable requests select objectives by
+    exact metric ID; tuple position never selects a model.
 
     """
 
@@ -562,19 +562,6 @@ class TaskSpec:
 
         """
         return len(self.operator_axes)
-
-    @property
-    def default_objective(self) -> MetricSpec:
-        """
-        Return the task default evaluation objective.
-
-        Returns
-        -------
-        MetricSpec
-            First declared default metric.
-
-        """
-        return self.default_metrics[0]
 
     def field(self, name: str) -> FieldSpec:
         """

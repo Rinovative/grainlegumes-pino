@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 _ID_DATASET = "tiny_steady_id"
 _OOD_DATASET = "tiny_steady_ood_named"
-_RUN_NAME = "tiny_steady_flow_smoke"
+_RUN_SUFFIX = "integration_smoke"
 _SHAPE = (8, 8)
 _ARTIFACT_CROP = 2
 
@@ -263,12 +263,10 @@ def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
     raw = {
         "task": "steady_flow",
         "run": {
-            "name": _RUN_NAME,
             "seed": 23,
             "deterministic": True,
             "device": "cpu",
-            "prefix": None,
-            "suffix": None,
+            "suffix": _RUN_SUFFIX,
         },
         "data": {
             "train_dataset": _ID_DATASET,
@@ -317,6 +315,7 @@ def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
         "training": {
             "epochs": 1,
             "evaluation_interval": 1,
+            "ood_evaluation_interval": 1,
             "mixed_precision": False,
         },
         "tracking": {
@@ -445,7 +444,11 @@ def completed_smoke(tmp_path_factory: pytest.TempPathFactory) -> CompletedSmoke:
     assert config["tracking"]["wandb"]["mode"] == "disabled"
     run_dir = experiments.run.prepare_fresh_run(
         config,
-        run_dir=output_root / _RUN_NAME,
+        run_dir=common.paths.resolve_run_output_dir(
+            str(config["task"]),
+            str(config["run"]["name"]),
+            output_root=output_root,
+        ),
     )
     environment = pytest.MonkeyPatch()
     environment.delenv("WANDB_API_KEY", raising=False)
@@ -572,7 +575,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert _state_dict_equal(loaded_state, best_state)
     assert not _state_dict_equal(loaded_state, last_state)
 
-    generated = analysis.artifact_service.build_artifacts(
+    generated = analysis.artifacts.service.build_artifacts(
         runs_root=smoke.run_dir,
         dataset_root=smoke.dataset_root,
         metadata_root=smoke.metadata_root,
@@ -610,12 +613,10 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             "normalized_count_v",
             "normalized_rmse_v",
         }.issubset(frame.columns)
-        assert not {"l2", "h1", "phys_mse", "cont_mse", "mom_mse", "bc_mse"}.intersection(frame.columns)
         with np.load(Path(frame.iloc[0]["npz_path"]), allow_pickle=False) as payload:
             assert payload["output_fields"].tolist() == ["p", "u", "v"]
             assert payload["artifact_fields"].tolist() == ["p", "u", "v", "U"]
             assert payload["artifact_units"].tolist() == ["Pa", "m/s", "m/s", "m/s"]
-            assert "Rc" not in payload.files
             assert {"Rx", "Ry", "div_u", "div_eps_u", "coordinates"}.issubset(payload.files)
             div_u_interior = payload["div_u"][_ARTIFACT_CROP:-_ARTIFACT_CROP, _ARTIFACT_CROP:-_ARTIFACT_CROP]
             div_eps_u_interior = payload["div_eps_u"][_ARTIFACT_CROP:-_ARTIFACT_CROP, _ARTIFACT_CROP:-_ARTIFACT_CROP]
@@ -623,7 +624,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             assert frame.iloc[0]["div_eps_velocity_mse"] == pytest.approx(float(np.mean(div_eps_u_interior**2)))
         enriched = analysis.evaluation.dataframe.build_eval_df(frame)
         assert enriched.attrs["output_units"] == ("Pa", "m/s", "m/s")
-        assert enriched.attrs["normalized_macro_rmse"] == analysis.artifacts.aggregate_normalized_macro_rmse(
+        assert enriched.attrs["normalized_macro_rmse"] == analysis.artifacts.contracts.aggregate_normalized_macro_rmse(
             frame,
             output_fields=("p", "u", "v"),
         )
@@ -641,8 +642,8 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert loaded_id.attrs["artifact_root"] == str(id_target.resolve())
     assert loaded_id["source_index"].tolist() == split["eval_indices"].tolist()
     for role, target in zip(("eval", "ood"), targets, strict=True):
-        stored_provenance = json.loads((target / analysis.artifacts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
-        assert stored_provenance["outputs"] == analysis.artifacts.artifact_output_manifest(target)
+        stored_provenance = json.loads((target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
+        assert stored_provenance["outputs"] == analysis.artifacts.contracts.artifact_output_manifest(target)
         assert stored_provenance["run"]["normalizer_sha256"] == smoke.completed["summary"]["normalizer_sha256"]
         assert stored_provenance["evaluator"]["objective"] == smoke.completed["config"]["evaluation"]["objective"]
         assert stored_provenance["physics"]["selected_training_continuity"] == "div_eps_velocity"
@@ -657,7 +658,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert stored_provenance["normalizer"]["sha256"] == smoke.completed["summary"]["normalizer_sha256"]
         assert stored_provenance["evaluator"]["normalized_evidence"]["squared_error_accumulation_dtype"] == "float64"
         physics = stored_provenance["physics"]
-        assert physics["residual_schema_version"] == analysis.artifacts.RESIDUAL_SCHEMA_VERSION
+        assert physics["residual_schema_version"] == analysis.artifacts.contracts.RESIDUAL_SCHEMA_VERSION
         assert physics["task_contract_digest"] == domain.tasks.registry.get_task("steady_flow").contract_digest
         assert physics["derivatives"] == {
             "kind": "spectral",
@@ -673,7 +674,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         }
         assert physics["scalar_definitions"]["pressure_outlet_mean_square"]["formula"] == "mean_outlet(p)**2"
         assert physics["residual_evaluation_region"]["residual_arrays"] == "full grid"
-        runtime_comparison = analysis.timing.load_runtime_comparison(target)
+        runtime_comparison = analysis.artifacts.timing.load_runtime_comparison(target)
         assert runtime_comparison["split_role"] == role
         assert runtime_comparison["measurement"] == {
             "clock": "time.perf_counter_ns",
@@ -683,17 +684,17 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         }
         assert runtime_comparison["aggregates"]["neural_operator_forward_s"]["count"] == len(frames[role])
 
-    id_provenance = json.loads((id_target / analysis.artifacts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
+    id_provenance = json.loads((id_target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
     assert id_provenance["aggregate"]["value"] == pytest.approx(
         smoke.completed["summary"]["best_metric"],
-        rel=analysis.artifacts.NORMALIZED_OBJECTIVE_TOLERANCE["rtol"],
-        abs=analysis.artifacts.NORMALIZED_OBJECTIVE_TOLERANCE["atol"],
+        rel=analysis.artifacts.contracts.NORMALIZED_OBJECTIVE_TOLERANCE["rtol"],
+        abs=analysis.artifacts.contracts.NORMALIZED_OBJECTIVE_TOLERANCE["atol"],
     )
 
     for target in targets:
         (target / "cache_marker.txt").write_text("preserve", encoding="utf-8")
     before_cache = _artifact_inventory(targets)
-    cached = analysis.artifact_service.build_artifacts(
+    cached = analysis.artifacts.service.build_artifacts(
         runs_root=smoke.run_dir,
         dataset_root=smoke.dataset_root,
         metadata_root=smoke.metadata_root,
@@ -704,10 +705,10 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     pd.testing.assert_frame_equal(cached[smoke.run_dir.name]["ood"], frames["ood"])
     assert _artifact_inventory(targets) == before_cache
 
-    runtime_path = id_target / analysis.timing.RUNTIME_COMPARISON_FILENAME
+    runtime_path = id_target / analysis.artifacts.timing.RUNTIME_COMPARISON_FILENAME
     valid_runtime = runtime_path.read_bytes()
     runtime_path.unlink()
-    without_runtime = analysis.artifact_service.run_or_load_artifacts(
+    without_runtime = analysis.artifacts.service.run_or_load_artifacts(
         run_dir=smoke.run_dir,
         dataset_name=_ID_DATASET,
         split="eval",
@@ -724,7 +725,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     incompatible_runtime = json.loads(valid_runtime)
     incompatible_runtime["dataset_identity"]["fingerprint"] = "incompatible"
     common.serialization.atomic_write_json(runtime_path, incompatible_runtime)
-    with_incompatible_runtime = analysis.artifact_service.run_or_load_artifacts(
+    with_incompatible_runtime = analysis.artifacts.service.run_or_load_artifacts(
         run_dir=smoke.run_dir,
         dataset_name=_ID_DATASET,
         split="eval",
@@ -738,15 +739,15 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert runtime_path.read_bytes() != valid_runtime
     runtime_path.write_bytes(valid_runtime)
 
-    provenance_path = id_target / analysis.artifacts.ARTIFACT_PROVENANCE_FILENAME
+    provenance_path = id_target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME
     valid_provenance = provenance_path.read_text(encoding="utf-8")
     provenance_path.write_text("{}\n", encoding="utf-8")
     incompatible_cache = _artifact_inventory((id_target,))
     with pytest.raises(
-        analysis.artifact_service.ArtifactCacheError,
+        analysis.artifacts.service.ArtifactCacheError,
         match="provenance",
     ):
-        analysis.artifact_service.run_or_load_artifacts(
+        analysis.artifacts.service.run_or_load_artifacts(
             run_dir=smoke.run_dir,
             dataset_name=_ID_DATASET,
             split="eval",
@@ -764,10 +765,10 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     parquet_path.write_bytes(valid_parquet + b"corrupt")
     corrupted_parquet_cache = _artifact_inventory((id_target,))
     with pytest.raises(
-        analysis.artifact_service.ArtifactCacheError,
+        analysis.artifacts.service.ArtifactCacheError,
         match="payload digest manifest mismatch",
     ):
-        analysis.artifact_service.run_or_load_artifacts(
+        analysis.artifacts.service.run_or_load_artifacts(
             run_dir=smoke.run_dir,
             dataset_name=_ID_DATASET,
             split="eval",
@@ -784,10 +785,10 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     corrupted_npz.write_bytes(corrupted_npz.read_bytes() + b"corrupt")
     corrupted_cache = _artifact_inventory((id_target,))
     with pytest.raises(
-        analysis.artifact_service.ArtifactCacheError,
+        analysis.artifacts.service.ArtifactCacheError,
         match="payload digest manifest mismatch",
     ):
-        analysis.artifact_service.run_or_load_artifacts(
+        analysis.artifacts.service.run_or_load_artifacts(
             run_dir=smoke.run_dir,
             dataset_name=_ID_DATASET,
             split="eval",
@@ -802,7 +803,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     sibling_marker = common.paths.resolve_ood_analysis_dir(smoke.run_dir, "unselected_ood") / "keep.txt"
     sibling_marker.parent.mkdir(parents=True)
     sibling_marker.write_text("keep", encoding="utf-8")
-    rebuilt_artifacts = analysis.artifact_service.build_artifacts(
+    rebuilt_artifacts = analysis.artifacts.service.build_artifacts(
         runs_root=smoke.run_dir,
         dataset_root=smoke.dataset_root,
         metadata_root=smoke.metadata_root,

@@ -32,7 +32,7 @@ from matplotlib.figure import Figure
 from . import analysis_ui_components as components
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     import pandas as pd
 
@@ -350,6 +350,9 @@ def make_interactive_case_viewer(
         n_cases=n_cases_active,
         start_idx=start_idx,
     )
+    if not isinstance(case_index, widgets.BoundedIntText):
+        msg = "Contiguous case navigation must provide a bounded integer text control."
+        raise TypeError(msg)
 
     # ------------------------------------------------------------------
     # Output container
@@ -551,3 +554,208 @@ def make_casecount_viewer(
     )
 
     return widgets.VBox([header, out])
+
+
+# =============================================================================
+# 3) DATASET CASE-SCOPE VIEWER (aggregate and synchronized single cases)
+# =============================================================================
+
+
+def make_dataset_case_scope_viewer(  # noqa: C901, PLR0915
+    *,
+    datasets: dict[str, pd.DataFrame],
+    case_numbers_by_dataset: Mapping[str, Sequence[int]],
+    single_plot_func: Callable[..., Any],
+    aggregate_plot_func: Callable[..., Any] | None = None,
+    start_cases: int = 100,
+    step_size: int = 50,
+) -> widgets.VBox:
+    """Render selected datasets in aggregate or synchronized case-number scope."""
+    if not datasets or any(frame.empty for frame in datasets.values()):
+        msg = "Dataset case viewers require non-empty labelled frames."
+        raise ValueError(msg)
+    if tuple(case_numbers_by_dataset) != tuple(datasets):
+        msg = "Case-number metadata must match dataset labels and order."
+        raise ValueError(msg)
+    normalized_numbers = {name: tuple(case_numbers_by_dataset[name]) for name in datasets}
+    if any(not numbers for numbers in normalized_numbers.values()):
+        msg = "Every dataset must expose at least one navigable case number."
+        raise ValueError(msg)
+
+    selector = cast("components.CheckboxGroup", components.ui_checkbox_datasets(dataset_names=list(datasets)))
+    selected_names = list(datasets)
+
+    def _shared_numbers(names: Sequence[str]) -> tuple[int, ...]:
+        """Preserve the first selected manifest order while intersecting IDs."""
+        if not names:
+            return ()
+        shared = set(normalized_numbers[names[0]])
+        for name in names[1:]:
+            shared.intersection_update(normalized_numbers[name])
+        return tuple(number for number in normalized_numbers[names[0]] if number in shared)
+
+    shared_numbers = _shared_numbers(selected_names)
+    if not shared_numbers:
+        msg = "Initially selected datasets have no shared case numbers."
+        raise ValueError(msg)
+    case_number, previous_case, next_case = components.ui_step_case_index(case_numbers=shared_numbers)
+    max_cases = min(len(datasets[name]) for name in selected_names)
+    case_count, fewer_cases, more_cases = components.ui_step_case_count(
+        start_cases=min(start_cases, max_cases),
+        min_cases=1,
+        max_cases=max_cases,
+        step_size=step_size,
+    )
+    scope = None
+    if aggregate_plot_func is not None:
+        scope = widgets.ToggleButtons(
+            options=(("Aggregate", "aggregate"), ("Single case", "single")),
+            value="aggregate",
+        )
+    controls = widgets.HBox(layout=widgets.Layout(align_items="center"))
+    output = components.ui_output_plot()
+    state = {"updating": False}
+    case_state = {"options": shared_numbers, "last_valid": case_number.value}
+
+    def _active_names() -> list[str]:
+        """Return checked dataset labels in stable input order."""
+        return [name for name, checkbox in selector.boxes.items() if checkbox.value]
+
+    def _show_message(message: str) -> None:
+        """Replace the current result with one actionable selection message."""
+        with output:
+            output.clear_output(wait=True)
+            print(message)
+
+    def _single_scope() -> bool:
+        """Return whether the current viewer renders individual cases."""
+        return scope is None or scope.value == "single"
+
+    def _sync_case_buttons() -> None:
+        """Disable case arrows exactly at the current sparse-option bounds."""
+        options = case_state["options"]
+        if not options or case_number.value not in options:
+            previous_case.disabled = True
+            next_case.disabled = True
+            return
+        position = options.index(case_number.value)
+        previous_case.disabled = position == 0
+        next_case.disabled = position == len(options) - 1
+
+    def _update_controls() -> None:
+        """Expose only controls relevant to the active scientific scope."""
+        prefix: list[widgets.Widget] = [] if scope is None else [scope]
+        if _single_scope():
+            controls.children = (*prefix, case_number, previous_case, next_case, selector)
+        else:
+            controls.children = (*prefix, case_count, fewer_cases, more_cases, selector)
+
+    def _render() -> None:
+        """Render once from the current validated selection state."""
+        if state["updating"]:
+            return
+        names = _active_names()
+        if not names:
+            _show_message("Select at least one dataset.")
+            return
+        selected = {name: datasets[name] for name in names}
+        if _single_scope():
+            shared = _shared_numbers(names)
+            if not shared:
+                _show_message("Selected datasets have no shared case numbers. Choose a different dataset combination.")
+                return
+            if case_number.value not in shared:
+                _show_message("Enter a case number shared by every selected dataset, or use the arrows.")
+                return
+            _render_figure(
+                out=output,
+                plot_func=single_plot_func,
+                kwargs={"datasets": selected, "case_number": int(case_number.value)},
+            )
+            return
+        if aggregate_plot_func is None:
+            msg = "Aggregate rendering is unavailable for this view."
+            raise RuntimeError(msg)
+        _render_figure(
+            out=output,
+            plot_func=aggregate_plot_func,
+            kwargs={"datasets": selected, "max_cases": int(case_count.value)},
+        )
+
+    def _rebind_dataset_state(_: object = None) -> None:
+        """Recompute valid common IDs and aggregate bounds, then render once."""
+        names = _active_names()
+        if not names:
+            case_state["options"] = ()
+            previous_case.disabled = True
+            next_case.disabled = True
+            _render()
+            return
+        state["updating"] = True
+        try:
+            shared = _shared_numbers(names)
+            case_state["options"] = shared
+            old_number = case_number.value
+            if shared:
+                selected_number = old_number if old_number in shared else shared[0]
+                case_state["last_valid"] = selected_number
+                case_number.value = selected_number
+            _sync_case_buttons()
+            maximum = min(len(datasets[name]) for name in names)
+            case_count.max = maximum
+            case_count.value = min(case_count.value, maximum)
+        finally:
+            state["updating"] = False
+        _render()
+
+    def _step_case(delta: int) -> None:
+        """Move through the current sparse shared-number options."""
+        options = case_state["options"]
+        if not options or case_number.value not in options:
+            return
+        current = options.index(case_number.value)
+        case_number.value = options[max(0, min(len(options) - 1, current + delta))]
+
+    def _step_count(delta: int) -> None:
+        """Move the aggregate prefix count within the selected-frame bound."""
+        case_count.value = max(case_count.min, min(case_count.max, case_count.value + delta * step_size))
+
+    def _on_case_change(_: object = None) -> None:
+        """Validate a typed case number, then update navigation and render once."""
+        if state["updating"]:
+            return
+        requested_number = case_number.value
+        if requested_number not in case_state["options"]:
+            state["updating"] = True
+            try:
+                case_number.value = case_state["last_valid"]
+            finally:
+                state["updating"] = False
+            _sync_case_buttons()
+            _show_message(f"Case {requested_number} is unavailable for the selected datasets. Enter a shared case number or use the arrows.")
+            return
+        case_state["last_valid"] = requested_number
+        _sync_case_buttons()
+        _render()
+
+    previous_case.on_click(lambda _: _step_case(-1))
+    next_case.on_click(lambda _: _step_case(1))
+    fewer_cases.on_click(lambda _: _step_count(-1))
+    more_cases.on_click(lambda _: _step_count(1))
+    case_number.observe(_on_case_change, names="value")
+    case_count.observe(lambda _: _render(), names="value")
+    for checkbox in selector.boxes.values():
+        checkbox.observe(_rebind_dataset_state, names="value")
+    if scope is not None:
+
+        def _on_scope_change(_: object = None) -> None:
+            """Update the active control surface and render the new scope once."""
+            _update_controls()
+            _render()
+
+        scope.observe(_on_scope_change, names="value")
+
+    _sync_case_buttons()
+    _update_controls()
+    _render()
+    return widgets.VBox([controls, output])

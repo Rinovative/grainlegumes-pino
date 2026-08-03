@@ -24,7 +24,7 @@ This module does NOT:
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 import ipywidgets as widgets
 import matplotlib.ticker as mticker
@@ -297,28 +297,40 @@ def _build_checkbox_group(
 
 def ui_step_case_index(
     *,
-    n_cases: int,
+    n_cases: int | None = None,
     start_idx: int = 0,
-) -> tuple[widgets.BoundedIntText, widgets.Button, widgets.Button]:
-    """
-    Step control for selecting individual case index.
+    case_numbers: Sequence[int] | None = None,
+) -> tuple[widgets.BoundedIntText | widgets.IntText, widgets.Button, widgets.Button]:
+    """Build the maintained numeric case navigator for contiguous indices or sparse IDs."""
+    if case_numbers is not None:
+        if n_cases is not None:
+            msg = "Case navigation accepts n_cases or case_numbers, not both."
+            raise ValueError(msg)
+        numbers = tuple(case_numbers)
+        if not numbers or any(isinstance(number, bool) or not isinstance(number, int) for number in numbers):
+            msg = "Case-number navigation requires at least one integer case number."
+            raise ValueError(msg)
+        if len(numbers) != len(set(numbers)):
+            msg = "Case-number navigation cannot contain duplicate values."
+            raise ValueError(msg)
+        if start_idx < 0 or start_idx >= len(numbers):
+            msg = f"start_idx must select an available case number, got {start_idx}."
+            raise ValueError(msg)
+        sparse_control = widgets.IntText(
+            value=numbers[start_idx],
+            description="Case:",
+            continuous_update=False,
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="120px"),
+        )
+        previous = widgets.Button(description="←", layout=widgets.Layout(width="40px"))
+        following = widgets.Button(description="→", layout=widgets.Layout(width="40px"))
+        return sparse_control, previous, following
 
-    0-based index internally, but 1-based display to user.
-
-    Parameters
-    ----------
-    n_cases : int
-        Total number of cases.
-    start_idx : int, optional
-        Initial case index (0-based, default: 0).
-
-    Returns
-    -------
-    tuple[widgets.BoundedIntText, widgets.Button, widgets.Button]
-        Control widget, previous button, next button.
-
-    """
-    control, prev_btn, next_btn = _build_int_step_control(
+    if n_cases is None:
+        msg = "Contiguous case navigation requires n_cases."
+        raise ValueError(msg)
+    control, previous, following = _build_int_step_control(
         value=start_idx + 1,
         minimum=1,
         maximum=n_cases,
@@ -328,11 +340,12 @@ def ui_step_case_index(
         prev_label="←",
         next_label="→",
     )
-
-    prev_btn.layout = widgets.Layout(width="40px")
-    next_btn.layout = widgets.Layout(width="40px")
-
-    return cast("widgets.BoundedIntText", control), prev_btn, next_btn
+    previous.layout = widgets.Layout(width="40px")
+    following.layout = widgets.Layout(width="40px")
+    if not isinstance(control, widgets.BoundedIntText):
+        msg = "Unit-step case navigation must construct a bounded integer text control."
+        raise TypeError(msg)
+    return control, previous, following
 
 
 def ui_step_case_count(
@@ -372,7 +385,10 @@ def ui_step_case_count(
         prev_label="⟨",
         next_label="⟩",
     )
-    return cast("widgets.IntSlider", control), prev_btn, next_btn
+    if not isinstance(control, widgets.IntSlider):
+        msg = "Multi-step case-count navigation must construct an integer slider."
+        raise TypeError(msg)
+    return control, prev_btn, next_btn
 
 
 # =============================================================================

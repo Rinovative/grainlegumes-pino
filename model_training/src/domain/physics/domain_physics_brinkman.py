@@ -27,11 +27,11 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal, cast
 
 import torch
 from torch import Tensor
 
+from . import domain_physics_contracts as physics_contracts
 from .domain_physics_boundary import PressureBoundaryResiduals, pressure_boundary_residuals
 from .domain_physics_derivatives import DerivativeOperator, SpatialAxes, crop_interior, infer_uniform_spacing
 
@@ -40,9 +40,6 @@ POROSITY_FLOOR = 1e-6
 PERMEABILITY_SCALE_FLOOR = 1e-30
 PERMEABILITY_DETERMINANT_FLOOR = 1e-4
 PERMEABILITY_CROSS_RATIO_CLIP = 0.999
-ContinuityKind = Literal["div_eps_velocity", "div_velocity"]
-STEADY_BRINKMAN_KIND = "steady_2d_brinkman"
-PRESSURE_BOUNDARY_KIND = "pressure_inlet_zero_pressure_outlet"
 _MIN_TASK_TENSOR_RANK = 3
 
 
@@ -89,7 +86,7 @@ class ContinuityResiduals:
     selected: Tensor
     divergence_velocity: Tensor
     divergence_porosity_velocity: Tensor
-    kind: ContinuityKind
+    kind: physics_contracts.ContinuityKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,28 +190,6 @@ class BrinkmanDiagnostics:
         }
 
 
-def available_continuity_kinds() -> tuple[str, ...]:
-    """Return supported semantic continuity formulations."""
-    return ("div_velocity", "div_eps_velocity")
-
-
-def validate_continuity_kind(kind: str) -> ContinuityKind:
-    """
-    Validate and return one exact continuity formulation identifier.
-
-    Raises
-    ------
-    ValueError
-        If ``kind`` is not ``"div_velocity"`` or ``"div_eps_velocity"``.
-
-    """
-    if kind not in available_continuity_kinds():
-        available = ", ".join(available_continuity_kinds())
-        msg = f"Unknown continuity identifier {kind!r}. Available continuity formulations: {available}."
-        raise ValueError(msg)
-    return cast("ContinuityKind", kind)
-
-
 def continuity_residuals(
     velocity_x: Tensor,
     velocity_y: Tensor,
@@ -260,7 +235,7 @@ def continuity_residuals(
     if velocity_x.shape != velocity_y.shape or velocity_x.shape != porosity.shape:
         msg = "Velocity components and porosity must have identical shapes."
         raise ValueError(msg)
-    resolved_kind = validate_continuity_kind(kind)
+    resolved_kind = physics_contracts.validate_continuity_kind(kind)
     divergence_velocity = derivatives.divergence(
         velocity_x,
         velocity_y,
@@ -535,8 +510,8 @@ def evaluate_steady_2d_brinkman(
     and scalars remain available regardless of that selection.
 
     """
-    if boundary != PRESSURE_BOUNDARY_KIND:
-        msg = f"Unknown pressure boundary identifier {boundary!r}; expected {PRESSURE_BOUNDARY_KIND!r}."
+    if boundary != physics_contracts.PRESSURE_BOUNDARY_KIND:
+        msg = f"Unknown pressure boundary identifier {boundary!r}; expected {physics_contracts.PRESSURE_BOUNDARY_KIND!r}."
         raise ValueError(msg)
     input_values = _field_mapping(
         inputs,
@@ -612,7 +587,7 @@ def evaluate_steady_2d_brinkman(
 
 
 PhysicsEvaluator = Callable[..., BrinkmanDiagnostics]
-_PHYSICS_EVALUATORS = MappingProxyType({STEADY_BRINKMAN_KIND: evaluate_steady_2d_brinkman})
+_PHYSICS_EVALUATORS = MappingProxyType({physics_contracts.STEADY_BRINKMAN_KIND: evaluate_steady_2d_brinkman})
 
 
 def available_physics_kinds() -> tuple[str, ...]:

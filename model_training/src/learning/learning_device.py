@@ -5,7 +5,7 @@ learning_device.py
 Resolve the exact runtime device policy shared by every execution service.
 
 Responsibilities:
-  - Validate the canonical auto, cuda, and cpu policy vocabulary
+  - Consume the dependency-free auto, cuda, and cpu policy contract
   - Resolve one concrete indexed Torch device at a top-level service boundary
   - Fail strict CUDA requests without an availability-based CPU fallback
   - Return compact, immutable, serialization-safe runtime metadata
@@ -26,21 +26,19 @@ This module does NOT:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any
 
 import torch
 
-DevicePolicy = Literal["auto", "cuda", "cpu"]
-DEVICE_POLICIES: tuple[DevicePolicy, ...] = ("auto", "cuda", "cpu")
+from . import learning_device_policy as _policy
 
-
-class DevicePolicyError(ValueError):
-    """
-    Represent an invalid user-facing runtime-device policy.
-
-    Raised by :func:`validate_device_policy` before availability is queried; it
-    distinguishes malformed policy input from failure to satisfy valid CUDA.
-    """
+__all__ = [
+    "DeviceResolution",
+    "DeviceResolutionError",
+    "DeviceRuntimeMetadata",
+    "resolve_device",
+    "validate_mixed_precision_device",
+]
 
 
 class DeviceResolutionError(RuntimeError):
@@ -76,7 +74,7 @@ class DeviceRuntimeMetadata:
 
     """
 
-    requested_policy: DevicePolicy
+    requested_policy: _policy.DevicePolicy
     resolved_device: str
     device_type: str
     pytorch_version: str
@@ -130,7 +128,7 @@ class DeviceResolution:
 
     """
 
-    requested_policy: DevicePolicy
+    requested_policy: _policy.DevicePolicy
     device: torch.device
     device_type: str
     cuda_index: int | None
@@ -149,36 +147,7 @@ class DeviceResolution:
         return self.metadata.as_dict()
 
 
-def validate_device_policy(policy: Any, *, path: str = "device") -> DevicePolicy:
-    """
-    Validate one exact user-facing runtime device policy.
-
-    Parameters
-    ----------
-    policy : Any
-        Candidate policy value.
-    path : str, optional
-        Semantic source path included in errors.
-
-    Returns
-    -------
-    DevicePolicy
-        The unchanged exact policy.
-
-    Raises
-    ------
-    DevicePolicyError
-        If the value is not exactly ``auto``, ``cuda``, or ``cpu``.
-
-    """
-    if type(policy) is not str or policy not in DEVICE_POLICIES:
-        allowed = ", ".join(DEVICE_POLICIES)
-        msg = f"{path} must be exactly one of: {allowed}; got {policy!r}."
-        raise DevicePolicyError(msg)
-    return cast("DevicePolicy", policy)
-
-
-def _cpu_resolution(policy: DevicePolicy) -> DeviceResolution:
+def _cpu_resolution(policy: _policy.DevicePolicy) -> DeviceResolution:
     """
     Construct a concrete CPU decision without touching the CUDA runtime API.
 
@@ -202,7 +171,7 @@ def _cpu_resolution(policy: DevicePolicy) -> DeviceResolution:
     )
 
 
-def _cuda_resolution(policy: DevicePolicy, *, path: str) -> DeviceResolution:
+def _cuda_resolution(policy: _policy.DevicePolicy, *, path: str) -> DeviceResolution:
     """
     Construct an indexed CUDA decision or fail without device substitution.
 
@@ -267,7 +236,7 @@ def resolve_device(policy: Any, *, path: str = "device") -> DeviceResolution:
         If strict CUDA is unavailable or unusable.
 
     """
-    requested = validate_device_policy(policy, path=path)
+    requested = _policy.validate_device_policy(policy, path=path)
     if requested == "cpu":
         return _cpu_resolution(requested)
 

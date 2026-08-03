@@ -4,10 +4,10 @@ domain_task_steady_flow.py
 ===============================================================================
 Declare the authoritative steady two-dimensional porous-flow task contract.
 
-Defines:
+Responsibilities:
   - Exact ordered steady-flow input and output fields
   - Field units, stored representations, tensor axes, and preprocessing
-  - Default datasets, semantic metrics, losses, and physics selection
+  - Fallback datasets for omitted config selection, semantic metrics, losses, and physics
 
 Design principles:
   - The declaration is immutable and contains only canonical identifiers
@@ -17,11 +17,14 @@ Design principles:
 This module does NOT:
   - Load, fingerprint, or validate stored datasets
   - Implement derivatives, residual equations, losses, or metrics
+  - Select datasets for explicit executable experiment recipes
   - Define checkpoint, resume, inference, or artifact lifecycle behavior
 ===============================================================================
 """
 
 from __future__ import annotations
+
+from src.domain.physics import domain_physics_contracts as physics_contracts
 
 from .domain_task_spec import (
     TASK_SCHEMA_VERSION,
@@ -161,10 +164,10 @@ STEADY_FLOW = TaskSpec(
         ),
     ),
     physics=PhysicsSpec(
-        kind="steady_2d_brinkman",
-        equation_set="steady_two_dimensional_brinkman",
-        continuity="div_eps_velocity",
-        allowed_continuities=("div_velocity", "div_eps_velocity"),
-        boundary="pressure_inlet_zero_pressure_outlet",
+        kind=physics_contracts.STEADY_BRINKMAN_KIND,
+        equation_set=physics_contracts.STEADY_BRINKMAN_EQUATION_SET,
+        continuity=physics_contracts.DEFAULT_CONTINUITY_KIND,
+        allowed_continuities=physics_contracts.available_continuity_kinds(),
+        boundary=physics_contracts.PRESSURE_BOUNDARY_KIND,
     ),
 )

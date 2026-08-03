@@ -1,30 +1,31 @@
 """
-Artifact production and notebook-centered scientific analysis.
+Scientific analysis, evaluation, presentation, and notebook interfaces.
 
 Provides:
-- artifact_service: cache discovery, validation, generation, rebuilding, and upload
-- artifacts: task-aware Parquet and NPZ artifact generation
-- curated_renderer: fixed local scientific media rendering
-- eda: exploratory dataset tables, panels, and plots
-- evaluation: artifact readers, panels, tables, and scientific plots
-- presentation: numbered EDA and evaluation display registries
-- ui: reusable notebook widgets, panels, and viewers
+- artifacts: artifact schemas, generation, lifecycle, and runtime evidence
+- eda: exploratory generated-data analysis and visualization
+- evaluation: persisted prediction evaluation and scientific plots
+- presentation: ordered and curated scientific presentation services
+- ui: reusable notebook controls, panels, and viewers
 """
 
-from . import analysis_artifact_service as artifact_service
-from . import analysis_artifacts as artifacts
-from . import analysis_curated_renderer as curated_renderer
-from . import analysis_presentation as presentation
-from . import analysis_timing as timing
-from . import eda, evaluation, ui
+from __future__ import annotations
 
-__all__ = [
-    "artifact_service",
-    "artifacts",
-    "curated_renderer",
-    "eda",
-    "evaluation",
-    "presentation",
-    "timing",
-    "ui",
-]
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from . import artifacts, eda, evaluation, presentation, ui
+
+_MODULES = {"artifacts": "artifacts", "eda": "eda", "evaluation": "evaluation", "presentation": "presentation", "ui": "ui"}
+__all__ = ["artifacts", "eda", "evaluation", "presentation", "ui"]
+
+
+def __getattr__(name: str) -> object:
+    """Resolve one declared public name on first access."""
+    if name not in _MODULES:
+        message = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(message)
+    module = import_module(f"{__name__}.{_MODULES[name]}")
+    globals()[name] = module
+    return module

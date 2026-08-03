@@ -161,6 +161,6 @@ def test_derivative_semantics_fail_clearly() -> None:
     fallback or unused extension settings from changing scientific meaning.
     """
     with pytest.raises(ValueError, match="Unknown derivative identifier"):
-        domain.physics.derivatives.build_derivative_operator("automatic", extension="none")
+        domain.physics.derivatives.build_derivative_operator("unsupported", extension="none")
     with pytest.raises(ValueError, match="require extension 'none'"):
         domain.physics.derivatives.build_derivative_operator("physical", extension="reflect")

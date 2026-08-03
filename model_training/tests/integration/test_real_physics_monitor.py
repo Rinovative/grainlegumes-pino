@@ -10,7 +10,7 @@ import torch
 from src import common, experiments, learning
 from support import real_data
 
-_GPU_SMOKE_CONFIG = Path(__file__).parents[2] / "configs/acceptance/steady_flow_fno_gpu_smoke.yaml"
+_GPU_SMOKE_CONFIG = Path(__file__).parents[2] / "configs/tasks/steady_flow/acceptance/fno_gpu_smoke.yaml"
 _EXPECTED_FIRST_ID_INDEX = 418
 _EXPECTED_FIRST_OOD_INDEX = 57
 _FULL_SPATIAL_SHAPE = (251, 401)

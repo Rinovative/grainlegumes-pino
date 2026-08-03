@@ -119,6 +119,32 @@ def _open_lock_file(path: Path) -> int:
     return descriptor
 
 
+def file_lock_is_active(path: Path | str) -> bool:
+    """Return whether an existing regular lock file is currently held, without creating it."""
+    lock_path = Path(path).expanduser().resolve(strict=False)
+    if not lock_path.is_file():
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags)
+    except FileNotFoundError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            msg = f"Lock path is not a regular file: {lock_path}"
+            raise OSError(msg)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            raise
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def exclusive_file_lock(
     path: Path | str,

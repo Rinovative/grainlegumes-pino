@@ -10,16 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Rino M. Albertin" }]
 
-[tool.setuptools]
-package-dir = { "" = "model_training" }
-
-[tool.setuptools.packages.find]
-where = ["model_training"]
-include = ["src*"]
-
 [tool.pytest.ini_options]
 markers = [
-  "real_data: strict opt-in acceptance requiring RUN_REAL_DATA_TESTS=1 and MODEL_TRAINING_DATA_ROOT",
+  "real_data: strict opt-in acceptance requiring RUN_REAL_DATA_TESTS=1 and an explicit domain data root",
 ]
 
 # ============================================================

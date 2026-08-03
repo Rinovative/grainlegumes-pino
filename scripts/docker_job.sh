@@ -6,19 +6,48 @@ MODEL_DIR="${PROJECT_DIR}/model_training"
 HOST_STORAGE_ROOT="${STORAGE_ROOT:-${PROJECT_DIR}/../storage}"
 HOST_GENERATED_DATA_ROOT="${HOST_STORAGE_ROOT}/data_generation"
 HOST_MODEL_TRAINING_DATA_ROOT="${HOST_STORAGE_ROOT}/data_training"
-LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/steady_flow/logs/queue"
+IMAGE_NAME="grainlegumes-pino-airflow"
+PREFLIGHT_RUNTIME="/workspace/repo/scripts/config_preflight_runtime.py"
+PROJECT_PYTHON_MINIMUM="3.11"
+DETECTED_HOST_PYTHON_EXECUTABLE="not found"
+DETECTED_HOST_PYTHON_VERSION="unavailable"
 
 usage() {
   cat >&2 <<EOF
 Usage:
-  $0 [--queue-gpu auto|INDEX] train <experiment.yaml> [semantic CLI options...]
-  $0 [--queue-gpu auto|INDEX] optuna <study.yaml> [semantic CLI options...]
-  $0 [--queue-gpu auto|INDEX] artifacts [semantic CLI options...]
+  $0 train <experiment_config> [training options...] [--queue-gpu auto|INDEX] [--follow]
+  $0 optuna <optuna_config> [Optuna options...] [--queue-gpu auto|INDEX] [--follow]
+  $0 artifacts [artifact options...] [--queue-gpu auto|INDEX]
+
+Workflows:
+  train <experiment_config>
+      Submit one normal training run and return immediately. Resume is explicit.
+  optuna <optuna_config>
+      Submit one Optuna study and return immediately. Persistent continuation uses study storage.
+
+Steady-flow experiment roles:
+  experiments/capacity_and_physics/  controlled capacity-matched physics investigation
+  experiments/best_of_class/          final model-family representatives
+  experiments/model_selection/        manually authored candidate recipes
+  optuna/                              automated hyperparameter-optimization studies
+
+Current task-first examples:
+  $0 train model_training/configs/tasks/steady_flow/experiments/capacity_and_physics/fno_m12x12_h24_l4.yaml
+  $0 train model_training/configs/tasks/steady_flow/experiments/best_of_class/uno_m64x64_h32_l7_mr0p495.yaml
+  $0 train model_training/configs/tasks/steady_flow/experiments/model_selection/fno_m48x48_h64_l4.yaml
+  $0 optuna model_training/configs/tasks/steady_flow/optuna/fno_search.yaml
 
 GPU selection:
-  omit --queue-gpu  display utilization, propose the least-memory GPU, and prompt
-  --queue-gpu auto  select the least-memory GPU without prompting
-  --queue-gpu INDEX select one reported GPU index without prompting
+  omit --queue-gpu  in an interactive TTY, show usage and prompt for one host GPU;
+                    press Enter to accept the least-memory proposal
+  --queue-gpu auto  select the least-memory host GPU without prompting
+  --queue-gpu INDEX select one reported physical host GPU without prompting
+
+Non-interactive callers must provide --queue-gpu auto or --queue-gpu INDEX.
+--follow is independent of GPU selection and follows the detached worker host log.
+Ctrl+C during GPU selection submits nothing. Ctrl+C during log following stops only
+the follower; the queue job continues with no worker input channel. No --wait mode
+exists; the wrapper never polls or waits for worker completion.
 EOF
 }
 
@@ -29,6 +58,35 @@ fail() {
   exit "${status}"
 }
 
+detect_host_python() {
+  local executable=""
+  local version=""
+
+  if executable="$(command -v python 2>/dev/null)" && [[ -n "${executable}" ]]; then
+    DETECTED_HOST_PYTHON_EXECUTABLE="${executable}"
+    if version="$("${executable}" -c 'import sys; print("{}.{}.{}".format(*sys.version_info[:3]))' 2>/dev/null)" \
+        && [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      DETECTED_HOST_PYTHON_VERSION="${version}"
+    fi
+  fi
+}
+
+host_python_is_below_project_minimum() {
+  if [[ ! "${DETECTED_HOST_PYTHON_VERSION}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+    return 1
+  fi
+  (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 11) ))
+}
+
+preflight_runtime_failure() {
+  local detail="$1"
+  printf 'Configuration preflight could not start.\n' >&2
+  printf 'Host Python: %s (%s)\n' "${DETECTED_HOST_PYTHON_VERSION}" "${DETECTED_HOST_PYTHON_EXECUTABLE}" >&2
+  printf 'Required Python: >=%s\n' "${PROJECT_PYTHON_MINIMUM}" >&2
+  printf 'Maintained preflight container: %s\n' "${detail}" >&2
+  exit 1
+}
+
 trim_whitespace() {
   local value="$1"
   value="${value#"${value%%[![:space:]]*}"}"
@@ -36,13 +94,10 @@ trim_whitespace() {
   printf '%s' "${value}"
 }
 
-resolve_config_argument() {
+resolve_host_config_argument() {
   local requested="$1"
   local candidate=""
   local candidate_dir
-  local resolved
-  local generated_dir=""
-  local training_dir=""
 
   if [[ "${requested}" == /* ]]; then
     candidate="${requested}"
@@ -62,9 +117,15 @@ resolve_config_argument() {
   if [[ ! -r "${candidate}" ]]; then
     fail 2 "Config path is not readable: ${requested}"
   fi
-
   candidate_dir="$(cd "$(dirname "${candidate}")" && pwd -P)"
-  resolved="${candidate_dir}/$(basename "${candidate}")"
+  printf '%s/%s' "${candidate_dir}" "$(basename "${candidate}")"
+}
+
+translate_config_argument() {
+  local resolved="$1"
+  local generated_dir=""
+  local training_dir=""
+
   if [[ "${resolved}" == "${MODEL_DIR}/"* ]]; then
     printf '%s' "${resolved#"${MODEL_DIR}/"}"
     return
@@ -87,7 +148,7 @@ resolve_config_argument() {
     printf '/workspace/repo/model_training/data/%s' "${resolved#"${training_dir}/"}"
     return
   fi
-  fail 2 "Config path must be inside the repository or one configured data domain: ${requested}"
+  fail 2 "Config path must be inside the repository or one configured data domain: ${resolved}"
 }
 
 translate_semantic_path() {
@@ -132,6 +193,74 @@ translate_semantic_path() {
   else
     printf '%s' "${requested}"
   fi
+}
+
+run_config_preflight() {
+  local workflow="$1"
+  local container_config="$2"
+  local output=""
+  local status=0
+  local mount_args=(
+    --mount "type=bind,source=${PROJECT_DIR},target=/workspace/repo,readonly"
+  )
+  local command=()
+
+  case "${container_config}" in
+    /workspace/repo/data_generation/data/*)
+      mount_args+=(
+        --mount "type=bind,source=${HOST_GENERATED_DATA_ROOT},target=/workspace/repo/data_generation/data,readonly"
+      )
+      ;;
+    /workspace/repo/model_training/data/*)
+      mount_args+=(
+        --mount "type=bind,source=${HOST_MODEL_TRAINING_DATA_ROOT},target=/workspace/repo/model_training/data,readonly"
+      )
+      ;;
+  esac
+
+  detect_host_python
+  if host_python_is_below_project_minimum; then
+    printf '%s\n' \
+      "Host Python ${DETECTED_HOST_PYTHON_VERSION} at ${DETECTED_HOST_PYTHON_EXECUTABLE} is below the project minimum >=${PROJECT_PYTHON_MINIMUM}. Running configuration preflight in the maintained CPU-only project container." \
+      >&2
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    preflight_runtime_failure "Docker was not found on PATH."
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    preflight_runtime_failure "the Docker daemon is unavailable."
+  fi
+  if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+    preflight_runtime_failure "image '${IMAGE_NAME}' is missing; build it with ./scripts/docker_build.sh."
+  fi
+
+  command=(
+    docker run --rm
+    --network none
+    --workdir /workspace/repo/model_training
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m
+    -e HOME=/tmp
+    -e PYTHONDONTWRITEBYTECODE=1
+    -e PYTHONNOUSERSITE=1
+    -e PYTHONPATH=/workspace/repo/model_training
+    -e PROJECT_ROOT=/workspace/repo
+    -e GENERATED_DATA_ROOT=/workspace/repo/data_generation/data
+    -e MODEL_TRAINING_DATA_ROOT=/workspace/repo/model_training/data
+    "${mount_args[@]}"
+    "${IMAGE_NAME}"
+    python "${PREFLIGHT_RUNTIME}" "${workflow}" "${container_config}"
+  )
+  if output="$("${command[@]}")"; then
+    printf '%s' "${output}"
+    return 0
+  else
+    status=$?
+  fi
+  if [[ -n "${output}" ]]; then
+    printf '%s\n' "${output}"
+  fi
+  return "${status}"
 }
 
 is_semantic_path_option() {
@@ -201,9 +330,6 @@ validate_semantic_device_arguments() {
       --queue-gpu|--queue-gpu=*)
         fail 2 "--queue-gpu is a wrapper option and must appear before the job type."
         ;;
-      --cpu|--cpu=*)
-        fail 2 "--cpu is unsupported; queued jobs always use --device cuda."
-        ;;
       --device)
         if (( index + 1 >= ${#arguments[@]} )); then
           fail 2 "--device requires one of auto, cuda, or cpu."
@@ -231,39 +357,132 @@ validate_semantic_device_arguments() {
   fi
 }
 
-QUEUE_GPU_REQUEST="prompt"
-if (( $# >= 1 )) && [[ "$1" == "--queue-gpu" ]]; then
-  if (( $# < 2 )) || [[ -z "$2" ]]; then
-    fail 2 "--queue-gpu requires auto or one reported GPU index."
-  fi
-  QUEUE_GPU_REQUEST="$2"
-  shift 2
-elif (( $# >= 1 )) && [[ "$1" == --queue-gpu=* ]]; then
-  fail 2 "Use the documented form: --queue-gpu auto|INDEX before the job type."
-fi
+QUEUE_GPU_REQUEST=""
+QUEUE_GPU_SEEN=false
+FOLLOW_LOG=false
+JOB_TYPE=""
+SEMANTIC_ARGS=()
 
-if (( $# == 0 )); then
+while (( $# > 0 )); do
+  argument="$1"
+  if [[ -z "${JOB_TYPE}" ]]; then
+    case "${argument}" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --follow)
+        if [[ "${FOLLOW_LOG}" == true ]]; then
+          fail 2 "Duplicate --follow options are not allowed."
+        fi
+        FOLLOW_LOG=true
+        shift
+        ;;
+      --queue-gpu)
+        if [[ "${QUEUE_GPU_SEEN}" == true ]]; then
+          fail 2 "Duplicate --queue-gpu options are not allowed."
+        fi
+        if (( $# < 2 )) || [[ -z "$2" ]]; then
+          fail 2 "--queue-gpu requires auto or one reported GPU index."
+        fi
+        QUEUE_GPU_REQUEST="$2"
+        QUEUE_GPU_SEEN=true
+        shift 2
+        ;;
+      --queue-gpu=*)
+        fail 2 "Use the documented form: --queue-gpu auto|INDEX."
+        ;;
+      train|optuna|artifacts)
+        JOB_TYPE="${argument}"
+        shift
+        ;;
+      *)
+        usage
+        fail 2 "Unsupported job type or wrapper option: ${argument}"
+        ;;
+    esac
+    continue
+  fi
+
+  case "${argument}" in
+    --follow)
+      if [[ "${FOLLOW_LOG}" == true ]]; then
+        fail 2 "Duplicate --follow options are not allowed."
+      fi
+      FOLLOW_LOG=true
+      shift
+      ;;
+    --queue-gpu)
+      if [[ "${QUEUE_GPU_SEEN}" == true ]]; then
+        fail 2 "Duplicate --queue-gpu options are not allowed."
+      fi
+      if (( $# < 2 )) || [[ -z "$2" ]]; then
+        fail 2 "--queue-gpu requires auto or one reported GPU index."
+      fi
+      QUEUE_GPU_REQUEST="$2"
+      QUEUE_GPU_SEEN=true
+      shift 2
+      ;;
+    --queue-gpu=*)
+      fail 2 "Use the documented form: --queue-gpu auto|INDEX."
+      ;;
+    --wait|--wait=*|--follow-and-wait|--follow-and-wait=*)
+      fail 2 "Queue completion waiting is unsupported; submission is detached."
+      ;;
+    *)
+      SEMANTIC_ARGS+=("${argument}")
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${JOB_TYPE}" ]]; then
   usage
   exit 2
 fi
 
-JOB_TYPE="$1"
-shift
-SEMANTIC_ARGS=("$@")
+RESOLVED_TASK="steady_flow"
+CANONICAL_CONFIG_PATH="not applicable"
 case "${JOB_TYPE}" in
   train|optuna)
     if (( ${#SEMANTIC_ARGS[@]} == 0 )); then
       fail 2 "${JOB_TYPE} requires a YAML config path."
     fi
-    SEMANTIC_ARGS[0]="$(resolve_config_argument "${SEMANTIC_ARGS[0]}")"
+    if [[ "${JOB_TYPE}" == "optuna" ]]; then
+      for argument in "${SEMANTIC_ARGS[@]}"; do
+        case "${argument}" in
+          --resume|--resume=*)
+            fail 2 "--resume is a training checkpoint option and is unsupported for Optuna study continuation."
+            ;;
+        esac
+      done
+    fi
+    HOST_CONFIG_PATH="$(resolve_host_config_argument "${SEMANTIC_ARGS[0]}")"
+    SEMANTIC_ARGS[0]="$(translate_config_argument "${HOST_CONFIG_PATH}")"
+    if PREFLIGHT_OUTPUT="$(run_config_preflight "${JOB_TYPE}" "${SEMANTIC_ARGS[0]}")"; then
+      :
+    else
+      PREFLIGHT_STATUS=$?
+      if [[ -n "${PREFLIGHT_OUTPUT}" ]]; then
+        printf '%s\n' "${PREFLIGHT_OUTPUT}"
+      fi
+      exit "${PREFLIGHT_STATUS}"
+    fi
+    IFS=$'\t' read -r SUPPLIED_CONFIG_FAMILY RESOLVED_TASK CANONICAL_CONFIG_PATH PREFLIGHT_EXTRA <<< "${PREFLIGHT_OUTPUT}"
+    if [[ -z "${SUPPLIED_CONFIG_FAMILY}" || -z "${RESOLVED_TASK}" || -z "${CANONICAL_CONFIG_PATH}" || -n "${PREFLIGHT_EXTRA:-}" ]]; then
+      fail 1 "Configuration preflight returned a malformed container summary."
+    fi
     ;;
   artifacts)
-    ;;
-  *)
-    usage
-    fail 2 "Unsupported job type: ${JOB_TYPE}"
+    if [[ "${FOLLOW_LOG}" == true ]]; then
+      fail 2 "--follow is supported only for train and optuna workflows."
+    fi
     ;;
 esac
+
+if [[ "${FOLLOW_LOG}" == true ]] && ! command -v tail >/dev/null 2>&1; then
+  fail 1 "tail is required for --follow but was not found on PATH."
+fi
 translate_semantic_path_options "${JOB_TYPE}" "${SEMANTIC_ARGS[@]}"
 validate_semantic_device_arguments "${SEMANTIC_ARGS[@]}"
 
@@ -331,54 +550,191 @@ for index in "${!GPU_IDS[@]}"; do
     "${GPU_IDS[index]}" "${GPU_NAMES[index]}" "${GPU_UTILIZATIONS[index]}" \
     "${GPU_MEMORY_USED[index]}" "${GPU_MEMORY_TOTAL[index]}"
 done
-printf 'Proposed GPU: %s (least allocated memory; lowest index breaks ties)\n' "${AUTO_GPU}"
+printf 'Proposed GPU: %s\n' "${AUTO_GPU}"
+printf 'Proposal reason: least allocated memory; lowest index breaks ties\n'
 
 GPU_LIST="$(IFS=,; printf '%s' "${GPU_IDS[*]}")"
-case "${QUEUE_GPU_REQUEST}" in
-  prompt)
-    if ! IFS= read -r -p "Select GPU (${GPU_LIST}; Enter for proposed ${AUTO_GPU}): " GPU_ID; then
-      fail 2 "GPU selection input closed before a choice was received."
+gpu_is_reported() {
+  local candidate="$1"
+  local reported_index
+  for reported_index in "${GPU_IDS[@]}"; do
+    if [[ "${reported_index}" == "${candidate}" ]]; then
+      return 0
     fi
-    GPU_ID="${GPU_ID:-${AUTO_GPU}}"
+  done
+  return 1
+}
+
+case "${QUEUE_GPU_REQUEST}" in
+  "")
+    if [[ ! -t 0 ]]; then
+      printf '%s\n\n' "GPU selection requires an explicit option in non-interactive mode." >&2
+      printf '%s\n' "Use automatic selection:" "  --queue-gpu auto" "" >&2
+      printf '%s\n' "Or select one physical host GPU:" "  --queue-gpu INDEX" >&2
+      exit 2
+    fi
+
+    selection_interrupted() {
+      printf '\nGPU selection cancelled; no queue job was submitted.\n' >&2
+      exit 130
+    }
+    trap selection_interrupted INT
+
+    GPU_ID=""
+    SELECTION_ATTEMPTS=0
+    while (( SELECTION_ATTEMPTS < 10 )); do
+      printf 'Select GPU (%s; Enter for proposed %s): ' "${GPU_LIST}" "${AUTO_GPU}"
+      if ! IFS= read -r GPU_INPUT; then
+        trap - INT
+        unset -f selection_interrupted
+        fail 2 "GPU selection input closed before a choice was received; no queue job was submitted."
+      fi
+      GPU_INPUT="$(trim_whitespace "${GPU_INPUT}")"
+      if [[ -z "${GPU_INPUT}" ]]; then
+        GPU_ID="${AUTO_GPU}"
+        break
+      fi
+      if [[ ! "${GPU_INPUT}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        printf 'Invalid GPU selection %s; enter one reported index or press Enter.\n' "${GPU_INPUT@Q}" >&2
+      elif ! gpu_is_reported "${GPU_INPUT}"; then
+        printf 'GPU %s is not one of the reported indices: %s.\n' "${GPU_INPUT@Q}" "${GPU_LIST}" >&2
+      else
+        GPU_ID="${GPU_INPUT}"
+        break
+      fi
+      SELECTION_ATTEMPTS=$((SELECTION_ATTEMPTS + 1))
+    done
+    trap - INT
+    unset -f selection_interrupted
+    if [[ -z "${GPU_ID}" ]]; then
+      fail 2 "GPU selection failed after 10 invalid attempts; no queue job was submitted."
+    fi
+    printf 'Selected GPU: %s\n' "${GPU_ID}"
     ;;
   auto)
     GPU_ID="${AUTO_GPU}"
+    printf 'Automatically selected GPU: %s\n' "${GPU_ID}"
+    printf 'Reason: least allocated memory; lowest index breaks ties\n'
     ;;
   *)
     if [[ ! "${QUEUE_GPU_REQUEST}" =~ ^(0|[1-9][0-9]*)$ ]]; then
       fail 2 "--queue-gpu must be auto or one non-negative reported GPU index."
     fi
     GPU_ID="${QUEUE_GPU_REQUEST}"
+    if ! gpu_is_reported "${GPU_ID}"; then
+      fail 2 "GPU ${GPU_ID@Q} is not one of the reported indices: ${GPU_LIST}."
+    fi
+    printf 'Selected GPU: %s\n' "${GPU_ID}"
+    printf 'Selection source: explicit --queue-gpu\n'
     ;;
 esac
 
-GPU_IS_REPORTED=false
-for reported_index in "${GPU_IDS[@]}"; do
-  if [[ "${reported_index}" == "${GPU_ID}" ]]; then
-    GPU_IS_REPORTED=true
-    break
-  fi
-done
-if [[ "${GPU_IS_REPORTED}" != true ]]; then
-  fail 2 "GPU ${GPU_ID@Q} is not one of the reported indices: ${GPU_LIST}."
-fi
-
+TASK_SPOOLER_SOCKET="/etc/ts/socket_${GPU_ID}"
+LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/${RESOLVED_TASK}/logs/queue"
 mkdir -p "${LOG_DIR}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_PATH="$(mktemp --suffix=.log "${LOG_DIR}/${TIMESTAMP}__${JOB_TYPE}__gpu${GPU_ID}__XXXXXX")"
 LOG_BASENAME="$(basename "${LOG_PATH}")"
-
-printf 'Selected GPU: %s\n' "${GPU_ID}"
-printf 'Submitting validated %s job through runTSGPU.py.\n' "${JOB_TYPE}"
-cd "${PROJECT_DIR}"
-runTSGPU.py -g"${GPU_ID}" -- "${PROJECT_DIR}/scripts/_docker_run.sh" \
-  "${GPU_ID}" \
-  "${JOB_TYPE}" \
-  "${LOG_BASENAME}" \
+QUEUE_COMMAND=(
+  runTSGPU.py
+  "-g${GPU_ID}"
+  --
+  "${PROJECT_DIR}/scripts/_docker_run.sh"
+  "${GPU_ID}"
+  "${JOB_TYPE}"
+  "${LOG_BASENAME}"
   "${SEMANTIC_ARGS[@]}"
+)
 
-printf 'Queued %s job on GPU %s.\n' "${JOB_TYPE}" "${GPU_ID}"
-printf 'Queue: runTSGPU.py -g%s -- %s/scripts/_docker_run.sh [validated %s arguments]\n' \
-  "${GPU_ID}" "${PROJECT_DIR}" "${JOB_TYPE}"
-printf 'Log:   %s\n' "${LOG_PATH}"
-printf 'Tail:  tail -F %q\n' "${LOG_PATH}"
+cd "${PROJECT_DIR}"
+if QUEUE_OUTPUT="$(TS_SOCKET="${TASK_SPOOLER_SOCKET}" CUDA_VISIBLE_DEVICES="${GPU_ID}" "${QUEUE_COMMAND[@]}")"; then
+  :
+else
+  QUEUE_STATUS=$?
+  if [[ -n "${QUEUE_OUTPUT}" ]]; then
+    printf 'Queue submission output:\n%s\n' "${QUEUE_OUTPUT}" >&2
+  fi
+  fail "${QUEUE_STATUS}" "Queue submission failed for ${JOB_TYPE} workflow."
+fi
+
+QUEUE_JOB_IDS=()
+REPORTED_QUEUE_SOCKETS=()
+QUEUE_DIAGNOSTICS=()
+while IFS= read -r queue_line || [[ -n "${queue_line}" ]]; do
+  trimmed_queue_line="$(trim_whitespace "${queue_line}")"
+  if [[ -z "${trimmed_queue_line}" ]]; then
+    continue
+  fi
+  if [[ "${trimmed_queue_line}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    QUEUE_JOB_IDS+=("${trimmed_queue_line}")
+  elif [[ "${trimmed_queue_line}" =~ ^TS[[:space:]]socket:[[:space:]]+(/[^[:space:]]+)$ ]]; then
+    REPORTED_QUEUE_SOCKETS+=("${BASH_REMATCH[1]}")
+  else
+    QUEUE_DIAGNOSTICS+=("${trimmed_queue_line}")
+  fi
+done <<< "${QUEUE_OUTPUT}"
+
+if (( ${#QUEUE_JOB_IDS[@]} == 1 )); then
+  QUEUE_JOB_ID="${QUEUE_JOB_IDS[0]}"
+else
+  QUEUE_JOB_ID="unavailable"
+  TRIMMED_QUEUE_OUTPUT="$(trim_whitespace "${QUEUE_OUTPUT}")"
+  if [[ -n "${TRIMMED_QUEUE_OUTPUT}" ]]; then
+    printf 'Queue submission output:\n%s\n' "${TRIMMED_QUEUE_OUTPUT}"
+  fi
+fi
+
+if (( ${#REPORTED_QUEUE_SOCKETS[@]} == 1 )); then
+  if [[ "${REPORTED_QUEUE_SOCKETS[0]}" != "${TASK_SPOOLER_SOCKET}" ]]; then
+    QUEUE_DIAGNOSTICS+=(
+      "queue helper socket report ${REPORTED_QUEUE_SOCKETS[0]@Q} did not match selected GPU socket ${TASK_SPOOLER_SOCKET@Q}"
+    )
+  fi
+elif (( ${#REPORTED_QUEUE_SOCKETS[@]} > 1 )); then
+  QUEUE_DIAGNOSTICS+=("queue helper reported multiple task-spooler sockets")
+fi
+
+if (( ${#QUEUE_DIAGNOSTICS[@]} > 0 )); then
+  printf 'Queue submission diagnostics:\n'
+  printf '  %s\n' "${QUEUE_DIAGNOSTICS[@]}"
+fi
+
+printf 'Queue job ID: %s\n' "${QUEUE_JOB_ID}"
+printf 'Workflow: %s\n' "${JOB_TYPE}"
+printf 'Task: %s\n' "${RESOLVED_TASK}"
+printf 'Config: %s\n' "${CANONICAL_CONFIG_PATH}"
+printf 'Selected host GPU: %s\n' "${GPU_ID}"
+printf 'CUDA_VISIBLE_DEVICES: %s\n' "${GPU_ID}"
+printf 'Container CUDA device: 0\n'
+printf 'Task-spooler socket: %s\n' "${TASK_SPOOLER_SOCKET}"
+printf 'Queued command:'
+printf ' %q' "${QUEUE_COMMAND[@]}"
+printf '\n'
+printf 'Host log: %s\n' "${LOG_PATH}"
+printf 'Follow manually:\n'
+printf '  tail -n +1 -F %q\n' "${LOG_PATH}"
+
+if [[ "${FOLLOW_LOG}" != true ]]; then
+  exit 0
+fi
+
+printf 'Following host log. Press Ctrl+C to stop following; the queue job continues.\n'
+FOLLOW_INTERRUPTED=false
+follow_interrupt() {
+  FOLLOW_INTERRUPTED=true
+}
+trap follow_interrupt INT
+set +e
+tail -n +1 -F "${LOG_PATH}"
+TAIL_STATUS=$?
+set -e
+trap - INT
+unset -f follow_interrupt
+if [[ "${FOLLOW_INTERRUPTED}" == true ]] || (( TAIL_STATUS == 130 )); then
+  printf 'Log following stopped. Queue job %s continues independently.\n' "${QUEUE_JOB_ID}"
+  exit 0
+fi
+if (( TAIL_STATUS != 0 )); then
+  fail "${TAIL_STATUS}" "Host log following failed; queue job ${QUEUE_JOB_ID} continues independently."
+fi
+printf 'Log following ended. Queue job %s continues independently.\n' "${QUEUE_JOB_ID}"

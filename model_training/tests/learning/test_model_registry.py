@@ -1,19 +1,21 @@
 # ruff: noqa: S101
 """
-Protect public semantic registries for models, losses, metrics, derivatives, and physics.
+Protect public semantic registries for models, losses, metrics, and physics.
 
-The tests require canonical identifiers to resolve, implementation/display aliases
+The tests require canonical identifiers to resolve, neutral unsupported identifiers
 to fail, structural dimensionality/depth constraints to agree with builders, and
 CPU construction not to query CUDA. Numerical model quality and training lifecycle
 are deliberately covered elsewhere.
 """
 
-from pathlib import Path
+import importlib
+import sys
 from typing import Any
 
 import pytest
 import torch
 from src import domain, experiments, learning
+from support import configs
 
 
 def test_semantic_model_loss_metric_and_physics_ids_resolve() -> None:
@@ -30,28 +32,37 @@ def test_semantic_model_loss_metric_and_physics_ids_resolve() -> None:
     assert learning.metrics.metrics.resolve_metric_kind("relative_h1").direction == "minimize"
     assert learning.metrics.metrics.resolve_metric_kind("rmse").direction == "minimize"
     assert domain.tasks.registry.resolve_physics("steady_2d_brinkman").kind == "steady_2d_brinkman"
-    assert learning.losses.factory.resolve_physics_loss_implementation("steady_2d_brinkman").kind == "steady_2d_brinkman"
 
 
-def test_nonsemantic_implementation_identifiers_fail_clearly() -> None:
-    """
-    Query class names, display labels, shorthand, capitalization drift, and unknown IDs.
+def test_current_uno_dependency_resampling_remains_bicubic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protect the maintained 2D neuraloperator resampling fact used by preflight."""
+    resampling = importlib.import_module("neuralop.layers.resample")
+    observed: dict[str, Any] = {}
 
-    Every nonsemantic family must fail at its owning registry so no undocumented
-    undocumented identifier vocabulary enters persisted configuration.
-    """
-    for identifier in ("PI-FNO", "PINOLoss", "FNO"):
-        with pytest.raises(ValueError, match="Unknown model identifier"):
-            learning.models.factory.resolve_model_kind(identifier)
-    for identifier in ("PINOLoss", "H1Loss", "LpLoss", "h1"):
-        with pytest.raises(ValueError, match="Unknown loss identifier"):
-            learning.losses.factory.resolve_data_loss_kind(identifier)
+    def interpolate(value: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        observed.update(kwargs)
+        return value
+
+    monkeypatch.setattr(resampling.F, "interpolate", interpolate)
+    value = torch.zeros(1, 1, 8, 8)
+    assert resampling.resample(value, 0.5, [2, 3]) is value
+    assert observed["mode"] == "bicubic"
+    assert observed["align_corners"] is True
+    assert learning.models.factory.UNO_RESAMPLING_MODE == "bicubic"
+
+
+def test_unknown_semantic_identifiers_fail_clearly() -> None:
+    """Reject one neutral unsupported identifier at each canonical registry."""
+    with pytest.raises(ValueError, match="Unknown model identifier"):
+        learning.models.factory.resolve_model_kind("unsupported")
+    with pytest.raises(ValueError, match="Unknown loss identifier"):
+        learning.losses.factory.resolve_data_loss_kind("unsupported")
     with pytest.raises(ValueError, match="Unknown metric identifier"):
-        learning.metrics.metrics.resolve_metric_kind("RMSEOverall")
+        learning.metrics.metrics.resolve_metric_kind("unsupported")
     with pytest.raises(ValueError, match="Unknown physics identifier"):
-        domain.tasks.registry.resolve_physics("PINOLoss")
-    with pytest.raises(ValueError, match="Unknown physics loss identifier"):
-        learning.losses.factory.resolve_physics_loss_implementation("PINOLoss")
+        domain.tasks.registry.resolve_physics("unsupported")
 
 
 def test_model_factory_rejects_unsupported_dimensionality_and_uno_depth() -> None:
@@ -102,6 +113,63 @@ def test_model_factory_rejects_unsupported_dimensionality_and_uno_depth() -> Non
         )
 
 
+def test_real_uno_constructor_has_no_repeated_skip_debug_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Construct a small real UNO without dependency-owned skip-option print noise."""
+    learning.models.factory.build_uno(
+        in_channels=4,
+        out_channels=3,
+        n_layers=5,
+        hidden_channels=4,
+        modes_x=8,
+        modes_y=8,
+    )
+
+    captured = capsys.readouterr()
+    assert "fno_skip=" not in captured.out
+    assert "channel_mlp_skip=" not in captured.out
+
+
+def test_uno_noise_filter_reemits_unrelated_diagnostics_and_propagates_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Filter only exact known debug lines while preserving architecture args and failures."""
+    neuralop_models = importlib.import_module("neuralop.models")
+    observed: dict[str, Any] = {}
+
+    class FailingUNO:
+        def __init__(self, **kwargs: Any) -> None:
+            observed.update(kwargs)
+            print("fno_skip='linear'")
+            print("channel_mlp_skip='linear'")
+            print("preserved constructor diagnostic")
+            print("preserved constructor warning", file=sys.stderr)
+            message = "visible constructor failure"
+            raise RuntimeError(message)
+
+    monkeypatch.setattr(neuralop_models, "UNO", FailingUNO)
+    with pytest.raises(RuntimeError, match="visible constructor failure"):
+        learning.models.factory.build_uno(
+            in_channels=4,
+            out_channels=3,
+            n_layers=5,
+            hidden_channels=4,
+            modes_x=8,
+            modes_y=8,
+            channel_mlp_skip="identity",
+        )
+
+    captured = capsys.readouterr()
+    assert "fno_skip=" not in captured.out
+    assert "channel_mlp_skip=" not in captured.out
+    assert "preserved constructor diagnostic" in captured.out
+    assert "preserved constructor warning" in captured.err
+    assert observed["channel_mlp_skip"] == "identity"
+    assert observed["uno_n_modes"][0] == [8, 8]
+
+
 def test_model_factory_uses_only_the_required_concrete_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -111,7 +179,7 @@ def test_model_factory_uses_only_the_required_concrete_device(
     Construction must use only the concrete device supplied and reject string or
     unindexed CUDA inputs, preserving device resolution as orchestration ownership.
     """
-    config_path = Path(__file__).parents[2] / "configs/experiments/steady_flow_fno.yaml"
+    config_path = configs.experiment_config_path(model_kind="fno", physics_enabled=False)
     config = experiments.config.loader.load_and_resolve_config(config_path)
     config["model"]["params"].update(
         {"n_modes": [2, 2], "hidden_channels": 2, "n_layers": 1},

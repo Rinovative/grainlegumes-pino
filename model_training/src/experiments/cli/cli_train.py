@@ -22,6 +22,7 @@ This module does NOT:
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 
 from . import cli_device
@@ -45,6 +46,50 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override outputs only; dataset lookup remains bound to dataset_root",
     )
     return parser
+
+
+def _print_existing_run_admission(report: dict[str, object]) -> None:
+    """Render one actionable, non-interactive fresh-run rejection."""
+    completed = report.get("completed_epoch")
+    target = report.get("target_epoch")
+    compatibility = str(report.get("resume_compatibility"))
+    active = report.get("active_lock")
+    active_label = "present" if active is True else "absent" if active is False else "unknown"
+    state = report.get("state")
+    state_mapping = state if isinstance(state, dict) else {}
+    state_label = ", ".join(f"{name}={'available' if available else 'missing'}" for name, available in state_mapping.items())
+
+    print("Run admission rejected: existing run requires explicit resume.", file=sys.stderr)
+    print(f"Requested canonical run name: {report.get('requested_run_name')}", file=sys.stderr)
+    print(f"Canonical config path: {report.get('config_path')}", file=sys.stderr)
+    print(f"Existing directory: {report.get('run_dir')}", file=sys.stderr)
+    print(f"Lifecycle status: {report.get('status')}", file=sys.stderr)
+    print(f"Completed epoch: {completed if completed is not None else 'unknown'}", file=sys.stderr)
+    print(f"Requested target epoch: {target}", file=sys.stderr)
+    print(
+        f"Last checkpoint: {'available' if report.get('last_checkpoint_available') else 'missing'}",
+        file=sys.stderr,
+    )
+    print(
+        f"Best checkpoint: {'available' if report.get('best_checkpoint_available') else 'missing'}",
+        file=sys.stderr,
+    )
+    print(f"Manifest/state: {state_label or 'unavailable'}", file=sys.stderr)
+    print(f"Active lock: {active_label}", file=sys.stderr)
+    print(f"Resume compatibility: {compatibility}", file=sys.stderr)
+    print(f"Reason: {report.get('reason')}", file=sys.stderr)
+
+    if compatibility == "completed":
+        print("Run already completed; no training was started.", file=sys.stderr)
+        print(f"Completed epoch: {completed if completed is not None else 'unknown'} / {target}", file=sys.stderr)
+    elif compatibility == "compatible":
+        config_path = shlex.quote(str(report.get("config_path")))
+        run_dir = shlex.quote(str(report.get("run_dir")))
+        print("Resume explicitly with:", file=sys.stderr)
+        print(
+            f"  ./scripts/docker_job.sh train {config_path} --resume {run_dir}",
+            file=sys.stderr,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,7 +127,14 @@ def main(argv: list[str] | None = None) -> int:
         print("Training interrupted.", file=sys.stderr)
         return 130
     except Exception as error:  # noqa: BLE001
-        print(f"Training failed: {type(error).__name__}: {error}", file=sys.stderr)
+        from src.experiments import experiments_console  # noqa: PLC0415
+        from src.experiments import experiments_run as run_service  # noqa: PLC0415
+
+        if isinstance(error, run_service.ExistingRunAdmissionError):
+            _print_existing_run_admission(error.report)
+            return 1
+        print("Training failed; sanitized traceback follows.", file=sys.stderr, flush=True)
+        experiments_console.print_sanitized_traceback(error)
         return 1
 
     result = outcome["result"]

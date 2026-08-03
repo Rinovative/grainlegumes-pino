@@ -10,13 +10,12 @@ failures. Normalized-versus-physical space routing is covered by
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 from src import domain, experiments, learning
+from support import configs
 
-_CONFIG = Path(__file__).parents[2] / "configs" / "experiments" / "steady_flow_fno.yaml"
+_CONFIG = configs.acceptance_config_path()
 
 
 def _metric_config() -> dict[str, object]:

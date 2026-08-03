@@ -1,10 +1,10 @@
 """
-Task contracts and registries.
+Registered scientific task specifications.
 
 Provides:
-- registry: strict semantic task and physics lookup
-- spec: immutable field, metric, physics, and task descriptors
-- steady_flow: the canonical steady-flow task contract
+- registry: task registration and lookup
+- spec: immutable task-schema definitions
+- steady_flow: maintained steady-flow task contract
 """
 
 from . import domain_task_registry as registry

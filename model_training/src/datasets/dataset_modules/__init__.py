@@ -1,8 +1,8 @@
 """
-Dataset modules for model-ready samples.
+Model-ready task dataset modules.
 
 Provides:
-- flow: strict task tensor construction from current dataset payloads
+- flow: strict steady-flow tensor dataset module
 """
 
 from . import dataset_module_flow as flow

@@ -1,8 +1,7 @@
 """
-Expose shared synthetic task builders for lifecycle and contract tests.
+Reusable fixtures and task builders for repository tests.
 
-Support objects model the public TaskSpec surface while remaining unregistered and
-small enough for CPU unit tests. They are intentionally not storage fixtures,
-scientific benchmark tasks, or production defaults; individual modules document
-additional simplifications.
+Provides:
+- real_data: guarded mounted-data fixture access
+- synthetic_task: unregistered synthetic task and identity builders
 """

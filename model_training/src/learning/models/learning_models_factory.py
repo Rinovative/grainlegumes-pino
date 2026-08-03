@@ -7,6 +7,7 @@ Construct FNO and UNO models from resolved experiment configs.
 Responsibilities:
   - Build FNO models from channel, mode and layer settings
   - Build UNO models with configured mode schedules
+  - Declare the maintained neuraloperator UNO resampling semantics
   - Resolve semantic model identifiers from strict registries
 
 Design principles:
@@ -25,21 +26,25 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import io
+import sys
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-import torch
-from neuralop.models import FNO, UNO
-
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterator, Mapping
+
+    import torch
+    from neuralop.models import FNO, UNO
 
 _SkipConnection = Literal["linear", "identity", "soft-gating"]
 _UNO_LAYERS_5 = 5
 _UNO_LAYERS_7 = 7
 _MIN_UNO_MODE = 8
 _FNO_MODE_DIMENSIONS = 2
+UNO_RESAMPLING_MODE = "bicubic"
 
 
 def _validate_skip(name: str, value: str) -> _SkipConnection:
@@ -97,6 +102,8 @@ def build_fno(
         Initialized FNO model
 
     """
+    from neuralop.models import FNO  # noqa: PLC0415
+
     n_modes_tuple = tuple(int(mode) for mode in n_modes)
     if len(n_modes_tuple) != _FNO_MODE_DIMENSIONS:
         msg = f"FNO requires exactly two n_modes entries, got: {n_modes!r}"
@@ -119,6 +126,20 @@ def build_fno(
         model.to(device)
 
     return model
+
+
+@contextmanager
+def _filter_uno_constructor_stdout() -> Iterator[None]:
+    """Suppress only neuraloperator's known UNO skip-option debug lines."""
+    captured = io.StringIO()
+    known_noise = {f"{name}={value!r}" for name in ("fno_skip", "channel_mlp_skip") for value in ("linear", "identity", "soft-gating", None)}
+    try:
+        with redirect_stdout(captured):
+            yield
+    finally:
+        for line in captured.getvalue().splitlines(keepends=True):
+            if line.rstrip("\r\n") not in known_noise:
+                sys.stdout.write(line)
 
 
 def build_uno(
@@ -165,6 +186,8 @@ def build_uno(
         Initialized UNO model
 
     """
+    from neuralop.models import UNO  # noqa: PLC0415
+
     if n_layers not in {_UNO_LAYERS_5, _UNO_LAYERS_7}:
         msg = f"UNO supports exactly {_UNO_LAYERS_5} or {_UNO_LAYERS_7} layers, got {n_layers}."
         raise ValueError(msg)
@@ -221,16 +244,17 @@ def build_uno(
 
     uno_out_channels = [hidden_channels] * n_layers
 
-    model = UNO(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        hidden_channels=hidden_channels,
-        n_layers=n_layers,
-        uno_out_channels=uno_out_channels,
-        uno_n_modes=uno_n_modes,
-        uno_scalings=uno_scalings,
-        channel_mlp_skip=_validate_skip("channel_mlp_skip", channel_mlp_skip),
-    )
+    with _filter_uno_constructor_stdout():
+        model = UNO(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            hidden_channels=hidden_channels,
+            n_layers=n_layers,
+            uno_out_channels=uno_out_channels,
+            uno_n_modes=uno_n_modes,
+            uno_scalings=uno_scalings,
+            channel_mlp_skip=_validate_skip("channel_mlp_skip", channel_mlp_skip),
+        )
 
     if device is not None:
         model.to(device)
@@ -480,6 +504,8 @@ def build_model(config: dict[str, Any], *, device: torch.device) -> torch.nn.Mod
         If the semantic model identifier or parameters are invalid.
 
     """
+    import torch  # noqa: PLC0415
+
     model_config = config.get("model")
     if not isinstance(model_config, dict):
         msg = "Resolved config must contain a model mapping."

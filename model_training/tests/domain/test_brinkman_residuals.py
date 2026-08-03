@@ -154,7 +154,7 @@ def test_both_continuity_formulations_are_semantically_selected() -> None:
     assert torch.allclose(conservative.selected, torch.full_like(x_grid, 0.25), atol=1e-12)
     assert torch.allclose(plain.selected, torch.ones_like(x_grid), atol=1e-12)
     with pytest.raises(ValueError, match="Unknown continuity identifier"):
-        domain.physics.brinkman.validate_continuity_kind("automatic")
+        domain.physics.contracts.validate_continuity_kind("unsupported")
 
 
 def test_outlet_pressure_gauge_is_reduced_per_sample() -> None:

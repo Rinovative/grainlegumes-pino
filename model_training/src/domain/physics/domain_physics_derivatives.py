@@ -25,14 +25,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal, Protocol, cast
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor
 from torch.nn import functional
 
-DerivativeKind = Literal["physical", "spectral"]
-SpectralExtension = Literal["none", "reflect"]
+from . import domain_physics_contracts as physics_contracts
+
 SpatialAxes = tuple[int, int]
 _MIN_SPATIAL_POINTS = 2
 _SPATIAL_AXIS_COUNT = 2
@@ -52,12 +52,12 @@ class DerivativeOperator(Protocol):
     """
 
     @property
-    def kind(self) -> DerivativeKind:
+    def kind(self) -> physics_contracts.DerivativeKind:
         """Return the semantic derivative identifier."""
         ...
 
     @property
-    def extension(self) -> SpectralExtension:
+    def extension(self) -> physics_contracts.SpectralExtension:
         """Return the explicit boundary-extension identifier."""
         ...
 
@@ -350,8 +350,8 @@ class PhysicalDerivatives:
     """
 
     axes: SpatialAxes = (-2, -1)
-    kind: DerivativeKind = "physical"
-    extension: SpectralExtension = "none"
+    kind: physics_contracts.DerivativeKind = "physical"
+    extension: physics_contracts.SpectralExtension = "none"
 
     def __post_init__(self) -> None:
         """Reject meaningless extension settings for physical derivatives."""
@@ -469,9 +469,9 @@ class SpectralDerivatives:
 
     """
 
-    extension: SpectralExtension = "reflect"
+    extension: physics_contracts.SpectralExtension = "reflect"
     axes: SpatialAxes = (-2, -1)
-    kind: DerivativeKind = "spectral"
+    kind: physics_contracts.DerivativeKind = "spectral"
 
     def __post_init__(self) -> None:
         """Validate the spectral extension identifier."""
@@ -609,11 +609,6 @@ class SpectralDerivatives:
         return derivative_x + derivative_y
 
 
-def available_derivative_kinds() -> tuple[str, ...]:
-    """Return supported semantic derivative identifiers."""
-    return ("physical", "spectral")
-
-
 def build_derivative_operator(
     kind: str,
     *,
@@ -644,16 +639,7 @@ def build_derivative_operator(
         extension requested for physical differences.
 
     """
-    if kind == "physical":
-        if extension != "none":
-            msg = "Physical derivatives require extension 'none'."
-            raise ValueError(msg)
+    resolved_kind, resolved_extension = physics_contracts.validate_derivative_kind(kind, extension=extension)
+    if resolved_kind == "physical":
         return PhysicalDerivatives(axes=axes)
-    if kind == "spectral":
-        if extension not in {"none", "reflect"}:
-            msg = f"Unknown derivative extension {extension!r}; expected 'none' or 'reflect'."
-            raise ValueError(msg)
-        return SpectralDerivatives(extension=cast("SpectralExtension", extension), axes=axes)
-    available = ", ".join(available_derivative_kinds())
-    msg = f"Unknown derivative identifier {kind!r}. Available derivatives: {available}."
-    raise ValueError(msg)
+    return SpectralDerivatives(extension=resolved_extension, axes=axes)

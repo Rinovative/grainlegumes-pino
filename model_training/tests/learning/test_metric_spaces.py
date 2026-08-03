@@ -11,13 +11,13 @@ these fixtures do not model training normalization quality.
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 
 import pytest
 import torch
 from src import experiments, learning
+from support import configs
 
-_CONFIG = Path(__file__).parents[2] / "configs" / "experiments" / "steady_flow_fno.yaml"
+_CONFIG = configs.acceptance_config_path()
 
 
 class AffineNormalizer:
@@ -156,11 +156,17 @@ def test_incompatible_physical_aggregate_is_rejected() -> None:
     scalar cannot falsely imply a coherent physical unit.
     """
     raw = experiments.config.loader.load_yaml(_CONFIG)
-    aggregate = copy.deepcopy(next(metric for metric in raw["evaluation"]["metrics"] if metric["id"] == "physical_rmse_p"))
+    defaults = experiments.config.defaults.get_task_defaults(str(raw["task"]))
+    aggregate = copy.deepcopy(
+        next(metric for metric in defaults["evaluation"]["metrics"] if metric["id"] == "physical_rmse_p"),
+    )
+    aggregate.pop("direction")
     aggregate["id"] = "physical_rmse_all"
     aggregate["fields"] = ["p", "u", "v"]
-    raw["evaluation"]["metrics"] = [aggregate]
-    raw["evaluation"]["objective"] = {"id": "physical_rmse_all"}
+    raw["evaluation"] = {
+        "metrics": [aggregate],
+        "objective": {"id": "physical_rmse_all"},
+    }
 
     with pytest.raises(ValueError, match="incompatible units"):
         experiments.config.loader.resolve_config(raw)

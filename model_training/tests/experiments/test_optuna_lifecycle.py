@@ -1,6 +1,6 @@
 # ruff: noqa: S101
 """
-Exercise continuous pruning, semantic study signatures, reopening, and outcomes.
+Exercise sparse pruning, semantic study signatures, reopening, and outcomes.
 
 A tiny CPU SQLite study proves actual completed-epoch steps and fresh additional
 trials; stubs classify pruning, non-finite, OOM, recoverable, interrupt, and bug
@@ -11,8 +11,8 @@ covered by ``test_optuna_contract``; no production study is run.
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -20,30 +20,18 @@ import optuna
 import pytest
 import torch
 from src import common, experiments
+from support import configs
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from pathlib import Path
 
 optuna_runtime = experiments.tuning.optuna
 search_space = experiments.tuning.search_space
-_CONFIG_ROOT = Path(__file__).parents[2] / "configs" / "optuna"
-_EXPECTED_OBJECTIVE = {
-    "id": "normalized_macro_rmse",
-    "kind": "macro_rmse",
-    "space": "normalized",
-    "fields": ["p", "u", "v"],
-    "reduction": "field_macro_element_mean",
-    "direction": "minimize",
-}
-_MAX_CATEGORICAL_VALUES = 3
 _EXPECTED_GLOBAL_STEP = 7
 _EXPECTED_RESUMED_TRIAL_COUNT = 4
-_EXPECTED_RECIPES = {
-    "steady_flow_fno_search.yaml": ("fno", False),
-    "steady_flow_pifno_search.yaml": ("fno", True),
-    "steady_flow_piuno_search.yaml": ("uno", True),
-    "steady_flow_uno_search.yaml": ("uno", False),
-}
+_SYNTHETIC_SMOKE_TRIALS = 2
+_SYNTHETIC_SMOKE_EPOCHS = 2
 
 
 class _Trial:
@@ -106,54 +94,20 @@ class _Trial:
         return self.prune
 
 
-def _load(name: str = "steady_flow_fno_search.yaml") -> optuna_runtime.OptunaStudyConfig:
-    """Load a recipe with external tracking disabled for local lifecycle tests."""
-    config = optuna_runtime.load_optuna_study_config(_CONFIG_ROOT / name)
+def _load(
+    *,
+    model_kind: str = "fno",
+    physics_enabled: bool = False,
+) -> optuna_runtime.OptunaStudyConfig:
+    """Load a semantic recipe with external tracking disabled for lifecycle tests."""
+    path = configs.optuna_config_path(
+        model_kind=model_kind,
+        physics_enabled=physics_enabled,
+    )
+    config = optuna_runtime.load_optuna_study_config(path)
     base_config = copy.deepcopy(config.base_config)
     base_config["tracking"]["wandb"]["mode"] = "disabled"
     return replace(config, base_config=base_config)
-
-
-def test_exact_four_recipes_are_safe_complete_and_small() -> None:
-    """
-    Enumerate the maintained recipes and inspect model, physics, cadence, and searches.
-
-    Exactly four small studies must exist, each base value must remain admissible,
-    and continuity may vary only for physics-informed recipes.
-    """
-    paths = sorted(_CONFIG_ROOT.glob("*.yaml"))
-    assert {path.name for path in paths} == set(_EXPECTED_RECIPES)
-
-    for path in paths:
-        expected_model, expected_physics = _EXPECTED_RECIPES[path.name]
-        config = optuna_runtime.load_optuna_study_config(path)
-        raw = experiments.config.loader.load_yaml(path)
-        base = config.base_config
-        assert base["model"]["kind"] == expected_model
-        assert base["loss"]["physics"]["enabled"] is expected_physics
-        assert base["evaluation"]["objective"] == _EXPECTED_OBJECTIVE
-        assert base["training"]["evaluation_interval"] == 1
-        assert base["data"]["num_workers"] == 0
-        assert base["data"]["persistent_workers"] is False
-        assert raw["study"]["pruner"] == {
-            "kind": "median",
-            "n_startup_trials": 5,
-            "n_warmup_steps": 20,
-            "interval_steps": 1,
-        }
-        assert "report_epochs" not in raw["study"]
-        categorical_sizes = [
-            len(parameter.values)
-            for parameter in config.search_space
-            if parameter.kind == "categorical" and parameter.path != "loss.physics.continuity"
-        ]
-        assert max(categorical_sizes) <= _MAX_CATEGORICAL_VALUES
-        continuity = [parameter for parameter in config.search_space if parameter.path == "loss.physics.continuity"]
-        if expected_physics:
-            assert len(continuity) == 1
-            assert continuity[0].values == ("div_velocity", "div_eps_velocity")
-        else:
-            assert continuity == []
 
 
 def test_signature_excludes_invocation_and_tracking_but_covers_science(tmp_path: Path) -> None:
@@ -170,7 +124,6 @@ def test_signature_excludes_invocation_and_tracking_but_covers_science(tmp_path:
     operational_base["run"]["device"] = "cpu"
     operational_base["paths"]["output_root"] = str(tmp_path / "elsewhere")
     operational_base["tracking"]["wandb"]["mode"] = "offline"
-    operational_base["tracking"]["wandb"]["monitor"]["interval"] += 1
     operational_study = copy.deepcopy(config.study)
     operational_study.update({"name": "display_name_changed", "n_trials": 97, "storage": "sqlite:///elsewhere.db"})
     operational = replace(config, base_config=operational_base, study=operational_study)
@@ -190,8 +143,16 @@ def test_signature_excludes_invocation_and_tracking_but_covers_science(tmp_path:
     seeded["seed"] += 1
     scientific_variants.append(replace(config, study=seeded))
     pruned = copy.deepcopy(config.study)
-    pruned["pruner"]["n_warmup_steps"] += 1
+    pruned["pruner"]["n_warmup_steps"] += 5
     scientific_variants.append(replace(config, study=pruned))
+    cadence = copy.deepcopy(config.base_config)
+    cadence["training"]["evaluation_interval"] = 10
+    cadence["training"]["ood_evaluation_interval"] = 10
+    cadence["tracking"]["wandb"]["monitor"]["interval"] = 10
+    cadence_study = copy.deepcopy(config.study)
+    cadence_study["pruner"]["n_warmup_steps"] = 30
+    cadence_study["pruner"]["interval_steps"] = 10
+    scientific_variants.append(replace(config, base_config=cadence, study=cadence_study))
     parameters = list(config.search_space)
     parameters[0] = replace(parameters[0], values=(*parameters[0].values, 144))
     scientific_variants.append(replace(config, search_space=tuple(parameters)))
@@ -202,6 +163,8 @@ def test_signature_excludes_invocation_and_tracking_but_covers_science(tmp_path:
     lifecycle = baseline["payload"]["trial_lifecycle"]
     assert lifecycle["resume_policy"] == "new_trials_only"
     assert lifecycle["trial_count_policy"] == "additional_fresh_trials_per_invocation"
+    assert lifecycle["training_seed_policy"] == "fixed_configured_run_seed_across_trials"
+    assert lifecycle["trial_identity_policy"] == "native_zero_based_optuna_number"
 
 
 def test_reporter_requires_held_out_metric_continuity_and_prunes_immediately() -> None:
@@ -253,7 +216,7 @@ def test_search_policy_rejects_unapproved_kinds_defaults_and_model_values() -> N
     with pytest.raises(ValueError, match="not approved"):
         search_space.validate_search_space_paths(fno.base_config, (physics_on_supervised,))
 
-    pi_fno = _load("steady_flow_pifno_search.yaml")
+    pi_fno = _load(model_kind="fno", physics_enabled=True)
     bad_continuity = replace(
         physics_on_supervised,
         values=("div_eps_velocity", "unsupported_continuity"),
@@ -261,7 +224,7 @@ def test_search_policy_rejects_unapproved_kinds_defaults_and_model_values() -> N
     with pytest.raises(ValueError, match="unsupported by the task contract"):
         search_space.validate_search_space_paths(pi_fno.base_config, (bad_continuity,))
 
-    uno = _load("steady_flow_uno_search.yaml")
+    uno = _load(model_kind="uno", physics_enabled=False)
     bad_depth = search_space.SearchSpaceParameter(
         path="model.params.n_layers",
         name="n_layers",
@@ -307,8 +270,8 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
     settings["pruner"] = {
         "kind": "median",
         "n_startup_trials": 0,
-        "n_warmup_steps": 0,
-        "interval_steps": 1,
+        "n_warmup_steps": 5,
+        "interval_steps": 5,
     }
     config = replace(config, study=settings)
 
@@ -324,9 +287,12 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
                 trial=trial,
                 objective_id="normalized_macro_rmse",
                 direction="minimize",
+                evaluation_interval=5,
+                target_epoch=10,
+                pruner_config=settings["pruner"],
             )
             values = (0.10, 0.09) if trial.number == 0 else (1.0, 0.9)
-            for epoch, value in enumerate(values, start=1):
+            for epoch, value in zip((5, 10), values, strict=True):
                 reporter(epoch, {"id/normalized_macro_rmse": value, "global_step": float(epoch)})
             assert reporter.best_value is not None
             return reporter.best_value
@@ -353,11 +319,15 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
         resumed.trials[0].value,
         dict(resumed.trials[0].intermediate_values),
     )
-    assert resumed.trials[0].intermediate_values == {1: 0.10, 2: 0.09}
-    assert resumed.trials[2].intermediate_values == {1: 1.0}
+    assert resumed.trials[0].intermediate_values == {5: 0.10, 10: 0.09}
+    assert resumed.trials[2].intermediate_values == {5: 1.0}
     assert resumed.user_attrs["semantic_signature"] == optuna_runtime.build_study_signature(config)["digest"]
     study_dir = tmp_path / "steady_flow" / "studies" / settings["name"]
     assert (study_dir / f"{settings['name']}.db").is_file()
+    summary = json.loads((study_dir / "study_summary.json").read_text(encoding="utf-8"))
+    assert summary["training_seed"] == config.base_config["run"]["seed"]
+    assert summary["sampler"]["seed"] == config.study["seed"]
+    assert [trial["number"] for trial in summary["trials"]] == [0, 1, 2]
     assert not list(study_dir.glob("trial_*"))
 
     def unexpected_factory(_config: optuna_runtime.OptunaStudyConfig) -> Callable[[Any], float]:
@@ -385,6 +355,84 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
     assert len(optuna.load_study(study_name=settings["name"], storage=storage).trials) == _EXPECTED_RESUMED_TRIAL_COUNT
 
 
+def test_fno_smoke_wrapper_is_bounded_and_persists_a_synthetic_local_study(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exercise a bounded projection of the smoke wrapper without external workloads."""
+    path = configs.optuna_config_path(model_kind="fno", physics_enabled=False, role="smoke")
+    config = optuna_runtime.load_optuna_study_config(path)
+    base = copy.deepcopy(config.base_config)
+    base["tracking"]["wandb"]["mode"] = "disabled"
+    base["training"]["epochs"] = _SYNTHETIC_SMOKE_EPOCHS
+    settings = copy.deepcopy(config.study)
+    settings["n_trials"] = _SYNTHETIC_SMOKE_TRIALS
+    config = optuna_runtime.with_runtime_overrides(
+        replace(config, base_config=base, study=settings),
+        device="cpu",
+        output_root=tmp_path,
+    )
+    target_epoch = config.base_config["training"]["epochs"]
+    cadence = config.base_config["training"]["evaluation_interval"]
+    configured_trials = config.study["n_trials"]
+    training_seed = config.base_config["run"]["seed"]
+    sampler_seed = config.study["seed"]
+
+    def synthetic_factory(study_config: optuna_runtime.OptunaStudyConfig) -> Callable[[Any], float]:
+        def objective(trial: Any) -> float:
+            overrides = search_space.suggest_trial_overrides(trial, study_config.search_space)
+            trial.set_user_attr("synthetic_overrides", overrides)
+            reporter = optuna_runtime.OptunaEpochReporter(
+                trial=trial,
+                objective_id="normalized_macro_rmse",
+                direction="minimize",
+                evaluation_interval=cadence,
+                target_epoch=target_epoch,
+                pruner_config=study_config.study["pruner"],
+            )
+            for epoch in range(1, target_epoch + 1):
+                value = 1.0 - 0.1 * trial.number - 0.01 * epoch
+                reporter(epoch, {"id/normalized_macro_rmse": value, "global_step": float(epoch)})
+            assert reporter.best_value is not None
+            return reporter.best_value
+
+        return objective
+
+    monkeypatch.setattr(optuna_runtime, "create_objective", synthetic_factory)
+    study = optuna_runtime.run_optuna_study(config)
+    output = capsys.readouterr().out
+
+    assert "event=optuna_study status=started" in output
+    assert "study_role=smoke" in output
+    assert f"sampler_seed={sampler_seed}" in output
+    assert f"configured_trials={configured_trials}" in output
+    assert f"invocation_trials={configured_trials}" in output
+    assert "timeout=none" in output
+    assert f"maximum_epochs={target_epoch}" in output
+    assert f"id_interval={cadence} ood_interval={cadence} physics_interval={cadence}" in output
+    assert f"warmup_epochs={config.study['pruner']['n_warmup_steps']}" in output
+    assert f"pruning_interval_epochs={config.study['pruner']['interval_steps']}" in output
+    assert f"wandb_group={config.study['name']}" in output
+    assert "event=optuna_study status=completed" in output
+    assert f"attempted_trials={configured_trials} completed_trials={configured_trials} pruned_trials=0 failed_trials=0" in output
+    assert "best_parameters=" in output
+    assert config.study["role"] == "smoke"
+    assert [trial.number for trial in study.trials] == list(range(configured_trials))
+    assert all(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials)
+    expected_parameters = {parameter.name for parameter in config.search_space if parameter.kind != "fixed"}
+    assert all(set(trial.params) == expected_parameters for trial in study.trials)
+    expected_epochs = set(range(1, target_epoch + 1))
+    assert all(set(trial.intermediate_values) == expected_epochs for trial in study.trials)
+    study_dir = tmp_path / str(config.base_config["task"]) / "studies" / str(config.study["name"])
+    summary = json.loads((study_dir / "study_summary.json").read_text(encoding="utf-8"))
+    assert summary["study_role"] == "smoke"
+    assert summary["configured_trials"] == summary["attempted_trials"] == summary["completed"] == configured_trials
+    assert summary["parameter_importance"]["status"] == "not_computed"
+    assert summary["training_seed"] == training_seed
+    assert summary["sampler"]["seed"] == sampler_seed
+
+
 def _install_running_failure_harness(
     error: BaseException,
     monkeypatch: pytest.MonkeyPatch,
@@ -395,7 +443,7 @@ def _install_running_failure_harness(
     The harness builds only inert CPU objects, keeps allocation/status/summary code
     real, and injects ``error`` at the training boundary for taxonomy assertions.
     """
-    processor = SimpleNamespace(state_dict=dict, in_normalizer=None, out_normalizer=None)
+    processor = SimpleNamespace(state_dict=dict, in_normalizer=None, out_normalizer=None, to=lambda _device: None)
 
     def configure_reproducibility(_config: dict[str, Any], *, device: torch.device) -> dict[str, int]:
         """Return the minimum deterministic subseed mapping without changing RNGs."""
@@ -430,14 +478,14 @@ def _install_running_failure_harness(
         del device
         return SimpleNamespace()
 
-    def build_eval_metrics(_config: dict[str, Any], *, device: torch.device) -> dict[str, Any]:
+    def build_evaluation_metrics(_config: dict[str, Any], *, device: torch.device) -> dict[str, Any]:
         """Return no metrics because injected training fails before evaluation."""
         del device
         return {}
 
     monkeypatch.setattr(optuna_runtime.learning.models.factory, "build_model", build_model)
     monkeypatch.setattr(optuna_runtime.learning.losses.factory, "build_training_loss", build_training_loss)
-    monkeypatch.setattr(optuna_runtime.learning.losses.factory, "build_eval_metrics", build_eval_metrics)
+    monkeypatch.setattr(optuna_runtime.learning.metrics.metrics, "build_evaluation_metrics", build_evaluation_metrics)
     monkeypatch.setattr(
         optuna_runtime.learning.training.optim,
         "build_optimizer",
@@ -479,7 +527,7 @@ def test_pruned_wandb_objective_is_mirrored_only_after_local_publication(
     def prune_training(**kwargs: Any) -> Any:
         """Invoke one epoch callback that must prune before training can continue."""
         callback = kwargs["epoch_end_callback"]
-        callback(1, {"id/normalized_macro_rmse": 0.5, "global_step": 3.0})
+        callback(5, {"id/normalized_macro_rmse": 0.5, "global_step": 3.0})
         pytest.fail("pruning callback must stop training immediately")
 
     def epoch_callback(_session: Any) -> Callable[[int, dict[str, float]], None]:
@@ -504,7 +552,7 @@ def test_pruned_wandb_objective_is_mirrored_only_after_local_publication(
         optuna_runtime.run_trial(config, trial)
 
     assert events == ["local:pruned", "wandb"]
-    assert trial.reports == [(0.5, 1)]
+    assert trial.reports == [(0.5, 5)]
 
 
 @pytest.mark.parametrize(
@@ -570,7 +618,7 @@ def test_running_trial_failure_taxonomy_is_precise_and_cpu_cleanup_is_guarded(
     run_dir = common.paths.resolve_optuna_trial_dir(
         "steady_flow",
         config.study["name"],
-        trial.number,
+        trial.attrs["run_name"],
         output_root=tmp_path,
     )
     summary = experiments.run.read_run_summary(run_dir)

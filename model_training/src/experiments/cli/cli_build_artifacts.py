@@ -131,9 +131,9 @@ def main(argv: list[str] | None = None) -> int:
             runs_root = common.paths.resolve_runs_root(task)
         else:
             parser.error("--task is required when --runs-root is not supplied")
-        dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_dataset_root()
+        dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_training_raw_root()
         metadata_root = args.metadata_root if args.metadata_root is not None else common.paths.get_training_meta_root()
-        results = analysis.artifact_service.build_artifacts(
+        results = analysis.artifacts.service.build_artifacts(
             runs_root=runs_root,
             dataset_root=dataset_root,
             metadata_root=metadata_root,

@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from src import common, experiments
+from support import configs
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_two_public_domains_derive_owned_lifecycle_stages(
@@ -31,8 +35,6 @@ def test_two_public_domains_derive_owned_lifecycle_stages(
     assert common.paths.get_dataset_build_locks_root() == training_root / ".state" / "dataset-builds" / "locks"
     assert common.paths.get_dataset_build_transactions_root() == training_root / ".state" / "dataset-builds" / "transactions"
     assert common.paths.get_run_locks_root() == training_root / ".state" / "runs" / "locks"
-    assert common.paths.get_dataset_root() == training_root / "raw"
-    assert common.paths.get_output_root() == training_root / "processed"
 
     assert common.paths.resolve_generated_batch_dir("tiny", stage="raw") == generated_root / "raw" / "tiny"
     assert common.paths.resolve_generated_batch_dir("tiny", stage="processed") == generated_root / "processed" / "tiny"
@@ -76,7 +78,7 @@ def test_resolved_training_config_records_only_training_domain_paths(
     monkeypatch.setenv("GENERATED_DATA_ROOT", str(generated_root))
     monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
     config = experiments.config.loader.load_and_resolve_config(
-        Path("model_training/configs/experiments/steady_flow_fno.yaml"),
+        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
     )
 
     assert config["paths"] == {
@@ -97,7 +99,7 @@ def test_output_override_cannot_relocate_dataset_inputs(
     second_output_root = tmp_path / "bounded outputs"
     monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
     config = experiments.config.loader.load_and_resolve_config(
-        Path("model_training/configs/experiments/steady_flow_fno.yaml"),
+        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
     )
     dataset_before = common.paths.resolve_dataset_path(
         config["data"]["train_dataset"],
@@ -163,7 +165,9 @@ def test_owned_path_resolvers_apply_logical_name_validation(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_run_output_dir(invalid_name, "run", output_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):
-        common.paths.resolve_optuna_trial_dir("steady_flow", invalid_name, 0, output_root=tmp_path)
+        common.paths.resolve_optuna_trial_dir("steady_flow", invalid_name, "run", output_root=tmp_path)
+    with pytest.raises(ValueError, match="single non-empty path component"):
+        common.paths.resolve_optuna_trial_dir("steady_flow", "study", invalid_name, output_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):
         common.paths.resolve_runs_root(invalid_name, output_root=tmp_path)
     with pytest.raises(ValueError, match="single non-empty path component"):

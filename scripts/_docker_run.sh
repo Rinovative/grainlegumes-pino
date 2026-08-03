@@ -48,8 +48,8 @@ while (( INDEX < ${#SEMANTIC_ARGS[@]} )); do
       echo "--queue-gpu is wrapper-only and must not reach the queue worker." >&2
       exit 2
       ;;
-    --cpu|--cpu=*)
-      echo "--cpu is unsupported; queued jobs always use --device cuda." >&2
+    --follow|--follow=*|--wait|--wait=*|--follow-and-wait|--follow-and-wait=*)
+      echo "Log-following and completion-wait options must not reach the queue worker." >&2
       exit 2
       ;;
     --device)
@@ -104,7 +104,10 @@ mkdir -p \
 # Capture both streams and the final Docker status in the unique host-visible log.
 exec > "${LOG_FILE}" 2>&1
 printf 'Queue worker job: %s\n' "${JOB_TYPE}"
-printf 'Scheduler GPU: %s\n' "${GPU_ID}"
+printf 'Selected host GPU: %s\n' "${GPU_ID}"
+printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES:-${GPU_ID}}"
+printf 'Container CUDA device: 0\n'
+printf 'Task-spooler socket: %s\n' "${TS_SOCKET:-/etc/ts/socket_${GPU_ID}}"
 printf 'Host log: %s\n' "${LOG_FILE}"
 
 if ! command -v docker >/dev/null 2>&1; then

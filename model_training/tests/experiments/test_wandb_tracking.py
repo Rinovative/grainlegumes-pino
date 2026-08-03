@@ -9,13 +9,16 @@ from typing import Any
 import pytest
 import torch
 from src import experiments, learning
+from support import configs
 
 tracking = experiments.tracking
-_CONFIG_PATH = Path(__file__).parents[2] / "configs/experiments/steady_flow_fno.yaml"
-_PI_FNO_CONFIG_PATH = Path(__file__).parents[2] / "configs/experiments/steady_flow_pifno.yaml"
-_UNO_CONFIG_PATH = Path(__file__).parents[2] / "configs/experiments/steady_flow_uno.yaml"
-_PI_UNO_CONFIG_PATH = Path(__file__).parents[2] / "configs/experiments/steady_flow_piuno.yaml"
-_GPU_CONFIG_PATH = Path(__file__).parents[2] / "configs/acceptance/steady_flow_fno_gpu_smoke.yaml"
+_EXPERIMENT_CONFIGS = configs.experiment_config_paths()
+_CONFIG_PATH = configs.acceptance_config_path()
+_PI_FNO_CONFIG_PATH = configs.experiment_config_path(
+    model_kind="fno",
+    physics_enabled=True,
+)
+_GPU_CONFIG_PATH = configs.acceptance_config_path()
 
 
 class _FakeArtifact:
@@ -147,6 +150,14 @@ def _resolved_config(
     return experiments.config.loader.resolve_config(raw)
 
 
+def _expected_variant(config: dict[str, Any]) -> str:
+    """Derive the public model taxonomy from resolved model and loss semantics."""
+    model_kind = config["model"]["kind"]
+    if config["loss"]["physics"]["enabled"]:
+        return f"pi-{model_kind}"
+    return str(model_kind)
+
+
 def _patch_wandb(
     monkeypatch: pytest.MonkeyPatch,
     fake_wandb: _FakeWandb,
@@ -181,100 +192,88 @@ def test_airflow_and_drying_projects_are_explicitly_separate() -> None:
     assert _resolved_config()["tracking"]["wandb"]["project"] == projects["airflow"]
 
 
-@pytest.mark.parametrize(
-    ("config_path", "variant", "run_name"),
-    [
-        (_CONFIG_PATH, "fno", "steady_flow__fno_m128x160_h64_l3__s9"),
-        (_PI_FNO_CONFIG_PATH, "pi-fno", "steady_flow__pi-fno_m128x160_h64_l3__s9"),
-        (_UNO_CONFIG_PATH, "uno", "steady_flow__uno_m64x64_h32_l5_r0p5__s9"),
-        (_PI_UNO_CONFIG_PATH, "pi-uno", "steady_flow__pi-uno_m64x64_h32_l5_r0p5__s9"),
-    ],
-)
-def test_normal_taxonomy_uses_only_variant_tag_and_structured_architecture(
-    config_path: Path,
-    variant: str,
-    run_name: str,
-) -> None:
-    """Keep one base tag while retaining compact names and full model config."""
-    config = _resolved_config(config_path=config_path)
+def test_normal_recipes_explicitly_select_semantic_taxonomy_and_tracking() -> None:
+    """Validate every discovered recipe without freezing filenames or run names."""
+    for config_path in _EXPERIMENT_CONFIGS:
+        raw = experiments.config.loader.load_yaml(config_path)
+        assert raw["tracking"]["wandb"]["mode"] == "online"
+        assert raw["tracking"]["wandb"]["workflow"] == "train"
+        config = experiments.config.loader.resolve_config(raw)
+        variant = _expected_variant(config)
+        settings = config["tracking"]["wandb"]
+
+        assert settings["mode"] == "online"
+        assert settings["workflow"] == "train"
+        assert settings["study"] is None
+        assert settings["project"] == "grainlegumes-pino-airflow"
+        assert settings["entity"] == "Rinovative-Hub"
+        assert settings["tags"] == [variant]
+        assert settings["monitor"]["enabled"] is True
+        assert settings["monitor"]["interval"] == config["training"]["evaluation_interval"]
+        assert settings["monitor"]["interval"] == config["training"]["ood_evaluation_interval"]
+        assert settings["monitor"]["max_cases"] >= 1
+        assert settings["upload"]["evaluation_artifacts"] is False
+        assert not any(tag.startswith("arch:") for tag in settings["tags"])
+        assert "final" not in settings["tags"]
+        assert config["run"]["name"]
+        assert config["model"]["params"]
+
+
+def test_gpu_smoke_tracking_override_is_reachable_and_consumed() -> None:
+    """Preserve acceptance workflow ownership without freezing its mutable budget."""
+    raw = experiments.config.loader.load_yaml(_GPU_CONFIG_PATH)
+    assert raw["tracking"]["wandb"]["mode"] == "online"
+    assert raw["tracking"]["wandb"]["workflow"] == "gpu_smoke"
+    config = experiments.config.loader.resolve_config(raw)
     settings = config["tracking"]["wandb"]
+    cadence = config["training"]["evaluation_interval"]
+
     assert settings["mode"] == "online"
+    assert settings["workflow"] == "gpu_smoke"
+    assert settings["study"] is None
     assert settings["project"] == "grainlegumes-pino-airflow"
     assert settings["entity"] == "Rinovative-Hub"
-    assert settings["tags"] == [variant]
-    assert "group" not in settings
-    assert "job_type" not in settings
-    assert "campaign" not in settings
-    assert not any(tag.startswith("arch:") for tag in settings["tags"])
-    assert "final" not in settings["tags"]
-    assert config["run"]["name"] == run_name
-    assert config["model"]["params"]
-
-
-def test_optuna_and_acceptance_taxonomy_is_minimal() -> None:
-    """Use variant-plus-optuna for trials and no tags for validation runs."""
-    tuned = _resolved_config(workflow="optuna_trial", study="steady_flow_fno_search")["tracking"]["wandb"]
-    assert tuned["tags"] == ["fno", "optuna"]
-    assert tuned["study"] == "steady_flow_fno_search"
-    assert "group" not in tuned
-    assert "job_type" not in tuned
-
-    gpu_raw = experiments.config.loader.load_yaml(_GPU_CONFIG_PATH)
-    gpu = experiments.config.loader.resolve_config(gpu_raw)["tracking"]["wandb"]
-    assert gpu["tags"] == []
-    assert "group" not in gpu
-    assert "job_type" not in gpu
-
-
-@pytest.mark.parametrize(
-    ("config_path", "variant", "study"),
-    [
-        (_CONFIG_PATH, "fno", "steady_flow_fno_search"),
-        (_PI_FNO_CONFIG_PATH, "pi-fno", "steady_flow_pifno_search"),
-        (_UNO_CONFIG_PATH, "uno", "steady_flow_uno_search"),
-        (_PI_UNO_CONFIG_PATH, "pi-uno", "steady_flow_piuno_search"),
-    ],
-)
-def test_all_optuna_variants_use_variant_plus_optuna(
-    config_path: Path,
-    variant: str,
-    study: str,
-) -> None:
-    """Keep all trial tags exact and free of architecture or study slugs."""
-    settings = _resolved_config(
-        workflow="optuna_trial",
-        study=study,
-        config_path=config_path,
-    )["tracking"]["wandb"]
-    assert settings["tags"] == [variant, "optuna"]
-    assert "group" not in settings
-    assert "job_type" not in settings
-
-
-@pytest.mark.parametrize("workflow", ["gpu_smoke", "cpu_acceptance", "tracking_validation"])
-def test_all_acceptance_workflows_have_no_tags(workflow: str) -> None:
-    """Keep bounded validation runs intentionally untagged."""
-    settings = _resolved_config(workflow=workflow)["tracking"]["wandb"]
     assert settings["tags"] == []
-    assert "group" not in settings
-    assert "job_type" not in settings
+    assert settings["monitor"]["enabled"] is True
+    assert settings["monitor"]["interval"] == cadence
+    assert settings["monitor"]["max_cases"] >= 1
+    assert settings["upload"]["evaluation_artifacts"] is False
+    assert cadence <= config["training"]["epochs"]
+    assert config["training"]["ood_evaluation_interval"] == cadence
+    assert experiments.run.initial_tracking_state(config)["workflow"] == "gpu_smoke"
 
 
-def test_retired_campaign_is_rejected() -> None:
-    """Reject the removed campaign/group taxonomy at the user boundary."""
-    raw = experiments.config.loader.load_yaml(_CONFIG_PATH)
-    raw["tracking"] = {"wandb": {"campaign": "final"}}
-    with pytest.raises(ValueError, match=r"unknown key.*campaign"):
-        experiments.config.loader.resolve_config(raw)
+def test_workflow_taxonomies_and_derived_organization_are_strict() -> None:
+    """Keep trial tags semantic, validation tags empty, and organization derived."""
+    for config_path in _EXPERIMENT_CONFIGS:
+        base = experiments.config.loader.load_and_resolve_config(config_path)
+        variant = _expected_variant(base)
+        study = f"{variant}-study"
+        settings = _resolved_config(
+            workflow="optuna_trial",
+            study=study,
+            config_path=config_path,
+        )["tracking"]["wandb"]
+        assert settings["mode"] == "online"
+        assert settings["workflow"] == "optuna_trial"
+        assert settings["study"] == study
+        assert settings["project"] == "grainlegumes-pino-airflow"
+        assert settings["entity"] == "Rinovative-Hub"
+        assert settings["tags"] == [variant, "optuna"]
+        assert settings["monitor"]["enabled"] is True
+        assert settings["monitor"]["interval"] == base["training"]["evaluation_interval"]
+        assert settings["monitor"]["max_cases"] >= 1
+        assert settings["upload"]["evaluation_artifacts"] is False
 
+    for workflow in ("gpu_smoke", "cpu_acceptance", "tracking_validation"):
+        settings = _resolved_config(workflow=workflow)["tracking"]["wandb"]
+        assert settings["tags"] == []
 
-@pytest.mark.parametrize("key", ["project", "entity", "group", "job_type", "campaign", "tags"])
-def test_user_cannot_override_derived_organization(key: str) -> None:
-    """Reject every W&B organization field at the public user-schema boundary."""
-    raw = experiments.config.loader.load_yaml(_CONFIG_PATH)
-    raw["tracking"] = {"wandb": {key: "override"}}
-    with pytest.raises(ValueError, match=rf"tracking\.wandb.*{key}"):
-        experiments.config.loader.resolve_config(raw)
+    for key in ("project", "entity", "tags"):
+        raw = experiments.config.loader.load_yaml(_CONFIG_PATH)
+        raw["tracking"] = {"wandb": {key: "override"}}
+        with pytest.raises(ValueError, match=rf"tracking\.wandb.*{key}"):
+            experiments.config.loader.resolve_config(raw)
 
 
 def test_disabled_wandb_has_no_sdk_or_filesystem_side_effects(
@@ -342,7 +341,6 @@ def test_online_initialization_has_no_workspace_side_effects(
     assert captured.out == ""
     assert captured.err == ""
     assert list(recwarn) == []
-    assert not hasattr(session, "workspace_url")
 
 
 def test_fresh_ids_are_opaque_and_online_resume_is_strict(
@@ -356,7 +354,7 @@ def test_fresh_ids_are_opaque_and_online_resume_is_strict(
     semantic_config = {
         "model": {
             "variant": "fno",
-            "parameter_counts": {"total": 127_445_475, "trainable": 127_445_475},
+            "parameter_counts": {"total": 9, "trainable": 6},
         }
     }
     first_state, first_update = _state_recorder()
@@ -398,11 +396,9 @@ def test_fresh_ids_are_opaque_and_online_resume_is_strict(
         assert fake.initializations[0][key] == fake.initializations[2][key]
     assert fake.initializations[0]["tags"] == ["fno"]
     assert fake.initializations[2]["tags"] is None
-    assert "group" not in fake.initializations[0]
-    assert "job_type" not in fake.initializations[0]
     assert fake.initializations[2]["config"]["model"]["parameter_counts"] == {
-        "total": 127_445_475,
-        "trainable": 127_445_475,
+        "total": 9,
+        "trainable": 6,
     }
     resumed.log_epoch(6, {"train/loss_total": 1.0, "global_step": 7.0})
     with pytest.raises(tracking.TrackingError, match="cannot rewrite"):
@@ -428,6 +424,35 @@ def test_online_resume_preserves_manual_tags_and_restores_required_base_tag(
     assert config["tracking"]["wandb"]["tags"] == ["fno"]
     assert "final" not in str(config)
     assert session.run_id == "persisted-run-id"
+
+
+def test_real_sdk_offline_smoke_is_local_and_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initialize, log, and finish one real offline SDK run without credentials."""
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_SILENT", "true")
+    monkeypatch.setenv("WANDB_CONSOLE", "off")
+    monkeypatch.setenv("WANDB_DISABLE_GIT", "true")
+    monkeypatch.setenv("WANDB_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("WANDB_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("WANDB_DATA_DIR", str(tmp_path / "data"))
+    state, update = _state_recorder()
+    session = tracking.initialize_wandb(
+        _resolved_config(mode="offline", epochs=1),
+        run_dir=tmp_path,
+        semantic_config={"runtime": {"device": {"resolved_device": "cpu"}}},
+        state_updater=update,
+    )
+    session.log_epoch(1, {"train/loss_total": 1.0, "train/loss_data": 0.9})
+    session.finish(status="completed", result={"completed_epoch": 1})
+    assert session.enabled
+    assert state["requested_mode"] == "offline"
+    assert state["last_logged_epoch"] == 1
+    assert state["status"] == "finished"
+    assert list((tmp_path / "wandb").glob("offline-run-*"))
 
 
 def test_offline_mode_needs_no_key_and_keeps_resume_identity(
@@ -522,43 +547,79 @@ def test_semantic_config_is_complete_path_free_and_nonduplicative(
     assert payload["evaluation"]["objective"]["id"] == "normalized_macro_rmse"
     assert payload["evaluation"]["roles"] == {
         "selection": "id",
-        "diagnostic": "ood",
-        "cadence": "same_evaluation_interval",
+        "diagnostic": ["ood", "physics"],
+        "event_model": "completed_epoch_interval_or_terminal",
+        "id_interval_epochs": config["training"]["evaluation_interval"],
+        "ood_interval_epochs": config["training"]["ood_evaluation_interval"],
+        "physics_interval_epochs": config["tracking"]["wandb"]["monitor"]["interval"],
+        "epoch_zero_evaluation": False,
     }
     assert payload["loss"]["data"]["kind"] == "relative_h1"
+    assert payload["loss"]["physics"] == {"enabled": False}
+    assert payload["diagnostics"]["physics_monitor"] == {
+        "enabled": True,
+        "role": "id",
+        "membership": "bounded_saved_evaluation_prefix",
+        "interval_epochs": config["tracking"]["wandb"]["monitor"]["interval"],
+        "max_cases": config["tracking"]["wandb"]["monitor"]["max_cases"],
+        "physics_kind": "steady_2d_brinkman",
+        "equation_set": "steady_two_dimensional_brinkman",
+        "continuity_forms": ["div_velocity", "div_eps_velocity"],
+        "boundary": "pressure_inlet_zero_pressure_outlet",
+        "derivatives": {"kind": "spectral", "extension": "reflect"},
+        "interior_crop": 2,
+        "metric_ids": [
+            "momentum_residual_mse",
+            "continuity_div_velocity_mse",
+            "continuity_div_eps_velocity_mse",
+            "pressure_boundary_mse",
+        ],
+    }
     assert payload["data"]["datasets"]["id"]["dataset_id"] == "train-data"
     assert payload["data"]["split"]["membership_digests"]["eval"] == "d" * 64
     assert payload["data"]["split"]["artifact_sha256"] == "2" * 64
     assert payload["provenance"]["config_digest"] == "1" * 64
+    assert payload["provenance"]["schema_versions"]["tracking_integration"] == 3
     assert "effective_config" not in payload
     assert "paths" not in payload
     assert "tracking" not in payload
     serialized = str(payload)
-    assert "job_type" not in serialized
-    assert "group" not in serialized
     assert secret not in serialized
     assert "WANDB_API_KEY" not in serialized
     assert str(Path.home()) not in serialized
 
 
-@pytest.mark.parametrize(
-    ("config_path", "expected"),
-    [
-        (_CONFIG_PATH, 127_445_475),
-        (_PI_FNO_CONFIG_PATH, 127_445_475),
-        (_UNO_CONFIG_PATH, 8_758_195),
-        (_PI_UNO_CONFIG_PATH, 8_758_195),
-    ],
-)
-def test_instantiated_model_parameter_counts_are_exact_and_runtime_independent(
-    config_path: Path,
-    expected: int,
-) -> None:
-    """Count real FNO/UNO parameters without formulas, device, or dtype dependence."""
-    config = experiments.config.loader.load_and_resolve_config(config_path)
-    model = learning.models.factory.build_model(config, device=torch.device("cpu"))
+def test_pi_semantic_config_retains_active_optimization_physics() -> None:
+    """Retain full PI settings only when physics participates in optimization."""
+    config = _resolved_config(config_path=_PI_FNO_CONFIG_PATH)
+    payload = tracking.build_semantic_config(
+        config,
+        split_indices=_split_evidence(config),
+        split_indices_sha256="2" * 64,
+        normalizer_sha256="f" * 64,
+        checkpoint_identity={"effective_config_digest": "1" * 64},
+        model=torch.nn.Linear(2, 3),
+        device_metadata={
+            "requested_policy": "cpu",
+            "resolved_device": "cpu",
+            "device_type": "cpu",
+            "pytorch_version": torch.__version__,
+        },
+        duration_contract=experiments.run.RUN_DURATION_CONTRACT,
+    )
+    assert payload["loss"]["physics"]["enabled"] is True
+    assert payload["loss"]["physics"]["residual_weight"] == config["loss"]["physics"]["residual_weight"]
+    assert payload["loss"]["physics"]["boundary_weight"] == config["loss"]["physics"]["boundary_weight"]
+    assert payload["diagnostics"]["physics_monitor"]["enabled"] is True
+
+
+def test_model_parameter_counts_use_parameter_state_not_runtime_placement() -> None:
+    """Count a small module across trainability, device, and dtype transitions."""
+    model = torch.nn.Linear(2, 3)
+    model.bias.requires_grad_(False)
     cpu_counts = tracking.model_parameter_counts(model)
-    assert cpu_counts == {"total": expected, "trainable": expected}
+
+    assert cpu_counts == {"total": 9, "trainable": 6}
     assert all(type(value) is int for value in cpu_counts.values())
     model.to(device=torch.device("meta"), dtype=torch.float16)
     assert tracking.model_parameter_counts(model) == cpu_counts
@@ -597,7 +658,6 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
             "runtime": {"device": {"resolved_device": "cpu"}},
         },
         state_updater=update,
-        monitor_evaluator=lambda: monitor_values,
     )
     source_accuracy = {
         f"{role}/{metric_id}": float(index)
@@ -615,6 +675,8 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
             "train/loss_data": 0.7,
             "optimization/learning_rate": 0.125,
             "system/epoch_duration_seconds": 1.5,
+            "system/train_duration_seconds": 0.75,
+            "system/train_samples_per_second": 8.0,
             "global_step": 12.0,
             "id/normalized_macro_rmse": 0.7,
             "ood/normalized_macro_rmse": 1.0,
@@ -623,6 +685,7 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
             "ood/normalized_rmse": 92.0,
             "objective/value": 99.0,
             **source_accuracy,
+            **monitor_values,
         },
     )
     selected_science_metrics = {
@@ -694,6 +757,8 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
         "Overview/train_loss_data": 0.7,
         "Overview/learning_rate": 0.125,
         "Diagnostics/epoch_duration_seconds": 1.5,
+        "Diagnostics/train_duration_seconds": 0.75,
+        "Diagnostics/train_samples_per_second": 8.0,
     }
     expected_logged.update(
         {
@@ -725,6 +790,8 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
         "Physics/ID/continuity_div_eps_velocity_mse",
         "Physics/ID/pressure_boundary_mse",
         "Diagnostics/epoch_duration_seconds",
+        "Diagnostics/train_duration_seconds",
+        "Diagnostics/train_samples_per_second",
     ]
     assert [name for name, _kwargs in run.metric_definitions] == expected_definitions
     assert run.metric_definitions[0][1] == {"hidden": True, "summary": "none"}
@@ -734,6 +801,7 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
         "Accuracy",
         "Physics",
         "Diagnostics",
+        "Optuna",
     )
     assert all(definition.owner for definition in session.history_metric_definitions)
     assert all(definition.computation_cost for definition in session.history_metric_definitions)
@@ -746,10 +814,9 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
     assert "Diagnostics/cuda_peak_memory_allocated_bytes" not in expected_definitions
 
     initialization = fake.initializations[0]
+    assert initialization["name"] == config["run"]["name"] == session.run_name
     assert "_disable_stats" not in initialization["settings"]
     assert initialization["tags"] == ["fno"]
-    assert "group" not in initialization
-    assert "job_type" not in initialization
     assert run.saved == []
     assert run.summary["selected/epoch"] == 4
     assert run.summary["terminal/epoch"] == 5
@@ -769,10 +836,7 @@ def test_epoch_history_uses_exact_namespaces_and_selected_terminal_summary(
     assert run.summary["run/global_step"] == 12
     assert run.summary["run/resume_count"] == 1
     assert run.summary["selected/checkpoint_sha256_short"] == "9" * 16
-    assert not any(key.startswith("final/") for key in run.summary)
-    assert "objective/best_value" not in run.summary
     assert run.summary["tracking/status"] == "finished"
-    assert "device/requested" not in run.summary
     assert state["last_logged_epoch"] == 5
     assert state["status"] == "finished"
     assert run.exit_codes == [0]
@@ -803,11 +867,14 @@ def test_pi_history_uses_only_the_configured_continuity_contribution(
         },
     )
 
+    continuity = config["loss"]["physics"]["continuity"]
+    continuity_metric = f"Physics/Training/loss_continuity_{continuity}"
+    continuity_value = 3.0 if continuity == "div_velocity" else 4.0
     training_definitions = [name for name, _kwargs in fake.runs[0].metric_definitions if name.startswith("Physics/Training/")]
     assert training_definitions == [
         "Physics/Training/loss_momentum",
         "Physics/Training/loss_boundary",
-        "Physics/Training/loss_continuity_div_eps_velocity",
+        continuity_metric,
         "Physics/Training/residual_weight",
         "Physics/Training/boundary_weight",
     ]
@@ -817,7 +884,7 @@ def test_pi_history_uses_only_the_configured_continuity_contribution(
                 "epoch": 1,
                 "Physics/Training/loss_momentum": 1.0,
                 "Physics/Training/loss_boundary": 2.0,
-                "Physics/Training/loss_continuity_div_eps_velocity": 4.0,
+                continuity_metric: continuity_value,
                 "Physics/Training/residual_weight": 5.0,
                 "Physics/Training/boundary_weight": 6.0,
             },
@@ -846,6 +913,8 @@ def test_cuda_peak_diagnostic_is_registered_and_emitted_only_for_cuda(
         1,
         {
             "system/epoch_duration_seconds": 2.0,
+            "system/train_duration_seconds": 1.25,
+            "system/train_samples_per_second": 16.0,
             "system/cuda_peak_memory_allocated_bytes": 4096.0,
         },
     )
@@ -855,6 +924,8 @@ def test_cuda_peak_diagnostic_is_registered_and_emitted_only_for_cuda(
             {
                 "epoch": 1,
                 "Diagnostics/epoch_duration_seconds": 2.0,
+                "Diagnostics/train_duration_seconds": 1.25,
+                "Diagnostics/train_samples_per_second": 16.0,
                 "Diagnostics/cuda_peak_memory_allocated_bytes": 4096.0,
             },
             1,
@@ -866,55 +937,124 @@ def test_optuna_history_and_terminal_summary_preserve_trial_comparison_keys(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Retain each trial trajectory and its selected ID objective for Optuna views."""
+    """Mirror exact Optuna reports and retain selected objective plus seed metadata."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
+    training_seed = 17
+    sampler_seed = 23
     session = tracking.initialize_wandb(
         _resolved_config(workflow="optuna_trial", study="steady_flow_fno_search"),
         run_dir=tmp_path,
         semantic_config={
             "tuning": {
                 "study_name": "steady_flow_fno_search",
+                "study_role": "production",
                 "trial_number": 7,
+                "training_seed": training_seed,
+                "sampler_seed": sampler_seed,
                 "search_signature": "search-signature",
                 "sampled_parameters": {"model.hidden_channels": 48},
             }
         },
     )
-    session.log_epoch(3, {"id/normalized_macro_rmse": 0.72})
+    session.log_epoch(
+        5,
+        {
+            "id/normalized_macro_rmse": 0.72,
+            "optuna/objective": 0.72,
+            "optuna/best_objective_so_far": 0.72,
+        },
+    )
     session.finish(
         status="completed",
         result={
+            "best_metric": 0.61,
             "selected_epoch": 2,
             "selected_metrics": {
                 "selected/id/normalized_macro_rmse": 0.61,
                 "selected/ood/normalized_macro_rmse": 0.79,
             },
         },
+        local_summary={"elapsed_seconds": 12.5, "best_metric": 0.61},
     )
 
     run = fake.runs[0]
-    assert run.logs == [({"epoch": 3, "Overview/ID/normalized_macro_rmse": 0.72}, 3)]
+    assert run.logs == [
+        (
+            {
+                "epoch": 5,
+                "Overview/ID/normalized_macro_rmse": 0.72,
+                "Optuna/objective": 0.72,
+                "Optuna/best_objective_so_far": 0.72,
+            },
+            5,
+        )
+    ]
+    assert [name for name, _settings in run.metric_definitions if name.startswith("Optuna/")] == [
+        "Optuna/objective",
+        "Optuna/best_objective_so_far",
+    ]
+    initialization = fake.initializations[0]
+    assert initialization["group"] == "steady_flow_fno_search"
+    assert initialization["job_type"] == "optuna_trial"
+    assert initialization["tags"] == ["fno", "optuna-production"]
     assert run.summary["tuning/study_name"] == "steady_flow_fno_search"
+    assert run.summary["tuning/study_role"] == "production"
     assert run.summary["tuning/trial_number"] == 7
+    assert run.summary["tuning/training_seed"] == training_seed
+    assert run.summary["tuning/sampler_seed"] == sampler_seed
     assert run.summary["tuning/search_signature"] == "search-signature"
     assert run.summary["tuning/sampled_parameters"] == {"model.hidden_channels": 48}
     assert run.summary["tuning/final_state"] == "completed"
+    assert run.summary["Optuna/trial_number"] == 7
+    assert run.summary["Optuna/state"] == "completed"
+    assert run.summary["Optuna/pruned"] is False
+    assert run.summary["Optuna/objective"] == 0.61
+    assert run.summary["Optuna/trial_duration_seconds"] == 12.5
     assert run.summary["selected/id/normalized_macro_rmse"] == 0.61
     assert run.summary["selected/ood/normalized_macro_rmse"] == 0.79
     assert run.summary["selected/epoch"] == 2
 
 
-def test_monitor_membership_and_metrics_are_fixed_and_bounded(
+def test_tracking_consumes_authoritative_completed_epoch_physics_without_epoch_zero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reuse one saved ID prefix and log four monitor metrics only at cadence."""
+    """Map supplied physics metrics without owning their evaluation or cadence."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config(epochs=3)
+    physics = {
+        "physics/id/momentum_residual_mse": 1.0,
+        "physics/id/continuity_div_velocity_mse": 2.0,
+        "physics/id/continuity_div_eps_velocity_mse": 3.0,
+        "physics/id/pressure_boundary_mse": 4.0,
+    }
+    session = tracking.initialize_wandb(config, run_dir=tmp_path)
+    with pytest.raises(tracking.TrackingError, match="epoch >= 1"):
+        session.log_epoch(0, physics)
+    session.log_epoch(1, {"train/loss_total": 8.0})
+    session.log_epoch(2, {"train/loss_total": 7.0, **physics})
+
+    assert [step for _payload, step in fake.runs[0].logs] == [1, 2]
+    assert "Physics/ID/momentum_residual_mse" not in fake.runs[0].logs[0][0]
+    assert fake.runs[0].logs[1][0]["Physics/ID/momentum_residual_mse"] == 1.0
+
+    resumed = tracking.initialize_wandb(
+        config,
+        run_dir=tmp_path,
+        resume=True,
+        persisted_run_id=session.run_id,
+        previous_last_logged_epoch=2,
+    )
+    resumed.log_epoch(3, {"train/loss_total": 6.0})
+    assert fake.runs[1].logs == [({"epoch": 3, "Overview/train_loss_total": 6.0}, 3)]
+
+
+def test_monitor_membership_is_fixed_and_bounded() -> None:
+    """Reuse one deterministic saved ID prefix for training-owned diagnostics."""
+    config = _resolved_config(epochs=3)
     config["tracking"]["wandb"]["monitor"]["max_cases"] = 2
-    config["tracking"]["wandb"]["monitor"]["interval"] = 2
     split = _split_evidence(config)
     split["eval_indices"] = torch.tensor([2, 0, 1])
     first = tracking.build_monitor_membership(config, split)
@@ -924,79 +1064,36 @@ def test_monitor_membership_and_metrics_are_fixed_and_bounded(
     assert first["source_indices"] == [2, 0]
     assert first["sample_ids"] == ["case_0003", "case_0001"]
 
-    calls = 0
 
-    def monitor() -> dict[str, float]:
-        nonlocal calls
-        calls += 1
-        return {
-            "physics/id/momentum_residual_mse": 1.0,
-            "physics/id/continuity_div_velocity_mse": 2.0,
-            "physics/id/continuity_div_eps_velocity_mse": 3.0,
-            "physics/id/pressure_boundary_mse": 4.0,
-        }
-
-    session = tracking.initialize_wandb(
-        config,
-        run_dir=tmp_path,
-        monitor_evaluator=monitor,
-    )
-    for epoch in (1, 2, 3):
-        session.log_epoch(epoch, {"train/loss_total": float(epoch)})
-    assert calls == 2
-    assert "Physics/ID/momentum_residual_mse" not in fake.runs[0].logs[0][0]
-    assert fake.runs[0].logs[1][0]["Physics/ID/continuity_div_velocity_mse"] == 2.0
-    assert fake.runs[0].logs[2][0]["Physics/ID/pressure_boundary_mse"] == 4.0
+def test_gpu_smoke_declares_reachable_dense_completed_epoch_evaluations() -> None:
+    """Keep acceptance evaluation dense, terminal-inclusive, and free of epoch zero."""
+    config = experiments.config.loader.load_and_resolve_config(_GPU_CONFIG_PATH)
+    target_epoch = config["training"]["epochs"]
+    cadence = config["training"]["evaluation_interval"]
+    assert config["training"]["ood_evaluation_interval"] == cadence
+    assert config["tracking"]["wandb"]["monitor"]["interval"] == cadence
+    events = learning.training.events.completed_epoch_events(interval=cadence, target_epoch=target_epoch)
+    assert events == tuple(range(1, target_epoch + 1))
+    assert 0 not in events
+    assert events[-1] == target_epoch
 
 
-def test_scientific_monitor_failure_is_recorded_but_not_reclassified_as_io(
+def test_unmapped_source_metric_is_ignored_without_observer_recomputation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Retain the scientific owner and original cause across the W&B callback."""
+    """Ignore unsupported source keys while logging the declared metric surface."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
-    state, update = _state_recorder()
-
-    def monitor() -> dict[str, float]:
-        cause = ValueError("x-coordinate spacing is materially nonuniform")
-        message = "Bounded physics-monitor scientific evaluation failed"
-        raise learning.training.loop.PhysicsMonitorEvaluationError(message) from cause
-
-    session = tracking.initialize_wandb(
-        _resolved_config(epochs=1),
-        run_dir=tmp_path,
-        state_updater=update,
-        monitor_evaluator=monitor,
+    session = tracking.initialize_wandb(_resolved_config(epochs=1), run_dir=tmp_path)
+    session.log_epoch(
+        1,
+        {
+            "train/loss_total": 1.0,
+            "physics/id/unsupported": 2.0,
+        },
     )
-    with pytest.raises(learning.training.loop.PhysicsMonitorEvaluationError) as captured:
-        session.log_epoch(1, {"train/loss_total": 1.0})
-    assert isinstance(captured.value.__cause__, ValueError)
-    assert not isinstance(captured.value, tracking.TrackingIOError)
-    assert state["status"] == "failed"
-    assert state["failed_operation"] == "physics_monitor"
-    assert state["failure_owner"] == "scientific_evaluation"
-    assert fake.runs[0].logs == []
-
-
-def test_monitor_payload_contract_failure_is_callback_not_io(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Classify unsupported monitor keys as callback orchestration."""
-    fake = _FakeWandb()
-    _patch_wandb(monkeypatch, fake)
-    state, update = _state_recorder()
-    session = tracking.initialize_wandb(
-        _resolved_config(epochs=1),
-        run_dir=tmp_path,
-        state_updater=update,
-        monitor_evaluator=lambda: {"physics/id/unsupported": 1.0},
-    )
-    with pytest.raises(tracking.TrackingCallbackError, match="unsupported key"):
-        session.log_epoch(1, {"train/loss_total": 1.0})
-    assert state["failure_owner"] == "callback_orchestration"
-    assert state["failed_operation"] == "physics_monitor"
+    assert fake.runs[0].logs == [({"epoch": 1, "Overview/train_loss_total": 1.0}, 1)]
 
 
 @pytest.mark.parametrize("mode", ["online", "offline"])
@@ -1023,6 +1120,26 @@ def test_requested_history_failures_are_fail_closed(
     session.finish(status="failed", error="history failure")
     assert fake.runs[0].summary["tracking/status"] == "failed"
     assert state["status"] == "failed"
+
+
+def test_combined_console_and_wandb_consumers_receive_one_authoritative_payload() -> None:
+    """Forward the exact same computed object without recomputation or mutation."""
+    payload = {
+        "train/loss_total": 0.5,
+        "id/normalized_macro_rmse": 0.25,
+        "physics/id/momentum_residual_mse": 4.0,
+    }
+    observed: list[tuple[int, dict[str, float]]] = []
+
+    def consume(epoch: int, values: dict[str, float]) -> None:
+        observed.append((epoch, values))
+
+    callback = tracking.combine_epoch_callbacks(consume, consume)
+    assert callback is not None
+    callback(5, payload)
+    assert observed == [(5, payload), (5, payload)]
+    assert observed[0][1] is payload
+    assert observed[1][1] is payload
 
 
 def test_authoritative_consumer_runs_before_observer_failure(
@@ -1178,10 +1295,9 @@ def test_persisted_identity_requires_exactly_one_run_id() -> None:
         tracking.persisted_wandb_identity(summary)
 
 
-@pytest.mark.parametrize(
-    ("wandb_settings", "match"),
-    [
-        ({"enabled": True}, r"tracking\.wandb.*enabled"),
+def test_wandb_config_is_strict() -> None:
+    """Reject malformed values and invalid workflow context."""
+    invalid_settings = (
         ({"mode": "invalid"}, r"tracking\.wandb\.mode"),
         ({"monitor": {"interval": 0}}, r"tracking\.wandb\.monitor\.interval"),
         (
@@ -1193,14 +1309,9 @@ def test_persisted_identity_requires_exactly_one_run_id() -> None:
             {"workflow": "train", "study": "not_allowed"},
             r"tracking\.wandb\.study is valid only",
         ),
-    ],
-)
-def test_wandb_config_is_strict(
-    wandb_settings: dict[str, Any],
-    match: str,
-) -> None:
-    """Reject retired fields, malformed values, and invalid workflow context."""
-    raw = experiments.config.loader.load_yaml(_CONFIG_PATH)
-    raw["tracking"] = {"wandb": wandb_settings}
-    with pytest.raises(ValueError, match=match):
-        experiments.config.loader.resolve_config(raw)
+    )
+    for wandb_settings, match in invalid_settings:
+        raw = experiments.config.loader.load_yaml(_CONFIG_PATH)
+        raw["tracking"] = {"wandb": wandb_settings}
+        with pytest.raises(ValueError, match=match):
+            experiments.config.loader.resolve_config(raw)

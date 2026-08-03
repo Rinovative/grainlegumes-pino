@@ -1,4 +1,4 @@
-# ruff: noqa: BLE001, S101, EM101, PLR2004, TC003, TRY003
+# ruff: noqa: BLE001, S101, EM101, PLR2004, SLF001, TRY003
 """
 Protect collision-safe run allocation, writer leases, resume, and status transitions.
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import multiprocessing as mp
 import queue
+import shlex
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,8 @@ from typing import Any
 
 import pytest
 from src import common, experiments
+from src.experiments.cli import cli_train
+from support import configs
 
 
 def _objective(identifier: str) -> dict[str, Any]:
@@ -64,6 +67,287 @@ def test_fresh_collision_rejects_before_any_run_write(tmp_path: Path) -> None:
     assert after == before
     assert not (run_dir / "config.yaml").exists()
     assert not (run_dir / "summary.json").exists()
+
+
+def _resolved_admission_config(output_root: Path) -> dict[str, Any]:
+    """Return one complete maintained config redirected only to a temporary output root."""
+    resolved = experiments.config.loader.load_and_resolve_config(configs.experiment_config_paths()[0])
+    resolved["paths"]["output_root"] = str(output_root)
+    return resolved
+
+
+def _write_lightweight_admission_state(
+    run_dir: Path,
+    config: dict[str, Any],
+    *,
+    status: str,
+    completed_epoch: int,
+    include_best: bool = True,
+) -> None:
+    """Publish only metadata and placeholder state needed by read-only admission inspection."""
+    run_dir.mkdir(parents=True)
+    experiments.config.loader.save_yaml(config, common.paths.resolve_run_config_path(run_dir))
+    common.serialization.atomic_write_json(
+        common.paths.resolve_run_summary_path(run_dir),
+        {
+            "schema_version": experiments.run.RUN_SUMMARY_SCHEMA_VERSION,
+            "status": status,
+            "completed_epoch": completed_epoch,
+        },
+    )
+    common.paths.resolve_split_indices_path(run_dir).touch()
+    common.paths.resolve_normalizer_path(run_dir).touch()
+    common.paths.resolve_last_checkpoint_file(run_dir).touch()
+    if include_best:
+        common.paths.resolve_best_checkpoint_file(run_dir).touch()
+
+
+def _admission_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: str,
+    completed_epoch: int | None,
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    """Create one lightweight existing run and inspect it without runtime allocation."""
+    output_root = tmp_path / "outputs"
+    training_root = tmp_path / "training"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_run_output_dir(
+        config["task"],
+        config["run"]["name"],
+        output_root=output_root,
+    )
+    _write_lightweight_admission_state(
+        run_dir,
+        config,
+        status=status,
+        completed_epoch=config["training"]["epochs"] if completed_epoch is None else completed_epoch,
+    )
+    before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    report = experiments.run.inspect_existing_run_admission(
+        run_dir,
+        config,
+        config_path=configs.experiment_config_paths()[0],
+    )
+    after = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before
+    return report, run_dir, config
+
+
+def test_compatible_interrupted_admission_prints_a_parser_valid_resume_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recommend explicit resume only for a compatible inactive interrupted run."""
+    report, run_dir, _config = _admission_report(
+        tmp_path,
+        monkeypatch,
+        status="interrupted",
+        completed_epoch=3,
+    )
+
+    assert report["resume_compatibility"] == "compatible"
+    assert report["active_lock"] is False
+    assert report["last_checkpoint_available"] is True
+    assert report["best_checkpoint_available"] is True
+    cli_train._print_existing_run_admission(report)
+    stderr = capsys.readouterr().err
+    command_line = next(line.strip() for line in stderr.splitlines() if line.strip().startswith("./scripts/docker_job.sh"))
+    arguments = shlex.split(command_line)
+    assert arguments[:2] == ["./scripts/docker_job.sh", "train"]
+    parsed = cli_train._build_parser().parse_args(arguments[2:])
+    assert Path(parsed.resume) == run_dir
+    assert parsed.config_path == report["config_path"]
+
+
+def test_explicit_historical_run_reference_preserves_persisted_name_without_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admit persisted old naming metadata read-only through its exact directory reference."""
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(tmp_path / "training"))
+    requested = _resolved_admission_config(output_root)
+    historical = copy.deepcopy(requested)
+    historical["run"]["prefix"] = None
+    historical["run"]["suffix"] = "historical_manual_identity"
+    historical["run"]["name"] = "old_format_exact_leaf"
+    run_dir = common.paths.resolve_run_output_dir(
+        historical["task"],
+        historical["run"]["name"],
+        output_root=output_root,
+    )
+    _write_lightweight_admission_state(
+        run_dir,
+        historical,
+        status="interrupted",
+        completed_epoch=2,
+    )
+    before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    report = experiments.run.inspect_existing_run_admission(
+        run_dir,
+        requested,
+        config_path=configs.experiment_config_paths()[0],
+    )
+
+    after = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    proposed_dir = common.paths.resolve_run_output_dir(
+        requested["task"],
+        requested["run"]["name"],
+        output_root=output_root,
+    )
+    assert report["resume_compatibility"] == "compatible"
+    assert report["run_dir"] == str(run_dir.resolve())
+    assert after == before
+    assert not proposed_dir.exists()
+    assert tuple(path.name for path in run_dir.parent.iterdir()) == (historical["run"]["name"],)
+
+
+def test_completed_admission_is_separate_and_has_no_resume_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Report a completed target separately without recommending same-target resume."""
+    report, _run_dir, config = _admission_report(
+        tmp_path,
+        monkeypatch,
+        status="completed",
+        completed_epoch=None,
+    )
+    assert report["resume_compatibility"] == "completed"
+    assert report["completed_epoch"] == config["training"]["epochs"]
+
+    cli_train._print_existing_run_admission(report)
+    stderr = capsys.readouterr().err
+    assert "Run already completed; no training was started." in stderr
+    assert f"Completed epoch: {config['training']['epochs']} / {config['training']['epochs']}" in stderr
+    assert "Resume explicitly with:" not in stderr
+
+
+def test_incompatible_and_damaged_admission_fail_closed_without_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Expose a specific semantic incompatibility and suppress executable resume advice."""
+    report, run_dir, config = _admission_report(
+        tmp_path,
+        monkeypatch,
+        status="interrupted",
+        completed_epoch=2,
+    )
+    saved = copy.deepcopy(config)
+    saved["optimizer"]["lr"] = float(saved["optimizer"]["lr"]) * 2
+    experiments.config.loader.save_yaml(saved, common.paths.resolve_run_config_path(run_dir))
+    report = experiments.run.inspect_existing_run_admission(
+        run_dir,
+        config,
+        config_path=configs.experiment_config_paths()[0],
+    )
+
+    assert report["resume_compatibility"] == "incompatible"
+    assert "Differing field(s): optimizer.lr" in report["reason"]
+    cli_train._print_existing_run_admission(report)
+    stderr = capsys.readouterr().err
+    assert "Resume compatibility: incompatible" in stderr
+    assert "Reason: Requested config is incompatible" in stderr
+    assert "Resume explicitly with:" not in stderr
+
+
+def test_damaged_completed_and_malformed_summary_admission_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat missing selected state and invalid lifecycle JSON as incompatible."""
+    output_root = tmp_path / "outputs"
+    training_root = tmp_path / "training"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_run_output_dir(config["task"], config["run"]["name"], output_root=output_root)
+    _write_lightweight_admission_state(
+        run_dir,
+        config,
+        status="completed",
+        completed_epoch=config["training"]["epochs"],
+        include_best=False,
+    )
+
+    damaged = experiments.run.inspect_existing_run_admission(
+        run_dir,
+        config,
+        config_path=configs.experiment_config_paths()[0],
+    )
+    assert damaged["resume_compatibility"] == "incompatible"
+    assert damaged["reason"] == "Completed run is missing best_checkpoint.pt."
+
+    common.paths.resolve_run_summary_path(run_dir).write_text("{invalid", encoding="utf-8")
+    malformed = experiments.run.inspect_existing_run_admission(
+        run_dir,
+        config,
+        config_path=configs.experiment_config_paths()[0],
+    )
+    assert malformed["resume_compatibility"] == "incompatible"
+    assert "invalid JSON" in malformed["reason"]
+
+
+def test_active_lock_admission_is_blocked_without_simultaneous_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Report an active writer as blocked and never recommend simultaneous resume."""
+    output_root = tmp_path / "outputs"
+    training_root = tmp_path / "training"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_run_output_dir(config["task"], config["run"]["name"], output_root=output_root)
+    _write_lightweight_admission_state(run_dir, config, status="interrupted", completed_epoch=2)
+
+    with common.locking.exclusive_file_lock(common.paths.resolve_run_lock_path(run_dir), blocking=False):
+        report = experiments.run.inspect_existing_run_admission(
+            run_dir,
+            config,
+            config_path=configs.experiment_config_paths()[0],
+        )
+
+    assert report["active_lock"] is True
+    assert report["resume_compatibility"] == "blocked"
+    cli_train._print_existing_run_admission(report)
+    stderr = capsys.readouterr().err
+    assert "Active lock: present" in stderr
+    assert "Resume compatibility: blocked" in stderr
+    assert "Resume explicitly with:" not in stderr
+
+
+def test_fresh_existing_run_rejects_before_device_model_or_tracking_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Classify an existing leaf before concrete device or downstream runtime setup."""
+    output_root = tmp_path / "outputs"
+    training_root = tmp_path / "training"
+    monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
+    config_path = configs.experiment_config_paths()[0]
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_run_output_dir(config["task"], config["run"]["name"], output_root=output_root)
+    _write_lightweight_admission_state(run_dir, config, status="interrupted", completed_epoch=2)
+    before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    def reject_device(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("device resolution must not run for an existing fresh destination")
+
+    monkeypatch.setattr(experiments.run.learning.device, "resolve_device", reject_device)
+    with pytest.raises(experiments.run.ExistingRunAdmissionError) as captured:
+        experiments.run.run_experiment(config_path, output_root=output_root)
+
+    assert captured.value.report["resume_compatibility"] == "compatible"
+    after = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before
 
 
 def test_initialization_failure_never_looks_loadable(
@@ -120,9 +404,10 @@ def test_optuna_trial_paths_are_study_and_trial_qualified(tmp_path: Path) -> Non
     All leaves must be distinct and exact reallocation must fail, protecting Optuna
     output ownership from study/trial collisions.
     """
-    first = common.paths.resolve_optuna_trial_dir("task", "study-a", 3, output_root=tmp_path)
-    other_study = common.paths.resolve_optuna_trial_dir("task", "study-b", 3, output_root=tmp_path)
-    other_trial = common.paths.resolve_optuna_trial_dir("task", "study-a", 4, output_root=tmp_path)
+    first = common.paths.resolve_optuna_trial_dir("task", "study-a", "fno__s1__optuna_trial_003", output_root=tmp_path)
+    other_study = common.paths.resolve_optuna_trial_dir("task", "study-b", "fno__s1__optuna_trial_003", output_root=tmp_path)
+    other_trial = common.paths.resolve_optuna_trial_dir("task", "study-a", "fno__s1__optuna_trial_004", output_root=tmp_path)
+    assert first.name == "fno__s1__optuna_trial_003"
 
     assert len({first, other_study, other_trial}) == 3
     experiments.run.allocate_run_directory(first)

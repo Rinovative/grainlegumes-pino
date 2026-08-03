@@ -12,7 +12,8 @@ Responsibilities:
 
 Design principles:
   - Resolution is strict, path-aware, deterministic, and side-effect free
-  - Task-fixed semantics come only from domain.tasks
+  - Task-fixed semantics and full metric definitions come only from domain.tasks
+  - Executable YAMLs use one canonical section order and explicitly select their objective
   - Saved configuration identifiers never depend on Python class names
 
 This module does NOT:
@@ -25,13 +26,19 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
-import importlib
+import re
 from collections.abc import Mapping, Sequence
 from io import StringIO
 from pathlib import Path
-from typing import Any, Protocol, TextIO, cast
+from typing import Any
+
+import yaml
 
 from src import common, datasets, domain
+from src.learning import learning_device_policy
+from src.learning.losses import learning_losses_factory as loss_factory
+from src.learning.metrics import learning_metrics as metric_registry
+from src.learning.models import learning_models_factory as model_factory
 
 from . import experiments_config_defaults as config_defaults
 
@@ -46,38 +53,21 @@ class ConfigError(ValueError):
     """
 
 
-class _YamlModule(Protocol):
-    """Minimal PyYAML surface used by this module."""
-
-    def safe_load(self, stream: TextIO) -> Any:
-        """Load YAML from a text stream."""
-
-    def dump(
-        self,
-        data: Any,
-        stream: TextIO,
-        *,
-        default_flow_style: bool,
-        sort_keys: bool,
-    ) -> Any:
-        """Write YAML to a text stream."""
-
-
-yaml = cast("_YamlModule", importlib.import_module("yaml"))
-_ROOT_KEYS = frozenset(
-    {
-        "task",
-        "run",
-        "data",
-        "model",
-        "loss",
-        "evaluation",
-        "optimizer",
-        "scheduler",
-        "training",
-        "tracking",
-    }
+CANONICAL_EXPERIMENT_SECTION_ORDER = (
+    "task",
+    "run",
+    "data",
+    "model",
+    "loss",
+    "evaluation",
+    "optimizer",
+    "scheduler",
+    "training",
+    "tracking",
 )
+_ROOT_KEYS = frozenset(CANONICAL_EXPERIMENT_SECTION_ORDER)
+EXPERIMENT_ROOT_KEYS = _ROOT_KEYS
+_TASK_CONFIG_MARKER = ("configs", "tasks")
 _TASK_FIXED_KEYS = frozenset(
     {
         "input_fields",
@@ -101,7 +91,7 @@ _RESOLVED_PATH_KEYS = frozenset(
     }
 )
 _SECTION_KEYS = {
-    "run": frozenset({"seed", "deterministic", "device", "prefix", "suffix", "name"}),
+    "run": frozenset({"seed", "deterministic", "device", "suffix", "name"}),
     "data": frozenset(
         {
             "train_dataset",
@@ -119,7 +109,7 @@ _SECTION_KEYS = {
     "evaluation": frozenset({"metrics", "objective"}),
     "optimizer": frozenset({"kind", "lr", "weight_decay", "betas", "second_moment_floor"}),
     "scheduler": frozenset({"kind", "factor", "patience", "min_lr"}),
-    "training": frozenset({"epochs", "evaluation_interval", "mixed_precision"}),
+    "training": frozenset({"epochs", "evaluation_interval", "ood_evaluation_interval", "mixed_precision"}),
     "tracking": frozenset({"wandb"}),
 }
 
@@ -140,7 +130,7 @@ def _reject_unknown(mapping: Mapping[str, Any], allowed: frozenset[str], *, path
         raise ConfigError(msg)
 
 
-def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C901
+def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C901, PLR0912
     """
     Reject noncanonical task-fixed overrides and unknown nested keys.
 
@@ -160,6 +150,11 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
             continue
         section_mapping = _as_mapping(user_config[section], path=section)
         _reject_unknown(section_mapping, allowed, path=section)
+
+    raw_run = _as_mapping(user_config.get("run"), path="run")
+    if raw_run.get("name") is not None:
+        msg = "run.name is derived and must not be supplied by an executable request."
+        raise ConfigError(msg)
 
     model = _as_mapping(user_config.get("model"), path="model")
     params = _as_mapping(model.get("params"), path="model.params")
@@ -251,27 +246,75 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                     path="tracking.wandb.upload",
                 )
 
-    if "evaluation" in user_config:
-        evaluation = _as_mapping(user_config["evaluation"], path="evaluation")
-        if "metrics" in evaluation:
-            metrics = evaluation["metrics"]
-            if isinstance(metrics, (str, bytes)) or not isinstance(metrics, Sequence):
-                msg = "evaluation.metrics must be a list of metric mappings."
-                raise ConfigError(msg)
-            for index, raw_metric in enumerate(metrics):
-                metric = _as_mapping(raw_metric, path=f"evaluation.metrics[{index}]")
-                _reject_unknown(
-                    metric,
-                    frozenset({"id", "kind", "space", "fields", "reduction"}),
-                    path=f"evaluation.metrics[{index}]",
-                )
-        if "objective" in evaluation:
-            objective = _as_mapping(evaluation["objective"], path="evaluation.objective")
+    if "evaluation" not in user_config:
+        msg = "evaluation.objective is required for every executable request."
+        raise ConfigError(msg)
+    evaluation = _as_mapping(user_config["evaluation"], path="evaluation")
+    if "metrics" in evaluation:
+        metrics = evaluation["metrics"]
+        if isinstance(metrics, (str, bytes)) or not isinstance(metrics, Sequence):
+            msg = "evaluation.metrics must be a list of metric mappings."
+            raise ConfigError(msg)
+        for index, raw_metric in enumerate(metrics):
+            metric = _as_mapping(raw_metric, path=f"evaluation.metrics[{index}]")
             _reject_unknown(
-                objective,
-                frozenset({"id"}),
-                path="evaluation.objective",
+                metric,
+                frozenset({"id", "kind", "space", "fields", "reduction"}),
+                path=f"evaluation.metrics[{index}]",
             )
+    if "objective" not in evaluation:
+        msg = "evaluation.objective is required for every executable request."
+        raise ConfigError(msg)
+    objective = _as_mapping(evaluation["objective"], path="evaluation.objective")
+    _reject_unknown(
+        objective,
+        frozenset({"id"}),
+        path="evaluation.objective",
+    )
+    objective_id = objective.get("id")
+    if not isinstance(objective_id, str) or not objective_id:
+        msg = "evaluation.objective.id must be a non-empty string."
+        raise ConfigError(msg)
+
+
+def task_directory_from_config_path(yaml_path: Path | str) -> str | None:
+    """Return the task owned by a ``configs/tasks/<task>/`` source path."""
+    parts = Path(yaml_path).expanduser().parts
+    matches = [index for index in range(len(parts) - 1) if tuple(parts[index : index + len(_TASK_CONFIG_MARKER)]) == _TASK_CONFIG_MARKER]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        msg = f"Config path contains an ambiguous repeated configs/tasks marker: {yaml_path}"
+        raise ConfigError(msg)
+    task_index = matches[0] + len(_TASK_CONFIG_MARKER)
+    if task_index >= len(parts) - 1:
+        msg = f"Task-first config path must include configs/tasks/<task>/<workflow>/...: {yaml_path}"
+        raise ConfigError(msg)
+    try:
+        return common.paths.validate_logical_name(parts[task_index], label="config directory task")
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+
+
+def validate_task_directory_identity(
+    yaml_path: Path | str,
+    *,
+    raw_task: object,
+    resolved_task: object,
+) -> None:
+    """Require a task-first source directory to agree with raw and resolved task identity."""
+    directory_task = task_directory_from_config_path(yaml_path)
+    if directory_task is None:
+        return
+    if raw_task != directory_task:
+        msg = (
+            f"Task config path mismatch for {yaml_path}: directory task is {directory_task!r}, "
+            f"but raw task is {raw_task!r}. Move the YAML or set its authoritative task to {directory_task!r}."
+        )
+        raise ConfigError(msg)
+    if resolved_task != directory_task:
+        msg = f"Task config path mismatch for {yaml_path}: directory task is {directory_task!r}, but resolved task is {resolved_task!r}."
+        raise ConfigError(msg)
 
 
 def load_yaml(path: Path | str) -> dict[str, Any]:
@@ -357,14 +400,6 @@ def deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, A
     return result
 
 
-def _semantic_modules() -> tuple[Any, Any, Any]:
-    """Import registries lazily to avoid package-initialization cycles."""
-    model_factory = importlib.import_module("src.learning.models.learning_models_factory")
-    loss_factory = importlib.import_module("src.learning.losses.learning_losses_factory")
-    metric_registry = importlib.import_module("src.learning.metrics.learning_metrics")
-    return model_factory, loss_factory, metric_registry
-
-
 def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) -> None:
     """
     Resolve loss semantics against the registered task contract in place.
@@ -374,7 +409,6 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
     schedules. Canonical numeric values are written back into ``config`` only
     after their path-qualified constraints have been checked.
     """
-    _, loss_factory, _ = _semantic_modules()
     loss = _as_mapping(config["loss"], path="loss")
     data_loss = _as_mapping(loss["data"], path="loss.data")
     kind = str(data_loss["kind"])
@@ -412,14 +446,14 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
         )
         raise ConfigError(msg)
     try:
-        domain.physics.brinkman.validate_continuity_kind(continuity)
+        domain.physics.contracts.validate_continuity_kind(continuity)
     except ValueError as error:
         msg = f"loss.physics.continuity: {error}"
         raise ConfigError(msg) from error
     physics["continuity"] = continuity
     derivatives = _as_mapping(physics["derivatives"], path="loss.physics.derivatives")
     try:
-        loss_factory.resolve_derivative_kind(
+        domain.physics.contracts.validate_derivative_kind(
             str(derivatives["kind"]),
             extension=str(derivatives["extension"]),
         )
@@ -520,7 +554,6 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
     a full copy of exactly one declared metric; partial or contradictory resolved
     objective mappings fail closed.
     """
-    _, _, metric_registry = _semantic_modules()
     evaluation = _as_mapping(config["evaluation"], path="evaluation")
     raw_metrics = evaluation["metrics"]
     if not isinstance(raw_metrics, list) or not raw_metrics:
@@ -677,6 +710,166 @@ def _model_variant(config: Mapping[str, Any]) -> str:
     return f"pi-{model_kind}" if bool(physics.get("enabled")) else model_kind
 
 
+def resolved_model_variant(config: Mapping[str, Any]) -> str:
+    """Return the loader-owned architecture and PI identity segment."""
+    task = str(config["task"])
+    model = _as_mapping(config.get("model"), path="model")
+    kind = str(model.get("kind"))
+    params = _as_mapping(model.get("params"), path="model.params")
+    variant = _model_variant(config)
+    if kind == "fno":
+        modes = params["n_modes"]
+        return f"{variant}_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
+    if kind == "uno":
+        mode_ratio = format(float(params["mode_ratio"]), ".8g").replace(".", "p")
+        return f"{variant}_m{params['modes_x']}x{params['modes_y']}_h{params['hidden_channels']}_l{params['n_layers']}_r{mode_ratio}"
+    domain.tasks.registry.get_task(task)
+    msg = f"Unknown model identifier {kind!r} while generating a run name."
+    raise ConfigError(msg)
+
+
+_RUN_SUFFIX_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*\Z")
+
+
+def resolved_scientific_variant(config: Mapping[str, Any]) -> str | None:
+    """Return the PI derivative/continuity identity from resolved physics."""
+    loss = _as_mapping(config.get("loss"), path="loss")
+    physics = _as_mapping(loss.get("physics"), path="loss.physics")
+    enabled = physics.get("enabled")
+    if type(enabled) is not bool:
+        msg = "Resolved loss.physics.enabled must be boolean while deriving scientific run identity."
+        raise ConfigError(msg)
+    if not enabled:
+        return None
+
+    derivatives = _as_mapping(physics.get("derivatives"), path="loss.physics.derivatives")
+    raw_kind = derivatives.get("kind")
+    raw_extension = derivatives.get("extension")
+    continuity = physics.get("continuity")
+    if not isinstance(raw_kind, str) or not isinstance(raw_extension, str):
+        msg = "PI run identity requires resolved derivative kind and extension identifiers."
+        raise ConfigError(msg)
+    if not isinstance(continuity, str) or not continuity:
+        msg = "PI run identity requires a resolved continuity identifier."
+        raise ConfigError(msg)
+    try:
+        kind, extension = domain.physics.contracts.validate_derivative_kind(
+            raw_kind,
+            extension=raw_extension,
+        )
+        resolved_continuity = domain.physics.contracts.validate_continuity_kind(continuity)
+    except ValueError as error:
+        msg = f"Cannot derive canonical PI scientific variant: {error}"
+        raise ConfigError(msg) from error
+
+    strategies = {
+        ("physical", "none"): "physical",
+        ("spectral", "reflect"): "spectral_reflect",
+    }
+    strategy = strategies.get((kind, extension))
+    if strategy is None:
+        msg = f"Unsupported resolved PI derivative strategy for run identity: kind={kind!r}, extension={extension!r}."
+        raise ConfigError(msg)
+    return f"{strategy}_{resolved_continuity}"
+
+
+def _identity_tokens(value: object) -> tuple[str, ...]:
+    """Split one derived identity at semantic token boundaries."""
+    return tuple(token for token in str(value).lower().replace("-", "_").split("_") if token)
+
+
+def _remove_identity_sequence(tokens: list[str], sequence: tuple[str, ...]) -> bool:
+    """Remove every exact token-bounded occurrence of one derived component."""
+    found = False
+    index = 0
+    while sequence and index <= len(tokens) - len(sequence):
+        if tuple(tokens[index : index + len(sequence)]) == sequence:
+            del tokens[index : index + len(sequence)]
+            found = True
+        else:
+            index += 1
+    return found
+
+
+def _derived_suffix_components(
+    config: Mapping[str, Any],
+    *,
+    model_key: str,
+    scientific_variant: str | None,
+) -> list[tuple[str, str]]:
+    """Return token-aware identities forbidden in manual experiment context."""
+    model = _as_mapping(config.get("model"), path="model")
+    run = _as_mapping(config.get("run"), path="run")
+    components = [
+        ("model architecture", model_key),
+        ("task", str(config.get("task"))),
+        ("model family", _model_variant(config)),
+        ("model kind", str(model.get("kind"))),
+        ("seed", f"s{run.get('seed')}"),
+        ("seed", f"seed{run.get('seed')}"),
+    ]
+    components.extend(("architecture parameter", token) for token in model_key.split("_")[1:])
+    if scientific_variant is not None:
+        physics = _as_mapping(_as_mapping(config.get("loss"), path="loss").get("physics"), path="loss.physics")
+        derivatives = _as_mapping(physics.get("derivatives"), path="loss.physics.derivatives")
+        continuity = str(physics.get("continuity"))
+        derivative_strategy = scientific_variant.removesuffix(f"_{continuity}")
+        components.extend(
+            [
+                ("scientific variant", scientific_variant),
+                ("derivative strategy", derivative_strategy),
+                ("derivative kind", str(derivatives.get("kind"))),
+                ("continuity formulation", continuity),
+            ]
+        )
+        extension = str(derivatives.get("extension"))
+        if extension != "none":
+            components.append(("derivative extension", extension))
+
+    unique: dict[tuple[str, ...], tuple[str, str]] = {}
+    for label, value in components:
+        tokens = _identity_tokens(value)
+        if tokens:
+            unique.setdefault(tokens, (label, value))
+    return sorted(unique.values(), key=lambda item: len(_identity_tokens(item[1])), reverse=True)
+
+
+def _validate_run_context(
+    config: Mapping[str, Any],
+    *,
+    model_key: str | None = None,
+    scientific_variant: str | None = None,
+) -> None:
+    """Require normalized suffix-only context without repeated derived identity."""
+    run = _as_mapping(config.get("run"), path="run")
+    suffix = run.get("suffix")
+    if suffix is None:
+        return
+    if not isinstance(suffix, str) or not suffix:
+        msg = f"run.suffix must be null or a non-empty normalized string, got {suffix!r}."
+        raise ConfigError(msg)
+
+    resolved_model_key = model_key or resolved_model_variant(config)
+    resolved_science = resolved_scientific_variant(config) if scientific_variant is None else scientific_variant
+    remaining = list(_identity_tokens(suffix))
+    duplicated: list[tuple[str, str]] = []
+    for label, value in _derived_suffix_components(
+        config,
+        model_key=resolved_model_key,
+        scientific_variant=resolved_science,
+    ):
+        if _remove_identity_sequence(remaining, _identity_tokens(value)):
+            duplicated.append((label, value))
+    if duplicated:
+        details = ", ".join(f"{label}={value!r}" for label, value in duplicated)
+        suggestion = "_".join(remaining) or "null"
+        msg = f"run.suffix {suffix!r} duplicates canonical derived identity ({details}). Suggested run.suffix: {suggestion}."
+        raise ConfigError(msg)
+    if _RUN_SUFFIX_PATTERN.fullmatch(suffix) is None:
+        msg = f"run.suffix {suffix!r} must be lowercase underscore-separated tokens with no leading, trailing, or repeated underscore."
+        raise ConfigError(msg)
+
+
 def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive the canonical project, optional study, and minimal base tags."""
     tracking = _as_mapping(config.get("tracking"), path="tracking")
@@ -686,7 +879,7 @@ def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
         msg = f"tracking.wandb.workflow must be one of {list(config_defaults.WANDB_WORKFLOWS)}, got {workflow!r}."
         raise ConfigError(msg)
 
-    common.paths.validate_logical_name(config.get("task"), label="task")
+    task = common.paths.validate_logical_name(config.get("task"), label="task")
     variant = _model_variant(config)
     raw_study = wandb.get("study")
     if raw_study is not None:
@@ -717,7 +910,7 @@ def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
         msg = f"Derived W&B tags must be unique and contain at most {config_defaults.WANDB_MAX_TAGS} values."
         raise ConfigError(msg)
     return {
-        "project": config_defaults.WANDB_PROJECT,
+        "project": config_defaults.WANDB_TASK_PROJECTS[task],
         "entity": config_defaults.WANDB_ENTITY,
         "study": study,
         "tags": tags,
@@ -819,6 +1012,9 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     if int(training["evaluation_interval"]) <= 0:
         msg = "training.evaluation_interval must be positive."
         raise ConfigError(msg)
+    if int(training["ood_evaluation_interval"]) <= 0:
+        msg = "training.ood_evaluation_interval must be positive."
+        raise ConfigError(msg)
     data = _as_mapping(config["data"], path="data")
     try:
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
@@ -829,15 +1025,14 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     _validate_tracking(config, require_derived=require_derived_tracking)
 
     run = _as_mapping(config["run"], path="run")
-    device_module = importlib.import_module("src.learning.learning_device")
     try:
-        run["device"] = device_module.validate_device_policy(
+        run["device"] = learning_device_policy.validate_device_policy(
             run.get("device"),
             path="run.device",
         )
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    for key in ("prefix", "suffix", "name"):
+    for key in ("suffix", "name"):
         value = run.get(key)
         if value is None:
             continue
@@ -845,6 +1040,7 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
             common.paths.validate_logical_name(value, label=f"run.{key}")
         except ValueError as error:
             raise ConfigError(str(error)) from error
+    _validate_run_context(config)
 
 
 def generate_run_name(config: dict[str, Any]) -> str:
@@ -859,35 +1055,28 @@ def generate_run_name(config: dict[str, Any]) -> str:
     Returns
     -------
     str
-        Deterministic task/model/loss/seed name with optional prefix and suffix.
+        Deterministic architecture/science/seed name with an optional final
+        experiment suffix.
 
     Raises
     ------
     ConfigError
-        If required semantic model settings are invalid.
+        If required semantic model or scientific settings are invalid.
 
     """
-    task = str(config["task"])
-    model = _as_mapping(config["model"], path="model")
-    kind = str(model["kind"])
-    params = _as_mapping(model["params"], path="model.params")
     run = _as_mapping(config["run"], path="run")
+    model_key = resolved_model_variant(config)
+    scientific_variant = resolved_scientific_variant(config)
+    _validate_run_context(
+        config,
+        model_key=model_key,
+        scientific_variant=scientific_variant,
+    )
 
-    variant = _model_variant(config)
-    if kind == "fno":
-        modes = params["n_modes"]
-        model_key = f"{variant}_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
-    elif kind == "uno":
-        mode_ratio = format(float(params["mode_ratio"]), ".8g").replace(".", "p")
-        model_key = f"{variant}_m{params['modes_x']}x{params['modes_y']}_h{params['hidden_channels']}_l{params['n_layers']}_r{mode_ratio}"
-    else:
-        domain.tasks.registry.get_task(task)
-        msg = f"Unknown model identifier {kind!r} while generating a run name."
-        raise ConfigError(msg)
-
-    parts = [task, model_key, f"s{run['seed']}"]
-    if run.get("prefix"):
-        parts.insert(0, str(run["prefix"]))
+    parts = [model_key]
+    if scientific_variant is not None:
+        parts.append(scientific_variant)
+    parts.append(f"s{run['seed']}")
     if run.get("suffix"):
         parts.append(str(run["suffix"]))
     return "__".join(parts)
@@ -932,7 +1121,6 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     effective = deep_merge(config_defaults.get_task_defaults(task_id), user_config)
     effective["task"] = task_id
 
-    model_factory, _, _ = _semantic_modules()
     model = _as_mapping(effective["model"], path="model")
     kind = model.get("kind")
     if not isinstance(kind, str):
@@ -980,12 +1168,11 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
         "project_root": str(common.paths.get_project_root()),
         "model_training_data_root": str(common.paths.get_model_training_data_root()),
         "training_meta_root": str(common.paths.get_training_meta_root()),
-        "dataset_root": str(common.paths.get_dataset_root()),
-        "output_root": str(common.paths.get_output_root()),
+        "dataset_root": str(common.paths.get_training_raw_root()),
+        "output_root": str(common.paths.get_training_processed_root()),
     }
     run = _as_mapping(effective["run"], path="run")
-    if not run.get("name"):
-        run["name"] = generate_run_name(effective)
+    run["name"] = generate_run_name(effective)
     try:
         common.paths.validate_logical_name(run["name"], label="run.name")
     except ValueError as error:
@@ -1077,7 +1264,6 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ConfigError(msg)
 
     task = validate_resolved_task_contract(effective)
-    model_factory, _, _ = _semantic_modules()
     model = _as_mapping(effective["model"], path="model")
     kind = model.get("kind")
     if not isinstance(kind, str) or not kind:
@@ -1105,6 +1291,10 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _validate_evaluation(effective, task=task)
     _validate_runtime_sections(effective, require_derived_tracking=True)
     get_resolved_objective(effective)
+    expected_run_name = generate_run_name(effective)
+    if effective["run"]["name"] != expected_run_name:
+        msg = f"Resolved run.name must equal the canonical generated leaf {expected_run_name!r}."
+        raise ConfigError(msg)
     paths = _as_mapping(effective["paths"], path="paths")
     missing_paths = sorted(_RESOLVED_PATH_KEYS.difference(paths))
     unknown_paths = sorted(set(paths).difference(_RESOLVED_PATH_KEYS))
@@ -1134,7 +1324,14 @@ def load_and_resolve_config(yaml_path: Path | str) -> dict[str, Any]:
         Fully resolved semantic configuration.
 
     """
-    return resolve_config(load_yaml(yaml_path))
+    raw = load_yaml(yaml_path)
+    resolved = resolve_config(raw)
+    validate_task_directory_identity(
+        yaml_path,
+        raw_task=raw.get("task"),
+        resolved_task=resolved.get("task"),
+    )
+    return resolved
 
 
 def create_dataloaders_from_config(

@@ -1,8 +1,8 @@
 """
-Model reconstruction and inference context modules.
+Saved-run inference reconstruction.
 
 Provides:
-- context: saved-run model, normalizer and dataloader reconstruction
+- context: model, normalizer, split, and dataloader reconstruction
 """
 
 from . import learning_inference as context

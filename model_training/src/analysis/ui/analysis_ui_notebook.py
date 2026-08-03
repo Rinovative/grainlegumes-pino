@@ -31,6 +31,8 @@ import pandas as pd
 from IPython.display import clear_output, display
 from matplotlib.figure import Figure
 
+from . import analysis_ui_viewers as viewers
+
 
 def _sanitize_name(name: str) -> str:
     """
@@ -61,18 +63,24 @@ def _show_anything(result: Any) -> None:
         display(result)
 
 
-def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> Any:
+def make_dropdown_section(
+    plots: list,
+    *,
+    export_state: dict | None = None,
+    select_first: bool = False,
+) -> Any:
     """
     Build one lazy dropdown whose entries render notebook views on selection.
 
     Parameters
     ----------
     plots : list
-        Ordered ``(title, zero-argument callable, export_name)`` entries. Index
-        ``-1`` is reserved for the initial non-rendering prompt.
+        Ordered ``(title, zero-argument callable, export_name)`` entries.
     export_state : dict | None, optional
         Shared mutable state receiving the current title/name and direct or
         viewer-rendered Matplotlib figure for later PDF export.
+    select_first : bool, optional
+        Omit the prompt and mark the first entry for activation when its tab opens.
 
     Returns
     -------
@@ -82,13 +90,15 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
 
     Notes
     -----
-    Selecting the prompt clears output. Before rendering, the prior export figure
-    is cleared; non-figure widgets may populate it later through viewer callbacks.
+    Selecting the prompt clears output. A first-entry section remains lazy until
+    its tab opens. Before rendering, the prior export figure is cleared; non-figure
+    widgets may populate it later through viewer callbacks.
 
     """
+    plot_options = [(title, i) for i, (title, _, _) in enumerate(plots)]
     dropdown = widgets.Dropdown(
-        options=[("Choose a view…", -1), *((title, i) for i, (title, _, _) in enumerate(plots))],
-        value=-1,
+        options=plot_options if select_first else [("Choose a view…", -1), *plot_options],
+        value=None if select_first else -1,
         description="View:",
         style={"description_width": "initial"},
         layout=widgets.Layout(width="360px"),
@@ -121,10 +131,8 @@ def make_dropdown_section(plots: list, *, export_state: dict | None = None) -> A
 
             # Tell analysis_ui_viewers where to store figures rendered inside viewers/callbacks
             if export_state is not None:
-                from . import analysis_ui_viewers as _viewers  # local import to avoid circular import  # noqa: PLC0415
-
                 export_state["fig"] = None
-                _viewers.set_export_context(export_state, plot_name=plot_name, title=title)
+                viewers.set_export_context(export_state, plot_name=plot_name, title=title)
 
             result = plot_func()
             if isinstance(result, tuple):
@@ -305,8 +313,21 @@ def make_lazy_panel_with_tabs(
     header = widgets.HBox([close_btn, export_btn])
     panel = widgets.VBox([header, status_out, tabs])
 
+    def activate_selected_view(_: object = None) -> None:
+        """Activate the first view of the selected opt-in section once."""
+        selected_index = tabs.selected_index
+        if selected_index is None:
+            return
+        section_children = getattr(sections[selected_index], "children", ())
+        if not section_children or not isinstance(section_children[0], widgets.Dropdown):
+            return
+        dropdown = section_children[0]
+        if dropdown.index is None and dropdown.options:
+            dropdown.index = 0
+
     def show_panel(_: None = None) -> None:
-        """Display the expanded panel."""
+        """Display the expanded panel with its selected tab ready to use."""
+        activate_selected_view()
         with main_out:
             clear_output()
             display(panel)
@@ -317,6 +338,7 @@ def make_lazy_panel_with_tabs(
             clear_output()
             display(open_btn)
 
+    tabs.observe(activate_selected_view, names="selected_index")
     open_btn.on_click(show_panel)
     close_btn.on_click(show_open)
     show_open()

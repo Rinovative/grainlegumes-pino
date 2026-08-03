@@ -13,6 +13,8 @@ Responsibilities:
 
 Design principles:
   - Reopening preserves history but each invocation allocates only additional fresh trials
+  - Embedded requests use the generic experiment structure; wrappers own study/search policy
+  - Wrapper objective and direction derive from the embedded resolved experiment objective
   - Device, output, tracking, and invocation count remain outside scientific identity
   - Local trial state is authoritative; W&B is an optional post-publication observer
   - Optuna imports stay lazy for help and dry-run validation
@@ -29,8 +31,8 @@ from __future__ import annotations
 import copy
 import gc
 import importlib
-import json
 import math
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
@@ -45,13 +47,17 @@ from src import common, datasets, experiments, learning
 
 from . import experiments_tuning_search_space as search_space
 
-STUDY_SIGNATURE_SCHEMA_VERSION = 1
-TRIAL_LIFECYCLE_SCHEMA_VERSION = 1
-_STUDY_NAME_SHORT_LIMIT = 32
+STUDY_SIGNATURE_SCHEMA_VERSION = 2
+TRIAL_LIFECYCLE_SCHEMA_VERSION = 2
 _STUDY_SIGNATURE_ATTR = "semantic_signature"
 _STUDY_SIGNATURE_PAYLOAD_ATTR = "semantic_signature_payload"
 _STUDY_SIGNATURE_SCHEMA_ATTR = "semantic_signature_schema_version"
 _RESOLVED_OBJECTIVE_ATTR = "resolved_objective"
+_SAMPLER_METADATA_ATTR = "sampler_metadata"
+_STUDY_SUMMARY_FILENAME = "study_summary.json"
+_PARAMETER_IMPORTANCE_MIN_COMPLETED_TRIALS = 20
+_STUDY_ROLES = frozenset({"production", "smoke"})
+OPTUNA_ROOT_KEYS = frozenset({"study", "experiment", "search_space"})
 _TRIAL_OUTCOMES = (
     "completed",
     "pruned",
@@ -171,65 +177,85 @@ class _OptunaStudyPaths:
 
 @dataclass
 class OptunaEpochReporter:
-    """
-    Report one held-out objective at every actual completed training epoch.
-
-    The adapter enforces continuous one-based epoch steps, finite values, the
-    configured optimization direction, and immediate pruning after local epoch
-    publication. It retains the last metrics/global step for truthful terminal
-    summaries and never reconstructs reports from planned epochs.
-
-    Attributes
-    ----------
-    trial : TrialProtocol
-        Current Optuna trial receiving reports and user attributes.
-    objective_id : str
-        Exact held-out evaluation key required at every completed epoch.
-    direction : {"minimize", "maximize"}
-        Direction used to retain best value and epoch.
-    last_reported_epoch : int | None
-        Latest durable one-based step accepted by Optuna.
-    last_metrics : dict[str, float] | None
-        Complete telemetry for the latest accepted epoch, used for terminal mirrors.
-
-    """
+    """Report the exact held-out objective only at genuine completed-epoch events."""
 
     trial: TrialProtocol
     objective_id: str
     direction: str
+    evaluation_interval: int = 1
+    target_epoch: int | None = None
+    pruner_config: Mapping[str, Any] | None = None
     best_value: float | None = None
     best_epoch: int | None = None
     last_reported_epoch: int | None = None
     last_reported_objective: float | None = None
     last_global_step: int | None = None
     last_metrics: dict[str, float] | None = None
+    last_pruning_eligible: bool | None = None
+    last_pruning_decision: str | None = None
+    last_report_duration_seconds: float | None = None
+    last_study_best_value: float | None = None
+
+    def _expected_epoch(self) -> int:
+        """Return the next interval-or-terminal completed epoch."""
+        interval = _require_exact_int(
+            self.evaluation_interval,
+            label="Optuna reporter evaluation_interval",
+            minimum=1,
+        )
+        if self.target_epoch is not None:
+            target = _require_exact_int(
+                self.target_epoch,
+                label="Optuna reporter target_epoch",
+                minimum=1,
+            )
+            if self.last_reported_epoch is None:
+                return min(interval, target)
+            return min(self.last_reported_epoch + interval, target)
+        if self.last_reported_epoch is None:
+            return interval
+        return self.last_reported_epoch + interval
+
+    def _pruning_eligible(self, epoch: int) -> bool | None:
+        """Return exact MedianPruner eligibility when prior study state is observable."""
+        pruner = dict(self.pruner_config or {})
+        if not pruner or pruner.get("kind") == "none":
+            return False
+        warmup = int(pruner.get("n_warmup_steps", 0))
+        if epoch < warmup:
+            return False
+        startup = int(pruner.get("n_startup_trials", 0))
+        if startup == 0:
+            return True
+        study = getattr(self.trial, "study", None)
+        get_trials = getattr(study, "get_trials", None)
+        if not callable(get_trials):
+            return None
+        try:
+            trials = cast("Sequence[Any]", get_trials(deepcopy=False))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        completed = sum(str(getattr(getattr(item, "state", None), "name", "")).lower() == "complete" for item in trials)
+        return completed >= startup
+
+    def _study_best_value(self) -> float | None:
+        """Return the current completed-study best without inventing a value."""
+        study = cast("Any", getattr(self.trial, "study", None))
+        try:
+            value = float(study.best_value)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
 
     def __call__(self, epoch: int, metrics: dict[str, float]) -> None:
-        """
-        Publish one completed-epoch objective and honor the pruner immediately.
-
-        Parameters
-        ----------
-        epoch : int
-            Actual positive completed epoch; gaps and duplicates are rejected.
-        metrics : dict[str, float]
-            Completed-epoch telemetry containing the configured held-out
-            objective and optionally ``global_step``.
-
-        Raises
-        ------
-        NonFiniteTrialError
-            If the objective is NaN or infinite.
-        optuna.TrialPruned
-            If the trial pruner rejects the newly reported epoch.
-
-        """
+        """Publish one actual ID evaluation at its completed epoch and ask the pruner once."""
+        report_started = time.perf_counter()
         if type(epoch) is not int or epoch <= 0:
             msg = f"Completed Optuna epoch must be a positive integer, got {epoch!r}."
             raise TypeError(msg)
-        expected_epoch = 1 if self.last_reported_epoch is None else self.last_reported_epoch + 1
+        expected_epoch = self._expected_epoch()
         if epoch != expected_epoch:
-            msg = f"Optuna reports must be continuous actual epochs; expected {expected_epoch}, got {epoch}."
+            msg = f"Optuna reports must follow interval-or-terminal completed epochs; expected {expected_epoch}, got {epoch}."
             raise ValueError(msg)
         metric_key = f"id/{self.objective_id}"
         if metric_key not in metrics:
@@ -256,8 +282,13 @@ class OptunaEpochReporter:
         self.last_reported_epoch = epoch
         self.last_reported_objective = value
         self.last_metrics = dict(metrics)
+        self.last_pruning_eligible = self._pruning_eligible(epoch)
+        self.last_study_best_value = self._study_best_value()
+        should_prune = bool(self.trial.should_prune())
+        self.last_pruning_decision = "prune" if should_prune else "continue"
+        self.last_report_duration_seconds = time.perf_counter() - report_started
 
-        if self.trial.should_prune():
+        if should_prune:
             msg = f"Pruned by Optuna at completed epoch {epoch}"
             raise _trial_pruned_error()(msg)
 
@@ -385,8 +416,8 @@ def _normalise_pruner_config(value: Any) -> dict[str, Any]:
         raise ValueError(msg)
     if kind == "median":
         pruner.setdefault("n_startup_trials", 5)
-        pruner.setdefault("n_warmup_steps", 20)
-        pruner.setdefault("interval_steps", 1)
+        pruner.setdefault("n_warmup_steps", 25)
+        pruner.setdefault("interval_steps", 5)
     for key in ("n_startup_trials", "n_warmup_steps"):
         if key in pruner:
             pruner[key] = _require_exact_int(
@@ -414,6 +445,7 @@ def _validate_study_settings(study: Mapping[str, Any]) -> None:
     """
     allowed = {
         "name",
+        "role",
         "objective",
         "direction",
         "seed",
@@ -430,6 +462,10 @@ def _validate_study_settings(study: Mapping[str, Any]) -> None:
         _require_nonempty_string(study.get("name"), label="study.name"),
         label="study.name",
     )
+    role = _require_nonempty_string(study.get("role"), label="study.role")
+    if role not in _STUDY_ROLES:
+        msg = f"study.role must be one of {sorted(_STUDY_ROLES)}, got {role!r}."
+        raise ValueError(msg)
     _require_nonempty_string(study.get("objective"), label="study.objective")
     direction = _require_nonempty_string(study.get("direction"), label="study.direction")
     if direction not in {"minimize", "maximize"}:
@@ -438,7 +474,11 @@ def _validate_study_settings(study: Mapping[str, Any]) -> None:
     _require_exact_int(study.get("seed"), label="study.seed")
     _require_exact_int(study.get("n_trials"), label="study.n_trials", minimum=1)
     _normalise_sampler_config(study.get("sampler"))
-    _normalise_pruner_config(study.get("pruner"))
+    pruner = _normalise_pruner_config(study.get("pruner"))
+    if pruner["kind"] == "median" and int(pruner["n_startup_trials"]) >= int(study["n_trials"]):
+        msg = "study.pruner.n_startup_trials must be smaller than study.n_trials."
+        raise ValueError(msg)
+    _sampler_seed(study)
     if "storage" in study:
         storage = study["storage"]
         if storage is not None:
@@ -453,7 +493,7 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
     independently from the resolved experiment objective, and all names and
     scalar types are validated before an ``OptunaStudyConfig`` is constructed.
     """
-    allowed = {"name", "seed", "n_trials", "sampler", "pruner", "storage"}
+    allowed = {"name", "role", "seed", "n_trials", "sampler", "pruner", "storage"}
     unknown = sorted(set(raw_study).difference(allowed))
     if unknown:
         msg = f"study contains unknown key(s): {unknown}. Allowed keys: {sorted(allowed)}."
@@ -461,11 +501,12 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
 
     study = dict(copy.deepcopy(raw_study))
     study.setdefault("name", source_path.stem)
+    study.setdefault("role", "production")
     study.setdefault("seed", base_config.get("run", {}).get("seed", 9))
     study.setdefault("n_trials", 30)
     study.setdefault(
         "pruner",
-        {"kind": "median", "n_startup_trials": 5, "n_warmup_steps": 20, "interval_steps": 1},
+        {"kind": "median", "n_startup_trials": 5, "n_warmup_steps": 25, "interval_steps": 5},
     )
     study.setdefault("sampler", {"kind": "tpe"})
 
@@ -479,6 +520,10 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
         _require_nonempty_string(study["name"], label="study.name"),
         label="study.name",
     )
+    study["role"] = _require_nonempty_string(study["role"], label="study.role")
+    if study["role"] not in _STUDY_ROLES:
+        msg = f"study.role must be one of {sorted(_STUDY_ROLES)}, got {study['role']!r}."
+        raise ValueError(msg)
     study["seed"] = _require_exact_int(study["seed"], label="study.seed")
     study["n_trials"] = _require_exact_int(study["n_trials"], label="study.n_trials", minimum=1)
     study["sampler"] = _normalise_sampler_config(study["sampler"])
@@ -493,10 +538,10 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
     """
     Load and semantically validate one complete Optuna study recipe.
 
-    The inline experiment is deep-copied and resolved first. Study objective and
-    direction are then derived from that resolved config before exact parameter
-    schemas, approved paths, supported choices, and base-value containment are
-    validated.
+    The inline experiment is deep-copied, receives its wrapper-owned study
+    tracking identity, and is resolved first. Study objective and direction are
+    then derived from that resolved config before exact parameter schemas,
+    approved paths, supported choices, and base-value containment are validated.
 
     Parameters
     ----------
@@ -533,7 +578,7 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
     source_path = Path(path)
     raw = experiments.config.loader.load_yaml(source_path)
     raw_mapping = _as_mapping(raw, label="Optuna YAML")
-    allowed_root = {"study", "experiment", "search_space"}
+    allowed_root = OPTUNA_ROOT_KEYS
     unknown_root = sorted(set(raw_mapping).difference(allowed_root))
     if unknown_root:
         msg = f"Optuna YAML contains unknown top-level key(s): {unknown_root}."
@@ -547,12 +592,41 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
         raise KeyError(msg)
 
     base_experiment = dict(copy.deepcopy(_as_mapping(raw_mapping["experiment"], label="experiment")))
-    base_config = experiments.config.loader.resolve_config(base_experiment)
-    study = _normalise_study(_as_mapping(raw_mapping.get("study", {}), label="study"), base_config, source_path)
-    wandb_settings = base_config["tracking"]["wandb"]
+    raw_run = _as_mapping(base_experiment.get("run"), label="experiment.run")
+    if "seed" not in raw_run:
+        msg = "experiment.run.seed must be explicit for an Optuna study."
+        raise ValueError(msg)
+    raw_study = _as_mapping(raw_mapping.get("study", {}), label="study")
+    if "seed" not in raw_study:
+        msg = "study.seed must be explicit for deterministic sampler reconstruction."
+        raise ValueError(msg)
+    study_name = common.paths.validate_logical_name(
+        _require_nonempty_string(raw_study.get("name", source_path.stem), label="study.name"),
+        label="study.name",
+    )
+
+    effective_experiment = copy.deepcopy(base_experiment)
+    tracking = dict(_as_mapping(effective_experiment.get("tracking"), label="experiment.tracking"))
+    wandb_settings = dict(_as_mapping(tracking.get("wandb"), label="experiment.tracking.wandb"))
+    workflow = wandb_settings.get("workflow")
+    if workflow != "optuna_trial":
+        msg = "experiment.tracking.wandb.workflow must be 'optuna_trial' for an Optuna study."
+        raise ValueError(msg)
+    if "study" in wandb_settings:
+        msg = "experiment.tracking.wandb.study is wrapper-owned and must not be supplied."
+        raise ValueError(msg)
     wandb_settings["workflow"] = "optuna_trial"
-    wandb_settings["study"] = str(study["name"])
-    wandb_settings.update(experiments.config.loader.derive_wandb_organization(base_config))
+    wandb_settings["study"] = study_name
+    tracking["wandb"] = wandb_settings
+    effective_experiment["tracking"] = tracking
+
+    base_config = experiments.config.loader.resolve_config(effective_experiment)
+    experiments.config.loader.validate_task_directory_identity(
+        source_path,
+        raw_task=base_experiment.get("task"),
+        resolved_task=base_config.get("task"),
+    )
+    study = _normalise_study(raw_study, base_config, source_path)
     base_config = experiments.config.loader.validate_resolved_config(base_config)
     search_parameters = search_space.parse_search_space(raw_mapping["search_space"])
     search_space.validate_search_space_paths(base_config, search_parameters)
@@ -567,23 +641,20 @@ def load_optuna_study_config(path: Path | str) -> OptunaStudyConfig:
     )
 
 
-def _validate_reporting_contract(base_config: Mapping[str, Any]) -> None:
-    """
-    Require held-out objective evaluation after every completed trial epoch.
-
-    Continuous one-based Optuna reports and immediate pruning are truthful only
-    when ``training.evaluation_interval`` is exactly one; larger intervals fail
-    before study creation or trial-directory allocation.
-    """
+def _validate_reporting_contract(base_config: Mapping[str, Any]) -> int:
+    """Require one shared positive ID/OOD/physics interval for Optuna trials."""
     training = _as_mapping(base_config.get("training"), label="experiment.training")
-    interval = _require_exact_int(
-        training.get("evaluation_interval"),
-        label="training.evaluation_interval",
-        minimum=1,
-    )
-    if interval != 1:
-        msg = "Optuna training.evaluation_interval must be 1 for continuous pruning."
+    wandb = _as_mapping(_as_mapping(base_config.get("tracking"), label="experiment.tracking").get("wandb"), label="tracking.wandb")
+    monitor = _as_mapping(wandb.get("monitor"), label="tracking.wandb.monitor")
+    intervals = {
+        "ID": _require_exact_int(training.get("evaluation_interval"), label="training.evaluation_interval", minimum=1),
+        "OOD": _require_exact_int(training.get("ood_evaluation_interval"), label="training.ood_evaluation_interval", minimum=1),
+        "physics": _require_exact_int(monitor.get("interval"), label="tracking.wandb.monitor.interval", minimum=1),
+    }
+    if len(set(intervals.values())) != 1:
+        msg = f"Optuna ID/OOD/physics intervals must share one completed-epoch cadence, got {intervals}."
         raise ValueError(msg)
+    return intervals["ID"]
 
 
 def _validate_search_space_choices(
@@ -606,6 +677,8 @@ def _validate_search_space_choices(
             candidates = (parameter.value,)
         for candidate in candidates:
             candidate_config = search_space.apply_trial_overrides(base_config, {parameter.path: candidate})
+            candidate_config["run"].pop("name", None)
+            candidate_config["run"]["name"] = experiments.config.loader.generate_run_name(candidate_config)
             try:
                 experiments.config.loader.validate_resolved_config(candidate_config)
             except (KeyError, TypeError, ValueError) as error:
@@ -623,7 +696,16 @@ def _validate_study_contract(config: OptunaStudyConfig) -> tuple[OptunaStudyConf
     """
     _validate_study_settings(config.study)
     base_config = experiments.config.loader.validate_resolved_config(config.base_config)
-    _validate_reporting_contract(base_config)
+    reporting_interval = _validate_reporting_contract(base_config)
+    pruner = _normalise_pruner_config(config.study["pruner"])
+    if pruner["kind"] == "median":
+        if int(pruner["interval_steps"]) != reporting_interval:
+            msg = "study.pruner.interval_steps must equal the genuine ID evaluation interval."
+            raise ValueError(msg)
+        warmup = int(pruner["n_warmup_steps"])
+        if warmup < reporting_interval or warmup % reporting_interval != 0:
+            msg = "study.pruner.n_warmup_steps must be a positive whole number of ID evaluation intervals."
+            raise ValueError(msg)
     objective = experiments.config.loader.get_resolved_objective(base_config)
     if config.study.get("objective") != objective["id"]:
         msg = "Resolved study objective id does not match its experiment objective."
@@ -689,6 +771,7 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
     sampler = _normalise_sampler_config(validated.study["sampler"])
     pruner = _normalise_pruner_config(validated.study["pruner"])
     sampler_seed = _sampler_seed(validated.study)
+    reporting_interval = _validate_reporting_contract(validated.base_config)
     payload = {
         "schema_version": STUDY_SIGNATURE_SCHEMA_VERSION,
         "task": {
@@ -701,15 +784,17 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
             search_space.search_space_summary(validated.search_space),
             key=lambda item: (str(item["path"]), str(item["name"])),
         ),
+        "study_role": validated.study["role"],
         "objective": objective,
         "direction": objective["direction"],
         "sampler": {**sampler, "seed": sampler_seed},
         "pruner": pruner,
         "reporting": {
             "metric_source": "held_out_evaluation",
-            "evaluation_interval": 1,
+            "evaluation_interval": reporting_interval,
+            "event_model": "completed_epoch_interval_or_terminal",
             "step": "actual_completed_epoch",
-            "pruning_subset": None,
+            "pruning_subset": "id_only",
         },
         "trial_lifecycle": {
             "schema_version": TRIAL_LIFECYCLE_SCHEMA_VERSION,
@@ -717,6 +802,8 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
             "outcomes": list(_TRIAL_OUTCOMES),
             "resume_policy": "new_trials_only",
             "trial_count_policy": "additional_fresh_trials_per_invocation",
+            "training_seed_policy": "fixed_configured_run_seed_across_trials",
+            "trial_identity_policy": "native_zero_based_optuna_number",
         },
     }
     return {
@@ -795,52 +882,6 @@ def _resolve_study_paths(config: OptunaStudyConfig) -> _OptunaStudyPaths:
     return _OptunaStudyPaths(study_dir, study_dir / "trials", storage, local_storage_path)
 
 
-def _describe_dataset_identity(config: Mapping[str, Any], dataset_id: str) -> dict[str, Any]:
-    """Validate one configured dataset through its compact metadata package."""
-    task = experiments.config.loader.validate_resolved_task_contract(config)
-    paths = _as_mapping(config.get("paths"), label="experiment.paths")
-    dataset_path = common.paths.resolve_dataset_path(dataset_id, dataset_root=Path(paths["dataset_root"]))
-    metadata_dir = common.paths.resolve_dataset_metadata_dir(dataset_id, metadata_root=Path(paths["training_meta_root"]))
-    if not dataset_path.is_file() or dataset_path.is_symlink():
-        msg = f"Configured training dataset is not a regular file: {dataset_path}"
-        raise FileNotFoundError(msg)
-
-    metadata = _as_mapping(
-        json.loads((metadata_dir / datasets.metadata.METADATA_FILENAME).read_text(encoding="utf-8")),
-        label="dataset metadata",
-    )
-    manifest = _as_mapping(
-        json.loads((metadata_dir / datasets.metadata.SOURCE_MANIFEST_FILENAME).read_text(encoding="utf-8")),
-        label="source manifest snapshot",
-    )
-    scientific = _as_mapping(metadata.get("scientific_identity"), label="dataset metadata scientific_identity")
-    identity = datasets.identity.DatasetIdentity(
-        dataset_id=dataset_id,
-        task=task.id,
-        task_contract_digest=task.contract_digest,
-        fingerprint=scientific["dataset_fingerprint"],
-        sample_ids=tuple(manifest["intended_case_ids"]),
-        sample_count=scientific["sample_count"],
-        spatial_shape=tuple(scientific["spatial_shape"]),
-        generated_batch_identity_sha256=scientific["generated_batch_identity_sha256"],
-    )
-    package = datasets.metadata.validate_dataset_metadata_directory(metadata_dir, dataset_identity=identity)
-    artifact = package.metadata["artifacts"]["dataset"]
-    if dataset_path.name != artifact["filename"] or dataset_path.stat().st_size != artifact["size_bytes"]:
-        msg = "Configured training dataset name or size does not match its metadata package."
-        raise ValueError(msg)
-    return {
-        "dataset_id": identity.dataset_id,
-        "dataset_path": str(dataset_path),
-        "metadata_dir": str(metadata_dir),
-        "validation": "metadata_package_and_artifact_stat",
-        "task": identity.task,
-        "task_contract_digest": identity.task_contract_digest,
-        "fingerprint": identity.fingerprint,
-        "sample_count": identity.sample_count,
-    }
-
-
 def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and summarize the exact configured ID and OOD dataset roles."""
     data = _as_mapping(config.get("data"), label="experiment.data")
@@ -850,9 +891,34 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
         msg = "data.ood_datasets must contain exactly one configured dataset id."
         raise ValueError(msg)
     ood_dataset = _require_nonempty_string(raw_ood[0], label="data.ood_datasets[0]")
+
+    task = experiments.config.loader.validate_resolved_task_contract(config)
+    paths = _as_mapping(config.get("paths"), label="experiment.paths")
+
+    def summarize(dataset_id: str) -> dict[str, Any]:
+        summary = datasets.metadata.load_dataset_metadata_summary(
+            dataset_id,
+            task=task,
+            dataset_root=Path(paths["dataset_root"]),
+            metadata_root=Path(paths["training_meta_root"]),
+        )
+        if not summary.dataset_exists:
+            msg = f"Configured training dataset is not a regular file: {summary.dataset_path}"
+            raise FileNotFoundError(msg)
+        return {
+            "dataset_id": summary.dataset_id,
+            "dataset_path": str(summary.dataset_path),
+            "metadata_dir": str(summary.metadata_directory),
+            "validation": "metadata_package_and_artifact_stat",
+            "task": summary.task_id,
+            "task_contract_digest": summary.task_contract_digest,
+            "fingerprint": summary.fingerprint,
+            "sample_count": summary.sample_count,
+        }
+
     return {
-        "id": _describe_dataset_identity(config, train_dataset),
-        "ood": [_describe_dataset_identity(config, ood_dataset)],
+        "id": summarize(train_dataset),
+        "ood": [summarize(ood_dataset)],
     }
 
 
@@ -872,25 +938,28 @@ def _build_pruner(study: Mapping[str, Any]) -> Any:
     if pruner_type == "median":
         return optuna.pruners.MedianPruner(
             n_startup_trials=pruner_cfg.get("n_startup_trials", 5),
-            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 20),
-            interval_steps=pruner_cfg.get("interval_steps", 1),
+            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 25),
+            interval_steps=pruner_cfg.get("interval_steps", 5),
         )
     msg = f"Unsupported Optuna pruner: {pruner_type!r}"
     raise ValueError(msg)
 
 
 def _sampler_seed(study: Mapping[str, Any]) -> int:
-    """Return a stable subseed in Optuna/NumPy's accepted 32-bit domain."""
-    raw_study_seed = _require_exact_int(study.get("seed"), label="study.seed")
-    return experiments.run.derive_subseed(raw_study_seed, "optuna-sampler") % (2**32)
+    """Return the explicit persisted Optuna sampler seed without derivation."""
+    seed = _require_exact_int(study.get("seed"), label="study.seed", minimum=0)
+    if seed >= 2**32:
+        msg = f"study.seed must fit Optuna/NumPy's 32-bit sampler domain, got {seed}."
+        raise ValueError(msg)
+    return seed
 
 
 def _build_sampler(study: Mapping[str, Any]) -> Any:
     """
     Build a deterministic Optuna sampler from validated semantic policy.
 
-    Both random and TPE receive the stable 32-bit study subseed; only TPE accepts
-    the normalized multivariate flag. Optuna remains lazily imported.
+    Both random and TPE receive the explicit persisted 32-bit study seed; only
+    TPE accepts the normalized multivariate flag. Optuna remains lazily imported.
     """
     sampler_cfg = _normalise_sampler_config(study.get("sampler"))
     sampler_type = sampler_cfg["kind"]
@@ -908,34 +977,20 @@ def _build_sampler(study: Mapping[str, Any]) -> Any:
     raise ValueError(msg)
 
 
-def _study_name_short(study_name: str) -> str:
-    """Return a bounded, recognizable study slug for trial run names."""
-    slug = study_name.replace("_", "-")
-    if len(slug) <= _STUDY_NAME_SHORT_LIMIT:
-        return slug
-    digest = common.serialization.canonical_json_sha256({"study_name": study_name})[:7]
-    return f"{slug[:24].rstrip('-')}-{digest}"
-
-
 def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol) -> tuple[dict[str, Any], dict[str, Any]]:
-    """
-    Sample, identify, and fully validate one fresh trial config.
-
-    Overrides are applied to an isolated base copy, a stable study/trial subseed
-    replaces the base run seed, objective identity is required to stay unchanged,
-    and a trial-qualified run name is regenerated. Run metadata is recorded on
-    the Optuna trial only after final resolved-config validation.
-    """
+    """Sample one trial while preserving the configured fixed training seed."""
+    trial_number = _require_exact_int(trial.number, label="Optuna trial.number", minimum=0)
     overrides = search_space.suggest_trial_overrides(trial, study_config.search_space)
     config = search_space.apply_trial_overrides(study_config.base_config, overrides)
-    config["run"]["seed"] = experiments.run.derive_subseed(
-        int(study_config.study["seed"]),
-        f"trial-{trial.number}",
-    )
+    training_seed = _require_exact_int(config["run"]["seed"], label="experiment.run.seed", minimum=0)
+    sampler_seed = _sampler_seed(study_config.study)
     wandb_settings = config["tracking"]["wandb"]
     wandb_settings["workflow"] = "optuna_trial"
     wandb_settings["study"] = str(study_config.study["name"])
     wandb_settings.update(experiments.config.loader.derive_wandb_organization(config))
+    config["run"]["suffix"] = f"optuna_trial_{trial_number:03d}"
+    config["run"].pop("name", None)
+    config["run"]["name"] = experiments.config.loader.generate_run_name(config)
     config = experiments.config.loader.validate_resolved_config(config)
 
     base_objective = experiments.config.loader.get_resolved_objective(study_config.base_config)
@@ -944,24 +999,24 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
         msg = "Sampled trial objective does not match the resolved study objective."
         raise ValueError(msg)
 
-    config["run"]["prefix"] = f"optuna-{_study_name_short(str(study_config.study['name']))}"
-    config["run"]["suffix"] = f"trial{trial.number:04d}"
-    config["run"].pop("name", None)
-    config["run"]["name"] = experiments.config.loader.generate_run_name(config)
-    config = experiments.config.loader.validate_resolved_config(config)
     analysis_parameters = {
         parameter.name: copy.deepcopy(overrides[parameter.path]) for parameter in study_config.search_space if parameter.kind != "fixed"
     }
     context = {
         "study_name": str(study_config.study["name"]),
-        "trial_number": int(trial.number),
+        "study_role": str(study_config.study["role"]),
+        "trial_number": trial_number,
+        "training_seed": training_seed,
+        "sampler_seed": sampler_seed,
         "overrides": overrides,
         "analysis_parameters": analysis_parameters,
         "search_signature": build_study_signature(study_config)["digest"],
     }
 
     trial.set_user_attr("run_name", config["run"]["name"])
-    trial.set_user_attr("run_seed", config["run"]["seed"])
+    trial.set_user_attr("run_seed", training_seed)
+    trial.set_user_attr("sampler_seed", sampler_seed)
+    trial.set_user_attr("study_role", context["study_role"])
     trial.set_user_attr("overrides", overrides)
     return config, context
 
@@ -971,7 +1026,7 @@ def _trial_run_dir(config: Mapping[str, Any], context: Mapping[str, Any]) -> Pat
     return common.paths.resolve_optuna_trial_dir(
         str(config["task"]),
         str(context["study_name"]),
-        int(context["trial_number"]),
+        str(config["run"]["name"]),
         output_root=Path(config["paths"]["output_root"]),
     )
 
@@ -1241,12 +1296,16 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
     if config["run"]["device"] != device_resolution.requested_policy:
         msg = "Prepared trial changed the already resolved runtime device policy."
         raise ValueError(msg)
+    experiments.run.validate_deterministic_model_device_policy(config, device_resolution)
     device = device_resolution.device
     objective = experiments.config.loader.get_resolved_objective(config)
     reporter = OptunaEpochReporter(
         trial=trial,
         objective_id=str(objective["id"]),
         direction=str(objective["direction"]),
+        evaluation_interval=int(config["training"]["evaluation_interval"]),
+        target_epoch=int(config["training"]["epochs"]),
+        pruner_config=study_config.study["pruner"],
     )
     trial_pruned = _trial_pruned_error()
     requested_run_dir = _trial_run_dir(config, context)
@@ -1256,8 +1315,28 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         run_dir=requested_run_dir,
         summary_extra=summary_extra,
     )
-
+    console_reporter = experiments.console.ConsoleReporter(
+        config=config,
+        run_dir=run_dir,
+        study_name=str(context["study_name"]),
+        trial_number=int(context["trial_number"]),
+    )
     start_time = datetime.now(UTC)
+    experiments.console.optuna_trial_event(
+        "started",
+        study=str(context["study_name"]),
+        study_role=str(context["study_role"]),
+        trial=int(context["trial_number"]),
+        run_name=str(config["run"]["name"]),
+        sampled=context["analysis_parameters"],
+        objective_id=str(objective["id"]),
+        training_seed=int(context["training_seed"]),
+        sampler_seed=int(context["sampler_seed"]),
+        device=str(device),
+        run_dir=run_dir,
+        max_epochs=int(config["training"]["epochs"]),
+    )
+
     checkpoint_identity: dict[str, Any] | None = None
     amp_enabled = False
     run_started = False
@@ -1273,7 +1352,6 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
     eval_metrics: Any = None
     optimizer: Any = None
     scheduler: Any = None
-    monitor_evaluator: experiments.tracking.MonitorEvaluator | None = None
     wandb_epoch_callback: Callable[[int, dict[str, float]], None] | None = None
     result: Mapping[str, Any] | None = None
 
@@ -1302,7 +1380,8 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
                 in_normalizer=data_processor.in_normalizer,
                 out_normalizer=data_processor.out_normalizer,
             )
-        eval_metrics = learning.losses.factory.build_eval_metrics(config, device=device)
+        data_processor.to(device)
+        eval_metrics = learning.metrics.metrics.build_evaluation_metrics(config, device=device)
         optimizer = learning.training.optim.build_optimizer(model, config)
         scheduler = learning.training.optim.build_scheduler(optimizer, config)
         checkpoint_identity = learning.training.checkpoint.build_checkpoint_identity(
@@ -1355,32 +1434,21 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
                 duration_contract=experiments.run.RUN_DURATION_CONTRACT,
                 tuning_context={
                     "study_name": context["study_name"],
+                    "study_role": context["study_role"],
                     "trial_number": context["trial_number"],
+                    "training_seed": context["training_seed"],
+                    "sampler_seed": context["sampler_seed"],
                     "search_signature": context["search_signature"],
                     "sampled_parameters": copy.deepcopy(context["analysis_parameters"]),
+                    "objective": copy.deepcopy(objective),
                 },
             )
-        if config["tracking"]["wandb"]["mode"] != "disabled" and bool(monitor_settings["enabled"]):
-            max_monitor_cases = int(monitor_settings["max_cases"])
-
-            def evaluate_monitor() -> Mapping[str, float]:
-                """Evaluate physics on the fixed trial monitor membership."""
-                return learning.training.loop.evaluate_physics_monitor(
-                    model,
-                    dataloaders["eval"],
-                    train_loss,
-                    device,
-                    data_processor,
-                    max_cases=max_monitor_cases,
-                )
-
-            monitor_evaluator = evaluate_monitor
+        console_reporter.startup(resolved_device=str(device))
         tracker = experiments.tracking.initialize_wandb(
             config,
             run_dir=run_dir,
             semantic_config=semantic_config,
             state_updater=state_updater,
-            monitor_evaluator=monitor_evaluator,
         )
         wandb_epoch_callback = experiments.tracking.epoch_callback(tracker)
 
@@ -1389,10 +1457,57 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             if wandb_epoch_callback is not None:
                 wandb_epoch_callback(epoch, metrics)
 
+        def optuna_tracking_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
+            """Mirror only the exact reported ID value and trial-best scalar under Optuna/."""
+            payload = dict(metrics)
+            if reporter.last_reported_objective is not None:
+                payload["optuna/objective"] = reporter.last_reported_objective
+            if reporter.best_value is not None:
+                payload["optuna/best_objective_so_far"] = reporter.best_value
+            return payload
+
         def trial_epoch_callback(epoch: int, metrics: dict[str, float]) -> None:
-            """Report pruning evidence before optional observer mirroring."""
-            reporter(epoch, metrics)
-            mirror_epoch_to_wandb(epoch, metrics)
+            """Log every epoch but report/prune only after one genuine ID evaluation."""
+            console_reporter.epoch(epoch, metrics)
+            id_key = f"id/{objective['id']}"
+            if id_key not in metrics:
+                mirror_epoch_to_wandb(epoch, metrics)
+                return
+            try:
+                reporter(epoch, metrics)
+            except trial_pruned:
+                experiments.console.optuna_trial_event(
+                    "observed",
+                    study=str(context["study_name"]),
+                    trial=int(context["trial_number"]),
+                    run_name=str(config["run"]["name"]),
+                    sampled=context["analysis_parameters"],
+                    objective_id=str(objective["id"]),
+                    objective=reporter.last_reported_objective,
+                    best_trial_objective=reporter.best_value,
+                    best_study_objective=reporter.last_study_best_value,
+                    step=reporter.last_reported_epoch,
+                    pruning="prune",
+                    pruning_eligible=reporter.last_pruning_eligible,
+                    report_duration_seconds=reporter.last_report_duration_seconds,
+                )
+                raise
+            experiments.console.optuna_trial_event(
+                "observed",
+                study=str(context["study_name"]),
+                trial=int(context["trial_number"]),
+                run_name=str(config["run"]["name"]),
+                sampled=context["analysis_parameters"],
+                objective_id=str(objective["id"]),
+                objective=reporter.last_reported_objective,
+                best_trial_objective=reporter.best_value,
+                best_study_objective=reporter.last_study_best_value,
+                step=reporter.last_reported_epoch,
+                pruning="continue",
+                pruning_eligible=reporter.last_pruning_eligible,
+                report_duration_seconds=reporter.last_report_duration_seconds,
+            )
+            mirror_epoch_to_wandb(epoch, optuna_tracking_metrics(metrics))
 
         result = learning.training.loop.train_loop(
             config=config,
@@ -1431,6 +1546,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         _validate_completed_reporting(reporter, result)
         tracking_status = "completed"
         tracking_result = result
+        console_reporter.final(result, total_wall_seconds=(datetime.now(UTC) - start_time).total_seconds())
 
     except (KeyboardInterrupt, SystemExit) as error:
         tracking_status = "interrupted"
@@ -1478,7 +1594,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         )
         pruning_epoch = reporter.last_reported_epoch
         if wandb_epoch_callback is not None and reporter.last_metrics is not None and pruning_epoch is not None:
-            wandb_epoch_callback(pruning_epoch, reporter.last_metrics)
+            wandb_epoch_callback(pruning_epoch, optuna_tracking_metrics(reporter.last_metrics))
         raise
     except FloatingPointError as error:
         tracking_error = error
@@ -1642,8 +1758,53 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             checkpoint_identity=checkpoint_identity,
             amp_enabled=amp_enabled,
         )
+        experiments.console.optuna_trial_event(
+            "completed",
+            study=str(context["study_name"]),
+            study_role=str(context["study_role"]),
+            trial=int(context["trial_number"]),
+            run_name=str(config["run"]["name"]),
+            sampled=context["analysis_parameters"],
+            objective_id=str(objective["id"]),
+            objective=objective_value,
+            best_trial_objective=reporter.best_value,
+            step=reporter.last_reported_epoch,
+            pruning="complete",
+            selected_best_epoch=int(result["best_epoch"]),
+            final_state="completed",
+            duration_seconds=(datetime.now(UTC) - start_time).total_seconds(),
+            checkpoint_state="best_and_last_published",
+            run_dir=run_dir,
+            wandb_url=tracker.url if tracker is not None else None,
+        )
         return objective_value
     finally:
+        if tracking_error is not None:
+            experiments.console.optuna_trial_event(
+                tracking_status,
+                study=str(context["study_name"]),
+                study_role=str(context["study_role"]),
+                trial=int(context["trial_number"]),
+                run_name=str(config["run"]["name"]),
+                sampled=context["analysis_parameters"],
+                objective_id=str(objective["id"]),
+                objective=reporter.last_reported_objective,
+                best_trial_objective=reporter.best_value,
+                step=reporter.last_reported_epoch,
+                pruning="prune" if tracking_status.endswith("pruned") else None,
+                pruner=str(study_config.study["pruner"]["kind"]) if tracking_status.endswith("pruned") else None,
+                selected_best_epoch=reporter.best_epoch,
+                final_state=tracking_status,
+                duration_seconds=(datetime.now(UTC) - start_time).total_seconds(),
+                checkpoint_state="durable_report_checkpoint" if reporter.last_reported_epoch is not None else "none",
+                run_dir=run_dir,
+                wandb_url=tracker.url if tracker is not None else None,
+                phase=str(getattr(tracking_error, "training_phase", "optuna_trial")),
+                exception_type=type(tracking_error).__name__,
+                error_message=str(tracking_error),
+            )
+            if tracking_status not in {"pruned", "nonfinite_pruned", "oom_pruned"}:
+                console_reporter.failure(tracking_error, status=tracking_status, phase="optuna_trial")
         if tracker is not None:
             local_summary: Mapping[str, Any] | None = None
             with suppress(Exception):
@@ -1668,7 +1829,6 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             except experiments.tracking.TrackingError:
                 if tracking_error is None:
                     raise
-        monitor_evaluator = None
         scheduler = None
         optimizer = None
         eval_metrics = None
@@ -1764,6 +1924,7 @@ def _publish_study_signature(study: Any, signature: Mapping[str, Any], objective
     study.set_user_attr(_STUDY_SIGNATURE_ATTR, signature["digest"])
     study.set_user_attr(_STUDY_SIGNATURE_PAYLOAD_ATTR, signature["payload"])
     study.set_user_attr(_RESOLVED_OBJECTIVE_ATTR, dict(objective))
+    study.set_user_attr(_SAMPLER_METADATA_ATTR, copy.deepcopy(signature["payload"]["sampler"]))
 
 
 def _validate_existing_study(
@@ -1787,6 +1948,7 @@ def _validate_existing_study(
         _STUDY_SIGNATURE_ATTR: signature["digest"],
         _STUDY_SIGNATURE_PAYLOAD_ATTR: signature["payload"],
         _RESOLVED_OBJECTIVE_ATTR: dict(objective),
+        _SAMPLER_METADATA_ATTR: copy.deepcopy(signature["payload"]["sampler"]),
     }
     missing = sorted(key for key in required if key not in study.user_attrs)
     if missing:
@@ -1876,6 +2038,130 @@ def _create_or_load_study(
     return study, False
 
 
+def _storage_console_location(paths: _OptunaStudyPaths) -> str:
+    """Return a useful storage label without credentials or query parameters."""
+    if paths.local_storage_path is not None:
+        return str(paths.local_storage_path)
+    scheme = paths.storage.split(":", 1)[0].strip().lower()
+    return f"{scheme or 'external'}://<configured>"
+
+
+def _trial_state_name(trial: Any) -> str:
+    """Return one stable lowercase Optuna trial state name."""
+    return str(getattr(getattr(trial, "state", None), "name", "unknown")).lower()
+
+
+def _study_lifecycle_summary(
+    study: Any,
+    *,
+    config: OptunaStudyConfig,
+    objective: Mapping[str, Any],
+    requested_trials: int,
+    reopened: bool,
+    status: str,
+    elapsed_seconds: float,
+    include_importance: bool,
+) -> dict[str, Any]:
+    """Build one bounded study inventory from persisted Optuna trial facts."""
+    trials = list(study.trials)
+    counts = {
+        "completed": sum(_trial_state_name(trial) == "complete" for trial in trials),
+        "pruned": sum(_trial_state_name(trial) == "pruned" for trial in trials),
+        "failed": sum(_trial_state_name(trial) == "fail" for trial in trials),
+        "running": sum(_trial_state_name(trial) == "running" for trial in trials),
+        "waiting": sum(_trial_state_name(trial) == "waiting" for trial in trials),
+    }
+    completed = [trial for trial in trials if _trial_state_name(trial) == "complete" and trial.value is not None]
+    reverse = objective["direction"] == "maximize"
+    best = sorted(completed, key=lambda item: float(item.value), reverse=reverse)[0] if completed else None
+    inventory: list[dict[str, Any]] = []
+    for trial in trials:
+        started = getattr(trial, "datetime_start", None)
+        finished = getattr(trial, "datetime_complete", None)
+        duration = (finished - started).total_seconds() if started is not None and finished is not None else None
+        attrs = getattr(trial, "user_attrs", {})
+        inventory.append(
+            {
+                "number": int(trial.number),
+                "state": _trial_state_name(trial),
+                "value": trial.value,
+                "params": copy.deepcopy(dict(getattr(trial, "params", {}))),
+                "run_name": attrs.get("run_name") if isinstance(attrs, Mapping) else None,
+                "training_seed": attrs.get("run_seed") if isinstance(attrs, Mapping) else None,
+                "sampler_seed": attrs.get("sampler_seed") if isinstance(attrs, Mapping) else None,
+                "duration_seconds": duration,
+            }
+        )
+
+    importance: dict[str, Any]
+    if include_importance and len(completed) >= _PARAMETER_IMPORTANCE_MIN_COMPLETED_TRIALS and any(trial.params for trial in completed):
+        try:
+            values = _optuna_module().importance.get_param_importances(study)
+        except (ImportError, RuntimeError, TypeError, ValueError) as error:
+            importance = {"status": "unavailable", "reason": type(error).__name__, "values": {}}
+        else:
+            importance = {"status": "computed", "minimum_completed_trials": _PARAMETER_IMPORTANCE_MIN_COMPLETED_TRIALS, "values": values}
+    else:
+        importance = {
+            "status": "not_computed",
+            "reason": "insufficient_completed_trials",
+            "minimum_completed_trials": _PARAMETER_IMPORTANCE_MIN_COMPLETED_TRIALS,
+            "values": {},
+        }
+
+    return {
+        "schema_version": 1,
+        "status": status,
+        "study_name": config.study["name"],
+        "study_role": config.study["role"],
+        "task": config.base_config["task"],
+        "model_kind": config.base_config["model"]["kind"],
+        "objective": copy.deepcopy(dict(objective)),
+        "sampler": {**copy.deepcopy(config.study["sampler"]), "seed": _sampler_seed(config.study)},
+        "pruner": copy.deepcopy(config.study["pruner"]),
+        "training_seed": int(config.base_config["run"]["seed"]),
+        "configured_trials": int(config.study["n_trials"]),
+        "invocation_trials_requested": requested_trials,
+        "continuation": "reopened" if reopened else "new",
+        "attempted_trials": len(trials),
+        **counts,
+        "best_trial_number": int(best.number) if best is not None else None,
+        "best_objective": float(best.value) if best is not None else None,
+        "best_parameters": copy.deepcopy(dict(best.params)) if best is not None else {},
+        "elapsed_seconds": elapsed_seconds,
+        "parameter_importance": importance,
+        "trials": inventory,
+    }
+
+
+def _publish_study_lifecycle_summary(paths: _OptunaStudyPaths, summary: Mapping[str, Any]) -> None:
+    """Persist the bounded inventory only beside repository-owned local storage."""
+    if paths.local_storage_path is not None:
+        common.serialization.atomic_write_json(paths.study_dir / _STUDY_SUMMARY_FILENAME, dict(summary))
+
+
+def _emit_study_summary(summary: Mapping[str, Any], *, storage: str, summary_file: str | None) -> None:
+    """Emit one concise W&B-independent study terminal event."""
+    experiments.console.optuna_study_event(
+        str(summary["status"]),
+        study=summary["study_name"],
+        study_role=summary["study_role"],
+        configured_trials=summary["configured_trials"],
+        invocation_trials_requested=summary["invocation_trials_requested"],
+        attempted_trials=summary["attempted_trials"],
+        completed_trials=summary["completed"],
+        pruned_trials=summary["pruned"],
+        failed_trials=summary["failed"],
+        best_trial=summary["best_trial_number"],
+        best_objective=summary["best_objective"],
+        best_parameters=summary["best_parameters"],
+        duration_seconds=summary["elapsed_seconds"],
+        storage=storage,
+        continuation=summary["continuation"],
+        summary_file=summary_file,
+    )
+
+
 def run_optuna_study(
     config: OptunaStudyConfig | Path | str,
     *,
@@ -1952,10 +2238,78 @@ def run_optuna_study(
     else:
         _publish_study_signature(study, signature, objective)
 
-    study.optimize(
-        create_objective(study_config),
-        n_trials=trial_count,
-        catch=(RecoverableTrialError,),
-        show_progress_bar=show_progress_bar,
+    pruner_config = study_config.study["pruner"]
+    reporting_interval = _validate_reporting_contract(study_config.base_config)
+    storage_label = _storage_console_location(study_paths)
+    invocation_started = time.perf_counter()
+    experiments.console.optuna_study_event(
+        "started",
+        study=study_name,
+        study_role=study_config.study["role"],
+        task=study_config.base_config["task"],
+        model_family=study_config.base_config["model"]["kind"],
+        storage=storage_label,
+        sampler=study_config.study["sampler"]["kind"],
+        sampler_seed=_sampler_seed(study_config.study),
+        pruner=pruner_config["kind"],
+        direction=objective["direction"],
+        objective=objective["id"],
+        configured_trials=int(study_config.study["n_trials"]),
+        invocation_trials=trial_count,
+        timeout="none",
+        parallelism=1,
+        maximum_epochs=int(study_config.base_config["training"]["epochs"]),
+        id_interval=reporting_interval,
+        ood_interval=reporting_interval,
+        physics_interval=reporting_interval,
+        startup_trials=pruner_config.get("n_startup_trials"),
+        warmup_epochs=pruner_config.get("n_warmup_steps"),
+        pruning_interval_epochs=pruner_config.get("interval_steps"),
+        wandb_project=study_config.base_config["tracking"]["wandb"]["project"],
+        wandb_group=study_name,
+        wandb_workflow=study_config.base_config["tracking"]["wandb"]["workflow"],
+        continuation="reopened" if reopened else "new",
+        existing_trials=len(study.trials),
+    )
+    try:
+        study.optimize(
+            create_objective(study_config),
+            n_trials=trial_count,
+            catch=(RecoverableTrialError,),
+            show_progress_bar=show_progress_bar,
+        )
+    except BaseException:
+        summary = _study_lifecycle_summary(
+            study,
+            config=study_config,
+            objective=objective,
+            requested_trials=trial_count,
+            reopened=reopened,
+            status="failed",
+            elapsed_seconds=time.perf_counter() - invocation_started,
+            include_importance=False,
+        )
+        _publish_study_lifecycle_summary(study_paths, summary)
+        _emit_study_summary(
+            summary,
+            storage=storage_label,
+            summary_file=_STUDY_SUMMARY_FILENAME if study_paths.local_storage_path is not None else None,
+        )
+        raise
+    summary = _study_lifecycle_summary(
+        study,
+        config=study_config,
+        objective=objective,
+        requested_trials=trial_count,
+        reopened=reopened,
+        status="completed",
+        elapsed_seconds=time.perf_counter() - invocation_started,
+        include_importance=True,
+    )
+    _publish_study_lifecycle_summary(study_paths, summary)
+    _emit_study_summary(
+        summary,
+        storage=storage_label,
+        summary_file=_STUDY_SUMMARY_FILENAME if study_paths.local_storage_path is not None else None,
     )
     return study

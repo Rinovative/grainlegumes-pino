@@ -7,7 +7,7 @@ Define the shared semantic runtime-device option used by command modules.
 Responsibilities:
   - Expose the exact auto, cuda, and cpu CLI vocabulary
   - Keep device help semantics consistent across training, Optuna, and artifacts
-  - Avoid importing Torch until a parser is explicitly constructed
+  - Avoid importing Torch while importing or constructing command parsers
 
 Design principles:
   - One dependency-light helper owns the exact command-line vocabulary
@@ -23,6 +23,8 @@ This module does NOT:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+from src.learning.learning_device_policy import DEVICE_POLICIES
 
 if TYPE_CHECKING:
     import argparse
@@ -48,11 +50,9 @@ def add_device_argument(
         Service-specific prefix prepended to the shared policy semantics.
 
     """
-    from src.learning import learning_device  # noqa: PLC0415
-
     parser.add_argument(
         "--device",
-        choices=learning_device.DEVICE_POLICIES,
+        choices=DEVICE_POLICIES,
         default=default,
         help=(f"{help_prefix}: auto chooses CUDA when usable, otherwise CPU; cuda is strict and never falls back; cpu avoids CUDA use"),
     )

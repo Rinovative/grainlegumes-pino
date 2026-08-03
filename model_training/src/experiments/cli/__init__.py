@@ -1,14 +1,10 @@
 """
-Import-free experiment command modules.
+Command-line entry points for experiment workflows.
 
-Modules:
-- cli_build_artifacts: validate or build artifacts for completed runs
-- cli_device: define the shared strict runtime-device option
-- cli_optuna: validate or execute additional Optuna trials
-- cli_train: execute a fresh or explicit-resume training run
-
-The initializer deliberately imports and exports no command module, keeping
-package import free of parser construction and optional runtime dependencies.
+Provides:
+- cli_train: model-training command
+- cli_optuna: Optuna-study command
+- cli_build_artifacts: artifact-generation command
 """
 
 __all__: list[str] = []

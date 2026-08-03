@@ -1,9 +1,9 @@
 """
-Exploratory data analysis plot modules.
+Scientific plots for exploratory generated-data analysis.
 
 Provides:
-- case_statistics: case-level metadata and field statistics plots
-- spectral: dataset spectral-analysis plots
+- case_statistics: case-level parameter and field-statistic plots
+- spectral: isotropic, directional, and evolution spectrum plots
 """
 
 from . import eda_plot_case_statistics as case_statistics

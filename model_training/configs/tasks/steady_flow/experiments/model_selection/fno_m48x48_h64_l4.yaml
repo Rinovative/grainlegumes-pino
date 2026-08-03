@@ -1,0 +1,66 @@
+# Recreated from named run: M-FNO_m48x48_h64_l4_20260110_085608
+# Source config: model_training/data/processed/safe/M-FNO_m48x48_h64_l4_20260110_085608/config.json
+
+task: steady_flow
+
+run:
+  seed: 9
+  deterministic: true
+  device: auto
+  suffix: lr_0p01
+
+data:
+  train_dataset: lhs_var80_seed3001
+  ood_datasets:
+    - lhs_var120_seed4001
+  batch_size: 32
+
+model:
+  kind: fno
+  params:
+    n_modes: [48, 48]
+    hidden_channels: 64
+    n_layers: 4
+    lifting_channel_ratio: 2
+    projection_channel_ratio: 2
+    fno_skip: linear
+    channel_mlp_skip: soft-gating
+    implementation: factorized
+
+loss:
+  data:
+    kind: relative_h1
+    space: normalized
+    weight: 1.0
+  physics:
+    enabled: false
+
+evaluation:
+  objective:
+    id: normalized_macro_rmse
+
+optimizer:
+  kind: adamw
+  lr: 1.0e-2
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  second_moment_floor: 1.0e-6
+
+scheduler:
+  kind: reduce_on_plateau
+  factor: 0.5
+  patience: 20
+  min_lr: 1.0e-5
+
+training:
+  epochs: 600
+  evaluation_interval: 5
+  ood_evaluation_interval: 5
+  mixed_precision: false
+
+tracking:
+  wandb:
+    mode: online
+    workflow: train
+    monitor:
+      interval: 5

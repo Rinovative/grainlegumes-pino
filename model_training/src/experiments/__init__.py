@@ -1,15 +1,14 @@
 """
-Lazy experiment configuration and execution services.
+Experiment configuration, execution, tracking, tuning, and validation services.
 
 Provides:
-- cli: import-free command modules and shared argument definitions
-- config: strict defaults and semantic YAML resolution
-- run: saved-run allocation, execution, resume, and validation
-- tracking: optional local-authoritative W&B observability
-- tuning: Optuna search-space and study orchestration
-
-Services are imported on first attribute access so importing this package does
-not initialize optional SDKs or runtime-heavy experiment modules.
+- cli: command-line experiment workflows
+- config: strict defaults and YAML configuration resolution
+- notebook_support: read-only notebook context and presentation preparation
+- run: experiment lifecycle, identity, persistence, and resume
+- tracking: W&B observer lifecycle and metric publication
+- tuning: search-space and Optuna-study services
+- validation: explicit production data-pipeline validation
 """
 
 from __future__ import annotations
@@ -18,40 +17,36 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import cli, config, tuning
+    from . import cli, config, tuning, validation
+    from . import experiments_console as console
+    from . import experiments_notebook_support as notebook_support
     from . import experiments_run as run
     from . import experiments_tracking as tracking
 
 _MODULES = {
     "cli": "cli",
     "config": "config",
+    "console": "experiments_console",
+    "notebook_support": "experiments_notebook_support",
     "run": "experiments_run",
     "tracking": "experiments_tracking",
     "tuning": "tuning",
+    "validation": "validation",
 }
-__all__ = ["cli", "config", "run", "tracking", "tuning"]
+__all__ = [
+    "cli",
+    "config",
+    "console",
+    "notebook_support",
+    "run",
+    "tracking",
+    "tuning",
+    "validation",
+]
 
 
 def __getattr__(name: str) -> object:
-    """
-    Resolve one declared public experiment service on first access.
-
-    Parameters
-    ----------
-    name : str
-        Public alias listed in :data:`__all__`.
-
-    Returns
-    -------
-    object
-        Imported service module, cached in this package namespace.
-
-    Raises
-    ------
-    AttributeError
-        If ``name`` is not a declared service alias.
-
-    """
+    """Resolve one declared public name on first access."""
     if name not in _MODULES:
         message = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(message)

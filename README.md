@@ -6,8 +6,6 @@
 **Author:** Rino M. Albertin  
 **Supervisor:** Prof. Dr. Christoph Würsch  
 
----
-
 ## 📌 Project Overview
 
 This specialization project studies the learning of physically consistent surrogate models for incompressible air flow in **porous granular media** using **Physics-Informed Neural Operators (PINOs)**.
@@ -74,14 +72,10 @@ A evaluation suite for systematic model comparison and assessment, supporting bo
 🧬 **Interactive research environment**  
 All evaluation components are provided as interactive Jupyter widgets with dataset selection, case sliders and dynamic plots for systematic exploration of model behaviour.
 
----
-
 ## 📄 Project Report
 
 Full project report, including methodology, model formulation, and detailed evaluation results:
 [Albertin_2026_PINO_Airflow_PorousMedia.pdf](docs/Albertin_2026_PINO_Airflow_PorousMedia.pdf)
-
----
 
 ## 📊 Visualization
 
@@ -108,8 +102,6 @@ Representative qualitative comparison of pressure-field predictions on a challen
 Evaluation of the best-performing model (PI-U-NO with physics-informed loss) on a challenging outlier case.
 </em>
 </p>
-
----
 
 ## 🧭 Data Flow Overview
 
@@ -297,8 +289,6 @@ D3 --> P1
 ```
 </details>
 
----
-
 ## ⚙️ Local Execution
 
 <details>
@@ -335,8 +325,6 @@ jupyter notebook --ip=0.0.0.0 --no-browser --allow-root
 Then open the URL shown in the terminal.
 
 </details>
-
----
 
 ## 📂 Repository Structure
 <details>
@@ -430,7 +418,6 @@ Then open the URL shown in the terminal.
 │   │   ├── eda.ipynb                                                 # Exploratory data analysis
 │   │   ├── eval_comparison_models.ipynb                              # Model comparison evaluation
 │   │   ├── eval_single_model.ipynb                                   # Single-model evaluation
-│   │   ├── sensitivity.ipynb                                         # Sensitivity analysis
 │   │   └── training_pipeline.ipynb                                   # Training pipeline overview
 │   │
 │   ├── src                                                           
@@ -486,13 +473,9 @@ Then open the URL shown in the terminal.
 ```
 </details>
 
----
-
 ## 📄 License
 
 This project is released under the [Apache License 2.0](LICENSE).
-
----
 
 ## 📚 Reference
 

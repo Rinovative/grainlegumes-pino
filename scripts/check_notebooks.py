@@ -1,45 +1,24 @@
-"""
-===============================================================================
-check_notebooks.py
-===============================================================================
-Enforce repository-specific notebook lifecycle and cleared-state contracts.
-
-Responsibilities:
-  - Require the exact maintained and archived notebook inventory
-  - Require maintained notebooks to contain cleared runnable code cells
-  - Require notice-only notebooks to remain Markdown-only
-  - Parse notebook-format-4 JSON without executing or rewriting notebooks
-
-Design principles:
-  - Validation is static, deterministic, read-only, and independent of cell counts
-  - Notebook lifecycle roles are explicit rather than inferred from cell content
-
-This module does NOT:
-  - Execute notebooks or validate the scientific behavior of their workflows
-  - Replace Ruff's syntax, import, and lint checks for notebook code cells
-===============================================================================
-"""
+"""Validate every discovered maintained notebook without executing or rewriting it."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _NOTEBOOK_ROOT = _REPOSITORY_ROOT / "model_training" / "notebooks"
 _NOTEBOOK_FORMAT = 4
-_MAINTAINED_NOTEBOOKS = frozenset(
-    {
-        "eda.ipynb",
-        "eval_single_model.ipynb",
-        "eval_comparison_models.ipynb",
-        "training_pipeline.ipynb",
-    }
-)
-_ARCHIVED_NOTEBOOKS = frozenset({"sensitivity.ipynb"})
-NotebookRole = Literal["maintained", "archived"]
+
+
+def discover_notebooks(root: Path = _NOTEBOOK_ROOT) -> tuple[Path, ...]:
+    """Return every notebook in a maintained directory and reject an empty inventory."""
+    paths = tuple(sorted(path for path in root.glob("*.ipynb") if path.is_file()))
+    if not paths:
+        message = f"Maintained notebook directory contains no notebooks: {root}"
+        raise FileNotFoundError(message)
+    return paths
 
 
 def _notebook_cells(path: Path) -> Sequence[Mapping[str, Any]]:
@@ -77,33 +56,8 @@ def _notebook_cells(path: Path) -> Sequence[Mapping[str, Any]]:
     return cells
 
 
-def validate_notebook(path: Path, *, role: NotebookRole) -> None:
-    """
-    Validate one notebook's repository-specific release state.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        Notebook-format-4 JSON file to inspect without mutation.
-    role : {"maintained", "archived"}
-        Maintained notebooks must contain at least one cleared code cell.
-        Archived notices must contain Markdown cells only.
-
-    Raises
-    ------
-    json.JSONDecodeError
-        If the file is not valid JSON. Ruff separately validates notebook code.
-    TypeError
-        If the minimal notebook/cell structure needed by this gate is malformed.
-    ValueError
-        If outputs/execution counts are saved, a maintained notebook has no code,
-        or the archived notice contains a non-Markdown cell.
-
-    Notes
-    -----
-    Python syntax and style deliberately remain Ruff's responsibility.
-
-    """
+def validate_notebook(path: Path) -> None:
+    """Require runnable code cells with cleared execution state and valid cell kinds."""
     cells = _notebook_cells(path)
     code_cells: list[Mapping[str, Any]] = []
     for index, cell in enumerate(cells):
@@ -121,45 +75,17 @@ def validate_notebook(path: Path, *, role: NotebookRole) -> None:
             message = f"{path}: code cell {index} must not contain saved outputs."
             raise ValueError(message)
 
-    if role == "maintained" and not code_cells:
+    if not code_cells:
         message = f"{path}: a maintained notebook must contain runnable code."
-        raise ValueError(message)
-    if role == "archived" and any(cell.get("cell_type") != "markdown" for cell in cells):
-        message = f"{path}: an archived notebook must be a Markdown-only notice."
         raise ValueError(message)
 
 
 def main() -> int:
-    """
-    Validate the declared maintained and archived notebook contracts.
-
-    Returns
-    -------
-    int
-        Zero after all declared notebooks pass clearing and lifecycle-role checks.
-
-    Raises
-    ------
-    FileNotFoundError
-        If a declared notebook is absent or an undeclared notebook appears in the
-        maintained notebook directory.
-
-    """
-    expected = _MAINTAINED_NOTEBOOKS | _ARCHIVED_NOTEBOOKS
-    observed = {path.name for path in _NOTEBOOK_ROOT.glob("*.ipynb")}
-    missing = sorted(expected - observed)
-    undeclared = sorted(observed - expected)
-    if missing or undeclared:
-        message = f"Notebook lifecycle inventory mismatch: missing={missing}; undeclared={undeclared}."
-        raise FileNotFoundError(message)
-
-    for name in sorted(_MAINTAINED_NOTEBOOKS):
-        validate_notebook(_NOTEBOOK_ROOT / name, role="maintained")
-    for name in sorted(_ARCHIVED_NOTEBOOKS):
-        validate_notebook(_NOTEBOOK_ROOT / name, role="archived")
-    archive_count = len(_ARCHIVED_NOTEBOOKS)
-    archive_label = "notice" if archive_count == 1 else "notices"
-    print(f"Validated {len(_MAINTAINED_NOTEBOOKS)} maintained notebooks and {archive_count} archived {archive_label}.")
+    """Validate every notebook currently maintained below the notebook root."""
+    paths = discover_notebooks()
+    for path in paths:
+        validate_notebook(path)
+    print(f"Validated {len(paths)} maintained notebooks.")
     return 0
 
 

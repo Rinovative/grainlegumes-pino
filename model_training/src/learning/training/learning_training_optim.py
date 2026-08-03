@@ -11,7 +11,7 @@ Responsibilities:
 
 Design principles:
   - YAML semantics map directly to optimizer arguments
-  - Factory functions avoid hidden training side effects
+  - Backend imports occur only when the corresponding factory is called
   - Unsupported types fail fast
 
 This module does NOT:
@@ -25,11 +25,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from neuralop.training import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-
 if TYPE_CHECKING:
     from torch import nn
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
     from torch.optim.optimizer import Optimizer
 
 _ADAM_BETA_COUNT = 2
@@ -65,6 +63,8 @@ def build_optimizer(
         If optimizer type is unknown or required parameters missing
 
     """
+    from neuralop.training import AdamW  # noqa: PLC0415
+
     opt_config = config.get("optimizer", {})
     opt_type = opt_config.get("kind", "adamw").lower()
 
@@ -130,6 +130,8 @@ def build_scheduler(
     sched_type = sched_config.get("kind", "reduce_on_plateau").lower()
 
     if sched_type == "reduce_on_plateau":
+        from torch.optim.lr_scheduler import ReduceLROnPlateau  # noqa: PLC0415
+
         direction = config["evaluation"]["objective"]["direction"]
         mode_by_direction = {"minimize": "min", "maximize": "max"}
         if direction not in mode_by_direction:

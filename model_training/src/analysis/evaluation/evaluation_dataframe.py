@@ -34,7 +34,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.analysis import analysis_artifacts as artifacts
+from src.analysis.artifacts import contracts
 
 PRIMARY_OBJECTIVE_ID = "normalized_macro_rmse"
 PRIMARY_OBJECTIVE_DEFINITION = {
@@ -184,8 +184,8 @@ def _validate_artifact_table(frame: pd.DataFrame) -> tuple[str, tuple[str, ...],
     if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in schema_values):
         msg = "artifact_schema_version must contain integer values."
         raise TypeError(msg)
-    if {int(value) for value in schema_values} != {artifacts.ARTIFACT_SCHEMA_VERSION}:
-        msg = f"Evaluation artifact table requires schema version {artifacts.ARTIFACT_SCHEMA_VERSION}."
+    if {int(value) for value in schema_values} != {contracts.ARTIFACT_SCHEMA_VERSION}:
+        msg = f"Evaluation artifact table requires schema version {contracts.ARTIFACT_SCHEMA_VERSION}."
         raise ValueError(msg)
 
     task_values = frame["task_id"].tolist()
@@ -217,7 +217,7 @@ def _validate_artifact_table(frame: pd.DataFrame) -> tuple[str, tuple[str, ...],
             raise ValueError(msg)
 
     predictive = {"rel_l2", "rel_h1", *(f"rmse_{field}" for field in output_fields)}
-    normalized = {column for field in output_fields for column in artifacts.normalized_statistic_columns(field)}
+    normalized = {column for field in output_fields for column in contracts.normalized_statistic_columns(field)}
     expected = set(_BASE_ARTIFACT_COLUMNS | predictive | normalized)
     metrics = set(predictive | normalized)
     if task_id == "steady_flow":
@@ -232,9 +232,6 @@ def _validate_artifact_table(frame: pd.DataFrame) -> tuple[str, tuple[str, ...],
     _validate_metric_values(frame, metrics)
     _validate_membership(frame)
     return task_id, output_fields, output_units
-
-
-aggregate_normalized_macro_rmse = artifacts.aggregate_normalized_macro_rmse
 
 
 def _parse_meta(value: Any) -> dict[str, Any]:
@@ -332,8 +329,8 @@ def _validated_provenance(
     """
     payload = dict(provenance)
     for field, expected in (
-        ("provenance_schema_version", artifacts.ARTIFACT_PROVENANCE_SCHEMA_VERSION),
-        ("artifact_schema_version", artifacts.ARTIFACT_SCHEMA_VERSION),
+        ("provenance_schema_version", contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION),
+        ("artifact_schema_version", contracts.ARTIFACT_SCHEMA_VERSION),
     ):
         value = payload.get(field)
         if isinstance(value, bool) or not isinstance(value, Integral) or int(value) != expected:
@@ -399,9 +396,9 @@ def _validated_provenance(
         if (
             isinstance(residual_schema_version, bool)
             or not isinstance(residual_schema_version, Integral)
-            or int(residual_schema_version) != artifacts.RESIDUAL_SCHEMA_VERSION
+            or int(residual_schema_version) != contracts.RESIDUAL_SCHEMA_VERSION
         ):
-            msg = f"Artifact physics requires integer residual_schema_version={artifacts.RESIDUAL_SCHEMA_VERSION}."
+            msg = f"Artifact physics requires integer residual_schema_version={contracts.RESIDUAL_SCHEMA_VERSION}."
             raise ValueError(msg)
 
     model = _mapping(payload.get("model"), label="provenance.model")
@@ -435,7 +432,7 @@ def _apply_contract_attrs(
     input fields/units, split role, artifact root, and residual schema after
     validation; no row values are changed here.
     """
-    frame.attrs["artifact_schema_version"] = artifacts.ARTIFACT_SCHEMA_VERSION
+    frame.attrs["artifact_schema_version"] = contracts.ARTIFACT_SCHEMA_VERSION
     frame.attrs["task_id"] = task_id
     frame.attrs["output_fields"] = output_fields
     frame.attrs["output_units"] = output_units
@@ -496,7 +493,7 @@ def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
 
     """
     task_id, output_fields, output_units = _validate_artifact_table(frame_raw)
-    aggregate = aggregate_normalized_macro_rmse(frame_raw, output_fields=output_fields)
+    aggregate = contracts.aggregate_normalized_macro_rmse(frame_raw, output_fields=output_fields)
     provenance = frame_raw.attrs.get("artifact_provenance")
     if provenance is not None and not isinstance(provenance, Mapping):
         msg = "DataFrame artifact_provenance attr must be a mapping."
@@ -583,7 +580,7 @@ def load_evaluation_artifact(artifact_root: str | Path) -> pd.DataFrame:
 
     """
     root = Path(artifact_root).resolve()
-    provenance_path = artifacts.artifact_provenance_path(root)
+    provenance_path = contracts.artifact_provenance_path(root)
     try:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -603,7 +600,7 @@ def load_evaluation_artifact(artifact_root: str | Path) -> pd.DataFrame:
         msg = "Declared artifact Parquet payload is missing or escapes its root."
         raise ValueError(msg)
     try:
-        computed_outputs = artifacts.artifact_output_manifest(root)
+        computed_outputs = contracts.artifact_output_manifest(root)
     except (OSError, RuntimeError) as error:
         msg = f"Artifact output manifest cannot be recomputed for {root}: {error}"
         raise ValueError(msg) from error
@@ -768,9 +765,9 @@ def validate_comparison(
             if (
                 isinstance(residual_schema_version, bool)
                 or not isinstance(residual_schema_version, Integral)
-                or int(residual_schema_version) != artifacts.RESIDUAL_SCHEMA_VERSION
+                or int(residual_schema_version) != contracts.RESIDUAL_SCHEMA_VERSION
             ):
-                msg = f"Physics plots require integer residual schema {artifacts.RESIDUAL_SCHEMA_VERSION}."
+                msg = f"Physics plots require integer residual schema {contracts.RESIDUAL_SCHEMA_VERSION}."
                 raise ComparisonCompatibilityError(msg)
         role = str(provenance.get("split_role"))
         grouped.setdefault(role, []).append((label, _comparison_identity(provenance, physics=require_physics)))
@@ -837,7 +834,7 @@ def numeric_metadata_columns(frame: pd.DataFrame) -> tuple[str, ...]:
         reserved.update(
             {
                 f"rmse_{field}",
-                *artifacts.normalized_statistic_columns(field),
+                *contracts.normalized_statistic_columns(field),
             }
         )
     columns: list[str] = []

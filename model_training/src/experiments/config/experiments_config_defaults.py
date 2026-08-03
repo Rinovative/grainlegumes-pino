@@ -6,11 +6,12 @@ Define generic runtime defaults around task-owned semantic contracts.
 
 Responsibilities:
   - Provide generic run, data-loader, optimizer, scheduler, and training defaults
-  - Project task-owned datasets, losses, metrics, and objective into config defaults
+  - Project task dataset fallbacks, losses, and metric definitions into config defaults
   - Return serializable defaults for strict experiment resolution
 
 Design principles:
-  - Task-fixed values come exclusively from the registered TaskSpec
+  - Explicit experiment data selection overrides TaskSpec dataset fallbacks
+  - Task-fixed scientific semantics come exclusively from the registered TaskSpec
   - Runtime defaults remain independent of concrete task field names
   - Semantic identifiers are distinct from Python implementation class names
 
@@ -31,7 +32,6 @@ RUN_DEFAULTS: dict[str, Any] = {
     "seed": 9,
     "deterministic": True,
     "device": "auto",
-    "prefix": None,
     "suffix": None,
 }
 
@@ -81,6 +81,7 @@ SCHEDULER_DEFAULTS: dict[str, dict[str, Any]] = {
 TRAINING_DEFAULTS: dict[str, Any] = {
     "epochs": 600,
     "evaluation_interval": 5,
+    "ood_evaluation_interval": 5,
     "mixed_precision": False,
 }
 
@@ -89,7 +90,9 @@ WANDB_REPOSITORY_PROJECTS = {
     "airflow": "grainlegumes-pino-airflow",
     "drying": "grainlegumes-pino-drying",
 }
-WANDB_PROJECT = WANDB_REPOSITORY_PROJECTS["airflow"]
+WANDB_TASK_PROJECTS = {
+    "steady_flow": WANDB_REPOSITORY_PROJECTS["airflow"],
+}
 WANDB_MAX_TAGS = 2
 WANDB_WORKFLOWS = (
     "train",
@@ -104,12 +107,12 @@ TRACKING_DEFAULTS: dict[str, Any] = {
         "mode": "online",
         "workflow": "train",
         "study": None,
-        "project": WANDB_PROJECT,
+        "project": WANDB_TASK_PROJECTS["steady_flow"],
         "entity": WANDB_ENTITY,
         "tags": [],
         "monitor": {
             "enabled": True,
-            "interval": 50,
+            "interval": 5,
             "max_cases": 4,
         },
         "upload": {
@@ -131,7 +134,7 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Serializable runtime defaults projected together with task-owned semantics.
+        Serializable runtime defaults with task dataset fallbacks and semantics.
 
     Raises
     ------
@@ -160,7 +163,6 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
         },
         "evaluation": {
             "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],
-            "objective": {"id": task.default_objective.id},
         },
         "optimizer": OPTIMIZER_DEFAULTS["adamw"],
         "scheduler": SCHEDULER_DEFAULTS["reduce_on_plateau"],

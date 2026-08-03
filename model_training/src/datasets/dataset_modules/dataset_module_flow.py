@@ -1,4 +1,25 @@
-"""Bind one validated final training dataset to model-ready tensors."""
+"""
+===============================================================================
+dataset_module_flow.py
+===============================================================================
+Bind one verified final training dataset to model-ready task tensors.
+
+Responsibilities:
+  - Enforce the current final-dataset schema kind
+  - Verify content and identity under the authoritative task contract
+  - Insert one task-ordered input/output pair into a sample mapping
+
+Design principles:
+  - Verification precedes all indexed tensor access
+  - Field order derives only from the immutable task specification
+  - The module retains no implicit path or split policy
+
+This module does NOT:
+  - Read dataset files or copy source metadata; ``dataset_simulation`` owns that
+  - Create fingerprints or schemas; ``dataset_identity`` owns those contracts
+  - Normalize, batch, or shuffle samples; dataset-base services own those steps
+===============================================================================
+"""
 
 from __future__ import annotations
 

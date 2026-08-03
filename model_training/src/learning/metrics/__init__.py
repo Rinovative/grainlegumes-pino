@@ -1,8 +1,8 @@
 """
-Task-resolved metric modules for training and evaluation.
+Task-resolved training and evaluation metrics.
 
 Provides:
-- metrics: semantic metric registry and explicit-space accumulators
+- metrics: metric registry and explicit-space accumulation
 """
 
 from . import learning_metrics as metrics

@@ -24,13 +24,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
-import torch
-from neuralop import H1Loss
 
 from src import domain
+
+if TYPE_CHECKING:
+    import torch
 
 MetricSpace = Literal["normalized", "physical"]
 MetricReduction = Literal["sample_mean", "element_mean", "field_macro_element_mean"]
@@ -261,6 +262,8 @@ class DatasetMetric:
         Construction performs no tensor transfer or normalization; the concrete
         device becomes an invariant checked on every update.
         """
+        import torch  # noqa: PLC0415
+
         if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
             msg = f"Metric construction requires one concrete CPU or CUDA torch.device, got {device!r}."
             raise TypeError(msg)
@@ -309,6 +312,8 @@ class DatasetMetric:
         include metric and batch identity; returned tensors preserve batch and
         spatial axes while selecting fields in declaration order.
         """
+        import torch  # noqa: PLC0415
+
         if space != self.space:
             msg = f"Metric {self.id!r} expects {self.space!r} tensors, got {space!r}."
             raise ValueError(msg)
@@ -498,6 +503,8 @@ class RelativeL2Metric(DatasetMetric):
             space=space,
             batch_index=batch_index,
         )
+        import torch  # noqa: PLC0415
+
         flat_difference = (selected_pred.double() - selected_target.double()).flatten(start_dim=1)
         flat_target = selected_target.double().flatten(start_dim=1)
         values = torch.linalg.vector_norm(flat_difference, dim=1) / (torch.linalg.vector_norm(flat_target, dim=1) + 1e-8)
@@ -505,6 +512,8 @@ class RelativeL2Metric(DatasetMetric):
 
     def _accumulate_samples(self, values: torch.Tensor, *, batch_index: int) -> None:
         """Accumulate finite sample values with sample context on failure."""
+        import torch  # noqa: PLC0415
+
         finite = torch.isfinite(values)
         if not bool(finite.all().item()):
             first = int((~finite).nonzero(as_tuple=False)[0, 0].item())
@@ -536,6 +545,8 @@ class RelativeH1Metric(RelativeL2Metric):
 
     def __init__(self, definition: ResolvedMetric, *, device: torch.device) -> None:
         """Build the task-dimensional relative H1 implementation."""
+        from neuralop import H1Loss  # noqa: PLC0415
+
         super().__init__(definition, device=device)
         self._implementation = H1Loss(
             d=definition.operator_dimensionality,
@@ -562,6 +573,8 @@ class RelativeH1Metric(RelativeL2Metric):
             space=space,
             batch_index=batch_index,
         )
+        import torch  # noqa: PLC0415
+
         values = torch.stack(
             [
                 self._implementation(

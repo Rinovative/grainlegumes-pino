@@ -38,7 +38,7 @@ def test_failed_atomic_save_preserves_previous_checkpoint(
         stream.flush()
         raise OSError("injected serialization failure")
 
-    monkeypatch.setattr(common.serialization.torch, "save", fail_after_partial)
+    monkeypatch.setattr(torch, "save", fail_after_partial)
     with pytest.raises(OSError, match="injected serialization failure"):
         common.serialization.atomic_torch_save({"epoch": 3}, destination)
 

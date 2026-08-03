@@ -1,13 +1,13 @@
 """
-Consolidated scientific plots used by numbered evaluation sections.
+Scientific plots for model-evaluation sections.
 
 Provides:
-- error_behavior: predictive distributions, spatial errors, and boundary effects
-- physical_consistency: momentum, continuity, and pressure diagnostics
-- run_summary: authoritative accuracy and physics trade-off summaries
-- samples_outliers: linked samples, ranked errors, and extreme inputs
-- sensitivity_capacity: model capacity and metadata sensitivity views
-- spectral_fidelity: reference, prediction, error, and transfer spectra
+- error_behavior: predictive-error distributions, maps, and decompositions
+- physical_consistency: residual and boundary-consistency plots
+- run_summary: completed-run overview plots
+- samples_outliers: sample, outlier, and extreme-case plots
+- sensitivity_capacity: capacity and metadata-sensitivity plots
+- spectral_fidelity: prediction-spectrum fidelity plots
 """
 
 from . import evaluation_plot_error_behavior as error_behavior

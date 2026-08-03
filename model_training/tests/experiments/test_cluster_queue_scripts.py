@@ -1,4 +1,4 @@
-# ruff: noqa: PLR2004, S101, S603
+# ruff: noqa: PLR2004, S101, S603, S606
 """
 Verify Docker and cluster launchers through isolated command stubs, never submission.
 
@@ -11,15 +11,50 @@ invalid CPU/fallback requests. It deliberately does not run Docker, Slurm,
 from __future__ import annotations
 
 import os
+import pty
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from support import configs
 
 _REPOSITORY_ROOT = Path(__file__).parents[3]
+_PRODUCTION_CONFIG = configs.experiment_config_path(
+    model_kind="fno",
+    physics_enabled=False,
+)
+_OPTUNA_CONFIG = configs.optuna_config_path(
+    model_kind="fno",
+    physics_enabled=False,
+)
+_OPTUNA_SMOKE_CONFIG = configs.optuna_config_path(
+    model_kind="fno",
+    physics_enabled=False,
+    role="smoke",
+)
+_CONFIG_ROOT_RELATIVE = _PRODUCTION_CONFIG.relative_to(
+    _REPOSITORY_ROOT / "model_training" / "configs",
+).as_posix()
+_CONFIG_MODEL_TRAINING_RELATIVE = _PRODUCTION_CONFIG.relative_to(
+    _REPOSITORY_ROOT / "model_training",
+).as_posix()
+_CONFIG_REPOSITORY_RELATIVE = _PRODUCTION_CONFIG.relative_to(_REPOSITORY_ROOT).as_posix()
+_OPTUNA_MODEL_TRAINING_RELATIVE = _OPTUNA_CONFIG.relative_to(
+    _REPOSITORY_ROOT / "model_training",
+).as_posix()
+_OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE = _OPTUNA_SMOKE_CONFIG.relative_to(
+    _REPOSITORY_ROOT / "model_training",
+).as_posix()
+_OPTUNA_SMOKE_REPOSITORY_RELATIVE = _OPTUNA_SMOKE_CONFIG.relative_to(_REPOSITORY_ROOT).as_posix()
+_SPACED_CONFIG_RELATIVE = "configs/tasks/steady_flow/experiments/best_of_class/config with spaces.yaml"
+_FNO_SEARCH_REPOSITORY_RELATIVE = "model_training/configs/tasks/steady_flow/optuna/fno_search.yaml"
+_UNO_REPOSITORY_RELATIVE = "model_training/configs/tasks/steady_flow/experiments/best_of_class/uno_m64x64_h32_l7_mr0p495.yaml"
+_UNO_CONFIG = _REPOSITORY_ROOT / _UNO_REPOSITORY_RELATIVE
+_UNO_MODEL_TRAINING_RELATIVE = _UNO_CONFIG.relative_to(_REPOSITORY_ROOT / "model_training").as_posix()
 
 
 @dataclass(frozen=True)
@@ -37,8 +72,8 @@ class _Harness:
         Directory containing the fake ``docker``, ``nvidia-smi``, and queue commands.
     home : pathlib.Path
         Isolated home used for optional credential-file precedence.
-    runtsgpu_capture, docker_capture, docker_environment_capture : pathlib.Path
-        NUL-delimited argument and environment capture files written by stubs.
+    launcher capture paths : pathlib.Path
+        NUL-delimited argument/environment and invocation capture files written by stubs.
 
     """
 
@@ -48,7 +83,11 @@ class _Harness:
     home: Path
     runtsgpu_capture: Path
     docker_capture: Path
+    preflight_docker_capture: Path
     docker_environment_capture: Path
+    tail_capture: Path
+    nvidia_capture: Path
+    host_python_capture: Path
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -80,26 +119,43 @@ def _harness(
     repository = tmp_path / "repository with spaces"
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("docker_job.sh", "_docker_run.sh", "docker_dev.sh"):
+    for name in ("docker_job.sh", "_docker_run.sh", "docker_dev.sh", "config_preflight_runtime.py"):
         shutil.copy2(_REPOSITORY_ROOT / "scripts" / name, scripts / name)
 
-    config_root = repository / "model_training" / "configs"
-    for relative in (
-        "experiments/steady_flow_fno.yaml",
-        "experiments/config with spaces.yaml",
-        "optuna/steady_flow_fno_search.yaml",
-    ):
-        config_path = config_root / relative
+    model_training = repository / "model_training"
+    shutil.copytree(_REPOSITORY_ROOT / "model_training" / "src", model_training / "src")
+    config_payloads = {
+        model_training / _CONFIG_MODEL_TRAINING_RELATIVE: _PRODUCTION_CONFIG.read_bytes(),
+        model_training / _SPACED_CONFIG_RELATIVE: _PRODUCTION_CONFIG.read_bytes(),
+        model_training / _OPTUNA_MODEL_TRAINING_RELATIVE: _OPTUNA_CONFIG.read_bytes(),
+        model_training / _OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE: _OPTUNA_SMOKE_CONFIG.read_bytes(),
+        model_training / _UNO_MODEL_TRAINING_RELATIVE: _UNO_CONFIG.read_bytes(),
+    }
+    for config_path, payload in config_payloads.items():
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("task: steady_flow\n", encoding="utf-8")
+        config_path.write_bytes(payload)
 
     binary_dir = tmp_path / "stub commands"
     binary_dir.mkdir()
+    _write_executable(
+        binary_dir / "python",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\0' "$@" > "${HOST_PYTHON_CAPTURE}"
+if [[ "${1-}" == "-c" ]]; then
+  printf '%s\\n' "${HOST_PYTHON_STUB_VERSION:-3.9.19}"
+  exit "${HOST_PYTHON_VERSION_EXIT_CODE:-0}"
+fi
+echo 'host Python was asked to import project code directly' >&2
+exit 97
+""",
+    )
     report = gpu_report if gpu_report is not None else ("0, Cluster GPU A, 20, 7000, 24000\n2, Cluster GPU B, 5, 1000, 24000\n")
     _write_executable(
         binary_dir / "nvidia-smi",
         f"""#!/usr/bin/env bash
 set -euo pipefail
+printf 'called\n' > "${{NVIDIA_CAPTURE}}"
 if [[ "${{1-}}" == "-L" ]]; then
   printf 'GPU 0: Cluster GPU A\\nGPU 2: Cluster GPU B\\n'
 elif [[ "$*" == *"--query-gpu=index,name,utilization.gpu,memory.used,memory.total"* ]]; then
@@ -115,10 +171,24 @@ fi
         """#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\0' "$@" > "${RUNTSGPU_CAPTURE}"
+if (( ${QUEUE_SUBMISSION_EXIT:-0} != 0 )); then
+  printf '%b' "${QUEUE_PARTIAL_OUTPUT-}"
+  echo 'stub queue submission refused' >&2
+  exit "${QUEUE_SUBMISSION_EXIT}"
+fi
 while (( $# > 0 )); do
   if [[ "$1" == "--" ]]; then
     shift
-    exec "$@"
+    set +e
+    "$@"
+    set -e
+    if [[ -n "${QUEUE_SUBMISSION_OUTPUT+x}" ]]; then
+      printf '%b' "${QUEUE_SUBMISSION_OUTPUT}"
+    else
+      printf 'TS socket: %s\n' "${TS_SOCKET:-/etc/ts/socket_unknown}"
+      printf '%s\n' "${QUEUE_JOB_ID:-25}"
+    fi
+    exit 0
   fi
   shift
 done
@@ -135,10 +205,13 @@ case "${1-}" in
     if [[ "$*" == *"--format"* ]]; then
       printf '{"nvidia": {}}\\n'
     fi
-    exit 0
+    exit "${DOCKER_INFO_EXIT_CODE:-0}"
     ;;
   image)
-    exit 0
+    if [[ "${DOCKER_IMAGE_AVAILABLE:-true}" == true ]]; then
+      exit 0
+    fi
+    exit 1
     ;;
   ps)
     if [[ "$*" == *" -a "* || "$*" == *"ps -a"* ]]; then
@@ -152,6 +225,50 @@ case "${1-}" in
     exit 0
     ;;
   run)
+    arguments=("$@")
+    bootstrap_index=-1
+    for index in "${!arguments[@]}"; do
+      if [[ "${arguments[index]}" == "/workspace/repo/scripts/config_preflight_runtime.py" ]]; then
+        bootstrap_index="${index}"
+        break
+      fi
+    done
+    if (( bootstrap_index >= 0 )); then
+      printf '%s\\0' "$@" > "${PREFLIGHT_DOCKER_CAPTURE}"
+      if (( ${PREFLIGHT_CONTAINER_EXIT_CODE:-0} != 0 )); then
+        printf '%s' "${PREFLIGHT_CONTAINER_STDOUT-}"
+        printf '%s' "${PREFLIGHT_CONTAINER_STDERR-}" >&2
+        exit "${PREFLIGHT_CONTAINER_EXIT_CODE}"
+      fi
+      workflow="${arguments[bootstrap_index + 1]}"
+      config="${arguments[bootstrap_index + 2]}"
+      case "${config}" in
+        configs/*)
+          host_config="${PROJECT_ROOT}/model_training/${config}"
+          ;;
+        /workspace/repo/model_training/data/*)
+          host_config="${STORAGE_ROOT}/data_training/${config#/workspace/repo/model_training/data/}"
+          ;;
+        /workspace/repo/data_generation/data/*)
+          host_config="${STORAGE_ROOT}/data_generation/${config#/workspace/repo/data_generation/data/}"
+          ;;
+        /workspace/repo/*)
+          host_config="${PROJECT_ROOT}/${config#/workspace/repo/}"
+          ;;
+        *)
+          host_config="${config}"
+          ;;
+      esac
+      (
+        cd "${PROJECT_ROOT}/model_training"
+        export PYTHONPATH="${PROJECT_ROOT}/model_training"
+        export PROJECT_ROOT
+        export GENERATED_DATA_ROOT="${STORAGE_ROOT}/data_generation"
+        export MODEL_TRAINING_DATA_ROOT="${STORAGE_ROOT}/data_training"
+        "${CONTAINER_PYTHON}" "${PROJECT_ROOT}/scripts/config_preflight_runtime.py" "${workflow}" "${host_config}"
+      )
+      exit $?
+    fi
     printf '%s\\0' "$@" > "${DOCKER_CAPTURE}"
     printf '%s' "${WANDB_API_KEY-<unset>}" > "${DOCKER_ENV_CAPTURE}"
     printf 'captured Docker stdout with spaces\\n'
@@ -164,6 +281,30 @@ case "${1-}" in
   *)
     printf 'unexpected Docker command: %s\\n' "$*" >&2
     exit 66
+    ;;
+esac
+""",
+    )
+
+    _write_executable(
+        binary_dir / "tail",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\0' "$@" > "${TAIL_CAPTURE}"
+case "${TAIL_MODE:-return}" in
+  return)
+    exit 0
+    ;;
+  interrupt)
+    kill -INT "$PPID"
+    exit 130
+    ;;
+  fail)
+    exit 42
+    ;;
+  *)
+    echo "unknown TAIL_MODE: ${TAIL_MODE}" >&2
+    exit 64
     ;;
 esac
 """,
@@ -200,10 +341,18 @@ esac
         {
             "PATH": f"{binary_dir}{os.pathsep}{fallback_binary_dir}",
             "HOME": str(home),
+            "PROJECT_ROOT": str(repository),
             "STORAGE_ROOT": str(storage_root),
             "RUNTSGPU_CAPTURE": str(tmp_path / "runtsgpu.args"),
             "DOCKER_CAPTURE": str(tmp_path / "docker.args"),
+            "PREFLIGHT_DOCKER_CAPTURE": str(tmp_path / "preflight-docker.args"),
             "DOCKER_ENV_CAPTURE": str(tmp_path / "docker.env"),
+            "TAIL_CAPTURE": str(tmp_path / "tail.args"),
+            "NVIDIA_CAPTURE": str(tmp_path / "nvidia.called"),
+            "HOST_PYTHON_CAPTURE": str(tmp_path / "host-python.args"),
+            "HOST_PYTHON_STUB_VERSION": "3.9.19",
+            "CONTAINER_PYTHON": sys.executable,
+            "QUEUE_JOB_ID": "25",
             "DOCKER_EXIT_CODE": str(docker_exit_code),
         }
     )
@@ -218,7 +367,11 @@ esac
         home=home,
         runtsgpu_capture=Path(environment["RUNTSGPU_CAPTURE"]),
         docker_capture=Path(environment["DOCKER_CAPTURE"]),
+        preflight_docker_capture=Path(environment["PREFLIGHT_DOCKER_CAPTURE"]),
         docker_environment_capture=Path(environment["DOCKER_ENV_CAPTURE"]),
+        tail_capture=Path(environment["TAIL_CAPTURE"]),
+        nvidia_capture=Path(environment["NVIDIA_CAPTURE"]),
+        host_python_capture=Path(environment["HOST_PYTHON_CAPTURE"]),
     )
 
 
@@ -236,6 +389,43 @@ def _run_job(
         text=True,
         capture_output=True,
         check=False,
+    )
+
+
+def _run_job_tty(
+    harness: _Harness,
+    *arguments: str,
+    selection: bytes = b"\n",
+) -> subprocess.CompletedProcess[str]:
+    """Run the wrapper with a controlling pseudo-terminal and scripted input."""
+    command = [str(harness.repository / "scripts" / "docker_job.sh"), *arguments]
+    pid, controller = pty.fork()
+    if pid == 0:
+        os.chdir(harness.repository)
+        os.execve(command[0], command, harness.environment)
+
+    output = bytearray()
+    selection_sent = False
+    try:
+        while True:
+            try:
+                chunk = os.read(controller, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+            if not selection_sent and b"Select GPU (" in output:
+                os.write(controller, selection)
+                selection_sent = True
+    finally:
+        os.close(controller)
+    _, wait_status = os.waitpid(pid, 0)
+    return subprocess.CompletedProcess(
+        command,
+        os.waitstatus_to_exitcode(wait_status),
+        output.decode(errors="replace").replace("\r\n", "\n"),
+        "",
     )
 
 
@@ -261,6 +451,30 @@ def _log_path(harness: _Harness) -> Path:
     logs = list(_queue_log_dir(harness).glob("*.log"))
     assert len(logs) == 1
     return logs[0]
+
+
+def _assert_preflight_container(
+    harness: _Harness,
+    *,
+    workflow: str,
+    config_path: str,
+) -> None:
+    """Verify one read-only, CPU-only, network-disabled authoritative preflight."""
+    arguments = _capture_arguments(harness.preflight_docker_capture)
+    assert arguments[:2] == ["run", "--rm"]
+    assert arguments[arguments.index("--network") + 1] == "none"
+    assert arguments[arguments.index("--workdir") + 1] == "/workspace/repo/model_training"
+    assert "--gpus" not in arguments
+    assert "WANDB_API_KEY" not in arguments
+    assert not any(argument.startswith("WANDB_") for argument in arguments)
+    assert f"type=bind,source={harness.repository},target=/workspace/repo,readonly" in arguments
+    assert arguments[-5:] == [
+        "grainlegumes-pino-airflow",
+        "python",
+        "/workspace/repo/scripts/config_preflight_runtime.py",
+        workflow,
+        config_path,
+    ]
 
 
 def _without_device(arguments: list[str]) -> list[str]:
@@ -332,6 +546,12 @@ def _assert_common_chain(
     log_basename = runtsgpu[5]
     assert re.fullmatch(rf"\d{{8}}_\d{{6}}__{job_type}__gpu{gpu}__[A-Za-z0-9]{{6}}\.log", log_basename)
     assert runtsgpu[6:] == command_arguments
+    if job_type in {"train", "optuna"}:
+        _assert_preflight_container(
+            harness,
+            workflow=job_type,
+            config_path=command_arguments[0],
+        )
 
     docker = _capture_arguments(harness.docker_capture)
     assert docker[:2] == ["run", "--rm"]
@@ -371,29 +591,37 @@ def _assert_common_chain(
     assert "captured Docker stdout with spaces" in log_text
     assert "captured Docker stderr with spaces" in log_text
     assert "Docker exit status: 0" in log_text
+    assert f"Selected host GPU: {gpu}" in log_text
+    assert f"CUDA_VISIBLE_DEVICES: {gpu}" in log_text
+    assert "Container CUDA device: 0" in log_text
+    assert f"Task-spooler socket: /etc/ts/socket_{gpu}" in log_text
     assert "Current GPU usage:" in result.stdout
-    assert f"Selected GPU: {gpu}" in result.stdout
-    assert f"Log:   {log_path}" in result.stdout
-    assert "Tail:  tail -F " in result.stdout
+    assert "Queue job ID: 25" in result.stdout
+    assert f"Workflow: {job_type}" in result.stdout
+    assert "Task: steady_flow" in result.stdout
+    assert f"Selected host GPU: {gpu}" in result.stdout
+    assert f"CUDA_VISIBLE_DEVICES: {gpu}" in result.stdout
+    assert "Container CUDA device: 0" in result.stdout
+    assert f"Task-spooler socket: /etc/ts/socket_{gpu}" in result.stdout
+    assert "Queued command:" in result.stdout
+    assert f"Host log: {log_path}" in result.stdout
+    assert "Follow manually:" in result.stdout
+    assert "tail -n +1 -F" in result.stdout
+    assert not harness.tail_capture.exists()
     return log_basename
 
 
-def test_prompted_default_gpu_queues_training_with_exact_arguments(tmp_path: Path) -> None:
-    """
-    Submit training interactively by accepting the least-memory GPU proposal.
-
-    Config/resume values containing spaces must survive queue and Docker argv exactly,
-    proving default selection does not alter semantic arguments.
-    """
+def test_default_tty_enter_accepts_proposal_and_preserves_training_arguments(tmp_path: Path) -> None:
+    """Prompt in a TTY and accept the least-memory proposal with Enter."""
     harness = _harness(tmp_path)
     arguments = [
-        "configs/experiments/config with spaces.yaml",
+        _SPACED_CONFIG_RELATIVE,
         "--resume",
         "/workspace/repo/model_training/data/processed/steady_flow/runs/run with spaces",
         "--device",
         "cuda",
     ]
-    result = _run_job(harness, "train", *arguments, selection="\n")
+    result = _run_job_tty(harness, "train", *arguments)
 
     _assert_common_chain(
         harness,
@@ -404,25 +632,88 @@ def test_prompted_default_gpu_queues_training_with_exact_arguments(tmp_path: Pat
         command_arguments=arguments,
     )
     assert "Proposed GPU: 2" in result.stdout
+    assert "Select GPU (0,2; Enter for proposed 2):" in result.stdout
+    assert "Automatically selected GPU" not in result.stdout
 
 
-def test_prompted_explicit_gpu_queues_optuna_with_runtime_overrides(tmp_path: Path) -> None:
+def test_default_tty_manual_override_and_invalid_reprompt(tmp_path: Path) -> None:
+    """Reject malformed/unavailable choices, then accept a different reported GPU."""
+    harness = _harness(tmp_path)
+    result = _run_job_tty(
+        harness,
+        "optuna",
+        _OPTUNA_SMOKE_REPOSITORY_RELATIVE,
+        selection=b"not-a-gpu\n7\n 0 \n",
+    )
+    _assert_common_chain(
+        harness,
+        result,
+        gpu="0",
+        job_type="optuna",
+        module="src.experiments.cli.cli_optuna",
+        command_arguments=[_OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE],
+    )
+    assert "Invalid GPU selection" in result.stdout
+    assert "not one of the reported indices" in result.stdout
+    assert result.stdout.count("Select GPU") == 3
+    assert "Selected GPU: 0" in result.stdout
+
+
+def test_default_noninteractive_requires_explicit_gpu_mode(tmp_path: Path) -> None:
+    """Fail closed after GPU discovery when stdin is not a TTY and no mode is explicit."""
+    harness = _harness(tmp_path)
+    result = _run_job(harness, "train", _CONFIG_MODEL_TRAINING_RELATIVE)
+
+    assert result.returncode == 2
+    assert "GPU selection requires an explicit option in non-interactive mode." in result.stderr
+    assert "--queue-gpu auto" in result.stderr
+    assert "--queue-gpu INDEX" in result.stderr
+    assert harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+def test_default_tty_eof_fails_without_submission(tmp_path: Path) -> None:
+    """Treat terminal EOF as cancellation rather than accepting the proposal."""
+    harness = _harness(tmp_path)
+    result = _run_job_tty(harness, "optuna", _OPTUNA_SMOKE_REPOSITORY_RELATIVE, selection=b"\x04")
+
+    assert result.returncode == 2
+    assert "input closed" in result.stdout
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+def test_default_tty_ctrl_c_submits_nothing(tmp_path: Path) -> None:
+    """Abort an active selection prompt on Ctrl+C without allocating queue state."""
+    harness = _harness(tmp_path)
+    result = _run_job_tty(harness, "train", _CONFIG_MODEL_TRAINING_RELATIVE, selection=b"\x03")
+
+    assert result.returncode == 130
+    assert "selection cancelled" in result.stdout
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+def test_explicit_gpu_after_config_queues_optuna_with_runtime_overrides(tmp_path: Path) -> None:
     """
-    Select a reported GPU explicitly for an Optuna job with several runtime overrides.
+    Select a reported GPU explicitly after an Optuna config with runtime overrides.
 
-    The chosen index and every spaced/flag argument must reach the correct inner
-    module unchanged, protecting interactive selection from consuming CLI options.
+    The wrapper option is stripped while every semantic argument reaches the maintained CLI.
     """
     harness = _harness(tmp_path)
     arguments = [
-        "configs/optuna/steady_flow_fno_search.yaml",
+        _OPTUNA_MODEL_TRAINING_RELATIVE,
         "--n-trials",
         "3",
         "--output-root",
         "/workspace/repo/model_training/data/processed/output root",
         "--show-progress-bar",
     ]
-    result = _run_job(harness, "optuna", *arguments, selection="0\n")
+    result = _run_job(harness, "optuna", *arguments, "--queue-gpu", "0")
 
     _assert_common_chain(
         harness,
@@ -432,6 +723,113 @@ def test_prompted_explicit_gpu_queues_optuna_with_runtime_overrides(tmp_path: Pa
         module="src.experiments.cli.cli_optuna",
         command_arguments=arguments,
     )
+    assert "Selection source: explicit --queue-gpu" in result.stdout
+    assert "Automatically selected GPU" not in result.stdout
+    assert "Select GPU" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("workflow", "repository_config", "container_config", "module"),
+    [
+        (
+            "optuna",
+            _FNO_SEARCH_REPOSITORY_RELATIVE,
+            _OPTUNA_MODEL_TRAINING_RELATIVE,
+            "src.experiments.cli.cli_optuna",
+        ),
+        (
+            "train",
+            _UNO_REPOSITORY_RELATIVE,
+            _UNO_MODEL_TRAINING_RELATIVE,
+            "src.experiments.cli.cli_train",
+        ),
+    ],
+)
+def test_exact_production_commands_reach_mocked_queue(
+    tmp_path: Path,
+    workflow: str,
+    repository_config: str,
+    container_config: str,
+    module: str,
+) -> None:
+    """Admit the documented production search and UNO train commands through stubs."""
+    harness = _harness(tmp_path)
+    result = _run_job_tty(harness, workflow, repository_config)
+
+    _assert_common_chain(
+        harness,
+        result,
+        gpu="2",
+        job_type=workflow,
+        module=module,
+        command_arguments=[container_config],
+    )
+
+
+def test_exact_fno_smoke_detached_command_parses_without_real_submission(tmp_path: Path) -> None:
+    """Parse the documented detached smoke command through isolated queue/Docker stubs."""
+    harness = _harness(tmp_path)
+    result = _run_job_tty(harness, "optuna", _OPTUNA_SMOKE_REPOSITORY_RELATIVE)
+
+    _assert_common_chain(
+        harness,
+        result,
+        gpu="2",
+        job_type="optuna",
+        module="src.experiments.cli.cli_optuna",
+        command_arguments=[_OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE],
+    )
+
+
+def test_exact_fno_smoke_follow_command_keeps_follow_host_only(tmp_path: Path) -> None:
+    """Parse the documented followed smoke command without forwarding its wrapper flag."""
+    harness = _harness(tmp_path)
+    result = _run_job(
+        harness,
+        "optuna",
+        _OPTUNA_SMOKE_REPOSITORY_RELATIVE,
+        "--queue-gpu",
+        "auto",
+        "--follow",
+    )
+
+    assert result.returncode == 0, result.stderr
+    runtsgpu = _capture_arguments(harness.runtsgpu_capture)
+    docker = _capture_arguments(harness.docker_capture)
+    assert runtsgpu[6:] == [_OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE]
+    assert docker[-6:] == [
+        "python",
+        "-m",
+        "src.experiments.cli.cli_optuna",
+        _OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE,
+        "--device",
+        "cuda",
+    ]
+    assert "--follow" not in runtsgpu
+    assert "--follow" not in docker
+    _assert_preflight_container(
+        harness,
+        workflow="optuna",
+        config_path=_OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE,
+    )
+    assert "--follow" not in _capture_arguments(harness.preflight_docker_capture)
+    assert _capture_arguments(harness.tail_capture) == ["-n", "+1", "-F", str(_log_path(harness))]
+
+
+def test_exact_uno_follow_command_keeps_follow_host_only(tmp_path: Path) -> None:
+    """Admit the exact UNO command while retaining follow entirely on the host."""
+    harness = _harness(tmp_path)
+    result = _run_job(harness, "train", _UNO_REPOSITORY_RELATIVE, "--queue-gpu", "auto", "--follow")
+
+    assert result.returncode == 0, result.stderr
+    _assert_preflight_container(
+        harness,
+        workflow="train",
+        config_path=_UNO_MODEL_TRAINING_RELATIVE,
+    )
+    assert _capture_arguments(harness.runtsgpu_capture)[6:] == [_UNO_MODEL_TRAINING_RELATIVE]
+    assert "--follow" not in _capture_arguments(harness.docker_capture)
+    assert _capture_arguments(harness.tail_capture) == ["-n", "+1", "-F", str(_log_path(harness))]
 
 
 @pytest.mark.parametrize(
@@ -465,6 +863,11 @@ def test_noninteractive_gpu_modes_preserve_artifact_arguments(
         module="src.experiments.cli.cli_build_artifacts",
         command_arguments=arguments,
     )
+    assert "Select GPU" not in result.stdout
+    if wrapper_arguments[-1] == "auto":
+        assert f"Automatically selected GPU: {expected_gpu}" in result.stdout
+    else:
+        assert "Selection source: explicit --queue-gpu" in result.stdout
 
 
 def test_least_memory_tie_uses_lowest_reported_index(tmp_path: Path) -> None:
@@ -481,11 +884,12 @@ def test_least_memory_tie_uses_lowest_reported_index(tmp_path: Path) -> None:
         "--queue-gpu",
         "auto",
         "train",
-        "configs/experiments/steady_flow_fno.yaml",
+        _CONFIG_MODEL_TRAINING_RELATIVE,
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Selected GPU: 3" in result.stdout
+    assert "Automatically selected GPU: 3" in result.stdout
+    assert "Reason: least allocated memory; lowest index breaks ties" in result.stdout
     assert _capture_arguments(harness.runtsgpu_capture)[0] == "-g3"
 
 
@@ -502,12 +906,327 @@ def test_repository_relative_config_path_is_validated_and_mapped(tmp_path: Path)
         "--queue-gpu",
         "auto",
         "train",
-        "model_training/configs/experiments/steady_flow_fno.yaml",
+        _CONFIG_REPOSITORY_RELATIVE,
     )
 
     assert result.returncode == 0, result.stderr
     runtsgpu = _capture_arguments(harness.runtsgpu_capture)
-    assert runtsgpu[6] == "configs/experiments/steady_flow_fno.yaml"
+    assert runtsgpu[6] == _CONFIG_MODEL_TRAINING_RELATIVE
+
+
+@pytest.mark.parametrize("host_version", ["3.8.20", "3.9.19"])
+def test_old_host_python_only_reports_version_and_uses_container(
+    tmp_path: Path,
+    host_version: str,
+) -> None:
+    """Never import project modules with old host Python; use the guarded image runtime."""
+    harness = _harness(tmp_path)
+    harness.environment["HOST_PYTHON_STUB_VERSION"] = host_version
+    result = _run_job(harness, "--queue-gpu", "auto", "optuna", _OPTUNA_SMOKE_REPOSITORY_RELATIVE)
+
+    assert result.returncode == 0, result.stderr
+    host_arguments = _capture_arguments(harness.host_python_capture)
+    assert host_arguments[0] == "-c"
+    assert len(host_arguments) == 2
+    assert "src" not in host_arguments[1]
+    assert "below the project minimum" in result.stderr
+    assert "maintained CPU-only project container" in result.stderr
+    assert "dataclass() got an unexpected keyword argument 'slots'" not in result.stdout + result.stderr
+    _assert_preflight_container(
+        harness,
+        workflow="optuna",
+        config_path=_OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE,
+    )
+
+
+def test_supported_host_python_is_still_not_an_implicit_project_runtime(tmp_path: Path) -> None:
+    """Use the maintained image even when arbitrary host Python happens to be new enough."""
+    harness = _harness(tmp_path)
+    harness.environment["HOST_PYTHON_STUB_VERSION"] = "3.11.15"
+    result = _run_job(harness, "--queue-gpu", "auto", "train", _UNO_REPOSITORY_RELATIVE)
+
+    assert result.returncode == 0, result.stderr
+    assert "below the project minimum" not in result.stderr
+    assert _capture_arguments(harness.host_python_capture)[0] == "-c"
+    _assert_preflight_container(
+        harness,
+        workflow="train",
+        config_path=_UNO_MODEL_TRAINING_RELATIVE,
+    )
+
+
+def test_host_python_is_optional_when_container_runtime_is_available(tmp_path: Path) -> None:
+    """Require neither a host installation nor shell activation for project validation."""
+    harness = _harness(tmp_path)
+    (harness.binary_dir / "python").unlink()
+    result = _run_job(harness, "--queue-gpu", "auto", "optuna", _OPTUNA_SMOKE_REPOSITORY_RELATIVE)
+
+    assert result.returncode == 0, result.stderr
+    assert not harness.host_python_capture.exists()
+    _assert_preflight_container(
+        harness,
+        workflow="optuna",
+        config_path=_OPTUNA_SMOKE_MODEL_TRAINING_RELATIVE,
+    )
+
+
+def test_missing_container_runtime_has_actionable_version_error_before_gpu(tmp_path: Path) -> None:
+    """Fail with host/project/runtime facts when the approved image is unavailable."""
+    harness = _harness(tmp_path)
+    harness.environment["DOCKER_IMAGE_AVAILABLE"] = "false"
+    result = _run_job(harness, "train", _UNO_REPOSITORY_RELATIVE)
+
+    assert result.returncode == 1
+    assert "Configuration preflight could not start" in result.stderr
+    assert "Host Python: 3.9.19" in result.stderr
+    assert "Required Python: >=3.11" in result.stderr
+    assert "image 'grainlegumes-pino-airflow' is missing" in result.stderr
+    assert "slots" not in result.stderr
+    assert not harness.preflight_docker_capture.exists()
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+def test_container_preflight_status_and_streams_propagate_before_gpu(tmp_path: Path) -> None:
+    """Return an explicit container failure status and both streams without queue state."""
+    harness = _harness(tmp_path)
+    harness.environment.update(
+        {
+            "PREFLIGHT_CONTAINER_EXIT_CODE": "73",
+            "PREFLIGHT_CONTAINER_STDOUT": "preflight stdout marker\n",
+            "PREFLIGHT_CONTAINER_STDERR": "preflight stderr marker\n",
+        }
+    )
+    result = _run_job(harness, "optuna", _OPTUNA_SMOKE_REPOSITORY_RELATIVE)
+
+    assert result.returncode == 73
+    assert "preflight stdout marker" in result.stdout
+    assert "preflight stderr marker" in result.stderr
+    assert harness.preflight_docker_capture.exists()
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+def test_malformed_yaml_fails_in_authoritative_container_before_gpu(tmp_path: Path) -> None:
+    """Reject malformed YAML through project validation without worker-side state."""
+    harness = _harness(tmp_path)
+    relative = "configs/tasks/steady_flow/experiments/malformed.yaml"
+    path = harness.repository / "model_training" / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("task: [unterminated\n", encoding="utf-8")
+
+    result = _run_job(harness, "train", relative)
+
+    assert result.returncode == 2
+    assert "YAML" in result.stderr or "while parsing" in result.stderr
+    _assert_preflight_container(harness, workflow="train", config_path=relative)
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+def test_obsolete_optuna_path_remains_missing_before_any_runtime(tmp_path: Path) -> None:
+    """Keep the removed pre-task-first Optuna path absent without an alias."""
+    harness = _harness(tmp_path)
+    old_path = "model_training/configs/optuna/steady_flow_fno_search.yaml"
+    result = _run_job(harness, "optuna", old_path)
+
+    assert result.returncode == 2
+    assert "Config path does not exist" in result.stderr
+    assert not (harness.repository / old_path).exists()
+    assert not harness.host_python_capture.exists()
+    assert not harness.preflight_docker_capture.exists()
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+def test_obsolete_low_capacity_path_remains_missing_before_any_runtime(tmp_path: Path) -> None:
+    """Keep the migrated experiment path absent without a compatibility alias."""
+    harness = _harness(tmp_path)
+    old_path = "model_training/configs/tasks/steady_flow/experiments/low_capacity/fno_low_capacity_m12x12_h24_l4.yaml"
+    result = _run_job(harness, "train", old_path)
+
+    assert result.returncode == 2
+    assert "Config path does not exist" in result.stderr
+    assert not (harness.repository / old_path).exists()
+    assert not harness.host_python_capture.exists()
+    assert not harness.preflight_docker_capture.exists()
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not _queue_log_dir(harness).exists()
+
+
+@pytest.mark.parametrize(
+    ("workflow", "config_path", "detected_family", "corrected_workflow"),
+    [
+        ("train", _OPTUNA_MODEL_TRAINING_RELATIVE, "optuna", "optuna"),
+        ("optuna", _CONFIG_MODEL_TRAINING_RELATIVE, "experiment", "train"),
+    ],
+)
+def test_wrong_workflow_fails_before_gpu_queue_and_log_allocation(
+    tmp_path: Path,
+    workflow: str,
+    config_path: str,
+    detected_family: str,
+    corrected_workflow: str,
+) -> None:
+    """Reject both inverse schema misuses before any GPU, queue, Docker, or log state."""
+    harness = _harness(tmp_path)
+    result = _run_job(harness, workflow, config_path)
+
+    assert result.returncode == 2
+    assert f"Supplied config family: {detected_family}" in result.stderr
+    assert f"Requested workflow: {workflow}" in result.stderr
+    assert f"./scripts/docker_job.sh {corrected_workflow} 'model_training/configs/tasks/" in result.stderr
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+    _assert_preflight_container(harness, workflow=workflow, config_path=config_path)
+    assert not _queue_log_dir(harness).exists()
+
+
+@pytest.mark.parametrize(
+    ("workflow", "config_path"),
+    [
+        ("train", _CONFIG_MODEL_TRAINING_RELATIVE),
+        ("optuna", _OPTUNA_MODEL_TRAINING_RELATIVE),
+    ],
+)
+def test_follow_is_host_only_and_targets_the_exact_delayed_log(
+    tmp_path: Path,
+    workflow: str,
+    config_path: str,
+) -> None:
+    """Follow the exact host log with tail -n +1 -F without forwarding the flag."""
+    harness = _harness(tmp_path)
+    result = _run_job(harness, workflow, config_path, "--queue-gpu", "auto", "--follow")
+
+    assert result.returncode == 0, result.stderr
+    assert "Following host log. Press Ctrl+C to stop following; the queue job continues." in result.stdout
+    assert "Log following ended. Queue job 25 continues independently." in result.stdout
+    assert _capture_arguments(harness.tail_capture) == ["-n", "+1", "-F", str(_log_path(harness))]
+    assert "--follow" not in _capture_arguments(harness.runtsgpu_capture)
+    assert "--follow" not in _capture_arguments(harness.docker_capture)
+
+
+def test_follow_ctrl_c_stops_only_tail_and_returns_cleanly(tmp_path: Path) -> None:
+    """A follower interrupt must leave the already submitted queue job independent."""
+    harness = _harness(tmp_path)
+    harness.environment["TAIL_MODE"] = "interrupt"
+    result = _run_job(
+        harness,
+        "train",
+        _CONFIG_MODEL_TRAINING_RELATIVE,
+        "--queue-gpu",
+        "auto",
+        "--follow",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Log following stopped. Queue job 25 continues independently." in result.stdout
+    assert harness.runtsgpu_capture.exists()
+    assert harness.docker_capture.exists()
+    assert _capture_arguments(harness.tail_capture) == ["-n", "+1", "-F", str(_log_path(harness))]
+    visible = result.stdout + result.stderr
+    assert "cancel" not in visible.lower()
+    assert "remove" not in visible.lower()
+
+
+def test_help_documents_detached_workflows_and_follow_without_wait_mode(tmp_path: Path) -> None:
+    """Expose train/Optuna/follow semantics without advertising completion waiting."""
+    harness = _harness(tmp_path)
+    result = _run_job(harness, "--help")
+
+    assert result.returncode == 0
+    help_text = result.stdout + result.stderr
+    assert "train <experiment_config>" in help_text
+    assert "optuna <optuna_config>" in help_text
+    assert "--follow" in help_text
+    assert "press Enter to accept the least-memory proposal" in help_text
+    assert "Non-interactive callers must provide --queue-gpu auto or --queue-gpu INDEX." in help_text
+    assert "Ctrl+C during GPU selection submits nothing" in help_text
+    assert "Ctrl+C during log following stops only" in help_text
+    assert "No --wait mode" in help_text
+    assert "exists; the wrapper never polls" in help_text
+    assert "\n  --wait" not in help_text
+    assert not harness.nvidia_capture.exists()
+    assert not harness.runtsgpu_capture.exists()
+
+
+def test_queue_submission_errors_are_not_swallowed(tmp_path: Path) -> None:
+    """Propagate scheduler submission failure without pretending a job was admitted."""
+    harness = _harness(tmp_path)
+    harness.environment["QUEUE_SUBMISSION_EXIT"] = "37"
+    harness.environment["QUEUE_PARTIAL_OUTPUT"] = "partial scheduler diagnostic\n"
+    result = _run_job(harness, "train", _CONFIG_MODEL_TRAINING_RELATIVE, "--queue-gpu", "auto")
+
+    assert result.returncode == 37
+    assert "partial scheduler diagnostic" in result.stderr
+    assert "stub queue submission refused" in result.stderr
+    assert "Queue submission failed for train workflow." in result.stderr
+    assert "Queue job ID:" not in result.stdout
+    assert harness.runtsgpu_capture.exists()
+    assert not harness.docker_capture.exists()
+
+
+def test_queue_output_with_whitespace_and_diagnostics_keeps_authoritative_id(tmp_path: Path) -> None:
+    """Extract one standalone numeric ID while preserving unrelated diagnostics."""
+    harness = _harness(tmp_path)
+    harness.environment["QUEUE_SUBMISSION_OUTPUT"] = "  TS socket: /etc/ts/socket_2  \nscheduler diagnostic with number 99 embedded\n  41  \n"
+    result = _run_job(harness, "--queue-gpu", "auto", "optuna", _OPTUNA_SMOKE_REPOSITORY_RELATIVE)
+
+    assert result.returncode == 0, result.stderr
+    assert "Queue job ID: 41" in result.stdout
+    assert "Queue submission diagnostics:" in result.stdout
+    assert "scheduler diagnostic with number 99 embedded" in result.stdout
+    assert "Queue submission output: 41" not in result.stdout
+    assert "Task-spooler socket: /etc/ts/socket_2" in result.stdout
+
+
+def test_generic_helper_socket_never_replaces_selected_gpu_socket(tmp_path: Path) -> None:
+    """Retain the selected GPU-specific socket when helper output reports a stale generic alias."""
+    harness = _harness(tmp_path)
+    harness.environment["QUEUE_SUBMISSION_OUTPUT"] = "TS socket: /etc/ts/socket\n52\n"
+    result = _run_job(harness, "--queue-gpu", "2", "train", _CONFIG_MODEL_TRAINING_RELATIVE)
+
+    assert result.returncode == 0, result.stderr
+    assert "Queue job ID: 52" in result.stdout
+    assert "did not match selected GPU socket" in result.stdout
+    assert "Task-spooler socket: /etc/ts/socket_2" in result.stdout
+    assert "Task-spooler socket: /etc/ts/socket\n" not in result.stdout
+
+
+def test_ambiguous_queue_output_never_invents_job_id(tmp_path: Path) -> None:
+    """Keep raw multiline output when more than one standalone numeric candidate exists."""
+    harness = _harness(tmp_path)
+    harness.environment["QUEUE_SUBMISSION_OUTPUT"] = "TS socket: /etc/ts/socket_0\n12\n13\nambiguous response\n"
+    result = _run_job(harness, "--queue-gpu", "0", "train", _CONFIG_MODEL_TRAINING_RELATIVE)
+
+    assert result.returncode == 0, result.stderr
+    assert "Queue submission output:" in result.stdout
+    assert "12" in result.stdout
+    assert "13" in result.stdout
+    assert "Queue job ID: unavailable" in result.stdout
+    assert "Queue job ID: 12" not in result.stdout
+
+
+def test_malformed_explicit_gpu_values_fail_before_submission(tmp_path: Path) -> None:
+    """Reject strings, negatives, and multiple indices without calling the queue helper."""
+    for value in ("gpu0", "-1", "0,2", "2 0"):
+        harness = _harness(tmp_path / value.replace("/", "_"))
+        result = _run_job(harness, "--queue-gpu", value, "artifacts")
+
+        assert result.returncode == 2
+        assert "--queue-gpu must be auto" in result.stderr
+        assert not harness.runtsgpu_capture.exists()
+        assert not harness.docker_capture.exists()
+        assert not _queue_log_dir(harness).exists()
 
 
 @pytest.mark.parametrize(
@@ -517,10 +1236,12 @@ def test_repository_relative_config_path_is_validated_and_mapped(tmp_path: Path)
         ("train",),
         ("optuna",),
         ("unsupported",),
-        ("train", "configs/experiments/missing.yaml"),
+        ("train", "configs/tasks/steady_flow/experiments/best_of_class/missing.yaml"),
         ("--queue-gpu",),
         ("--queue-gpu=auto", "artifacts"),
-        ("train", "configs/experiments/steady_flow_fno.yaml", "--queue-gpu", "auto"),
+        ("train", _CONFIG_MODEL_TRAINING_RELATIVE, "--queue-gpu", "auto", "--queue-gpu", "0"),
+        ("train", _CONFIG_MODEL_TRAINING_RELATIVE, "--wait"),
+        ("optuna", _OPTUNA_MODEL_TRAINING_RELATIVE, "--resume", "run"),
     ],
 )
 def test_invalid_job_or_wrapper_arguments_fail_before_submission(
@@ -528,7 +1249,7 @@ def test_invalid_job_or_wrapper_arguments_fail_before_submission(
     arguments: tuple[str, ...],
 ) -> None:
     """
-    Vary missing job/config values, unknown jobs, and misplaced queue options.
+    Vary missing values, unknown jobs, duplicate wrapper options, waiting, and cross-workflow resume.
 
     Every wrapper-syntax family must exit with usage status before queue capture,
     Docker execution, or log allocation, isolating validation from side effects.
@@ -550,7 +1271,6 @@ def test_invalid_job_or_wrapper_arguments_fail_before_submission(
         ("--device=cpu",),
         ("--device", "cuda", "--device", "cuda"),
         ("--device",),
-        ("--cpu",),
     ],
 )
 def test_invalid_queued_device_requests_fail_before_submission(
@@ -558,7 +1278,7 @@ def test_invalid_queued_device_requests_fail_before_submission(
     semantic_arguments: tuple[str, ...],
 ) -> None:
     """
-    Vary queued semantic options across CPU, auto, duplicates, missing values, and unsupported flags.
+    Vary queued semantic options across CPU, auto, duplicate, and missing device values.
 
     Every family must fail before submission because GPU queue placement always
     normalizes to one strict inner ``--device cuda`` request.
@@ -590,7 +1310,7 @@ def test_invalid_explicit_gpu_fails_before_submission(tmp_path: Path) -> None:
         "--queue-gpu",
         "7",
         "train",
-        "configs/experiments/steady_flow_fno.yaml",
+        _CONFIG_MODEL_TRAINING_RELATIVE,
     )
 
     assert result.returncode == 2
@@ -624,7 +1344,7 @@ def test_missing_infrastructure_fails_clearly_before_submission(
         "--queue-gpu",
         "auto",
         "train",
-        "configs/experiments/steady_flow_fno.yaml",
+        _CONFIG_MODEL_TRAINING_RELATIVE,
     )
 
     assert result.returncode == 1
@@ -665,7 +1385,7 @@ def test_repeated_submissions_allocate_distinct_logs(tmp_path: Path) -> None:
     queue requests from overwriting one another's authoritative output.
     """
     harness = _harness(tmp_path)
-    command = ("--queue-gpu", "auto", "train", "configs/experiments/steady_flow_fno.yaml")
+    command = ("--queue-gpu", "auto", "train", _CONFIG_MODEL_TRAINING_RELATIVE)
 
     first = _run_job(harness, *command)
     second = _run_job(harness, *command)
@@ -677,12 +1397,12 @@ def test_repeated_submissions_allocate_distinct_logs(tmp_path: Path) -> None:
     assert logs[0].name != logs[1].name
 
 
-def test_inner_docker_failure_reaches_queue_process_and_log(tmp_path: Path) -> None:
+def test_later_worker_failure_stays_in_log_after_detached_submission(tmp_path: Path) -> None:
     """
-    Make the Docker stub emit both streams and exit with status 37.
+    Make the queued Docker worker emit both streams and exit with status 37.
 
-    The queue process must propagate that exact status and preserve stdout/stderr
-    in its log without printing a misleading successful-submission message.
+    Successful submission remains detached; later worker status is preserved only
+    in the host log and is never propagated back to the submit shell.
     """
     harness = _harness(tmp_path, docker_exit_code=37)
     result = _run_job(
@@ -690,15 +1410,15 @@ def test_inner_docker_failure_reaches_queue_process_and_log(tmp_path: Path) -> N
         "--queue-gpu",
         "auto",
         "train",
-        "configs/experiments/steady_flow_fno.yaml",
+        _CONFIG_MODEL_TRAINING_RELATIVE,
     )
 
-    assert result.returncode == 37
+    assert result.returncode == 0
+    assert "Queue job ID: 25" in result.stdout
     log_text = _log_path(harness).read_text(encoding="utf-8")
     assert "captured Docker stdout with spaces" in log_text
     assert "captured Docker stderr with spaces" in log_text
     assert "Docker exit status: 37" in log_text
-    assert "Queued train job" not in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -751,14 +1471,17 @@ def test_storage_backed_config_maps_to_logical_training_domain(tmp_path: Path) -
     harness = _harness(tmp_path)
     config = Path(harness.environment["STORAGE_ROOT"]) / "data_training" / "processed" / "steady_flow" / "acceptance" / "bounded" / "config.yaml"
     config.parent.mkdir(parents=True)
-    config.write_text("task: steady_flow\n", encoding="utf-8")
+    config.write_bytes(_PRODUCTION_CONFIG.read_bytes())
 
     result = _run_job(harness, "--queue-gpu", "auto", "train", str(config))
 
     assert result.returncode == 0, result.stderr
-    assert _capture_arguments(harness.runtsgpu_capture)[6] == (
-        "/workspace/repo/model_training/data/processed/steady_flow/acceptance/bounded/config.yaml"
-    )
+    logical_path = "/workspace/repo/model_training/data/processed/steady_flow/acceptance/bounded/config.yaml"
+    assert _capture_arguments(harness.runtsgpu_capture)[6] == logical_path
+    preflight = _capture_arguments(harness.preflight_docker_capture)
+    storage_root = Path(harness.environment["STORAGE_ROOT"])
+    assert f"type=bind,source={storage_root / 'data_training'},target=/workspace/repo/model_training/data,readonly" in preflight
+    assert preflight[-1] == logical_path
 
 
 def test_train_translates_split_host_paths_including_new_output_destinations(tmp_path: Path) -> None:
@@ -768,7 +1491,7 @@ def test_train_translates_split_host_paths_including_new_output_destinations(tmp
     resume.mkdir(parents=True)
     output = Path(harness.environment["STORAGE_ROOT"]) / "data_training" / "processed" / "new output"
     arguments = [
-        "configs/experiments/steady_flow_fno.yaml",
+        _CONFIG_MODEL_TRAINING_RELATIVE,
         "--resume",
         str(resume),
         "--output-root",
@@ -799,7 +1522,7 @@ def test_optuna_translates_equals_host_output_path_without_requiring_existence(t
     harness = _harness(tmp_path)
     output = Path(harness.environment["STORAGE_ROOT"]) / "data_training" / "processed" / "future study"
     arguments = [
-        "configs/optuna/steady_flow_fno_search.yaml",
+        _OPTUNA_MODEL_TRAINING_RELATIVE,
         f"--output-root={output}",
     ]
     expected = [

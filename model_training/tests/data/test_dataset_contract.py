@@ -17,6 +17,7 @@ import torch
 from src import common, datasets, domain
 
 from data_generation import build_training_dataset as builder_module
+from data_generation import generated_batch as generated_module
 from data_generation.build_training_dataset import build_batch_dataset
 
 _SOLUTION_HEADER = (
@@ -322,6 +323,47 @@ def test_direct_builder_publishes_one_final_dataset_and_metadata(
     assert not (training_root / "processed").exists()
 
 
+def test_metadata_summary_validates_compact_package_without_loading_tensor(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+) -> None:
+    result, _generated_root, training_root = _build(tmp_path)
+    payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
+    identity = datasets.identity.validate_training_dataset_payload(
+        payload,
+        task=steady_task,
+        verify_content=True,
+    )
+
+    summary = datasets.metadata.load_dataset_metadata_summary(
+        "synthetic",
+        task=steady_task,
+        dataset_root=training_root / "raw",
+        metadata_root=training_root / "meta",
+    )
+
+    assert summary.dataset_id == identity.dataset_id
+    assert summary.dataset_path == result["dataset_path"]
+    assert summary.metadata_directory == result["metadata_path"]
+    assert summary.dataset_exists
+    assert summary.task_id == steady_task.id
+    assert summary.task_contract_digest == steady_task.contract_digest
+    assert summary.fingerprint == identity.fingerprint
+    assert summary.sample_ids == identity.sample_ids
+    assert summary.sample_count == identity.sample_count
+    assert summary.spatial_shape == identity.spatial_shape
+    assert summary.artifact_size_bytes == result["dataset_path"].stat().st_size
+
+    result["dataset_path"].unlink()
+    absent = datasets.metadata.load_dataset_metadata_summary(
+        "synthetic",
+        task=steady_task,
+        dataset_root=training_root / "raw",
+        metadata_root=training_root / "meta",
+    )
+    assert not absent.dataset_exists
+
+
 def test_active_dataset_lock_rejects_builder_and_persistent_anchor_is_harmless(tmp_path: Path) -> None:
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root)
@@ -410,7 +452,7 @@ def test_sample_snapshots_remain_coherent_when_live_sidecars_change_mid_build(
     sample_json_path = meta_dir / "synthetic.json"
     original_csv = sample_csv_path.read_bytes()
     original_json = sample_json_path.read_bytes()
-    original_interpret = builder_module._interpret_generated_case
+    original_interpret = generated_module.interpret_generated_case
     call_count = 0
 
     def mutate_live_samples_after_first_case(*args: Any, **kwargs: Any) -> Any:
@@ -422,7 +464,7 @@ def test_sample_snapshots_remain_coherent_when_live_sidecars_change_mid_build(
             sample_json_path.write_bytes(original_json + b"\n")
         return interpreted
 
-    monkeypatch.setattr(builder_module, "_interpret_generated_case", mutate_live_samples_after_first_case)
+    monkeypatch.setattr(generated_module, "interpret_generated_case", mutate_live_samples_after_first_case)
     training_root = tmp_path / "training"
     result = build_batch_dataset(
         "synthetic",
@@ -537,14 +579,14 @@ def test_builder_reverifies_manifest_hashes_after_case_read(
 ) -> None:
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root, case_numbers=(1,), timing_count=1)
-    original = builder_module._load_case_sources
+    original = generated_module._load_case_sources
 
     def mutate_after_read(csv_path: Path, metadata_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         result = original(csv_path, metadata_path)
         metadata_path.write_text(metadata_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
         return result
 
-    monkeypatch.setattr(builder_module, "_load_case_sources", mutate_after_read)
+    monkeypatch.setattr(generated_module, "_load_case_sources", mutate_after_read)
     with pytest.raises(RuntimeError, match=r"SHA-256 mismatch.*raw JSON"):
         build_batch_dataset(
             "synthetic",
@@ -1175,7 +1217,7 @@ def test_ready_publication_transaction_recovers_every_rename_boundary(
     def reject_rebuild(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("ready publication recovery rebuilt generated cases")
 
-    monkeypatch.setattr(builder_module, "_interpret_generated_case", reject_rebuild)
+    monkeypatch.setattr(generated_module, "interpret_generated_case", reject_rebuild)
     recovered = build_batch_dataset(
         "synthetic",
         generated_data_root=generated_root,
@@ -1309,7 +1351,7 @@ def test_interrupted_build_retains_inspectable_transaction_until_retry(
         "synthetic",
         model_training_data_root=training_root,
     )
-    original_interpret = builder_module._interpret_generated_case
+    original_interpret = generated_module.interpret_generated_case
     interrupted = False
 
     def interrupt_once(*args: Any, **kwargs: Any) -> Any:
@@ -1319,7 +1361,7 @@ def test_interrupted_build_retains_inspectable_transaction_until_retry(
             raise RuntimeError("injected interruption")
         return original_interpret(*args, **kwargs)
 
-    monkeypatch.setattr(builder_module, "_interpret_generated_case", interrupt_once)
+    monkeypatch.setattr(generated_module, "interpret_generated_case", interrupt_once)
     with pytest.raises(RuntimeError, match="injected interruption"):
         build_batch_dataset(
             "synthetic",
@@ -1446,7 +1488,7 @@ def test_progress_appearing_during_build_prevents_publication(
     transaction_path = common.paths.resolve_dataset_build_transaction_path("synthetic", model_training_data_root=training_root)
 
     if boundary == "before_ready":
-        original_interpret = builder_module._interpret_generated_case
+        original_interpret = generated_module.interpret_generated_case
         injected = False
 
         def inject_after_case(*args: Any, **kwargs: Any) -> Any:
@@ -1457,7 +1499,7 @@ def test_progress_appearing_during_build_prevents_publication(
                 _write_private_batch_progress(raw_dir)
             return interpreted
 
-        monkeypatch.setattr(builder_module, "_interpret_generated_case", inject_after_case)
+        monkeypatch.setattr(generated_module, "interpret_generated_case", inject_after_case)
     else:
         original_write_json = common.serialization.atomic_write_json
 
@@ -1549,10 +1591,13 @@ def test_eda_reads_validated_generated_sources_only(
     )
 
     assert list(frame.index) == ["case_0002"]
-    assert list(frame.columns) == [*steady_task.input_names, *steady_task.output_names, "meta"]
+    assert list(frame.columns) == [*steady_task.input_names, *steady_task.output_names, "meta", "U"]
     assert frame.attrs["loaded_case_count"] == 1
     assert frame.attrs["available_case_count"] == 2
     assert frame.attrs["generated_batch_identity"]["batch_name"] == "synthetic"
+    assert frame.attrs["field_units"]["kxx"] == "m^2"
+    assert frame.attrs["field_representations"]["kxx"] == "dimensionless_log10_ratio_to_1_m2"
+    assert frame.attrs["field_representations"]["kxy"] == "dimensionless_cross_component_ratio_to_geometric_mean"
     assert "dataset_identity" not in frame.attrs
     assert frame.iloc[0]["meta"]["parameters"] == {"alpha": 0.2}
     assert any("Generated batch" in message for message in logs)

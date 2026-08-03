@@ -22,7 +22,7 @@ This module does NOT:
   - Generate analysis artifacts; ``analysis.artifacts`` owns publication
   - Allocate or transition run directories; ``experiments.run`` owns lifecycle state
 
-Notes:
+Saved-run contract:
   - This module assumes the current saved-run contract:
     run_dir/
       config.yaml
@@ -39,7 +39,6 @@ Notes:
     5. Apply saved split membership before building the DataLoader
     6. Return the model, DataLoader, processor, and device for inference
 ===============================================================================
-
 """
 
 from __future__ import annotations
@@ -53,7 +52,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from src import common, datasets, experiments, learning
+from src import common, datasets, experiments
+
+from .. import learning_device  # noqa: TID252
+from ..models import learning_models_factory  # noqa: TID252
 
 if TYPE_CHECKING:
     from collections.abc import Sized
@@ -410,7 +412,7 @@ def _build_model_from_config(config: dict[str, Any], *, device: torch.device) ->
 
     """
     _model_section(config)
-    return learning.models.factory.build_model(config, device=device)
+    return learning_models_factory.build_model(config, device=device)
 
 
 # ======================================================================
@@ -448,7 +450,7 @@ def _build_eval_loader(dataset: Dataset[Any], batch_size: int) -> DataLoader:
 def load_inference_context_with_resolution(
     *,
     run_dir: str | Path,
-    device_resolution: learning.device.DeviceResolution,
+    device_resolution: learning_device.DeviceResolution,
     dataset_path: str | Path | None = None,
     dataset_root: str | Path | None = None,
     split: SplitRole | str = "eval",
@@ -468,7 +470,7 @@ def load_inference_context_with_resolution(
     run_dir : str | Path
         Path to a saved run directory containing `config.yaml`,
         `normalizer.pt`, `best_checkpoint.pt`, and `split_indices.pt`.
-    device_resolution : learning.device.DeviceResolution
+    device_resolution : learning_device.DeviceResolution
         Immutable runtime decision resolved by the inference or artifact boundary.
     dataset_path : str | Path | None, optional
         Optional exact final-dataset file. Its fingerprint and ordered sample
@@ -507,13 +509,13 @@ def load_inference_context_with_resolution(
         If a required completed-run or dataset artifact is absent.
 
     """
-    if not isinstance(device_resolution, learning.device.DeviceResolution):
+    if not isinstance(device_resolution, learning_device.DeviceResolution):
         msg = f"Inference requires one DeviceResolution, got {device_resolution!r}."
         raise TypeError(msg)
     device = device_resolution.device
     run_dir = Path(run_dir)
     requested_dataset_path = Path(dataset_path).expanduser() if dataset_path is not None else None
-    current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_dataset_root()
+    current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_training_raw_root()
     completed_run = experiments.run.validate_completed_run(run_dir)
 
     cfg = completed_run["config"]
@@ -612,7 +614,7 @@ def load_inference_context(
         Loaded model, deterministic loader, saved processor, and concrete device.
 
     """
-    resolution = learning.device.resolve_device(
+    resolution = learning_device.resolve_device(
         device_policy,
         path="device_policy",
     )

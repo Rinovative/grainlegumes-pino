@@ -7,13 +7,15 @@ Mirror authoritative local experiment state to optional W&B observability.
 Responsibilities:
   - Keep disabled tracking free of SDK imports and tracking side effects
   - Persist opaque fresh identities and exact-resume identities locally first
-  - Publish bounded semantic config, epoch history, summaries, and curated media
+  - Publish bounded semantic config, completed-epoch history, summaries, and curated media
+  - Mirror authoritative ID, OOD, and physics event values without recomputation
   - Fail closed on requested online or offline observer failures
   - Keep built-in system telemetry secondary to scientific metrics
 
 Design principles:
   - Local config, split, normalizer, checkpoints, summaries and artifacts win
   - W&B observes training and artifacts but never chooses or reconstructs them
+  - Normal histories contain genuine completed epochs only; final results are summaries
   - Fresh and exact-resume sessions have strict fail-closed identity semantics
   - Secrets, arbitrary environment state and incidental absolute paths are absent
 
@@ -47,7 +49,6 @@ if TYPE_CHECKING:
 
 EpochEndCallback = Callable[[int, dict[str, float]], None]
 TrackingStateUpdater = Callable[[Mapping[str, Any]], None]
-MonitorEvaluator = Callable[[], Mapping[str, float]]
 
 POST_ARTIFACT_MEDIA_KEYS = frozenset(
     {
@@ -66,6 +67,7 @@ AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
     "Accuracy",
     "Physics",
     "Diagnostics",
+    "Optuna",
 )
 ACCURACY_HISTORY_METRIC_IDS = (
     "normalized_rmse_p",
@@ -121,6 +123,7 @@ def automatic_history_metric_definitions(
     continuity: str,
     physics_monitor_enabled: bool,
     cuda_enabled: bool,
+    optuna_trial: bool = False,
 ) -> tuple[HistoryMetricDefinition, ...]:
     """
     Return the ordered automatic-personal-workspace history contract.
@@ -238,13 +241,49 @@ def automatic_history_metric_definitions(
                 )
             )
 
-    definitions.append(
-        _definition(
-            "system/epoch_duration_seconds",
-            "Diagnostics/epoch_duration_seconds",
-            owner=loop_owner,
-            computation_cost="one monotonic-clock subtraction",
-            scientific_question="How long does each completed epoch take?",
+    if optuna_trial:
+        definitions.extend(
+            (
+                _definition(
+                    "optuna/objective",
+                    "Optuna/objective",
+                    owner="src.experiments.tuning.experiments_tuning_optuna.OptunaEpochReporter",
+                    computation_cost="exact mirror of the existing ID objective payload",
+                    scientific_question="What exact objective value did Optuna receive at this report step?",
+                ),
+                _definition(
+                    "optuna/best_objective_so_far",
+                    "Optuna/best_objective_so_far",
+                    owner="src.experiments.tuning.experiments_tuning_optuna.OptunaEpochReporter",
+                    computation_cost="one direction-aware scalar comparison",
+                    scientific_question="What is the best reported objective reached by this trial?",
+                ),
+            )
+        )
+
+    definitions.extend(
+        (
+            _definition(
+                "system/epoch_duration_seconds",
+                "Diagnostics/epoch_duration_seconds",
+                owner=loop_owner,
+                computation_cost="one monotonic-clock subtraction",
+                scientific_question="How long does each complete maintained epoch lifecycle take?",
+            ),
+            _definition(
+                "system/train_duration_seconds",
+                "Diagnostics/train_duration_seconds",
+                owner=training_owner,
+                computation_cost="one training-phase clock interval and one CUDA synchronization pair when applicable",
+                scientific_question="How long does optimizer training take without evaluation or epoch finalization?",
+            ),
+            _definition(
+                "system/train_samples_per_second",
+                "Diagnostics/train_samples_per_second",
+                owner=training_owner,
+                computation_cost="one division of actual processed samples by training-phase duration",
+                scientific_question="What actual training throughput is achieved at the visible configured batch size?",
+            ),
         )
     )
     if cuda_enabled:
@@ -306,6 +345,7 @@ class _WandbRun(Protocol):
 
     summary: MutableMapping[str, Any]
     tags: Sequence[str] | None
+    url: str | None
 
     def define_metric(self, name: str, **kwargs: Any) -> Any:
         """Define one supported metric family and its epoch step contract."""
@@ -333,6 +373,8 @@ class _WandbInitKwargs(TypedDict):
     project: str
     entity: str | None
     tags: list[str] | None
+    group: str | None
+    job_type: str
     mode: str
     name: str
     id: str
@@ -460,7 +502,7 @@ def _git_metadata() -> dict[str, Any]:
     }
 
 
-TRACKING_INTEGRATION_VERSION = 2
+TRACKING_INTEGRATION_VERSION = 3
 
 
 def model_parameter_counts(model: Any) -> dict[str, int]:
@@ -541,21 +583,55 @@ def build_semantic_config(
         "split_seed",
     )
     preprocessing = task_contract.get("preprocessing")
-    if not isinstance(preprocessing, Mapping):
-        msg = "Semantic tracking config requires task preprocessing semantics."
+    physics_contract = task_contract.get("physics")
+    if not isinstance(preprocessing, Mapping) or not isinstance(physics_contract, Mapping):
+        msg = "Semantic tracking config requires task preprocessing and physics semantics."
         raise TypeError(msg)
 
     parameter_counts = model_parameter_counts(model)
     model_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", config["model"])))
-    physics_enabled = bool(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["physics"])["enabled"])
+    loss_config = cast("Mapping[str, Any]", config["loss"])
+    physics_config = cast("Mapping[str, Any]", loss_config["physics"])
+    derivative_config = physics_config.get("derivatives")
+    if not isinstance(derivative_config, Mapping):
+        msg = "Semantic tracking config requires physics derivative semantics."
+        raise TypeError(msg)
+    physics_enabled = bool(physics_config["enabled"])
+    loss_payload = {
+        "data": copy.deepcopy(dict(cast("Mapping[str, Any]", loss_config["data"]))),
+        "physics": copy.deepcopy(dict(physics_config)) if physics_enabled else {"enabled": False},
+    }
+    wandb_config = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["tracking"])["wandb"])
+    monitor_config = cast("Mapping[str, Any]", wandb_config["monitor"])
+    diagnostics_payload = {
+        "physics_monitor": {
+            "enabled": bool(monitor_config["enabled"]),
+            "role": "id",
+            "membership": "bounded_saved_evaluation_prefix",
+            "interval_epochs": int(monitor_config["interval"]),
+            "max_cases": int(monitor_config["max_cases"]),
+            "physics_kind": physics_contract.get("kind"),
+            "equation_set": physics_contract.get("equation_set"),
+            "continuity_forms": copy.deepcopy(physics_contract.get("allowed_continuities")),
+            "boundary": physics_contract.get("boundary"),
+            "derivatives": copy.deepcopy(dict(derivative_config)),
+            "interior_crop": int(physics_config["interior_crop"]),
+            "metric_ids": [source.removeprefix("physics/id/") for source in _PHYSICS_ID_SOURCE_KEYS],
+        }
+    }
     model_kind = str(model_payload["kind"])
     model_payload["variant"] = f"pi-{model_kind}" if physics_enabled else model_kind
     model_payload["parameter_counts"] = parameter_counts
     evaluation_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", config["evaluation"])))
+    training_config = cast("Mapping[str, Any]", config["training"])
     evaluation_payload["roles"] = {
         "selection": "id",
-        "diagnostic": "ood",
-        "cadence": "same_evaluation_interval",
+        "diagnostic": ["ood", "physics"],
+        "event_model": "completed_epoch_interval_or_terminal",
+        "id_interval_epochs": int(training_config["evaluation_interval"]),
+        "ood_interval_epochs": int(training_config["ood_evaluation_interval"]),
+        "physics_interval_epochs": int(monitor_config["interval"]),
+        "epoch_zero_evaluation": False,
     }
     source = _git_metadata()
     payload: dict[str, Any] = {
@@ -581,7 +657,8 @@ def build_semantic_config(
             },
         },
         "model": model_payload,
-        "loss": copy.deepcopy(dict(cast("Mapping[str, Any]", config["loss"]))),
+        "loss": loss_payload,
+        "diagnostics": diagnostics_payload,
         "evaluation": evaluation_payload,
         "optimizer": copy.deepcopy(dict(cast("Mapping[str, Any]", config["optimizer"]))),
         "scheduler": copy.deepcopy(config.get("scheduler")),
@@ -736,13 +813,9 @@ class WandbSession:
     semantic_config: Mapping[str, Any] = field(default_factory=dict)
     history_metric_definitions: tuple[HistoryMetricDefinition, ...] = ()
     state_updater: TrackingStateUpdater | None = None
-    monitor_evaluator: MonitorEvaluator | None = None
-    monitor_interval: int = 1
-    terminal_epoch: int = 1
     _last_logged_epoch: int | None = None
     _finished: bool = False
     _observer_failed: bool = False
-    _callback_failed: bool = False
     _failed_operation: str | None = None
     _uploaded_media: list[str] = field(default_factory=list)
 
@@ -750,6 +823,12 @@ class WandbSession:
     def enabled(self) -> bool:
         """Return whether this session owns an initialized SDK run."""
         return self._run is not None
+
+    @property
+    def url(self) -> str | None:
+        """Return the active W&B run URL when the SDK exposes one."""
+        value = getattr(self._run, "url", None)
+        return value if isinstance(value, str) and value else None
 
     @property
     def history_destination_by_source(self) -> dict[str, str]:
@@ -770,26 +849,6 @@ class WandbSession:
         msg = f"Requested {self.mode} W&B {operation} failed: {context['error_class']}: {context['error_message']}"
         return TrackingIOError(msg)
 
-    def _record_callback_failure(
-        self,
-        error: BaseException,
-        *,
-        operation: str,
-        owner: str,
-    ) -> None:
-        """Persist a non-I/O callback failure without changing its exception type."""
-        context = _safe_error(error)
-        self._callback_failed = True
-        self._failed_operation = operation
-        self._persist(
-            {
-                "status": "failed",
-                "failed_operation": operation,
-                "failure_owner": owner,
-                **context,
-            }
-        )
-
     def _run_operation(self, operation: str, action: Callable[[], None]) -> bool:
         """Apply one SDK mutation or fail the explicitly requested observer."""
         if self._run is None or self._finished:
@@ -804,6 +863,9 @@ class WandbSession:
         """Log one strictly increasing completed epoch with only approved keys."""
         if self._run is None or self._finished:
             return
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            msg = "W&B completed-epoch history requires an integer epoch >= 1."
+            raise TrackingError(msg)
         if self._last_logged_epoch is not None and epoch <= self._last_logged_epoch:
             msg = f"W&B completed-epoch history cannot rewrite epoch {epoch}; last successful epoch is {self._last_logged_epoch}."
             raise TrackingError(msg)
@@ -814,29 +876,6 @@ class WandbSession:
             destination = destination_by_source.get(key)
             if destination is not None:
                 payload[destination] = float(value)
-
-        should_monitor = self.monitor_evaluator is not None and (epoch % self.monitor_interval == 0 or epoch == self.terminal_epoch)
-        if should_monitor:
-            monitor_evaluator = cast("MonitorEvaluator", self.monitor_evaluator)
-            try:
-                monitor_values = monitor_evaluator()
-            except Exception as monitor_error:
-                self._record_callback_failure(
-                    monitor_error,
-                    operation="physics_monitor",
-                    owner="scientific_evaluation",
-                )
-                raise
-            unsupported = sorted(set(monitor_values).difference(_PHYSICS_ID_SOURCE_KEYS))
-            if unsupported:
-                unsupported_error = TrackingCallbackError(f"Physics monitor produced unsupported key(s): {unsupported}.")
-                self._record_callback_failure(
-                    unsupported_error,
-                    operation="physics_monitor",
-                    owner="callback_orchestration",
-                )
-                raise unsupported_error
-            payload.update({destination_by_source[key]: float(value) for key, value in monitor_values.items()})
 
         if self._run_operation(
             "history",
@@ -1003,7 +1042,7 @@ class WandbSession:
             "run/name": self.run_name,
             "objective/id": self.objective_id,
             "objective/direction": self.objective_direction,
-            "tracking/status": "failed" if self._observer_failed or self._callback_failed else "finished",
+            "tracking/status": "failed" if self._observer_failed else "finished",
             "tracking/mode": self.mode,
             "tracking/run_id": self.run_id,
         }
@@ -1041,13 +1080,19 @@ class WandbSession:
         if isinstance(tuning, Mapping):
             for source, target in (
                 ("study_name", "tuning/study_name"),
+                ("study_role", "tuning/study_role"),
                 ("trial_number", "tuning/trial_number"),
+                ("training_seed", "tuning/training_seed"),
+                ("sampler_seed", "tuning/sampler_seed"),
                 ("search_signature", "tuning/search_signature"),
                 ("sampled_parameters", "tuning/sampled_parameters"),
             ):
                 if source in tuning:
                     summary[target] = copy.deepcopy(tuning[source])
             summary["tuning/final_state"] = status
+            summary["Optuna/trial_number"] = tuning.get("trial_number")
+            summary["Optuna/state"] = status
+            summary["Optuna/pruned"] = status in {"pruned", "nonfinite_pruned", "oom_pruned"}
 
         if result is not None:
             for source, target in (
@@ -1058,6 +1103,8 @@ class WandbSession:
             ):
                 if source in result:
                     summary[target] = result[source]
+            if tuning is not None and "best_metric" in result:
+                summary["Optuna/objective"] = result["best_metric"]
             selected_metrics = result.get("selected_metrics")
             if isinstance(selected_metrics, Mapping):
                 summary.update({key: value for key, value in selected_metrics.items() if isinstance(key, str) and key.startswith("selected/")})
@@ -1075,6 +1122,11 @@ class WandbSession:
             ):
                 if source in local_summary:
                     summary[target] = local_summary[source]
+            if isinstance(tuning, Mapping):
+                if "elapsed_seconds" in local_summary:
+                    summary["Optuna/trial_duration_seconds"] = local_summary["elapsed_seconds"]
+                if "best_metric" in local_summary:
+                    summary["Optuna/objective"] = local_summary["best_metric"]
             checkpoint_digest = local_summary.get("best_checkpoint_sha256")
             if isinstance(checkpoint_digest, str):
                 summary["selected/checkpoint_sha256_short"] = checkpoint_digest[:16]
@@ -1120,8 +1172,20 @@ class WandbSession:
             self._finished = True
             raise self._operation_failure(failure, operation="finish") from failure
         self._finished = True
-        terminal_tracking_status = "failed" if self._observer_failed or self._callback_failed else "finished"
+        terminal_tracking_status = "failed" if self._observer_failed else "finished"
         self._persist({"status": terminal_tracking_status, "finished_at": _utc_now()})
+
+
+def _runtime_wandb_tags(settings: Mapping[str, Any], semantic_config: Mapping[str, Any] | None) -> list[str]:
+    """Add the explicit Optuna production/smoke role without repeating it in history."""
+    tags = list(cast("Sequence[str]", settings["tags"]))
+    if settings.get("workflow") != "optuna_trial" or not isinstance(semantic_config, Mapping):
+        return tags
+    tuning = semantic_config.get("tuning")
+    role = tuning.get("study_role") if isinstance(tuning, Mapping) else None
+    if role not in {"production", "smoke"}:
+        return tags
+    return [f"optuna-{role}" if tag == "optuna" else str(tag) for tag in tags]
 
 
 def initialize_wandb(
@@ -1133,7 +1197,6 @@ def initialize_wandb(
     persisted_run_id: str | None = None,
     previous_last_logged_epoch: int | None = None,
     state_updater: TrackingStateUpdater | None = None,
-    monitor_evaluator: MonitorEvaluator | None = None,
 ) -> WandbSession:
     """Initialize the configured W&B mode with strict identity and metric rules."""
     objective = cast("Mapping[str, Any]", config["evaluation"])["objective"]
@@ -1155,6 +1218,9 @@ def initialize_wandb(
     upload_settings = cast("Mapping[str, Any]", settings["upload"])
     monitor_settings = cast("Mapping[str, Any]", settings["monitor"])
     mode = str(settings["mode"])
+    workflow = str(settings["workflow"])
+    group = str(settings["study"]) if workflow == "optuna_trial" else None
+    runtime_tags = _runtime_wandb_tags(settings, semantic_config)
 
     if mode == "disabled":
         return WandbSession(
@@ -1190,7 +1256,9 @@ def initialize_wandb(
         "wandb_run_id": run_id,
         "project": settings["project"],
         "entity": settings["entity"],
-        "tags": list(cast("list[str]", settings["tags"])),
+        "tags": runtime_tags,
+        "group": group,
+        "job_type": workflow,
         "session_started_at": _utc_now(),
         "session_kind": "resume" if resume else "fresh",
         "status": "offline" if mode == "offline" else "active",
@@ -1229,8 +1297,9 @@ def initialize_wandb(
         tuple(str(metric["id"]) for metric in evaluation_metrics),
         physics_training_enabled=bool(physics_config["enabled"]),
         continuity=str(physics_config["continuity"]),
-        physics_monitor_enabled=monitor_evaluator is not None,
+        physics_monitor_enabled=bool(monitor_settings["enabled"]),
         cuda_enabled=cuda_enabled,
+        optuna_trial=workflow == "optuna_trial",
     )
 
     sdk_run: _WandbRun | None = None
@@ -1240,7 +1309,9 @@ def initialize_wandb(
             wandb.init(
                 project=str(settings["project"]),
                 entity=cast("str | None", settings["entity"]),
-                tags=None if resume and mode == "online" else list(cast("list[str]", settings["tags"])),
+                tags=None if resume and mode == "online" else runtime_tags,
+                group=group,
+                job_type=workflow,
                 mode=mode,
                 name=run_name,
                 id=run_id,
@@ -1254,7 +1325,7 @@ def initialize_wandb(
                 },
             )
         )
-        required_tags = tuple(cast("Sequence[str]", settings["tags"]))
+        required_tags = tuple(runtime_tags)
         existing_tags = tuple(str(tag) for tag in (sdk_run.tags or ()))
         merged_tags = (*existing_tags, *(tag for tag in required_tags if tag not in existing_tags))
         if merged_tags != existing_tags:
@@ -1303,9 +1374,6 @@ def initialize_wandb(
         semantic_config=copy.deepcopy(dict(semantic_config or {})),
         history_metric_definitions=history_definitions,
         state_updater=state_updater,
-        monitor_evaluator=monitor_evaluator,
-        monitor_interval=int(monitor_settings["interval"]),
-        terminal_epoch=int(cast("Mapping[str, Any]", config["training"])["epochs"]),
         _last_logged_epoch=previous_last_logged_epoch,
     )
 

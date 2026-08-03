@@ -227,8 +227,17 @@ def _config(epochs: int, *, direction: str = "minimize", evaluation_interval: in
     """Return the minimal resolved training contract used by loop tests."""
     return {
         "run": {"device": "cpu"},
-        "training": {"epochs": epochs, "evaluation_interval": evaluation_interval},
+        "training": {
+            "epochs": epochs,
+            "evaluation_interval": evaluation_interval,
+            "ood_evaluation_interval": evaluation_interval,
+        },
         "evaluation": {"objective": _objective(direction=direction)},
+        "tracking": {
+            "wandb": {
+                "monitor": {"enabled": False, "interval": evaluation_interval, "max_cases": 1},
+            }
+        },
     }
 
 
@@ -347,10 +356,17 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
     resumed_dir.mkdir()
 
     full_result, full_model, full_optimizer, full_scheduler, full_loss, full_loader = _run(full_dir, epochs=4, seed=151)
-    resume_observations: list[tuple[int, float]] = []
+    resume_observations: list[tuple[int, float, float, float]] = []
 
     def capture_resume_epoch(epoch: int, values: dict[str, float]) -> None:
-        resume_observations.append((epoch, values["system/epoch_duration_seconds"]))
+        resume_observations.append(
+            (
+                epoch,
+                values["system/epoch_duration_seconds"],
+                values["system/train_duration_seconds"],
+                values["system/train_samples_per_second"],
+            )
+        )
 
     _run(
         resumed_dir,
@@ -366,8 +382,12 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
         epoch_end_callback=capture_resume_epoch,
     )
 
-    assert [epoch for epoch, _duration in resume_observations] == [1, 2, 3, 4]
-    assert all(math.isfinite(duration) and duration > 0.0 for _epoch, duration in resume_observations)
+    assert [epoch for epoch, _epoch_duration, _train_duration, _throughput in resume_observations] == [1, 2, 3, 4]
+    assert all(
+        math.isfinite(value) and value > 0.0
+        for _epoch, epoch_duration, train_duration, throughput in resume_observations
+        for value in (epoch_duration, train_duration, throughput)
+    )
     assert resumed_result == full_result | {
         "checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "best_checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
@@ -702,8 +722,9 @@ def test_non_finite_objective_never_creates_a_loadable_best(tmp_path: Path) -> N
         learning.training.loop.train_loop(
             config={
                 "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1},
+                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
                 "evaluation": {"objective": _objective()},
+                "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
             },
             device=torch.device("cpu"),
             model=model,
@@ -909,6 +930,83 @@ def test_completed_epoch_callback_preserves_evaluation_cadence(
     assert [entry["epoch"] for entry in result["objective_history"]] == [2, 3]
 
 
+def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compute each due phase once and forward all results in one epoch payload."""
+    run_dir = tmp_path / "independent-cadences"
+    run_dir.mkdir()
+    model, optimizer, scheduler, loss, train_loader, eval_loader = _components(101)
+    ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
+    config = _config(6, evaluation_interval=2)
+    config["training"]["ood_evaluation_interval"] = 3
+    config["tracking"]["wandb"]["monitor"] = {
+        "enabled": True,
+        "interval": 4,
+        "max_cases": 2,
+    }
+    id_epochs: list[int] = []
+    ood_epochs: list[int] = []
+    physics_calls = 0
+    active_epoch = 0
+    observed: dict[int, dict[str, float]] = {}
+
+    def record_eval(
+        _model: nn.Module,
+        loader: DataLoader[Any],
+        _metrics: dict[str, Any],
+        _device: torch.device,
+        _processor: Any,
+    ) -> dict[str, float]:
+        target = id_epochs if loader is eval_loader else ood_epochs
+        target.append(active_epoch)
+        return {"mse": float(active_epoch)}
+
+    def record_physics(*_args: Any, **_kwargs: Any) -> dict[str, float]:
+        nonlocal physics_calls
+        physics_calls += 1
+        return {
+            "physics/id/momentum_residual_mse": float(physics_calls),
+            "physics/id/continuity_div_velocity_mse": 2.0,
+            "physics/id/continuity_div_eps_velocity_mse": 3.0,
+            "physics/id/pressure_boundary_mse": 4.0,
+        }
+
+    def capture(epoch: int, values: dict[str, float]) -> None:
+        nonlocal active_epoch
+        active_epoch = epoch + 1
+        observed[epoch] = dict(values)
+
+    active_epoch = 1
+    monkeypatch.setattr(learning.training.loop, "eval_one_epoch", record_eval)
+    monkeypatch.setattr(learning.training.loop, "evaluate_physics_monitor", record_physics)
+    learning.training.loop.train_loop(
+        config=config,
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        ood_loader=ood_loader,
+        train_loss=loss,
+        eval_metrics={"mse": _DatasetMSE()},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        epoch_end_callback=capture,
+        checkpoint_identity=_identity("independent-cadences"),
+    )
+
+    assert id_epochs == [2, 4, 6]
+    assert ood_epochs == [3, 6]
+    assert physics_calls == 2
+    assert [epoch for epoch, payload in observed.items() if "id/mse" in payload] == [2, 4, 6]
+    assert [epoch for epoch, payload in observed.items() if "ood/mse" in payload] == [3, 6]
+    assert [epoch for epoch, payload in observed.items() if "physics/id/momentum_residual_mse" in payload] == [4, 6]
+    assert observed[4]["physics/id/momentum_residual_mse"] == 1.0
+    assert observed[6]["physics/id/momentum_residual_mse"] == 2.0
+
+
 def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) -> None:
     """Evaluate ID then OOD while retaining ID as the sole objective source."""
     run_dir = tmp_path / "id-ood-selection"
@@ -1087,6 +1185,74 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     assert "selected/training/boundary_weight" not in settled_metrics
 
 
+def test_training_timer_excludes_post_training_epoch_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exclude evaluation, monitoring, checkpoints, and W&B from train duration."""
+    run_dir = tmp_path / "timing-boundary"
+    run_dir.mkdir()
+    model, optimizer, scheduler, loss, train_loader, eval_loader = _components(91)
+    events: list[str] = []
+    ticks = iter(float(value) for value in range(8))
+    observed: dict[str, float] = {}
+    real_eval = learning.training.loop.eval_one_epoch
+    real_save = learning.training.checkpoint.save_checkpoint
+    real_scheduler_step = type(scheduler).step
+
+    def clock() -> float:
+        events.append("clock")
+        return next(ticks)
+
+    def record_eval(*args: Any, **kwargs: Any) -> dict[str, float]:
+        events.append("evaluation")
+        return real_eval(*args, **kwargs)
+
+    def record_scheduler(instance: Any, value: float) -> None:
+        events.append("scheduler")
+        real_scheduler_step(instance, value)
+
+    def record_checkpoint(payload: dict[str, Any], path: Path | str) -> None:
+        events.append("checkpoint")
+        real_save(payload, path)
+
+    def record_epoch(_epoch: int, metrics: dict[str, float]) -> None:
+        events.extend(("physics_monitor", "wandb_logging"))
+        observed.update(metrics)
+
+    monkeypatch.setattr(learning.training.loop.time, "perf_counter", clock)
+    monkeypatch.setattr(learning.training.loop, "eval_one_epoch", record_eval)
+    monkeypatch.setattr(type(scheduler), "step", record_scheduler)
+    monkeypatch.setattr(learning.training.checkpoint, "save_checkpoint", record_checkpoint)
+
+    learning.training.loop.train_loop(
+        config=_config(1, evaluation_interval=1),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=loss,
+        eval_metrics={"mse": _DatasetMSE()},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        epoch_end_callback=record_epoch,
+        checkpoint_identity=_identity("timing-boundary"),
+    )
+
+    clock_positions = [index for index, event in enumerate(events) if event == "clock"]
+    assert len(clock_positions) == 8
+    train_stop = clock_positions[3]
+    epoch_stop = clock_positions[6]
+    assert all(events.index(event) > train_stop for event in ("evaluation", "scheduler", "checkpoint"))
+    assert all(events.index(event) > epoch_stop for event in ("physics_monitor", "wandb_logging"))
+    assert events.index("checkpoint") < epoch_stop
+    assert observed["system/train_duration_seconds"] == 1.0
+    assert observed["system/train_samples_per_second"] == 12.0
+    assert observed["system/epoch_duration_seconds"] == 5.0
+    assert observed["system/session_elapsed_seconds"] == 7.0
+
+
 def test_final_epoch_is_evaluated_when_interval_is_larger(tmp_path: Path) -> None:
     """
     Train one epoch with a nominal evaluation interval larger than total duration.
@@ -1099,8 +1265,9 @@ def test_final_epoch_is_evaluated_when_interval_is_larger(tmp_path: Path) -> Non
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(12)
     config = {
         "run": {"device": "cpu"},
-        "training": {"epochs": 1, "evaluation_interval": 5},
+        "training": {"epochs": 1, "evaluation_interval": 5, "ood_evaluation_interval": 5},
         "evaluation": {"objective": _objective()},
+        "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 5, "max_cases": 1}}},
     }
 
     result = learning.training.loop.train_loop(
@@ -1148,8 +1315,9 @@ def test_missing_best_prevents_successful_loop_completion(
         learning.training.loop.train_loop(
             config={
                 "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1},
+                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
                 "evaluation": {"objective": _objective()},
+                "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
             },
             device=torch.device("cpu"),
             model=model,

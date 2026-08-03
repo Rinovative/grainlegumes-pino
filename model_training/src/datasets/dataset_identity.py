@@ -1,8 +1,24 @@
 """
-Define and validate the single current training-dataset identity contract.
+===============================================================================
+dataset_identity.py
+===============================================================================
+Define and verify persisted final-dataset and split identity contracts.
 
-The persisted format is deliberately limited to one final, task-aware dataset.
-The direct builder computes case fingerprints in memory before publication.
+Responsibilities:
+  - Validate the single current task-aware training-dataset schema
+  - Compute stable case, dataset, and split-membership fingerprints
+  - Bind persisted tensors and ordered sample identities to task contracts
+
+Design principles:
+  - Identity is content-addressed, deterministic, and fail-closed
+  - Fingerprints are computed before publication and verified on consumption
+  - Ordered membership remains distinct from dataset-level content identity
+
+This module does NOT:
+  - Load final datasets into model-ready samples; ``dataset_simulation`` owns that
+  - Choose training/evaluation ratios or random seeds; experiment services own them
+  - Publish dataset files; the generation-domain builder owns publication
+===============================================================================
 """
 
 from __future__ import annotations
@@ -16,12 +32,11 @@ from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import torch
-from torch import Tensor
-
 from src import domain
 
 if TYPE_CHECKING:
+    from torch import Tensor
+
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 TRAINING_DATASET_SCHEMA_VERSION = 1
@@ -141,6 +156,8 @@ def _tensor_dtype(tensor: Tensor) -> str:
 
 
 def _update_tensor_hash(hasher: Any, tensor: Tensor) -> None:
+    import torch  # noqa: PLC0415
+
     contiguous = tensor.detach().cpu()
     if not contiguous.is_contiguous():
         contiguous = contiguous.contiguous()
@@ -484,7 +501,9 @@ def build_generated_batch_identity(
 
 
 def _require_tensor(value: Any, *, label: str, rank: int) -> Tensor:
-    if not isinstance(value, Tensor):
+    import torch  # noqa: PLC0415
+
+    if not isinstance(value, torch.Tensor):
         msg = f"{label} must be a torch.Tensor."
         raise TypeError(msg)
     tensor = value

@@ -1,4 +1,26 @@
-"""Validate self-contained model-training metadata snapshots."""
+"""
+===============================================================================
+dataset_metadata.py
+===============================================================================
+Validate and summarize self-contained model-training metadata packages.
+
+Responsibilities:
+  - Validate immutable metadata, source-manifest, sampling, and timing snapshots
+  - Bind metadata scientific identity to validated final-dataset identity
+  - Verify optional final-artifact path, size, and complete-file digest
+  - Provide one typed metadata-only summary for planning and notebook previews
+
+Design principles:
+  - Scientific metadata admission is strict, task-bound, and generation-independent
+  - Metadata-only summaries never deserialize the multi-gigabyte tensor payload
+  - Complete artifact hashing remains explicit at full admission boundaries
+
+This module does NOT:
+  - Construct final datasets or derive their tensor fingerprints
+  - Create splits, normalizers, dataloaders, runs, checkpoints, or artifacts
+  - Treat an absent final tensor payload as invalid for metadata-only preview
+===============================================================================
+"""
 
 from __future__ import annotations
 
@@ -12,16 +34,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from src import common, domain
-from src.datasets.dataset_identity import TRAINING_DATASET_SCHEMA_VERSION, build_generated_batch_identity
-
-if TYPE_CHECKING:
-    from src.datasets.dataset_identity import DatasetIdentity
+from src.datasets.dataset_identity import TRAINING_DATASET_SCHEMA_VERSION, DatasetIdentity, build_generated_batch_identity
 
 METADATA_FILENAME = "dataset_metadata.json"
 SOURCE_MANIFEST_FILENAME = "source_manifest.json"
@@ -134,6 +153,24 @@ class DatasetMetadata:
     def timing_summary(self) -> dict[str, Any]:
         """Return the validated optional COMSOL timing coverage summary."""
         return dict(self.metadata["operational_provenance"]["timing"])
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetMetadataSummary:
+    """Describe one validated metadata package without loading tensor content."""
+
+    dataset_id: str
+    dataset_path: Path
+    metadata_directory: Path
+    dataset_exists: bool
+    task_id: str
+    task_contract_digest: str
+    fingerprint: str
+    sample_ids: tuple[str, ...]
+    sample_count: int
+    spatial_shape: tuple[int, ...]
+    generated_batch_identity_sha256: str
+    artifact_size_bytes: int
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -1025,4 +1062,102 @@ def load_dataset_metadata(
         directory,
         dataset_identity=dataset_identity,
         dataset_path=dataset_path,
+    )
+
+
+def load_dataset_metadata_summary(
+    dataset_id: str,
+    *,
+    task: domain.tasks.spec.TaskSpec,
+    dataset_root: Path | str | None = None,
+    metadata_root: Path | str | None = None,
+) -> DatasetMetadataSummary:
+    """
+    Validate and summarize one compact metadata package without loading tensors.
+
+    An absent final dataset is represented by dataset_exists=False so planning
+    and notebook previews remain useful before data is mounted. When the artifact
+    exists, its regular-file status, filename, and size must match the package.
+    Complete-file hashing remains owned by load_dataset_metadata when a caller
+    supplies dataset_path.
+    """
+    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
+    directory = common.paths.resolve_dataset_metadata_dir(logical_id, metadata_root=metadata_root)
+    dataset_path = common.paths.resolve_dataset_path(logical_id, dataset_root=dataset_root)
+
+    metadata_document = _load_json(directory / METADATA_FILENAME, label="dataset metadata")
+    scientific = metadata_document.get("scientific_identity")
+    if not isinstance(scientific, dict):
+        msg = "Dataset metadata scientific_identity must be a mapping."
+        raise TypeError(msg)
+    manifest_document = _load_json(directory / SOURCE_MANIFEST_FILENAME, label="source manifest snapshot")
+    raw_sample_ids = manifest_document.get("intended_case_ids")
+    if not isinstance(raw_sample_ids, list) or not all(isinstance(value, str) and value for value in raw_sample_ids):
+        msg = "Source manifest intended_case_ids must contain non-empty strings."
+        raise TypeError(msg)
+
+    task_id = scientific.get("task_id")
+    if task_id != task.id:
+        msg = f"Dataset metadata for {logical_id!r} does not match TaskSpec {task.id!r}."
+        raise ValueError(msg)
+    task_contract_digest = _require_sha256(
+        scientific.get("task_contract_digest"),
+        label="Dataset metadata task_contract_digest",
+    )
+    if task_contract_digest != task.contract_digest:
+        msg = f"Dataset metadata for {logical_id!r} does not match TaskSpec {task.id!r}."
+        raise ValueError(msg)
+
+    fingerprint = _require_sha256(
+        scientific.get("dataset_fingerprint"),
+        label="Dataset metadata dataset_fingerprint",
+    )
+    generated_digest = _require_sha256(
+        scientific.get("generated_batch_identity_sha256"),
+        label="Dataset metadata generated_batch_identity_sha256",
+    )
+    sample_count = _require_positive_int(
+        scientific.get("sample_count"),
+        label="Dataset metadata sample_count",
+    )
+    spatial_shape = tuple(
+        _require_spatial_shape(
+            scientific.get("spatial_shape"),
+            label="Dataset metadata spatial_shape",
+        )
+    )
+    identity = DatasetIdentity(
+        dataset_id=logical_id,
+        task=task.id,
+        task_contract_digest=task.contract_digest,
+        fingerprint=fingerprint,
+        sample_ids=tuple(raw_sample_ids),
+        sample_count=sample_count,
+        spatial_shape=spatial_shape,
+        generated_batch_identity_sha256=generated_digest,
+    )
+    package = validate_dataset_metadata_directory(directory, dataset_identity=identity)
+    artifact = package.metadata["artifacts"]["dataset"]
+
+    if dataset_path.exists() and (not dataset_path.is_file() or dataset_path.is_symlink()):
+        msg = f"Final dataset artifact is not a regular file: {dataset_path}"
+        raise FileNotFoundError(msg)
+    dataset_exists = dataset_path.is_file() and not dataset_path.is_symlink()
+    if dataset_exists and (dataset_path.name != artifact["filename"] or dataset_path.stat().st_size != artifact["size_bytes"]):
+        msg = "Configured training dataset name or size does not match its metadata package."
+        raise ValueError(msg)
+
+    return DatasetMetadataSummary(
+        dataset_id=identity.dataset_id,
+        dataset_path=dataset_path,
+        metadata_directory=directory,
+        dataset_exists=dataset_exists,
+        task_id=identity.task,
+        task_contract_digest=identity.task_contract_digest,
+        fingerprint=identity.fingerprint,
+        sample_ids=identity.sample_ids,
+        sample_count=identity.sample_count,
+        spatial_shape=identity.spatial_shape,
+        generated_batch_identity_sha256=generated_digest,
+        artifact_size_bytes=int(artifact["size_bytes"]),
     )

@@ -52,11 +52,7 @@ def test_steady_flow_contract_is_exact_and_task_owned() -> None:
         "physical_rmse_u",
         "physical_rmse_v",
     ]
-    assert task.default_objective.kind == "macro_rmse"
-    assert task.default_objective.space == "normalized"
-    assert task.default_objective.fields == task.output_names
-    assert task.default_objective.reduction == "field_macro_element_mean"
-    assert task.default_objective.direction == "minimize"
+    assert not hasattr(task, "default_objective")
     assert {field.name: field.unit for field in (*task.inputs, *task.outputs)} == {
         "x": "m",
         "y": "m",

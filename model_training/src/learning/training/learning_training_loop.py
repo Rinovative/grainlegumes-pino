@@ -5,7 +5,8 @@ learning_training_loop.py
 Run the custom training and evaluation loop with checkpoint support.
 
 Responsibilities:
-  - Execute training and evaluation epochs
+  - Execute completed training, ID, OOD, and bounded physics events
+  - Use one terminal-inclusive predicate with independently resolved phase intervals
   - Consume the resolved semantic objective for scheduler and best-metric updates
   - Manage checkpoints, histories, and reproducibility state
   - Track histories, RNG state and optional mixed precision
@@ -27,7 +28,8 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -38,6 +40,7 @@ from torch.amp.grad_scaler import GradScaler
 from src import common
 
 from . import learning_training_checkpoint as checkpoints
+from . import learning_training_events as training_events
 
 if TYPE_CHECKING:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -50,6 +53,35 @@ EpochEndCallback = Callable[[int, dict[str, float]], None]
 
 class PhysicsMonitorEvaluationError(RuntimeError):
     """Identify a failure owned by bounded scientific physics evaluation."""
+
+
+def _synchronize_device(device: torch.device) -> None:
+    """Synchronize CUDA only where wall-clock phase timing requires it."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _loader_case_count(loader: Any) -> int:
+    """Return the concrete loader membership size when available."""
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        return 0
+    try:
+        return len(dataset)
+    except TypeError:
+        return 0
+
+
+@contextmanager
+def _training_phase(name: str, completed_epoch: int) -> Iterator[None]:
+    """Annotate failures with the active completed-epoch lifecycle phase."""
+    try:
+        yield
+    except BaseException as error:
+        with suppress(Exception):
+            error.training_phase = name  # type: ignore[attr-defined]
+            error.completed_epoch = completed_epoch  # type: ignore[attr-defined]
+        raise
 
 
 def _move_batch_to_device(batch: Any, device: torch.device) -> TensorBatch:
@@ -105,6 +137,24 @@ def _require_finite_training_loss(loss: torch.Tensor) -> None:
         raise FloatingPointError(msg)
 
 
+def _training_batch_size(batch: TensorBatch) -> int:
+    """Return the unambiguous positive sample dimension of one prepared batch."""
+    x = batch["x"]
+    y = batch["y"]
+    if x.ndim == 0 or y.ndim == 0:
+        msg = "Training batch tensors must expose a leading sample dimension."
+        raise ValueError(msg)
+    x_samples = int(x.shape[0])
+    y_samples = int(y.shape[0])
+    if x_samples != y_samples:
+        msg = f"Training batch sample dimensions disagree: x={x_samples}, y={y_samples}."
+        raise ValueError(msg)
+    if y_samples <= 0:
+        msg = "Training batches must contain at least one sample."
+        raise ValueError(msg)
+    return y_samples
+
+
 def train_one_epoch(
     model: nn.Module,
     train_loader: DataLoader,
@@ -119,9 +169,13 @@ def train_one_epoch(
     Execute one training epoch and sample-weight every named loss component.
 
     Batch means are multiplied by their actual sample counts before epoch
-    reduction. Supervised runs publish only total/data loss; physics-informed
-    runs additionally publish momentum, boundary, one formulation-qualified
-    continuity contribution, applied weights, and warmup fractions.
+    reduction. Training duration covers dataloader waiting through final batch
+    bookkeeping and optimizer work, while complete epoch duration remains a
+    separate outer lifecycle metric. Throughput is actual processed samples
+    divided by this training-phase duration; batch size remains relevant context.
+    Supervised runs publish only total/data loss; physics-informed runs additionally
+    publish momentum, boundary, one formulation-qualified continuity contribution,
+    applied weights, and warmup fractions.
 
     Parameters
     ----------
@@ -170,8 +224,12 @@ def train_one_epoch(
     sample_count = 0
     optimizer_steps = 0
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    train_started = time.perf_counter()
     for raw_batch in train_loader:
         batch = _prepare_batch(raw_batch, device, data_processor, training=True)
+        batch_samples = _training_batch_size(batch)
         optimizer.zero_grad()
 
         if use_amp and scaler is not None:
@@ -192,7 +250,6 @@ def train_one_epoch(
             optimizer.step()
             optimizer_steps += 1
 
-        batch_samples = int(batch["y"].shape[0])
         raw_components = getattr(loss_fn, "last_components", {})
         components = (
             dict(raw_components) if isinstance(raw_components, Mapping) and raw_components else {"total": loss.detach(), "data": loss.detach()}
@@ -204,14 +261,26 @@ def train_one_epoch(
             component_sums[name] = component_sums.get(name, 0.0) + float(value.item()) * batch_samples
         sample_count += batch_samples
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    train_duration = time.perf_counter() - train_started
     if sample_count == 0:
         msg = "Training loader produced no samples."
+        raise RuntimeError(msg)
+    if not math.isfinite(train_duration) or train_duration <= 0.0:
+        msg = f"Training phase has invalid duration {train_duration}."
+        raise RuntimeError(msg)
+    train_samples_per_second = sample_count / train_duration
+    if not math.isfinite(train_samples_per_second) or train_samples_per_second <= 0.0:
+        msg = f"Training phase has invalid throughput {train_samples_per_second}."
         raise RuntimeError(msg)
 
     averaged = {name: value / sample_count for name, value in component_sums.items()}
     result = {
         "train/loss_total": averaged["total"],
         "train/loss_data": averaged.get("data", averaged["total"]),
+        "system/train_duration_seconds": train_duration,
+        "system/train_samples_per_second": train_samples_per_second,
         "optimizer_steps": float(optimizer_steps),
     }
     if bool(getattr(loss_fn, "physics_enabled", False)):
@@ -319,7 +388,7 @@ def evaluate_physics_monitor(
     was_training = model.training
     model.eval()
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             for raw_batch in eval_loader:
                 if not isinstance(raw_batch, Mapping):
                     msg = f"Expected monitor batch mapping, got {type(raw_batch).__name__}."
@@ -574,7 +643,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         Already constructed runtime components. Fresh-run seeding must occur
         before their construction.
     ood_loader : torch.utils.data.DataLoader | None, optional
-        Saved OOD membership evaluated at the same cadence for diagnostics only.
+        Saved OOD membership evaluated at its resolved diagnostic cadence only.
     data_processor : Any | None, optional
         Saved/fitted normalization processor.
     scheduler : ReduceLROnPlateau | None, optional
@@ -587,7 +656,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         Exact ``last_checkpoint.pt`` continuation source.
     epoch_end_callback : Callable | None, optional
         Callback invoked after every completed epoch is safely checkpointed.
-        Evaluation metrics are present only on ordinary evaluation events.
+        ID, OOD, and physics values are present only when their shared predicate
+        is due under each phase's independently resolved interval.
     checkpoint_identity : Mapping[str, Any] | None, optional
         Immutable task/config/dataset/split/objective identity.
     scaler : Any | None, optional
@@ -628,12 +698,22 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
 
     n_epochs = int(config["training"]["epochs"])
     eval_interval = int(config["training"]["evaluation_interval"])
+    ood_eval_interval = int(config["training"]["ood_evaluation_interval"])
+    monitor_settings = config["tracking"]["wandb"]["monitor"]
+    physics_monitor_enabled = bool(monitor_settings["enabled"])
+    physics_monitor_interval = int(monitor_settings["interval"])
+    physics_monitor_max_cases = int(monitor_settings["max_cases"])
     if n_epochs <= 0:
         msg = f"training.epochs must be positive, got: {n_epochs}"
         raise ValueError(msg)
-    if eval_interval <= 0:
-        msg = f"training.evaluation_interval must be positive, got: {eval_interval}"
-        raise ValueError(msg)
+    for label, interval in (
+        ("training.evaluation_interval", eval_interval),
+        ("training.ood_evaluation_interval", ood_eval_interval),
+        ("tracking.wandb.monitor.interval", physics_monitor_interval),
+    ):
+        if interval <= 0:
+            msg = f"{label} must be positive, got: {interval}"
+            raise ValueError(msg)
     objective = config["evaluation"]["objective"]
     objective_id = str(objective["id"])
     objective_direction = str(objective["direction"])
@@ -699,6 +779,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
 
     best_path = common.paths.resolve_best_checkpoint_file(run_dir)
     last_path = common.paths.resolve_last_checkpoint_file(run_dir)
+    session_started = time.perf_counter()
 
     for epoch_index in range(start_epoch_index, n_epochs):
         completed_epoch = epoch_index + 1
@@ -714,27 +795,48 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         if callable(set_epoch):
             set_epoch(epoch_index)
 
-        train_metrics = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            train_loss,
-            device,
-            data_processor,
-            scaler,
-            amp_enabled,
-        )
+        with _training_phase("training_epoch", completed_epoch):
+            train_metrics = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                train_loss,
+                device,
+                data_processor,
+                scaler,
+                amp_enabled,
+            )
         optimizer_steps = int(train_metrics.pop("optimizer_steps"))
         global_step += optimizer_steps
 
         evaluated: dict[str, float] = {}
         id_metrics: dict[str, float] = {}
         ood_metrics: dict[str, float] = {}
-        should_evaluate = completed_epoch % eval_interval == 0 or completed_epoch == n_epochs
-        if should_evaluate:
-            id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
-            if ood_loader is not None:
-                ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+        current_metric: float | None = None
+        should_evaluate_id = training_events.is_completed_epoch_event(
+            completed_epoch,
+            interval=eval_interval,
+            target_epoch=n_epochs,
+        )
+        should_evaluate_ood = ood_loader is not None and training_events.is_completed_epoch_event(
+            completed_epoch,
+            interval=ood_eval_interval,
+            target_epoch=n_epochs,
+        )
+        should_monitor_physics = physics_monitor_enabled and training_events.is_completed_epoch_event(
+            completed_epoch,
+            interval=physics_monitor_interval,
+            target_epoch=n_epochs,
+        )
+
+        if should_evaluate_id:
+            _synchronize_device(device)
+            id_started = time.perf_counter()
+            with _training_phase("id_evaluation", completed_epoch):
+                id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
+            _synchronize_device(device)
+            evaluated["system/id_evaluation_duration_seconds"] = time.perf_counter() - id_started
+            evaluated["system/id_evaluation_case_count"] = float(_loader_case_count(eval_loader))
             current_metric = id_metrics.get(objective_id)
             if current_metric is None:
                 msg = f"Configured evaluation objective {objective_id!r} was not produced by ID evaluation metrics."
@@ -744,10 +846,6 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                 msg = f"ID evaluation objective {objective_id!r} is non-finite at epoch {completed_epoch}: {current_metric}."
                 raise FloatingPointError(msg)
             evaluated.update({f"id/{name}": value for name, value in id_metrics.items()})
-            evaluated.update({f"ood/{name}": value for name, value in ood_metrics.items()})
-            ood_objective = ood_metrics.get(objective_id)
-            if ood_objective is not None:
-                evaluated["generalization/objective_gap"] = float(ood_objective) - current_metric
             objective_history.append(
                 {
                     "epoch": completed_epoch,
@@ -757,9 +855,19 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             )
 
             if scheduler is not None:
-                scheduler.step(current_metric)
+                old_learning_rate = float(optimizer.param_groups[0]["lr"])
+                with _training_phase("scheduler_update", completed_epoch):
+                    scheduler.step(current_metric)
+                new_learning_rate = float(optimizer.param_groups[0]["lr"])
+                if new_learning_rate != old_learning_rate:
+                    evaluated["optimization/scheduler_old_learning_rate"] = old_learning_rate
+                    evaluated["optimization/scheduler_new_learning_rate"] = new_learning_rate
 
+            previous_best = best_metric
             is_better = best_metric is None or (current_metric < best_metric if objective_direction == "minimize" else current_metric > best_metric)
+            evaluated["checkpoint/new_best"] = float(is_better)
+            if previous_best is not None:
+                evaluated["checkpoint/previous_best_objective"] = float(previous_best)
             if is_better:
                 best_metric = current_metric
                 best_epoch = completed_epoch
@@ -780,7 +888,38 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                     train_loader=train_loader,
                     runtime_device=device,
                 )
-                checkpoints.save_checkpoint(best_payload, best_path)
+                with _training_phase("best_checkpoint", completed_epoch):
+                    checkpoints.save_checkpoint(best_payload, best_path)
+
+        if should_evaluate_ood and ood_loader is not None:
+            _synchronize_device(device)
+            ood_started = time.perf_counter()
+            with _training_phase("ood_evaluation", completed_epoch):
+                ood_metrics = eval_one_epoch(model, ood_loader, eval_metrics, device, data_processor)
+            _synchronize_device(device)
+            evaluated["system/ood_evaluation_duration_seconds"] = time.perf_counter() - ood_started
+            evaluated["system/ood_evaluation_case_count"] = float(_loader_case_count(ood_loader))
+            evaluated.update({f"ood/{name}": value for name, value in ood_metrics.items()})
+            ood_objective = ood_metrics.get(objective_id)
+            if ood_objective is not None and current_metric is not None:
+                evaluated["generalization/objective_gap"] = float(ood_objective) - current_metric
+
+        if should_monitor_physics:
+            _synchronize_device(device)
+            physics_started = time.perf_counter()
+            with _training_phase("physics_monitor", completed_epoch):
+                physics_metrics = evaluate_physics_monitor(
+                    model,
+                    eval_loader,
+                    train_loss,
+                    device,
+                    data_processor,
+                    max_cases=physics_monitor_max_cases,
+                )
+            _synchronize_device(device)
+            evaluated.update(physics_metrics)
+            evaluated["system/physics_monitor_duration_seconds"] = time.perf_counter() - physics_started
+            evaluated["system/physics_monitor_case_count"] = float(min(physics_monitor_max_cases, _loader_case_count(eval_loader)))
 
         last_payload = checkpoints.make_checkpoint(
             role="last",
@@ -799,7 +938,9 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             train_loader=train_loader,
             runtime_device=device,
         )
-        checkpoints.save_checkpoint(last_payload, last_path)
+        with _training_phase("last_checkpoint", completed_epoch):
+            checkpoints.save_checkpoint(last_payload, last_path)
+        evaluated["checkpoint/last_published"] = 1.0
 
         train_metrics["global_step"] = float(global_step)
         train_metrics["optimization/learning_rate"] = epoch_learning_rate
@@ -808,16 +949,19 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             msg = f"Completed epoch {completed_epoch} has invalid duration {epoch_duration}."
             raise RuntimeError(msg)
         train_metrics["system/epoch_duration_seconds"] = epoch_duration
+        elapsed = time.perf_counter() - session_started
+        train_metrics["system/session_elapsed_seconds"] = elapsed
+        epochs_this_session = completed_epoch - start_epoch_index
+        remaining_epochs = n_epochs - completed_epoch
+        if epochs_this_session > 0:
+            train_metrics["system/estimated_remaining_seconds"] = elapsed / epochs_this_session * remaining_epochs
         if device.type == "cuda":
             train_metrics["system/cuda_peak_memory_allocated_bytes"] = float(torch.cuda.max_memory_allocated(device))
 
         terminal_epoch_metrics = {**train_metrics, **evaluated}
         if epoch_end_callback is not None:
-            epoch_end_callback(completed_epoch, terminal_epoch_metrics)
-        if should_evaluate and (completed_epoch % (eval_interval * 10) == 0 or completed_epoch in {1, n_epochs}):
-            print(
-                f"Epoch {completed_epoch:3d} | train_loss: {train_metrics['train/loss_total']:.4f} | {objective_id}: {id_metrics[objective_id]:.4f}"
-            )
+            with _training_phase("epoch_observers", completed_epoch):
+                epoch_end_callback(completed_epoch, terminal_epoch_metrics)
 
     if best_metric is None or best_epoch is None:
         msg = "Training produced no finite objective and cannot be marked completed."

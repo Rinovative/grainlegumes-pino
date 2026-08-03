@@ -1,0 +1,170 @@
+study:
+  name: steady_flow_piuno_search_v2
+  role: production
+  seed: 9
+  n_trials: 30
+  sampler:
+    kind: tpe
+    multivariate: false
+  pruner:
+    kind: median
+    n_startup_trials: 5
+    n_warmup_steps: 25
+    interval_steps: 5
+
+experiment:
+  task: steady_flow
+
+  run:
+    seed: 9
+    deterministic: false
+    device: auto
+    suffix: optuna
+
+  data:
+    train_dataset: lhs_var80_seed3001
+    ood_datasets:
+      - lhs_var120_seed4001
+    batch_size: 32
+    num_workers: 0
+    pin_memory: true
+    persistent_workers: false
+
+  model:
+    kind: uno
+    params:
+      modes_x: 64
+      modes_y: 64
+      hidden_channels: 32
+      n_layers: 5
+      mode_ratio: 0.5
+
+  loss:
+    data:
+      kind: relative_h1
+      space: normalized
+      weight: 1.0
+    physics:
+      enabled: true
+      continuity: div_eps_velocity
+      derivatives:
+        kind: spectral
+        extension: reflect
+      interior_crop: 2
+      residual_weight:
+        target: 0.0001
+        warmup:
+          kind: linear
+          epochs: 50
+      boundary_weight:
+        target: 0.0005
+        warmup:
+          kind: linear
+          epochs: 50
+
+  evaluation:
+    objective:
+      id: normalized_macro_rmse
+
+  optimizer:
+    kind: adamw
+    lr: 0.0003883614530748613
+    weight_decay: 0.0001
+
+  scheduler:
+    kind: reduce_on_plateau
+    factor: 0.5
+    patience: 20
+
+  training:
+    epochs: 400
+    evaluation_interval: 5
+    ood_evaluation_interval: 5
+    mixed_precision: false
+
+  tracking:
+    wandb:
+      mode: online
+      workflow: optuna_trial
+      monitor:
+        interval: 5
+
+search_space:
+  model.params.modes_x:
+    name: modes_x
+    kind: categorical
+    values:
+    - 32
+    - 48
+    - 64
+  model.params.modes_y:
+    name: modes_y
+    kind: categorical
+    values:
+    - 32
+    - 48
+    - 64
+  model.params.hidden_channels:
+    name: hidden_channels
+    kind: categorical
+    values:
+    - 16
+    - 32
+  model.params.n_layers:
+    name: n_layers
+    kind: categorical
+    values:
+    - 5
+    - 7
+  model.params.mode_ratio:
+    name: mode_ratio
+    kind: categorical
+    values:
+    - 0.4
+    - 0.5
+    - 0.6
+  optimizer.lr:
+    name: lr
+    kind: float
+    low: 0.0001
+    high: 0.003
+    log: true
+  data.batch_size:
+    name: batch_size
+    kind: categorical
+    values:
+    - 8
+    - 16
+    - 32
+  loss.physics.residual_weight.target:
+    name: residual_weight
+    kind: float
+    low: 1.0e-05
+    high: 0.001
+    log: true
+  loss.physics.residual_weight.warmup.epochs:
+    name: residual_warmup_epochs
+    kind: categorical
+    values:
+    - 25
+    - 50
+    - 75
+  loss.physics.boundary_weight.target:
+    name: boundary_weight
+    kind: float
+    low: 5.0e-05
+    high: 0.005
+    log: true
+  loss.physics.boundary_weight.warmup.epochs:
+    name: boundary_warmup_epochs
+    kind: categorical
+    values:
+    - 25
+    - 50
+    - 75
+  loss.physics.continuity:
+    name: continuity
+    kind: categorical
+    values:
+    - div_velocity
+    - div_eps_velocity

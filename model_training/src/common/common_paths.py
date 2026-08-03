@@ -188,26 +188,6 @@ def resolve_artifact_lock_path(
     return get_run_locks_root(model_training_data_root=model_training_data_root) / f"artifact-{digest}.lock"
 
 
-def get_dataset_root() -> Path:
-    """
-    Return the derived final-dataset root.
-
-    This derived convenience reads no independent dataset-root variable; callers needing
-    a bounded alternate location pass an explicit resolver or CLI override.
-    """
-    return get_training_raw_root()
-
-
-def get_output_root() -> Path:
-    """
-    Return the derived training and evaluation output root.
-
-    This derived convenience reads no independent output-root variable; callers needing a
-    bounded alternate location pass an explicit resolver or CLI override.
-    """
-    return get_training_processed_root()
-
-
 def validate_logical_name(value: object, *, label: str) -> str:
     """
     Validate one logical identifier for safe use as a path component.
@@ -263,7 +243,7 @@ def resolve_dataset_dir(dataset_id: str, *, dataset_root: Path | str | None = No
 
     """
     dataset_id = validate_logical_name(dataset_id, label="dataset_id")
-    root = Path(dataset_root).expanduser() if dataset_root is not None else get_dataset_root()
+    root = Path(dataset_root).expanduser() if dataset_root is not None else get_training_raw_root()
     return root / dataset_id
 
 
@@ -377,49 +357,22 @@ def resolve_run_output_dir(
     """
     task = validate_logical_name(task, label="task")
     run_name = validate_logical_name(run_name, label="run_name")
-    root = Path(output_root).expanduser() if output_root is not None else get_output_root()
+    root = Path(output_root).expanduser() if output_root is not None else get_training_processed_root()
     return root / task / "runs" / run_name
 
 
 def resolve_optuna_trial_dir(
     task: str,
     study_name: str,
-    trial_number: int,
+    run_name: str,
     *,
     output_root: Path | str | None = None,
 ) -> Path:
-    """
-    Resolve one study-qualified Optuna trial directory.
-
-    Parameters
-    ----------
-    task : str
-        Registered task identifier.
-    study_name : str
-        Non-empty study identity.
-    trial_number : int
-        Non-negative Optuna trial number.
-    output_root : Path | str | None, optional
-        Explicit output root.
-
-    Returns
-    -------
-    Path
-        ``<output_root>/<task>/studies/<study>/trials/trial_<number>``.
-
-    Raises
-    ------
-    ValueError
-        If task/study identifiers are unsafe or ``trial_number`` is a boolean,
-        non-integer, or negative value.
-
-    """
+    """Resolve a study-qualified trial whose leaf equals its canonical run name."""
     task = validate_logical_name(task, label="task")
     study_name = validate_logical_name(study_name, label="study_name")
-    if isinstance(trial_number, bool) or not isinstance(trial_number, int) or trial_number < 0:
-        msg = f"trial_number must be a non-negative integer, got {trial_number!r}."
-        raise ValueError(msg)
-    return resolve_study_dir(task, study_name, output_root=output_root) / "trials" / f"trial_{trial_number:06d}"
+    run_name = validate_logical_name(run_name, label="run_name")
+    return resolve_study_dir(task, study_name, output_root=output_root) / "trials" / run_name
 
 
 def resolve_study_dir(
@@ -431,7 +384,7 @@ def resolve_study_dir(
     """Resolve one Optuna study below the task-owned ``studies`` subtree."""
     task = validate_logical_name(task, label="task")
     study_name = validate_logical_name(study_name, label="study_name")
-    root = Path(output_root).expanduser() if output_root is not None else get_output_root()
+    root = Path(output_root).expanduser() if output_root is not None else get_training_processed_root()
     return root / task / "studies" / study_name
 
 
@@ -458,7 +411,7 @@ def resolve_runs_root(task: str, *, output_root: Path | str | None = None) -> Pa
 
     """
     task = validate_logical_name(task, label="task")
-    root = Path(output_root).expanduser() if output_root is not None else get_output_root()
+    root = Path(output_root).expanduser() if output_root is not None else get_training_processed_root()
     return root / task / "runs"
 
 

@@ -42,7 +42,9 @@ import numpy as np
 import torch
 
 from src import common, datasets, learning
+from src.learning import learning_device_policy as device_policy
 
+from . import experiments_console as console
 from . import experiments_tracking as tracking
 from .config import experiments_config_loader as config_loader
 
@@ -58,6 +60,7 @@ RUN_DURATION_CONTRACT: dict[str, Any] = {
         "wandb_initialization",
         "training",
         "scheduled_id_ood_evaluation",
+        "scheduled_physics_monitor",
         "checkpoint_publication",
         "selected_checkpoint_evaluation",
     ],
@@ -102,6 +105,15 @@ class RunLifecycleError(RuntimeError):
     boundaries. It distinguishes invalid persisted run state from configuration
     schema errors and ordinary missing-file failures.
     """
+
+
+class ExistingRunAdmissionError(FileExistsError):
+    """Carry a read-only fail-closed report for a rejected fresh-run collision."""
+
+    def __init__(self, report: Mapping[str, Any]) -> None:
+        """Initialize the rejection with an isolated diagnostic report."""
+        super().__init__("Run admission rejected: existing run requires explicit resume.")
+        self.report = copy.deepcopy(dict(report))
 
 
 def _run_writer_lock_path(run_dir: Path | str) -> Path:
@@ -263,6 +275,35 @@ def configure_reproducibility(
     return seed_plan
 
 
+def validate_deterministic_model_device_policy(
+    config: Mapping[str, Any],
+    resolution: learning.device.DeviceResolution,
+) -> None:
+    """
+    Reject only the current UNO bicubic CUDA strict-determinism conflict.
+
+    Canonical FNO/PI-FNO requests retain strict determinism. Canonical UNO/PI-UNO
+    CUDA requests retain fixed seeds and controlled state with non-strict algorithms;
+    CPU UNO is not rejected by this architecture-bound check.
+    """
+    model = config.get("model")
+    run = config.get("run")
+    if not isinstance(model, Mapping) or not isinstance(run, Mapping):
+        return
+    current_uno_uses_bicubic = learning.models.factory.UNO_RESAMPLING_MODE == "bicubic"
+    unsupported = model.get("kind") == "uno" and resolution.device.type == "cuda" and bool(run.get("deterministic")) and current_uno_uses_bicubic
+    if not unsupported:
+        return
+    msg = (
+        "Strict deterministic CUDA execution is unsupported for the current UNO/PI-UNO architecture: "
+        "its maintained 2D resampling path uses bicubic interpolation, and bicubic CUDA backward has no "
+        "strict deterministic implementation in the supported environment. Set run.deterministic: false; "
+        "the configured seed remains active for controlled reproducibility. Changing interpolation would "
+        "alter UNO model semantics and is not an automatic fallback."
+    )
+    raise learning.device.DeviceResolutionError(msg)
+
+
 def _validated_runtime_device(
     config: Mapping[str, Any],
     resolution: learning.device.DeviceResolution,
@@ -278,7 +319,7 @@ def _validated_runtime_device(
     if not isinstance(run, Mapping):
         msg = "Resolved config must contain a run mapping."
         raise TypeError(msg)
-    requested = learning.device.validate_device_policy(run.get("device"), path="run.device")
+    requested = device_policy.validate_device_policy(run.get("device"), path="run.device")
     if resolution.requested_policy != requested:
         msg = f"Runtime device resolution does not match the requested config policy: {resolution.requested_policy!r} != {requested!r}."
         raise ValueError(msg)
@@ -658,6 +699,9 @@ def _config_comparison_view(config: Mapping[str, Any]) -> dict[str, Any]:
     run = view.get("run")
     if isinstance(run, dict):
         run.pop("device", None)
+        run.pop("name", None)
+        run.pop("prefix", None)
+        run.pop("suffix", None)
     training = view.get("training")
     if isinstance(training, dict):
         training.pop("epochs", None)
@@ -701,6 +745,127 @@ def validate_resume_config(
         msg = f"Resume may only retain or increase training.epochs; requested {requested_epochs}, saved {saved_epochs}."
         raise ValueError(msg)
     return requested_epochs
+
+
+def _canonical_config_source(config_path: Path | str) -> str:
+    """Return a repository-relative source label without persisting or rewriting it."""
+    source = Path(config_path).expanduser().resolve(strict=False)
+    project_root = common.paths.get_project_root().expanduser().resolve(strict=False)
+    try:
+        return source.relative_to(project_root).as_posix()
+    except ValueError:
+        return str(source)
+
+
+def inspect_existing_run_admission(
+    run_dir: Path | str,
+    requested_config: Mapping[str, Any],
+    *,
+    config_path: Path | str,
+) -> dict[str, Any]:
+    """Build a lightweight read-only lifecycle and resume-compatibility report."""
+    path = Path(run_dir).expanduser().resolve(strict=False)
+    summary_path = common.paths.resolve_run_summary_path(path)
+    config_file = common.paths.resolve_run_config_path(path)
+    state = {
+        "config": config_file.is_file(),
+        "summary": summary_path.is_file(),
+        "split_indices": common.paths.resolve_split_indices_path(path).is_file(),
+        "normalizer": common.paths.resolve_normalizer_path(path).is_file(),
+    }
+    last_available = common.paths.resolve_last_checkpoint_file(path).is_file()
+    best_available = common.paths.resolve_best_checkpoint_file(path).is_file()
+    target_epoch = int(requested_config["training"]["epochs"])
+    status = "unavailable"
+    completed_epoch: int | None = None
+    issues: list[str] = []
+
+    try:
+        summary = read_run_summary(path)
+    except (OSError, RunLifecycleError) as error:
+        issues.append(str(error))
+    else:
+        raw_status = summary.get("status")
+        if isinstance(raw_status, str) and raw_status:
+            status = raw_status
+        else:
+            issues.append("Run summary has no valid lifecycle status.")
+        raw_completed = summary.get("completed_epoch")
+        if type(raw_completed) is int and raw_completed >= 0:
+            completed_epoch = raw_completed
+
+    missing_resume = common.paths.missing_resume_run_files(path)
+    if missing_resume:
+        issues.append("Missing resume state: " + ", ".join(item.name for item in missing_resume) + ".")
+    if status == "completed" and completed_epoch is None:
+        issues.append("Completed run summary has no valid completed_epoch.")
+    if status == "completed" and not best_available:
+        issues.append("Completed run is missing best_checkpoint.pt.")
+
+    if state["config"]:
+        try:
+            saved_config = config_loader.load_yaml(config_file)
+            config_loader.validate_resolved_task_contract(saved_config)
+            validate_resume_config(requested_config, saved_config)
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            issues.append(str(error))
+
+    lock_state: bool | None
+    try:
+        lock_state = common.locking.file_lock_is_active(_run_writer_lock_path(path))
+    except OSError as error:
+        lock_state = None
+        issues.append(f"Active writer state could not be verified: {error}")
+
+    if lock_state is True:
+        compatibility = "blocked"
+        reason = "An active writer lease already owns this run."
+    elif issues:
+        compatibility = "incompatible"
+        reason = issues[0]
+    elif status == "completed":
+        compatibility = "completed"
+        if completed_epoch is not None and completed_epoch >= target_epoch:
+            reason = "The existing run already completed the requested target epoch."
+        else:
+            reason = "The existing run is completed; no automatic extension is admitted."
+    elif status not in {"running", "interrupted"}:
+        compatibility = "incompatible"
+        reason = f"Lifecycle status {status!r} is not eligible for explicit checkpoint resume."
+    else:
+        compatibility = "compatible"
+        reason = "Saved semantics and required resume state are compatible."
+
+    return {
+        "requested_run_name": requested_config["run"]["name"],
+        "config_path": _canonical_config_source(config_path),
+        "run_dir": str(path),
+        "status": status,
+        "completed_epoch": completed_epoch,
+        "target_epoch": target_epoch,
+        "last_checkpoint_available": last_available,
+        "best_checkpoint_available": best_available,
+        "state": state,
+        "active_lock": lock_state,
+        "resume_compatibility": compatibility,
+        "reason": reason,
+    }
+
+
+def reject_existing_fresh_run(
+    run_dir: Path | str,
+    requested_config: Mapping[str, Any],
+    *,
+    config_path: Path | str,
+) -> ExistingRunAdmissionError:
+    """Create the dedicated fresh-run rejection with no runtime allocation."""
+    return ExistingRunAdmissionError(
+        inspect_existing_run_admission(
+            run_dir,
+            requested_config,
+            config_path=config_path,
+        )
+    )
 
 
 def _validate_resume_output_root(
@@ -916,7 +1081,15 @@ def _execute_prepared_run_locked(
     tracking_error: BaseException | None = None
     tracking_initialization_attempted = False
     tracking_enabled = config["tracking"]["wandb"]["mode"] != "disabled"
+    console_reporter = console.ConsoleReporter(
+        config=config,
+        run_dir=run_dir,
+        resume=resume_from is not None,
+        study_name=str(summary_extra["study_name"]) if summary_extra and "study_name" in summary_extra else None,
+        trial_number=int(summary_extra["trial_number"]) if summary_extra and "trial_number" in summary_extra else None,
+    )
     try:
+        validate_deterministic_model_device_policy(config, device_resolution)
         device = _validated_runtime_device(config, device_resolution)
         amp_enabled = bool(config["training"]["mixed_precision"])
         seed_plan = build_seed_plan(int(config["run"]["seed"]))
@@ -977,7 +1150,8 @@ def _execute_prepared_run_locked(
                 in_normalizer=data_processor.in_normalizer,
                 out_normalizer=data_processor.out_normalizer,
             )
-        eval_metrics = learning.losses.factory.build_eval_metrics(config, device=device)
+        data_processor.to(device)
+        eval_metrics = learning.metrics.metrics.build_evaluation_metrics(config, device=device)
         optimizer = learning.training.optim.build_optimizer(model, config)
         scheduler = learning.training.optim.build_scheduler(optimizer, config)
         identity = learning.training.checkpoint.build_checkpoint_identity(
@@ -1004,7 +1178,6 @@ def _execute_prepared_run_locked(
             persisted_run_id, previous_last_logged_epoch = tracking.persisted_wandb_identity(read_run_summary(run_dir))
 
         semantic_config: Mapping[str, Any] | None = None
-        monitor_evaluator: tracking.MonitorEvaluator | None = None
         if tracking_enabled:
             semantic_config = tracking.build_semantic_config(
                 config,
@@ -1016,23 +1189,8 @@ def _execute_prepared_run_locked(
                 device_metadata=device_resolution.as_dict(),
                 duration_contract=RUN_DURATION_CONTRACT,
             )
-            monitor_settings = config["tracking"]["wandb"]["monitor"]
-            if bool(monitor_settings["enabled"]):
-                max_monitor_cases = int(monitor_settings["max_cases"])
 
-                def evaluate_monitor() -> Mapping[str, float]:
-                    """Evaluate the fixed saved-ID prefix without changing training state."""
-                    return learning.training.loop.evaluate_physics_monitor(
-                        model,
-                        dataloaders["eval"],
-                        train_loss,
-                        device,
-                        data_processor,
-                        max_cases=max_monitor_cases,
-                    )
-
-                monitor_evaluator = evaluate_monitor
-
+        console_reporter.startup(resolved_device=str(device))
         tracking_initialization_attempted = True
         tracker = tracking.initialize_wandb(
             config,
@@ -1042,7 +1200,6 @@ def _execute_prepared_run_locked(
             persisted_run_id=persisted_run_id,
             previous_last_logged_epoch=previous_last_logged_epoch,
             state_updater=state_updater,
-            monitor_evaluator=monitor_evaluator,
         )
 
         result = learning.training.loop.train_loop(
@@ -1061,6 +1218,7 @@ def _execute_prepared_run_locked(
             use_amp=config["training"].get("mixed_precision", False),
             resume_from=resume_from,
             epoch_end_callback=tracking.combine_epoch_callbacks(
+                console_reporter.epoch,
                 epoch_end_callback,
                 tracking.epoch_callback(tracker),
             ),
@@ -1085,6 +1243,7 @@ def _execute_prepared_run_locked(
         )
         result.update(selected)
         end_time = datetime.now(UTC)
+        console_reporter.final(result, total_wall_seconds=(end_time - start_time).total_seconds())
         completed_updates = {
             "task": config["task"],
             "run_name": config["run"]["name"],
@@ -1131,6 +1290,7 @@ def _execute_prepared_run_locked(
                     "error_message": "Local run was interrupted before tracking initialization.",
                 },
             )
+        console_reporter.failure(error, status=tracking_status)
         _mark_failure(run_dir, error, interrupted=True)
         raise
     except BaseException as error:
@@ -1146,6 +1306,7 @@ def _execute_prepared_run_locked(
                     "error_message": "Local run admission failed before tracking initialization.",
                 },
             )
+        console_reporter.failure(error, status=tracking_status)
         _mark_failure(run_dir, error, interrupted=False)
         raise
     finally:
@@ -1449,6 +1610,27 @@ def run_experiment(
             raise config_loader.ConfigError(msg)
         raw_run["device"] = device
     requested = config_loader.resolve_config(raw_requested)
+    config_loader.validate_task_directory_identity(
+        config_path,
+        raw_task=raw_requested.get("task"),
+        resolved_task=requested.get("task"),
+    )
+    fresh_destination: Path | None = None
+    if resume is None:
+        if output_root is not None:
+            requested["paths"]["output_root"] = str(Path(output_root).expanduser())
+        fresh_destination = common.paths.resolve_run_output_dir(
+            str(requested["task"]),
+            str(requested["run"]["name"]),
+            output_root=Path(requested["paths"]["output_root"]),
+        )
+        if fresh_destination.exists():
+            raise reject_existing_fresh_run(
+                fresh_destination,
+                requested,
+                config_path=config_path,
+            )
+
     device_resolution = learning.device.resolve_device(
         requested["run"]["device"],
         path="run.device",
@@ -1457,21 +1639,17 @@ def run_experiment(
         requested["training"]["mixed_precision"],
         device_resolution,
     )
+    validate_deterministic_model_device_policy(requested, device_resolution)
     if resume is None:
-        config = requested
-        if output_root is not None:
-            config["paths"]["output_root"] = str(Path(output_root).expanduser())
-        destination = common.paths.resolve_run_output_dir(
-            str(config["task"]),
-            str(config["run"]["name"]),
-            output_root=Path(config["paths"]["output_root"]),
-        )
-        with run_writer_lease(destination):
-            run_dir = _prepare_fresh_run_locked(config, run_dir=destination)
+        if fresh_destination is None:
+            msg = "Fresh-run destination was not resolved before runtime admission."
+            raise AssertionError(msg)
+        with run_writer_lease(fresh_destination):
+            run_dir = _prepare_fresh_run_locked(requested, run_dir=fresh_destination)
             result = _execute_prepared_run_locked(
-                config,
+                requested,
                 run_dir=run_dir,
-                persisted_config=config,
+                persisted_config=requested,
                 device_resolution=device_resolution,
             )
         return {"run_dir": run_dir, "result": result}

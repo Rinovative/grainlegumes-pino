@@ -1,0 +1,56 @@
+task: steady_flow
+
+run:
+  seed: 9
+  deterministic: true
+  device: cuda
+  suffix: gpu_smoke
+
+data:
+  train_dataset: lhs_var80_seed3001
+  ood_datasets:
+    - lhs_var120_seed4001
+  batch_size: 8
+  num_workers: 4
+
+model:
+  kind: fno
+  params:
+    n_modes: [128, 160]
+    hidden_channels: 64
+    n_layers: 3
+
+loss:
+  data:
+    kind: relative_h1
+    space: normalized
+    weight: 1.0
+  physics:
+    enabled: false
+
+evaluation:
+  objective:
+    id: normalized_macro_rmse
+
+optimizer:
+  kind: adamw
+  lr: 3.883614530748613e-4
+  weight_decay: 1.0e-4
+
+scheduler:
+  kind: reduce_on_plateau
+  factor: 0.5
+  patience: 20
+
+training:
+  epochs: 10
+  evaluation_interval: 1
+  ood_evaluation_interval: 1
+  mixed_precision: false
+
+tracking:
+  wandb:
+    mode: online
+    workflow: gpu_smoke
+    monitor:
+      interval: 1

@@ -83,7 +83,7 @@ def test_inference_and_artifacts_reject_running_status(tmp_path: Path) -> None:
     with pytest.raises(experiments.run.RunLifecycleError, match="status must be 'completed'"):
         learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
     with pytest.raises(experiments.run.RunLifecycleError, match="status must be 'completed'"):
-        analysis.artifact_service.load_run_artifact_plan(run_dir)
+        analysis.artifacts.service.load_run_artifact_plan(run_dir)
 
 
 def test_incomplete_run_is_rejected_before_reconstruction(tmp_path: Path) -> None:
@@ -98,7 +98,7 @@ def test_incomplete_run_is_rejected_before_reconstruction(tmp_path: Path) -> Non
     with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
         learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
     with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
-        analysis.artifact_service.load_run_artifact_plan(run_dir)
+        analysis.artifacts.service.load_run_artifact_plan(run_dir)
 
 
 def test_resume_requires_last_checkpoint_even_when_other_files_exist(

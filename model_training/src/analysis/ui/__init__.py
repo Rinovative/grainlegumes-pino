@@ -1,10 +1,10 @@
 """
-Notebook widgets, viewers and plotting UI helpers.
+Reusable notebook controls, viewers, and panel composition.
 
 Provides:
-- components: reusable widget constructors and UI helpers
-- notebook: notebook panel and export utilities
-- viewers: interactive case and aggregate viewers
+- components: shared widget controls and display components
+- notebook: notebook-panel construction utilities
+- viewers: interactive field and case viewers
 """
 
 from . import analysis_ui_components as components

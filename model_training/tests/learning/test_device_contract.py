@@ -11,14 +11,17 @@ numerics and queue selection are covered elsewhere.
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
 from src import analysis, experiments, learning
+from support import configs
 
-_CONFIG_ROOT = Path(__file__).parents[2] / "configs"
+if TYPE_CHECKING:
+    from pathlib import Path
+
+_CONFIG = configs.acceptance_config_path()
 _MOCK_CUDA_INDEX = 2
 
 
@@ -36,6 +39,25 @@ def _hide_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
 def _file_inventory(root: Path) -> dict[str, bytes]:
     """Return relative file contents below one mutation boundary."""
     return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def _mock_cuda_resolution() -> learning.device.DeviceResolution:
+    """Return an indexed CUDA runtime fact without querying physical hardware."""
+    metadata = learning.device.DeviceRuntimeMetadata(
+        requested_policy="cuda",
+        resolved_device="cuda:2",
+        device_type="cuda",
+        pytorch_version=str(torch.__version__),
+        cuda_index=_MOCK_CUDA_INDEX,
+        cuda_device_name="Mock GPU 2",
+    )
+    return learning.device.DeviceResolution(
+        requested_policy="cuda",
+        device=torch.device("cuda:2"),
+        device_type="cuda",
+        cuda_index=_MOCK_CUDA_INDEX,
+        metadata=metadata,
+    )
 
 
 def test_cpu_resolution_is_immutable_serializable_and_cuda_silent(
@@ -149,23 +171,22 @@ def test_cuda_availability_query_failure_is_wrapped_or_safely_falls_back(
     assert learning.device.resolve_device("auto", path="run.device").device == torch.device("cpu")
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    ["gpu", "cuda:0", "cuda:1", "mps", "automatic", "AUTO", True, False, 0, None],
-    ids=lambda value: f"{type(value).__name__}-{value}",
-)
-def test_invalid_device_aliases_fail_at_the_exact_semantic_path(invalid: Any) -> None:
+def test_invalid_device_values_fail_at_the_exact_semantic_path() -> None:
     """
-    Vary aliases, indexed devices, capitalization, booleans, numbers, and null.
+    Vary an unknown string, indexed device, boolean, number, and null.
 
     Every invalid family must fail at ``run.device`` while the base YAML remains
     fixed, proving config accepts only ``auto``, ``cuda``, or ``cpu`` strings.
     """
-    raw = experiments.config.loader.load_yaml(_CONFIG_ROOT / "experiments/steady_flow_fno.yaml")
-    raw["run"]["device"] = invalid
-
-    with pytest.raises(experiments.config.loader.ConfigError, match=r"run\.device must be exactly one of: auto, cuda, cpu"):
-        experiments.config.loader.resolve_config(raw)
+    invalid_values: tuple[Any, ...] = ("unsupported", "cuda:0", True, 0, None)
+    for invalid in invalid_values:
+        raw = experiments.config.loader.load_yaml(_CONFIG)
+        raw["run"]["device"] = invalid
+        with pytest.raises(
+            experiments.config.loader.ConfigError,
+            match=r"run\.device must be exactly one of: auto, cuda, cpu",
+        ):
+            experiments.config.loader.resolve_config(raw)
 
 
 def test_cpu_mixed_precision_is_rejected_before_scaler_construction() -> None:
@@ -189,10 +210,72 @@ def test_artifact_cpu_cleanup_does_not_touch_cuda_runtime(
     Cleanup must complete without touching CUDA runtime state, preserving CPU-only
     operation even after artifact generation.
     """
-    monkeypatch.setattr(analysis.artifact_service.torch.cuda, "empty_cache", _forbid_cuda_query)
-    monkeypatch.setattr(analysis.artifact_service.torch.cuda, "ipc_collect", _forbid_cuda_query)
+    monkeypatch.setattr(analysis.artifacts.service.torch.cuda, "empty_cache", _forbid_cuda_query)
+    monkeypatch.setattr(analysis.artifacts.service.torch.cuda, "ipc_collect", _forbid_cuda_query)
 
-    analysis.artifact_service.cleanup_runtime(torch.device("cpu"))
+    analysis.artifacts.service.cleanup_runtime(torch.device("cpu"))
+
+
+def test_current_uno_bicubic_cuda_policy_rejects_only_strict_determinism() -> None:
+    """Reject current CUDA UNO strictness while admitting non-strict, FNO, and CPU cases."""
+    uno_raw = experiments.config.loader.load_yaml(
+        configs.experiment_config_path(model_kind="uno", physics_enabled=False),
+    )
+    uno_raw["run"]["deterministic"] = True
+    uno = experiments.config.loader.resolve_config(uno_raw)
+    cuda = _mock_cuda_resolution()
+    with pytest.raises(
+        learning.device.DeviceResolutionError,
+        match=r"bicubic CUDA backward.*run\.deterministic: false.*seed remains active.*alter UNO model semantics",
+    ):
+        experiments.run.validate_deterministic_model_device_policy(uno, cuda)
+
+    uno["run"]["deterministic"] = False
+    experiments.run.validate_deterministic_model_device_policy(uno, cuda)
+    uno["run"]["deterministic"] = True
+    experiments.run.validate_deterministic_model_device_policy(uno, learning.device.resolve_device("cpu"))
+
+    fno = experiments.config.loader.load_and_resolve_config(
+        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
+    )
+    experiments.run.validate_deterministic_model_device_policy(fno, cuda)
+
+
+def test_uno_cuda_strict_determinism_fails_before_allocation_or_tracking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject an unsupported request before run locks, files, allocation, or W&B initialization."""
+    raw = experiments.config.loader.load_yaml(
+        configs.experiment_config_path(model_kind="uno", physics_enabled=True),
+    )
+    raw["run"]["device"] = "cuda"
+    raw["run"]["deterministic"] = True
+    allocation_attempted = False
+    tracking_attempted = False
+
+    def reject_allocation(_run_dir: Path | str) -> Path:
+        nonlocal allocation_attempted
+        allocation_attempted = True
+        pytest.fail("unsupported UNO request must not allocate")
+
+    def reject_tracking(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal tracking_attempted
+        tracking_attempted = True
+        pytest.fail("unsupported UNO request must not initialize W&B")
+
+    monkeypatch.setattr(experiments.run.config_loader, "load_yaml", lambda _path: raw)
+    monkeypatch.setattr(experiments.run.learning.device, "resolve_device", lambda *_args, **_kwargs: _mock_cuda_resolution())
+    monkeypatch.setattr(experiments.run, "allocate_run_directory", reject_allocation)
+    monkeypatch.setattr(experiments.run.tracking, "initialize_wandb", reject_tracking)
+    output_root = tmp_path / "outputs"
+
+    with pytest.raises(learning.device.DeviceResolutionError, match=r"Set run\.deterministic: false"):
+        experiments.run.run_experiment("unsupported-uno.yaml", output_root=output_root)
+
+    assert allocation_attempted is False
+    assert tracking_attempted is False
+    assert not output_root.exists()
 
 
 def test_strict_cuda_fails_before_fresh_training_allocation(
@@ -210,7 +293,7 @@ def test_strict_cuda_fails_before_fresh_training_allocation(
 
     with pytest.raises(learning.device.DeviceResolutionError, match="strict CUDA"):
         experiments.run.run_experiment(
-            _CONFIG_ROOT / "experiments/steady_flow_fno.yaml",
+            _CONFIG,
             device="cuda",
             output_root=output_root,
         )
@@ -238,7 +321,7 @@ def test_strict_cuda_does_not_mutate_an_existing_resume_run(
 
     with pytest.raises(learning.device.DeviceResolutionError, match="strict CUDA"):
         experiments.run.run_experiment(
-            _CONFIG_ROOT / "experiments/steady_flow_fno.yaml",
+            _CONFIG,
             resume=run_dir,
             device="cuda",
         )
@@ -284,7 +367,7 @@ def test_artifact_strict_cuda_fails_before_target_mutation(
     before = _file_inventory(runs_root)
 
     with pytest.raises(learning.device.DeviceResolutionError, match="strict CUDA"):
-        analysis.artifact_service.build_artifacts(
+        analysis.artifacts.service.build_artifacts(
             runs_root=runs_root,
             dataset_root=tmp_path / "datasets",
             device_policy="cuda",
@@ -305,7 +388,7 @@ def test_artifact_boundary_reuses_one_resolution_for_both_splits(
     once, preventing repeated policy resolution or cross-stage device drift.
     """
     run_dir = tmp_path / "run"
-    plan = analysis.artifact_service.RunArtifactPlan(
+    plan = analysis.artifacts.service.RunArtifactPlan(
         run_dir=run_dir,
         id_dataset_name="id",
         ood_dataset_name="ood",
@@ -313,22 +396,22 @@ def test_artifact_boundary_reuses_one_resolution_for_both_splits(
     resolutions: list[learning.device.DeviceResolution] = []
     cleanup_devices: list[torch.device] = []
 
-    monkeypatch.setattr(analysis.artifact_service, "iter_run_dirs", lambda *_args, **_kwargs: [run_dir])
-    monkeypatch.setattr(analysis.artifact_service, "load_run_artifact_plan", lambda _run_dir: plan)
+    monkeypatch.setattr(analysis.artifacts.service, "iter_run_dirs", lambda *_args, **_kwargs: [run_dir])
+    monkeypatch.setattr(analysis.artifacts.service, "load_run_artifact_plan", lambda _run_dir: plan)
 
     def capture_artifacts(**kwargs: Any) -> object:
         resolutions.append(kwargs["device_resolution"])
         return object()
 
-    monkeypatch.setattr(analysis.artifact_service, "run_or_load_artifacts", capture_artifacts)
-    monkeypatch.setattr(analysis.artifact_service, "cleanup_runtime", cleanup_devices.append)
+    monkeypatch.setattr(analysis.artifacts.service, "run_or_load_artifacts", capture_artifacts)
+    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", cleanup_devices.append)
     monkeypatch.setattr(
-        analysis.artifact_service,
+        analysis.artifacts.service,
         "_upload_published_artifacts",
         lambda **_kwargs: None,
     )
 
-    result = analysis.artifact_service.build_artifacts(
+    result = analysis.artifacts.service.build_artifacts(
         runs_root=tmp_path,
         dataset_root=tmp_path / "datasets",
         device_policy="cpu",

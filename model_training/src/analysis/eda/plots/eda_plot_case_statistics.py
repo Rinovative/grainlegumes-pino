@@ -119,6 +119,29 @@ def _as_float(x: Any) -> float | None:
     return None
 
 
+_RNG_IMPLEMENTATION_KEYS = frozenset(
+    {
+        "generator_state",
+        "generator_states",
+        "numpy_rng_state",
+        "python_rng_state",
+        "random_state",
+        "rng_counter",
+        "rng_counters",
+        "rng_state",
+        "rng_states",
+        "rng_type",
+        "torch_rng_state",
+    }
+)
+
+
+def _is_rng_implementation_key(key: str) -> bool:
+    """Return whether one exact metadata key owns RNG implementation state."""
+    normalized = key.strip().casefold().replace("-", "_").replace(" ", "_")
+    return normalized in _RNG_IMPLEMENTATION_KEYS
+
+
 def _flatten_dict_raw(dct: dict[str, Any]) -> dict[str, float]:
     """
     Flatten nested dictionary into a single-level dictionary with float values.
@@ -131,7 +154,8 @@ def _flatten_dict_raw(dct: dict[str, Any]) -> dict[str, float]:
     Returns
     -------
     dict[str, float]
-        Flattened dictionary with float values.
+        Flattened dictionary with float values, excluding exact RNG
+        implementation-state branches.
 
     """
     out: dict[str, float] = {}
@@ -140,6 +164,8 @@ def _flatten_dict_raw(dct: dict[str, Any]) -> dict[str, float]:
         """Flatten nested mappings/sequences while retaining numeric leaf paths."""
         if isinstance(obj, dict):
             for k, v in obj.items():
+                if _is_rng_implementation_key(str(k)):
+                    continue
                 _rec(f"{key}_{k}", v)
             return
 
@@ -153,6 +179,8 @@ def _flatten_dict_raw(dct: dict[str, Any]) -> dict[str, float]:
             out[key] = val
 
     for k, v in dct.items():
+        if _is_rng_implementation_key(str(k)):
+            continue
         _rec(k, v)
 
     return out
@@ -490,7 +518,7 @@ def plot_meta_statistics(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
-        start_cases=250,
+        start_cases=100,
         step_size=50,
         extra_widgets=[ds],
         dataset_selector=ds,
@@ -592,7 +620,7 @@ def plot_meta_parameters(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
-        start_cases=250,
+        start_cases=100,
         step_size=50,
         extra_widgets=[ds],
         dataset_selector=ds,
@@ -781,7 +809,7 @@ def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widg
     return analysis.ui.viewers.make_casecount_viewer(
         plot_func=_plot,
         datasets=datasets,
-        start_cases=250,
+        start_cases=100,
         step_size=50,
         extra_widgets=[ds],
         dataset_selector=ds,

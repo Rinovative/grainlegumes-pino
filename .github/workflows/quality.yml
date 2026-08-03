@@ -22,28 +22,19 @@ jobs:
           cache-downloads: true
           init-shell: bash
 
-      - name: Build, install, and smoke-test wheel
+      - name: Verify editable and wheel installation contracts
         shell: bash -l {0}
-        run: |
-          wheel_dir="${RUNNER_TEMP}/grainlegumes-pino-wheel"
-          mkdir -p "$wheel_dir"
-          python -m pip wheel --no-deps --no-build-isolation --wheel-dir "$wheel_dir" .
-          wheel_path="$(find "$wheel_dir" -maxdepth 1 -type f -name '*.whl' -print -quit)"
-          test -n "$wheel_path"
-          install_dir="${RUNNER_TEMP}/grainlegumes-pino-install"
-          python -m pip install --no-deps --target "$install_dir" "$wheel_path"
-          cd "$RUNNER_TEMP"
-          PACKAGE_INSTALL_ROOT="$install_dir" PYTHONPATH="$install_dir" python -c 'import os; from pathlib import Path; import src; from src import analysis, common, datasets, domain, experiments, learning; assert Path(src.__file__).resolve().is_relative_to(Path(os.environ["PACKAGE_INSTALL_ROOT"]).resolve())'
+        run: python scripts/check_package_install.py
 
       - name: Lint
         shell: bash -l {0}
-        run: ruff check model_training/src model_training/tests data_generation scripts/check_notebooks.py
+        run: ruff check setup.py model_training/src model_training/tests data_generation scripts/check_notebooks.py scripts/check_package_install.py
 
       - name: Check formatting
         shell: bash -l {0}
-        run: ruff format --check model_training/src model_training/tests data_generation scripts/check_notebooks.py --exclude '*.ipynb'
+        run: ruff format --check setup.py model_training/src model_training/tests data_generation scripts/check_notebooks.py scripts/check_package_install.py --exclude '*.ipynb'
 
-      - name: Validate maintained notebooks and archive notices
+      - name: Validate maintained notebooks
         shell: bash -l {0}
         run: |
           python scripts/check_notebooks.py
@@ -182,7 +173,7 @@ jobs:
           EOF
       - name: Compile maintained Python
         shell: bash -l {0}
-        run: python -m compileall -q model_training/src data_generation scripts/check_notebooks.py
+        run: python -m compileall -q setup.py model_training/src data_generation scripts/check_notebooks.py scripts/check_package_install.py
 
       - name: Run CPU tests
         shell: bash -l {0}
@@ -195,6 +186,6 @@ jobs:
           python -c "from src import analysis, common, datasets, domain, experiments, learning"
           python -m src.experiments.cli.cli_train --help
           python -m src.experiments.cli.cli_optuna --help
+          python -m src.experiments.cli.cli_config_preflight --help
           python -m src.experiments.cli.cli_build_artifacts --help
           cd ..
-          PYTHONPATH=model_training python -m data_generation.build_training_dataset --help

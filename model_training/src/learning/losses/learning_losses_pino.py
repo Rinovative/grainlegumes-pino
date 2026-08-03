@@ -41,6 +41,24 @@ class TensorNormalizer(Protocol):
         ...
 
 
+class SemanticDataLoss(nn.Module):
+    """Wrap a relative norm with one explicit non-negative semantic weight."""
+
+    def __init__(self, implementation: Any, *, weight: float) -> None:
+        """Validate the weight and retain the callable relative norm."""
+        super().__init__()
+        if weight < 0:
+            msg = f"Data-loss weight must be non-negative, got {weight}."
+            raise ValueError(msg)
+        self.implementation = implementation
+        self.weight = float(weight)
+        self.reduction = "sample_mean"
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        """Return the explicitly weighted relative data loss."""
+        return self.weight * self.implementation(pred, target)
+
+
 @dataclass(frozen=True, slots=True)
 class LinearWarmup:
     """
@@ -168,9 +186,9 @@ class SemanticComposedLoss(nn.Module):
         self.physics_kind = physics_kind
         self.input_fields = tuple(input_fields)
         self.output_fields = tuple(output_fields)
-        self.continuity = domain.physics.brinkman.validate_continuity_kind(continuity)
-        if boundary != domain.physics.brinkman.PRESSURE_BOUNDARY_KIND:
-            msg = f"Unknown pressure boundary identifier {boundary!r}; expected {domain.physics.brinkman.PRESSURE_BOUNDARY_KIND!r}."
+        self.continuity = domain.physics.contracts.validate_continuity_kind(continuity)
+        if boundary != domain.physics.contracts.PRESSURE_BOUNDARY_KIND:
+            msg = f"Unknown pressure boundary identifier {boundary!r}; expected {domain.physics.contracts.PRESSURE_BOUNDARY_KIND!r}."
             raise ValueError(msg)
         self.boundary = boundary
         self.derivatives = derivatives

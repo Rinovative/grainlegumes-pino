@@ -166,29 +166,6 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
     return pd.DataFrame(rows).set_index("label")
 
 
-def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    Return the combined authoritative run summary for notebook display.
-
-    Parameters
-    ----------
-    datasets : Mapping[str, pandas.DataFrame]
-        Labelled compatible evaluation frames.
-
-    Returns
-    -------
-    pandas.DataFrame
-        The provenance-backed table built by :func:`build_run_summary_table`.
-
-    Notes
-    -----
-    Normalized secondary, physical-unit, architecture, continuity, and provenance
-    evidence stay auditable beside the primary objective.
-
-    """
-    return build_run_summary_table(datasets)
-
-
 def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
     """
     Plot authoritative accuracy against four separate physics diagnostics.

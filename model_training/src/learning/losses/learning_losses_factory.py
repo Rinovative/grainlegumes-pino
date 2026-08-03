@@ -5,10 +5,9 @@ learning_losses_factory.py
 Build semantic supervised and physics-informed loss compositions.
 
 Responsibilities:
-  - Resolve semantic data-loss, derivative, and task-physics identifiers
+  - Resolve semantic supervised data-loss identifiers
   - Build task-dimensional data losses with explicit reduction and weighting
   - Build one named composition interface for supervised and physics training
-  - Delegate evaluation metric construction to learning.metrics
 
 Design principles:
   - Resolved semantic identifiers select implementations without exposing class names
@@ -26,16 +25,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
-
-import torch
-from neuralop import H1Loss, LpLoss
-from torch import Tensor, nn
+from typing import TYPE_CHECKING, Any
 
 from src import domain
-from src.learning.metrics import learning_metrics
 
-from . import learning_losses_pino as pino
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+
+    from . import learning_losses_pino as pino
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,82 +54,12 @@ class DataLossKindSpec:
     spaces: frozenset[str]
 
 
-@dataclass(frozen=True, slots=True)
-class PhysicsLossImplementation:
-    """
-    Bind one immutable task-physics identifier to its domain evaluator.
-
-    Attributes
-    ----------
-    kind : str
-        Canonical task-owned physics identifier.
-    evaluator : domain.physics.brinkman.PhysicsEvaluator
-        Domain diagnostic callable reused by loss composition.
-
-    """
-
-    kind: str
-    evaluator: domain.physics.brinkman.PhysicsEvaluator
-
-
 _DATA_LOSS_KINDS = MappingProxyType(
     {
         "relative_h1": DataLossKindSpec("relative_h1", frozenset({"normalized"})),
         "relative_l2": DataLossKindSpec("relative_l2", frozenset({"normalized"})),
     }
 )
-_PHYSICS_LOSS_IMPLEMENTATIONS = MappingProxyType(
-    {
-        domain.physics.brinkman.STEADY_BRINKMAN_KIND: PhysicsLossImplementation(
-            kind=domain.physics.brinkman.STEADY_BRINKMAN_KIND,
-            evaluator=domain.physics.brinkman.resolve_physics_evaluator(domain.physics.brinkman.STEADY_BRINKMAN_KIND),
-        )
-    }
-)
-_DERIVATIVE_EXTENSIONS = frozenset({"none", "reflect"})
-
-
-class SemanticDataLoss(nn.Module):
-    """
-    Wrap a NeuralOp relative norm with an explicit scalar semantic weight.
-
-    The configured implementation already owns its task-dimensional norm and
-    sample-mean reduction. ``forward`` applies only the validated non-negative
-    weight; normalized-versus-physical space admission remains the factory's
-    responsibility rather than being inferred from tensors.
-
-    Parameters
-    ----------
-    implementation : Any
-        Callable NeuralOp relative norm with its own dimensional reduction.
-    weight : float
-        Non-negative scalar applied to the returned norm.
-
-    Raises
-    ------
-    ValueError
-        If ``weight`` is negative.
-
-    """
-
-    def __init__(self, implementation: Any, *, weight: float) -> None:
-        """
-        Validate the weight and retain the callable relative norm.
-
-        Initialization also publishes the fixed ``sample_mean`` reduction used
-        by semantic config and training telemetry.
-        """
-        super().__init__()
-        if weight < 0:
-            msg = f"Data-loss weight must be non-negative, got {weight}."
-            raise ValueError(msg)
-        self.implementation = implementation
-        self.weight = float(weight)
-        self.reduction = "sample_mean"
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        """Return the explicitly weighted relative data loss."""
-        return self.weight * self.implementation(pred, target)
 
 
 def available_data_loss_kinds() -> tuple[str, ...]:
@@ -156,48 +84,6 @@ def validate_data_loss_semantics(kind: str, *, space: str) -> DataLossKindSpec:
         msg = f"Loss {kind!r} does not support space {space!r}; expected one of {sorted(spec.spaces)}."
         raise ValueError(msg)
     return spec
-
-
-def available_physics_loss_kinds() -> tuple[str, ...]:
-    """Return task physics identifiers with semantic loss adapters."""
-    return tuple(sorted(_PHYSICS_LOSS_IMPLEMENTATIONS))
-
-
-def resolve_physics_loss_implementation(kind: str) -> PhysicsLossImplementation:
-    """Resolve one task-selected domain physics evaluator for loss composition."""
-    try:
-        return _PHYSICS_LOSS_IMPLEMENTATIONS[kind]
-    except KeyError as error:
-        available = ", ".join(available_physics_loss_kinds())
-        msg = f"Unknown physics loss identifier {kind!r}. Available physics losses: {available}."
-        raise ValueError(msg) from error
-
-
-def available_derivative_kinds() -> tuple[str, ...]:
-    """Return semantic numerical derivative identifiers."""
-    return domain.physics.derivatives.available_derivative_kinds()
-
-
-def resolve_derivative_kind(kind: str, *, extension: str) -> tuple[str, str]:
-    """
-    Validate a derivative kind/extension pair without constructing an operator.
-
-    The kind must be registered, the extension must be ``none`` or ``reflect``,
-    and physical derivatives require ``none``. The unchanged canonical pair is
-    returned; unsupported semantics raise ``ValueError``.
-    """
-    if kind not in available_derivative_kinds():
-        available = ", ".join(available_derivative_kinds())
-        msg = f"Unknown derivative identifier {kind!r}. Available derivatives: {available}."
-        raise ValueError(msg)
-    if extension not in _DERIVATIVE_EXTENSIONS:
-        available = ", ".join(sorted(_DERIVATIVE_EXTENSIONS))
-        msg = f"Unknown derivative extension {extension!r}. Available extensions: {available}."
-        raise ValueError(msg)
-    if kind == "physical" and extension != "none":
-        msg = "Physical derivatives require extension 'none'."
-        raise ValueError(msg)
-    return kind, extension
 
 
 def build_data_loss(
@@ -227,6 +113,10 @@ def build_data_loss(
         Sample-mean relative loss module.
 
     """
+    from neuralop import H1Loss, LpLoss  # noqa: PLC0415
+
+    from . import learning_losses_pino as pino  # noqa: PLC0415
+
     validate_data_loss_semantics(kind, space=space)
     if operator_dimensionality <= 0:
         msg = f"operator_dimensionality must be positive, got {operator_dimensionality}."
@@ -238,7 +128,7 @@ def build_data_loss(
     else:
         msg = f"No implementation registered for loss identifier {kind!r}."
         raise ValueError(msg)
-    return SemanticDataLoss(implementation, weight=weight)
+    return pino.SemanticDataLoss(implementation, weight=weight)
 
 
 def _resolved_weight(config: dict[str, Any], name: str) -> pino.LinearWarmup:
@@ -249,6 +139,8 @@ def _resolved_weight(config: dict[str, Any], name: str) -> pino.LinearWarmup:
     the semantic weight name instead of silently producing a schedule. The
     returned object owns non-negative target and epoch validation.
     """
+    from . import learning_losses_pino as pino  # noqa: PLC0415
+
     weight = config.get(name)
     if not isinstance(weight, dict):
         msg = f"loss.physics.{name} must be a mapping."
@@ -298,16 +190,15 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
         contradict their registered semantic contracts.
 
     """
+    import torch  # noqa: PLC0415
+
+    from . import learning_losses_pino as pino  # noqa: PLC0415
+
     if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
         msg = f"Loss construction requires one concrete CPU or CUDA torch.device, got {device!r}."
         raise TypeError(msg)
     task = domain.tasks.registry.get_task(str(config["task"]))
     task_physics = domain.tasks.registry.resolve_physics(task.physics.kind)
-    implementation = resolve_physics_loss_implementation(task_physics.kind)
-    if implementation.evaluator is not domain.physics.brinkman.resolve_physics_evaluator(task_physics.kind):
-        msg = f"Physics loss registry drift for task physics {task_physics.kind!r}."
-        raise RuntimeError(msg)
-
     loss_config = config.get("loss")
     if not isinstance(loss_config, dict):
         msg = "Resolved config must contain a loss mapping."
@@ -331,7 +222,7 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
     if not isinstance(derivatives_config, dict):
         msg = "loss.physics.derivatives must be a mapping."
         raise TypeError(msg)
-    derivative_kind, extension = resolve_derivative_kind(
+    derivative_kind, extension = domain.physics.contracts.validate_derivative_kind(
         str(derivatives_config["kind"]),
         extension=str(derivatives_config["extension"]),
     )
@@ -360,12 +251,3 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
         interior_crop=int(physics_config["interior_crop"]),
     )
     return loss.to(device)
-
-
-def build_eval_metrics(
-    config: dict[str, Any],
-    *,
-    device: torch.device,
-) -> dict[str, learning_metrics.DatasetMetric]:
-    """Delegate device-bound semantic evaluation metric construction to its owner."""
-    return learning_metrics.build_evaluation_metrics(config, device=device)

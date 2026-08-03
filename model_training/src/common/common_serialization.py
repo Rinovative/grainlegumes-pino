@@ -33,8 +33,6 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-import torch
-
 PathWriter = Callable[[Path], None]
 
 
@@ -261,6 +259,7 @@ def atomic_torch_save(payload: Any, destination: Path | str) -> Path:
     helper does not define or validate checkpoint/artifact schema.
 
     """
+    import torch  # noqa: PLC0415
 
     def write_torch(temp_path: Path) -> None:
         with temp_path.open("wb") as stream:

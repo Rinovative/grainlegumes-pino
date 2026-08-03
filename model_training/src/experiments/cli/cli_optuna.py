@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        from src.experiments.tuning import experiments_tuning_optuna as optuna  # noqa: PLC0415
+        from src.experiments.tuning import optuna  # noqa: PLC0415
 
         study_config = optuna.load_optuna_study_config(args.config_path)
         study_config = optuna.with_runtime_overrides(

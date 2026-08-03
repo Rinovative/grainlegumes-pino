@@ -10,16 +10,14 @@ and evaluation metric reductions are verified in separate modules.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 from src import experiments, learning
+from support import configs
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
 _MIDPOINT_EPOCH = 2
-_CONFIG_ROOT = Path(__file__).parents[2] / "configs" / "experiments"
 
 
 class _ListMappingDataset(Dataset[dict[str, torch.Tensor]]):
@@ -50,7 +48,7 @@ class IdentityNormalizer:
 
 def _physics_config(
     *,
-    filename: str = "steady_flow_pifno.yaml",
+    model_kind: str = "fno",
     continuity: str = "div_eps_velocity",
 ) -> dict[str, object]:
     """
@@ -59,7 +57,9 @@ def _physics_config(
     Residual and boundary targets are fixed at two and three respectively, making
     their midpoint weights observable while retaining the selected FNO or UNO recipe.
     """
-    raw = experiments.config.loader.load_yaml(_CONFIG_ROOT / filename)
+    raw = experiments.config.loader.load_yaml(
+        configs.experiment_config_path(model_kind=model_kind, physics_enabled=True),
+    )
     raw["loss"]["physics"]["continuity"] = continuity  # type: ignore[index]
     raw["loss"]["physics"]["residual_weight"] = {  # type: ignore[index]
         "target": 2.0,
@@ -115,7 +115,9 @@ def test_disabled_physics_exposes_named_zero_components() -> None:
     Named physics components must remain present as exact zeros and total must
     equal data loss, keeping telemetry schema stable without fabricating residuals.
     """
-    supervised = experiments.config.loader.load_and_resolve_config(_CONFIG_ROOT / "steady_flow_fno.yaml")
+    supervised = experiments.config.loader.load_and_resolve_config(
+        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
+    )
     supervised_loss = learning.losses.factory.build_training_loss(supervised, device=torch.device("cpu"))
     pred = torch.ones((2, 3, 8, 8))
     target = torch.zeros_like(pred)
@@ -186,46 +188,38 @@ def test_physics_composition_weighting_and_linear_warmup() -> None:
         loss.set_epoch(-1)
 
 
-@pytest.mark.parametrize(
-    ("filename", "model_kind"),
-    [
-        ("steady_flow_pifno.yaml", "fno"),
-        ("steady_flow_piuno.yaml", "uno"),
-    ],
-)
-@pytest.mark.parametrize("continuity", ["div_velocity", "div_eps_velocity"])
-def test_pi_model_families_share_formulation_selected_loss_path(
-    filename: str,
-    model_kind: str,
-    continuity: str,
-) -> None:
+def test_pi_model_families_share_formulation_selected_loss_path() -> None:
     """
     Cross both PI model families with both allowed continuity formulations.
 
     Model kind may vary, but the semantic loss class and selected residual mapping
     stay fixed; the opposite continuity key must never enter optimization components.
     """
-    config = _physics_config(filename=filename, continuity=continuity)
-    loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
-    normalizer = IdentityNormalizer()
-    loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
-    inputs, pred, target = _manufactured_batch()
+    for model_kind in ("fno", "uno"):
+        for continuity in ("div_velocity", "div_eps_velocity"):
+            config = _physics_config(model_kind=model_kind, continuity=continuity)
+            loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
+            normalizer = IdentityNormalizer()
+            loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
+            inputs, pred, target = _manufactured_batch()
 
-    diagnostics = loss.compute_physics_diagnostics(pred, x=inputs)
-    components = loss.compute_components(pred, x=inputs, y=target, epoch=4)
-    continuity_name = f"continuity_{continuity}"
-    selected = diagnostics.continuity.divergence_velocity if continuity == "div_velocity" else diagnostics.continuity.divergence_porosity_velocity
-    selected_interior = selected[..., 1:-1, 1:-1]
-    expected = loss.component_weights(epoch=4)[continuity_name] * selected_interior.square().mean()
-    opposite = "continuity_div_eps_velocity" if continuity == "div_velocity" else "continuity_div_velocity"
+            diagnostics = loss.compute_physics_diagnostics(pred, x=inputs)
+            components = loss.compute_components(pred, x=inputs, y=target, epoch=4)
+            continuity_name = f"continuity_{continuity}"
+            selected = (
+                diagnostics.continuity.divergence_velocity if continuity == "div_velocity" else diagnostics.continuity.divergence_porosity_velocity
+            )
+            selected_interior = selected[..., 1:-1, 1:-1]
+            expected = loss.component_weights(epoch=4)[continuity_name] * selected_interior.square().mean()
+            opposite = "continuity_div_eps_velocity" if continuity == "div_velocity" else "continuity_div_velocity"
 
-    assert config["model"]["kind"] == model_kind  # type: ignore[index]
-    assert type(loss) is learning.losses.pino.SemanticComposedLoss
-    assert loss.continuity == continuity
-    assert loss.component_names == tuple(components)
-    assert torch.allclose(diagnostics.continuity.selected, selected)
-    assert torch.allclose(components[continuity_name], expected)
-    assert opposite not in components
+            assert config["model"]["kind"] == model_kind  # type: ignore[index]
+            assert type(loss) is learning.losses.pino.SemanticComposedLoss
+            assert loss.continuity == continuity
+            assert loss.component_names == tuple(components)
+            assert torch.allclose(diagnostics.continuity.selected, selected)
+            assert torch.allclose(components[continuity_name], expected)
+            assert opposite not in components
 
 
 def test_invalid_physics_loss_settings_fail_through_public_factory() -> None:
@@ -236,7 +230,7 @@ def test_invalid_physics_loss_settings_fail_through_public_factory() -> None:
     preventing implicit numerical or schedule fallbacks.
     """
     derivative_config = _physics_config()
-    derivative_config["loss"]["physics"]["derivatives"]["kind"] = "finite_difference"  # type: ignore[index]
+    derivative_config["loss"]["physics"]["derivatives"]["kind"] = "unsupported"  # type: ignore[index]
     with pytest.raises(ValueError, match="Unknown derivative identifier"):
         learning.losses.factory.build_training_loss(derivative_config, device=torch.device("cpu"))
 
@@ -353,6 +347,8 @@ def test_epoch_loss_components_are_weighted_by_actual_sample_count() -> None:
     assert values["train/loss_data"] == pytest.approx(13.0 / 3.0)
     assert values["train/loss_total"] != pytest.approx((2.0 + 9.0) / 2.0)
     assert values["optimizer_steps"] == 2.0
+    assert values["system/train_duration_seconds"] > 0.0
+    assert values["system/train_samples_per_second"] > 0.0
     assert not any("momentum" in key or "continuity" in key for key in values)
 
     physics_model = _IdentityScaleModel()
@@ -371,6 +367,8 @@ def test_epoch_loss_components_are_weighted_by_actual_sample_count() -> None:
         "physics/train/loss_continuity_div_velocity",
         "physics/train/residual_weight",
         "physics/train/boundary_weight",
+        "system/train_duration_seconds",
+        "system/train_samples_per_second",
         "optimizer_steps",
     }
     assert physics_values["physics/train/residual_weight"] == 0.25
@@ -383,57 +381,62 @@ class _ManufacturedMonitorModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.samples_seen = 0
+        self.inference_modes: list[bool] = []
+        self.grad_modes: list[bool] = []
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Return manufactured outputs and count the bounded samples consumed."""
+        """Return manufactured outputs and record bounded inference isolation."""
         self.samples_seen += int(inputs.shape[0])
+        self.inference_modes.append(torch.is_inference_mode_enabled())
+        self.grad_modes.append(torch.is_grad_enabled())
         zeros = torch.zeros_like(inputs[:, 0])
         return torch.stack((zeros, 1e-5 * inputs[:, 0], zeros), dim=1)
 
 
-@pytest.mark.parametrize(
-    "filename",
-    [
-        "steady_flow_fno.yaml",
-        "steady_flow_uno.yaml",
-        "steady_flow_pifno.yaml",
-        "steady_flow_piuno.yaml",
-    ],
-)
-def test_physics_monitor_is_bounded_and_reports_both_continuities(filename: str) -> None:
+def test_physics_monitor_is_bounded_and_reports_both_continuities() -> None:
     """
     Evaluate the shared domain diagnostics on only a fixed evaluation prefix.
 
     The monitor must consume exactly the bound and report both continuity metrics
     plus momentum/boundary values, without introducing a second physics formula.
     """
-    config = _physics_config(filename=filename)
-    loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
-    normalizer = IdentityNormalizer()
-    loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
     inputs, _pred, target = _manufactured_batch()
     samples = [{"x": inputs[0].clone(), "y": target[0].clone()} for _ in range(3)]
     loader = DataLoader(_ListMappingDataset(samples), batch_size=3, shuffle=False)
-    model = _ManufacturedMonitorModel()
 
-    values = learning.training.loop.evaluate_physics_monitor(
-        model,
-        loader,
-        loss,
-        torch.device("cpu"),
-        data_processor=None,
-        max_cases=2,
-    )
+    for model_kind in ("fno", "uno"):
+        for physics_enabled in (False, True):
+            config = experiments.config.loader.load_and_resolve_config(
+                configs.experiment_config_path(
+                    model_kind=model_kind,
+                    physics_enabled=physics_enabled,
+                ),
+            )
+            loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
+            normalizer = IdentityNormalizer()
+            loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
+            model = _ManufacturedMonitorModel()
 
-    assert model.samples_seen == 2
-    assert set(values) == {
-        "physics/id/momentum_residual_mse",
-        "physics/id/continuity_div_velocity_mse",
-        "physics/id/continuity_div_eps_velocity_mse",
-        "physics/id/pressure_boundary_mse",
-    }
-    assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
-    assert values["physics/id/continuity_div_velocity_mse"] != values["physics/id/continuity_div_eps_velocity_mse"]
+            values = learning.training.loop.evaluate_physics_monitor(
+                model,
+                loader,
+                loss,
+                torch.device("cpu"),
+                data_processor=None,
+                max_cases=2,
+            )
+
+            assert model.samples_seen == 2
+            assert model.inference_modes == [True]
+            assert model.grad_modes == [False]
+            assert set(values) == {
+                "physics/id/momentum_residual_mse",
+                "physics/id/continuity_div_velocity_mse",
+                "physics/id/continuity_div_eps_velocity_mse",
+                "physics/id/pressure_boundary_mse",
+            }
+            assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
+            assert values["physics/id/continuity_div_velocity_mse"] != values["physics/id/continuity_div_eps_velocity_mse"]
 
 
 class _FailingMonitorLoss(torch.nn.Module):

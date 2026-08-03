@@ -73,7 +73,7 @@ def _neural_cases() -> list[dict[str, Any]]:
 
 def _comsol_payload(*, digest: str = "a" * 64) -> dict[str, Any]:
     return {
-        "schema_kind": analysis.timing.COMSOL_SOLVE_SCHEMA_KIND,
+        "schema_kind": analysis.artifacts.timing.COMSOL_SOLVE_SCHEMA_KIND,
         "schema_version": 1,
         "batch_name": "batch-a",
         "batch_manifest_sha256": digest,
@@ -100,7 +100,7 @@ def _comsol_payload(*, digest: str = "a" * 64) -> dict[str, Any]:
 
 
 def _comparison(*, comsol: bool = True) -> dict[str, Any]:
-    return analysis.timing.build_runtime_comparison(
+    return analysis.artifacts.timing.build_runtime_comparison(
         split_role="eval",
         dataset_identity=_dataset_identity(),
         model_identity=_model_identity(),
@@ -148,7 +148,7 @@ def test_comsol_timing_resolution_uses_only_validated_training_metadata(
     digest = "a" * 64
     comsol_payload = _comsol_payload(digest=digest)
     package = _metadata_package(digest=digest, timing=comsol_payload, status="partial")
-    request = analysis.artifact_service.ArtifactRequest(
+    request = analysis.artifacts.service.ArtifactRequest(
         provenance={},
         source_indices=(),
         dataset_metadata=package,
@@ -156,7 +156,7 @@ def test_comsol_timing_resolution_uses_only_validated_training_metadata(
 
     generated_root = tmp_path / "must-not-be-opened"
     monkeypatch.setenv("GENERATED_DATA_ROOT", str(generated_root))
-    payload, resolved_digest, reason = analysis.artifact_service._resolve_comsol_timing(request)
+    payload, resolved_digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
     assert payload == comsol_payload
     assert resolved_digest == digest
     assert reason is None
@@ -165,12 +165,12 @@ def test_comsol_timing_resolution_uses_only_validated_training_metadata(
 
 def test_missing_training_timing_snapshot_is_nonfatal() -> None:
     package = _metadata_package(digest="a" * 64, timing=None, status="missing")
-    request = analysis.artifact_service.ArtifactRequest(
+    request = analysis.artifacts.service.ArtifactRequest(
         provenance={},
         source_indices=(),
         dataset_metadata=package,
     )
-    payload, digest, reason = analysis.artifact_service._resolve_comsol_timing(request)
+    payload, digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
     assert payload is None
     assert digest is None
     assert reason == "validated model-training COMSOL timing snapshot is missing"
@@ -187,13 +187,13 @@ def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
         "p90_s": [],
     }
     package = _metadata_package(digest="a" * 64, timing=comsol_payload, status="missing")
-    request = analysis.artifact_service.ArtifactRequest(
+    request = analysis.artifacts.service.ArtifactRequest(
         provenance={},
         source_indices=(),
         dataset_metadata=package,
     )
 
-    payload, digest, reason = analysis.artifact_service._resolve_comsol_timing(request)
+    payload, digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
 
     assert payload is None
     assert digest is None
@@ -206,7 +206,7 @@ def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: p
 
     monkeypatch.setattr(torch.cuda, "synchronize", forbidden)
     model = _RecordingProjection()
-    prediction, duration = analysis.timing.measure_forward(
+    prediction, duration = analysis.artifacts.timing.measure_forward(
         model=model,
         normalized_inputs=torch.ones(1, 2, 2, 2),
         device=torch.device("cpu"),
@@ -221,7 +221,7 @@ def test_warmup_is_separate_from_authoritative_measurement() -> None:
     model = _RecordingProjection()
     processor = SimpleNamespace(in_normalizer=_IdentityNormalizer())
     batch = {"x": torch.ones(4, 2, 2, 2)}
-    analysis.timing.warm_up_forward(
+    analysis.artifacts.timing.warm_up_forward(
         representative_batch=batch,
         model=model,
         processor=processor,
@@ -229,7 +229,7 @@ def test_warmup_is_separate_from_authoritative_measurement() -> None:
         passes=1,
     )
     assert model.inference_modes == [True]
-    _prediction, measured_s = analysis.timing.measure_forward(
+    _prediction, measured_s = analysis.artifacts.timing.measure_forward(
         model=model,
         normalized_inputs=batch["x"][:1],
         device=torch.device("cpu"),
@@ -246,7 +246,7 @@ def test_cuda_synchronizes_exact_resolved_device_around_forward(monkeypatch: pyt
 
     monkeypatch.setattr(torch.cuda, "synchronize", record)
     device = torch.device("cuda:2")
-    analysis.timing.measure_forward(
+    analysis.artifacts.timing.measure_forward(
         model=_RecordingProjection(),
         normalized_inputs=torch.ones(1, 2, 2, 2),
         device=device,
@@ -279,7 +279,7 @@ def test_missing_comsol_timing_retains_neural_measurements_without_fabrication()
 
 def test_manifest_mismatch_is_rejected() -> None:
     with pytest.raises(ValueError, match="batch manifest"):
-        analysis.timing.build_runtime_comparison(
+        analysis.artifacts.timing.build_runtime_comparison(
             split_role="eval",
             dataset_identity=_dataset_identity(),
             model_identity=_model_identity(),
@@ -306,7 +306,7 @@ def test_runtime_comparison_rejects_invalid_or_duplicate_cases(mutation: Any) ->
     payload = _comparison()
     mutation(payload)
     with pytest.raises((TypeError, ValueError)):
-        analysis.timing.validate_runtime_comparison(payload)
+        analysis.artifacts.timing.validate_runtime_comparison(payload)
 
 
 @pytest.mark.parametrize(
@@ -319,12 +319,12 @@ def test_timing_payloads_require_integer_schema_version_one(schema_version: obje
     comsol = _comsol_payload()
     comsol["schema_version"] = schema_version
     with pytest.raises(ValueError, match="invalid schema"):
-        analysis.timing.validate_comsol_solve_timing(comsol)
+        analysis.artifacts.timing.validate_comsol_solve_timing(comsol)
 
     comparison = _comparison()
     comparison["schema_version"] = schema_version
     with pytest.raises(ValueError, match="invalid schema"):
-        analysis.timing.validate_runtime_comparison(comparison)
+        analysis.artifacts.timing.validate_runtime_comparison(comparison)
 
 
 def test_metadata_timing_normalizes_one_current_matlab_case_object() -> None:
@@ -374,7 +374,7 @@ def test_metadata_timing_aggregate_count_requires_an_integer(measured_case_count
 def test_comsol_timing_accepts_nonlexicographic_manifest_order() -> None:
     payload = _comsol_payload()
     payload["cases"] = list(reversed(payload["cases"]))
-    assert analysis.timing.validate_comsol_solve_timing(payload) == payload
+    assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
 
 
 def test_empty_comsol_sidecar_uses_matlab_empty_aggregates() -> None:
@@ -387,16 +387,16 @@ def test_empty_comsol_sidecar_uses_matlab_empty_aggregates() -> None:
         "p10_s": [],
         "p90_s": [],
     }
-    assert analysis.timing.validate_comsol_solve_timing(payload) == payload
+    assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
 
 
 def test_comsol_aggregates_allow_only_machine_roundoff() -> None:
     payload = _comsol_payload()
     payload["aggregates"]["mean_s"] += 5e-15
-    assert analysis.timing.validate_comsol_solve_timing(payload) == payload
+    assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
     payload["aggregates"]["mean_s"] += 1e-3
     with pytest.raises(ValueError, match="derived from valid case records"):
-        analysis.timing.validate_comsol_solve_timing(payload)
+        analysis.artifacts.timing.validate_comsol_solve_timing(payload)
 
 
 def test_comsol_timing_rejects_zero_nonfinite_malformed_and_duplicate_records() -> None:
@@ -404,15 +404,15 @@ def test_comsol_timing_rejects_zero_nonfinite_malformed_and_duplicate_records() 
         payload = _comsol_payload()
         payload["cases"][0]["comsol_solve_s"] = value
         with pytest.raises((TypeError, ValueError)):
-            analysis.timing.validate_comsol_solve_timing(payload)
+            analysis.artifacts.timing.validate_comsol_solve_timing(payload)
     malformed = _comsol_payload()
     malformed["cases"][0].pop("case_id")
     with pytest.raises(ValueError, match="invalid fields"):
-        analysis.timing.validate_comsol_solve_timing(malformed)
+        analysis.artifacts.timing.validate_comsol_solve_timing(malformed)
     duplicate = _comsol_payload()
     duplicate["cases"][1]["case_id"] = "case_0001"
     with pytest.raises(ValueError, match="unique"):
-        analysis.timing.validate_comsol_solve_timing(duplicate)
+        analysis.artifacts.timing.validate_comsol_solve_timing(duplicate)
 
 
 def test_atomic_round_trip_and_scientific_manifest_exclusion(tmp_path: Path) -> None:
@@ -421,9 +421,9 @@ def test_atomic_round_trip_and_scientific_manifest_exclusion(tmp_path: Path) -> 
     npz_root.mkdir(parents=True)
     (artifact_root / "cases.parquet").write_bytes(b"scientific-table")
     (npz_root / "case_0001.npz").write_bytes(b"scientific-case")
-    before = analysis.artifacts.artifact_output_manifest(artifact_root)
-    path = analysis.timing.write_runtime_comparison(artifact_root, _comparison())
-    assert path.name == analysis.timing.RUNTIME_COMPARISON_FILENAME
+    before = analysis.artifacts.contracts.artifact_output_manifest(artifact_root)
+    path = analysis.artifacts.timing.write_runtime_comparison(artifact_root, _comparison())
+    assert path.name == analysis.artifacts.timing.RUNTIME_COMPARISON_FILENAME
     assert not list(artifact_root.glob(".*.tmp"))
-    assert analysis.timing.load_runtime_comparison(artifact_root) == _comparison()
-    assert analysis.artifacts.artifact_output_manifest(artifact_root) == before
+    assert analysis.artifacts.timing.load_runtime_comparison(artifact_root) == _comparison()
+    assert analysis.artifacts.contracts.artifact_output_manifest(artifact_root) == before

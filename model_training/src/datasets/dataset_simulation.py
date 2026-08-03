@@ -1,4 +1,25 @@
-"""Load the single current task-aware final training-dataset format."""
+"""
+===============================================================================
+dataset_simulation.py
+===============================================================================
+Load the single current task-aware final training-dataset format.
+
+Responsibilities:
+  - Load one final dataset payload from an explicit path
+  - Verify it through the shared flow module and identity contract
+  - Expose task-ordered input/output tensors with isolated source metadata
+
+Design principles:
+  - Dataset admission is strict before any sample is returned
+  - Task field order is authoritative for model-facing tensors
+  - Source metadata is copied so callers cannot mutate persisted payload state
+
+This module does NOT:
+  - Build or publish final datasets; ``data_generation`` owns construction
+  - Fit normalizers or split memberships; dataset-base services own those steps
+  - Resolve logical dataset names or storage roots; ``common.paths`` owns paths
+===============================================================================
+"""
 
 from __future__ import annotations
 
