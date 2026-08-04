@@ -4,7 +4,7 @@ Verify reusable physical and spectral derivative operators on analytic fields.
 
 Linear and periodic manufactured solutions cover gradients, divergence, crop,
 spacing inference, extension semantics, and invalid grids/identifiers. Brinkman
-equation assembly is covered separately; these tests do not claim accuracy on
+equation assembly is covered separately. These tests do not claim accuracy on
 production COMSOL fields.
 """
 

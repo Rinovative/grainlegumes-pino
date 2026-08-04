@@ -45,7 +45,7 @@ def test_enabled_real_data_acceptance_uses_only_mounted_roots_and_requires_packa
 
     assert real_data.require_real_data_root() == training_root
     assert real_data.require_real_generated_data_root() == generated_root
-    with pytest.raises(FileNotFoundError, match="lhs_var80_seed3001"):
-        real_data.require_real_metadata_package("lhs_var80_seed3001")
-    with pytest.raises(FileNotFoundError, match="lhs_var80_seed3001"):
-        real_data.require_real_generated_batch("lhs_var80_seed3001")
+    with pytest.raises(FileNotFoundError, match="artificial_missing_package"):
+        real_data.require_real_metadata_package("artificial_missing_package")
+    with pytest.raises(FileNotFoundError, match="artificial_missing_package"):
+        real_data.require_real_generated_batch("artificial_missing_package")

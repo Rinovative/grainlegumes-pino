@@ -94,7 +94,7 @@ def _neutral_table(frame: pd.DataFrame) -> dict[str, object]:
     """
     Convert one summary frame to a path-free, W&B-neutral table payload.
 
-    The index is materialized as columns; NumPy scalars become Python scalars,
+    The index is materialized as columns, and NumPy scalars become Python scalars,
     supported primitives remain unchanged, and other values use readable text.
     No W&B type is imported or constructed.
     """
@@ -142,7 +142,7 @@ def render_curated_analysis(
         Provenance-compatible ID or OOD evaluation frames with physics evidence.
     output_dir : str | pathlib.Path
         Caller-owned render directory outside every immutable artifact root. It
-        is created when absent; existing fixed-name PNG targets are overwritten.
+        is created when absent. Existing fixed-name PNG targets are overwritten.
 
     Returns
     -------
@@ -162,7 +162,7 @@ def render_curated_analysis(
     Notes
     -----
     Rendering owns only the four output figures. The caller owns directory
-    lifecycle and cleanup; evaluation readers and plot modules own admission and
+    lifecycle and cleanup. Evaluation readers and plot modules own admission and
     scientific calculations.
 
     """

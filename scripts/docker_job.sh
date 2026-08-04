@@ -17,37 +17,29 @@ usage() {
 Usage:
   $0 train <experiment_config> [training options...] [--queue-gpu auto|INDEX] [--follow]
   $0 optuna <optuna_config> [Optuna options...] [--queue-gpu auto|INDEX] [--follow]
-  $0 artifacts [artifact options...] [--queue-gpu auto|INDEX]
+  $0 artifacts (--task TASK | --runs-root PATH) [artifact options...] [--queue-gpu auto|INDEX]
 
 Workflows:
   train <experiment_config>
-      Submit one normal training run and return immediately. Resume is explicit.
+      Submit one direct run that builds or reuses bundle-local artifacts after completion.
+      Add --no-build-artifacts after the config to skip only post-training artifacts.
+      Resume is explicit.
   optuna <optuna_config>
       Submit one Optuna study and return immediately. Persistent continuation uses study storage.
-
-Steady-flow experiment roles:
-  experiments/capacity_and_physics/  controlled capacity-matched physics investigation
-  experiments/best_of_class/          final model-family representatives
-  experiments/model_selection/        manually authored candidate recipes
-  optuna/                              automated hyperparameter-optimization studies
-
-Current task-first examples:
-  $0 train model_training/configs/tasks/steady_flow/experiments/capacity_and_physics/fno_m12x12_h24_l4.yaml
-  $0 train model_training/configs/tasks/steady_flow/experiments/best_of_class/uno_m64x64_h32_l7_mr0p495.yaml
-  $0 train model_training/configs/tasks/steady_flow/experiments/model_selection/fno_m48x48_h64_l4.yaml
-  $0 optuna model_training/configs/tasks/steady_flow/optuna/fno_search.yaml
+  artifacts (--task TASK | --runs-root PATH)
+      Generate or validate analysis artifacts for completed runs and return immediately.
 
 GPU selection:
-  omit --queue-gpu  in an interactive TTY, show usage and prompt for one host GPU;
-                    press Enter to accept the least-memory proposal
+  omit --queue-gpu  in an interactive TTY, show usage, and prompt for one host GPU.
+                    Press Enter to accept the least-memory proposal
   --queue-gpu auto  select the least-memory host GPU without prompting
   --queue-gpu INDEX select one reported physical host GPU without prompting
 
 Non-interactive callers must provide --queue-gpu auto or --queue-gpu INDEX.
 --follow is independent of GPU selection and follows the detached worker host log.
 Ctrl+C during GPU selection submits nothing. Ctrl+C during log following stops only
-the follower; the queue job continues with no worker input channel. No --wait mode
-exists; the wrapper never polls or waits for worker completion.
+the follower. The queue job continues with no worker input channel. No --wait mode
+exists. The wrapper never polls or waits for worker completion.
 EOF
 }
 
@@ -232,7 +224,7 @@ run_config_preflight() {
     preflight_runtime_failure "the Docker daemon is unavailable."
   fi
   if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
-    preflight_runtime_failure "image '${IMAGE_NAME}' is missing; build it with ./scripts/docker_build.sh."
+    preflight_runtime_failure "image '${IMAGE_NAME}' is missing. Build it with ./scripts/docker_build.sh."
   fi
 
   command=(
@@ -353,7 +345,72 @@ validate_semantic_device_arguments() {
   done
 
   if (( count == 1 )) && [[ "${value}" != "cuda" ]]; then
-    fail 2 "Queued jobs require strict --device cuda; received --device ${value@Q}."
+    fail 2 "Queued jobs require explicit --device cuda. Received --device ${value@Q}."
+  fi
+}
+
+resolve_artifact_selection() {
+  local arguments=("$@")
+  local index=0
+  local argument
+  local value
+  local task_seen=false
+  local runs_root_seen=false
+  local artifact_task=""
+
+  while (( index < ${#arguments[@]} )); do
+    argument="${arguments[index]}"
+    case "${argument}" in
+      --task)
+        if (( index + 1 >= ${#arguments[@]} )) || [[ -z "${arguments[index + 1]}" || "${arguments[index + 1]}" == --* ]]; then
+          fail 2 "--task requires a non-empty registered task identifier."
+        fi
+        artifact_task="${arguments[index + 1]}"
+        task_seen=true
+        index=$((index + 2))
+        ;;
+      --task=*)
+        value="${argument#--task=}"
+        if [[ -z "${value}" ]]; then
+          fail 2 "--task requires a non-empty registered task identifier."
+        fi
+        artifact_task="${value}"
+        task_seen=true
+        index=$((index + 1))
+        ;;
+      --runs-root)
+        if (( index + 1 >= ${#arguments[@]} )) || [[ -z "${arguments[index + 1]}" || "${arguments[index + 1]}" == --* ]]; then
+          fail 2 "--runs-root requires a non-empty path value."
+        fi
+        runs_root_seen=true
+        index=$((index + 2))
+        ;;
+      --runs-root=*)
+        value="${argument#--runs-root=}"
+        if [[ -z "${value}" ]]; then
+          fail 2 "--runs-root requires a non-empty path value."
+        fi
+        runs_root_seen=true
+        index=$((index + 1))
+        ;;
+      *)
+        index=$((index + 1))
+        ;;
+    esac
+  done
+
+  if [[ "${task_seen}" == "${runs_root_seen}" ]]; then
+    fail 2 "Artifact jobs require exactly one of --task TASK or --runs-root PATH."
+  fi
+  if [[ "${task_seen}" == true ]]; then
+    if [[ "$(trim_whitespace "${artifact_task}")" != "${artifact_task}" || "${artifact_task}" == */* || "${artifact_task}" == *\\* || "${artifact_task}" == "." || "${artifact_task}" == ".." ]]; then
+      fail 2 "--task must be one safe registered task identifier."
+    fi
+    RESOLVED_TASK="${artifact_task}"
+    LOG_SCOPE="${artifact_task}"
+  else
+    RESOLVED_TASK="not supplied"
+    LOG_SCOPE="artifacts"
   fi
 }
 
@@ -427,7 +484,7 @@ while (( $# > 0 )); do
       fail 2 "Use the documented form: --queue-gpu auto|INDEX."
       ;;
     --wait|--wait=*|--follow-and-wait|--follow-and-wait=*)
-      fail 2 "Queue completion waiting is unsupported; submission is detached."
+      fail 2 "Queue completion waiting is unsupported. Submission is detached."
       ;;
     *)
       SEMANTIC_ARGS+=("${argument}")
@@ -441,7 +498,8 @@ if [[ -z "${JOB_TYPE}" ]]; then
   exit 2
 fi
 
-RESOLVED_TASK="steady_flow"
+RESOLVED_TASK="not supplied"
+LOG_SCOPE=""
 CANONICAL_CONFIG_PATH="not applicable"
 case "${JOB_TYPE}" in
   train|optuna)
@@ -472,11 +530,13 @@ case "${JOB_TYPE}" in
     if [[ -z "${SUPPLIED_CONFIG_FAMILY}" || -z "${RESOLVED_TASK}" || -z "${CANONICAL_CONFIG_PATH}" || -n "${PREFLIGHT_EXTRA:-}" ]]; then
       fail 1 "Configuration preflight returned a malformed container summary."
     fi
+    LOG_SCOPE="${RESOLVED_TASK}"
     ;;
   artifacts)
     if [[ "${FOLLOW_LOG}" == true ]]; then
       fail 2 "--follow is supported only for train and optuna workflows."
     fi
+    resolve_artifact_selection "${SEMANTIC_ARGS[@]}"
     ;;
 esac
 
@@ -551,7 +611,7 @@ for index in "${!GPU_IDS[@]}"; do
     "${GPU_MEMORY_USED[index]}" "${GPU_MEMORY_TOTAL[index]}"
 done
 printf 'Proposed GPU: %s\n' "${AUTO_GPU}"
-printf 'Proposal reason: least allocated memory; lowest index breaks ties\n'
+printf 'Proposal reason: least allocated memory. Lowest index breaks ties.\n'
 
 GPU_LIST="$(IFS=,; printf '%s' "${GPU_IDS[*]}")"
 gpu_is_reported() {
@@ -575,7 +635,7 @@ case "${QUEUE_GPU_REQUEST}" in
     fi
 
     selection_interrupted() {
-      printf '\nGPU selection cancelled; no queue job was submitted.\n' >&2
+      printf '\nGPU selection cancelled. No queue job was submitted.\n' >&2
       exit 130
     }
     trap selection_interrupted INT
@@ -583,11 +643,11 @@ case "${QUEUE_GPU_REQUEST}" in
     GPU_ID=""
     SELECTION_ATTEMPTS=0
     while (( SELECTION_ATTEMPTS < 10 )); do
-      printf 'Select GPU (%s; Enter for proposed %s): ' "${GPU_LIST}" "${AUTO_GPU}"
+      printf 'Select GPU (%s. Enter for proposed %s): ' "${GPU_LIST}" "${AUTO_GPU}"
       if ! IFS= read -r GPU_INPUT; then
         trap - INT
         unset -f selection_interrupted
-        fail 2 "GPU selection input closed before a choice was received; no queue job was submitted."
+        fail 2 "GPU selection input closed before a choice was received. No queue job was submitted."
       fi
       GPU_INPUT="$(trim_whitespace "${GPU_INPUT}")"
       if [[ -z "${GPU_INPUT}" ]]; then
@@ -595,7 +655,7 @@ case "${QUEUE_GPU_REQUEST}" in
         break
       fi
       if [[ ! "${GPU_INPUT}" =~ ^(0|[1-9][0-9]*)$ ]]; then
-        printf 'Invalid GPU selection %s; enter one reported index or press Enter.\n' "${GPU_INPUT@Q}" >&2
+        printf 'Invalid GPU selection %s. Enter one reported index or press Enter.\n' "${GPU_INPUT@Q}" >&2
       elif ! gpu_is_reported "${GPU_INPUT}"; then
         printf 'GPU %s is not one of the reported indices: %s.\n' "${GPU_INPUT@Q}" "${GPU_LIST}" >&2
       else
@@ -607,14 +667,14 @@ case "${QUEUE_GPU_REQUEST}" in
     trap - INT
     unset -f selection_interrupted
     if [[ -z "${GPU_ID}" ]]; then
-      fail 2 "GPU selection failed after 10 invalid attempts; no queue job was submitted."
+      fail 2 "GPU selection failed after 10 invalid attempts. No queue job was submitted."
     fi
     printf 'Selected GPU: %s\n' "${GPU_ID}"
     ;;
   auto)
     GPU_ID="${AUTO_GPU}"
     printf 'Automatically selected GPU: %s\n' "${GPU_ID}"
-    printf 'Reason: least allocated memory; lowest index breaks ties\n'
+    printf 'Reason: least allocated memory. Lowest index breaks ties.\n'
     ;;
   *)
     if [[ ! "${QUEUE_GPU_REQUEST}" =~ ^(0|[1-9][0-9]*)$ ]]; then
@@ -630,7 +690,7 @@ case "${QUEUE_GPU_REQUEST}" in
 esac
 
 TASK_SPOOLER_SOCKET="/etc/ts/socket_${GPU_ID}"
-LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/${RESOLVED_TASK}/logs/queue"
+LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/${LOG_SCOPE}/logs/queue"
 mkdir -p "${LOG_DIR}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_PATH="$(mktemp --suffix=.log "${LOG_DIR}/${TIMESTAMP}__${JOB_TYPE}__gpu${GPU_ID}__XXXXXX")"
@@ -642,6 +702,7 @@ QUEUE_COMMAND=(
   "${PROJECT_DIR}/scripts/_docker_run.sh"
   "${GPU_ID}"
   "${JOB_TYPE}"
+  "${LOG_SCOPE}"
   "${LOG_BASENAME}"
   "${SEMANTIC_ARGS[@]}"
 )
@@ -718,7 +779,7 @@ if [[ "${FOLLOW_LOG}" != true ]]; then
   exit 0
 fi
 
-printf 'Following host log. Press Ctrl+C to stop following; the queue job continues.\n'
+printf 'Following host log. Press Ctrl+C to stop following. The queue job continues.\n'
 FOLLOW_INTERRUPTED=false
 follow_interrupt() {
   FOLLOW_INTERRUPTED=true
@@ -735,6 +796,6 @@ if [[ "${FOLLOW_INTERRUPTED}" == true ]] || (( TAIL_STATUS == 130 )); then
   exit 0
 fi
 if (( TAIL_STATUS != 0 )); then
-  fail "${TAIL_STATUS}" "Host log following failed; queue job ${QUEUE_JOB_ID} continues independently."
+  fail "${TAIL_STATUS}" "Host log following failed. Queue job ${QUEUE_JOB_ID} continues independently."
 fi
 printf 'Log following ended. Queue job %s continues independently.\n' "${QUEUE_JOB_ID}"

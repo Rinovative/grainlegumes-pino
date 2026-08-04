@@ -4,7 +4,7 @@ Protect deterministic, content-bound dataset and saved-membership identity.
 
 The tests vary case order, tensors, metadata, sample IDs, and split indices to
 show that equivalent content is stable and tampering fails strict verification.
-Direct-builder transactions belong to ``test_dataset_contract``; large
+Direct-builder transactions belong to ``test_dataset_contract``. Large
 production tensors are deliberately not loaded.
 """
 
@@ -349,6 +349,13 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
         "split_seed": 9,
     }
     *_, split_info = datasets.base.create_dataloaders(**loader_args)
+    assert split_info["task_contract_digest"] == steady_task.contract_digest
+    assert split_info["metadata"]["datasets"]["train"]["data_contract_digest"] == steady_task.data_contract_digest
+    assert split_info["metadata"]["datasets"]["ood"]["data_contract_digest"] == steady_task.data_contract_digest
+    stale_header = copy.deepcopy(split_info)
+    stale_header["task_contract_digest"] = "8cdaf4de22d945e08783f118d5fa8374e37521f91b20b12c913230ba015ca91a"
+    with pytest.raises(ValueError, match="current registered task"):
+        datasets.base.validate_split_info(stale_header)
 
     replaced = training_dataset_payload_factory(
         "train",
@@ -476,7 +483,7 @@ def test_training_loader_retains_a_partial_batch(
     """
     Request a batch larger than the small valid training split.
 
-    The loader must retain one partial batch; dropping it would turn a valid
+    The loader must retain one partial batch. Dropping it would turn a valid
     dataset into an empty training lifecycle.
     """
     train_path = _save_dataset(tmp_path, training_dataset_payload_factory("partial_train"))

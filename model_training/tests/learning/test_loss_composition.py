@@ -12,19 +12,20 @@ from __future__ import annotations
 
 import pytest
 import torch
-from src import experiments, learning
+from src import domain, experiments, learning
 from support import configs
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
 _MIDPOINT_EPOCH = 2
+_TASK = domain.tasks.registry.get_task("steady_flow")
 
 
 class _ListMappingDataset(Dataset[dict[str, torch.Tensor]]):
     """
     Present caller-supplied tensor mappings to a DataLoader in their original order.
 
-    The fake owns no storage, normalization, or task semantics; tests choose batch
+    The fake owns no storage, normalization, or task semantics. Tests choose batch
     sizes over its finite samples to expose partial-batch aggregation behavior.
     """
 
@@ -57,8 +58,9 @@ def _physics_config(
     Residual and boundary targets are fixed at two and three respectively, making
     their midpoint weights observable while retaining the selected FNO or UNO recipe.
     """
-    raw = experiments.config.loader.load_yaml(
-        configs.experiment_config_path(model_kind=model_kind, physics_enabled=True),
+    raw = configs.direct_config(
+        model_kind=model_kind,
+        physics_enabled=True,
     )
     raw["loss"]["physics"]["continuity"] = continuity  # type: ignore[index]
     raw["loss"]["physics"]["residual_weight"] = {  # type: ignore[index]
@@ -74,13 +76,7 @@ def _physics_config(
 
 
 def _manufactured_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Build one 9-by-11 steady-flow BCHW batch with identity-normalized values.
-
-    Inputs follow the seven task channels, targets are zero, and the predicted
-    ``u = 1e-5 * x`` field plus inlet pressure data makes physics components
-    observable. The manufactured tensors are not a Brinkman solution benchmark.
-    """
+    """Build one TaskSpec-ordered manufactured steady-flow batch."""
     height = 9
     width = 11
     y_values = torch.linspace(0.0, 1.0, height)
@@ -91,21 +87,29 @@ def _manufactured_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     zeros = torch.zeros_like(x_grid)
     p_bc = zeros.clone()
     p_bc[:, 0, :] = 1.0
-    inputs = torch.stack(
-        (
-            x_grid,
-            y_grid,
-            zeros,
-            zeros,
-            zeros,
-            torch.full_like(x_grid, 0.5),
-            p_bc,
-        ),
-        dim=1,
-    )
-    pred = torch.stack((zeros, 1e-5 * x_grid, zeros), dim=1)
-    target = torch.zeros_like(pred)
-    return inputs, pred, target
+
+    coordinate_values = iter((x_grid, y_grid))
+    input_by_field: dict[str, torch.Tensor] = {}
+    for field in _TASK.inputs:
+        if field.role == "coordinate":
+            input_by_field[field.name] = next(coordinate_values)
+        elif field.role == "permeability":
+            input_by_field[field.name] = zeros
+        elif field.role == "porosity":
+            input_by_field[field.name] = torch.full_like(x_grid, 0.5)
+        elif field.role == "boundary":
+            input_by_field[field.name] = p_bc
+        else:
+            msg = f"unsupported steady-flow fixture role: {field.role}"
+            raise AssertionError(msg)
+    inputs = torch.stack([input_by_field[field] for field in _TASK.input_names], dim=1)
+
+    velocity = next(group for group in _TASK.output_groups if group.id == "velocity")
+    prediction_by_field = dict.fromkeys(_TASK.output_names, zeros)
+    prediction_by_field[velocity.fields[0]] = 1e-5 * x_grid
+    prediction = torch.stack([prediction_by_field[field] for field in _TASK.output_names], dim=1)
+    target = torch.zeros_like(prediction)
+    return inputs, prediction, target
 
 
 def test_disabled_physics_exposes_named_zero_components() -> None:
@@ -115,11 +119,12 @@ def test_disabled_physics_exposes_named_zero_components() -> None:
     Named physics components must remain present as exact zeros and total must
     equal data loss, keeping telemetry schema stable without fabricating residuals.
     """
-    supervised = experiments.config.loader.load_and_resolve_config(
-        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
+    supervised = experiments.config.loader.resolve_config(
+        configs.direct_config(model_kind="fno", physics_enabled=False),
     )
     supervised_loss = learning.losses.factory.build_training_loss(supervised, device=torch.device("cpu"))
-    pred = torch.ones((2, 3, 8, 8))
+    task = domain.tasks.registry.get_task(str(supervised["task"]))
+    pred = torch.ones((2, task.out_channels, 8, 8))
     target = torch.zeros_like(pred)
     components = supervised_loss.compute_components(pred, x=None, y=target)
 
@@ -193,7 +198,7 @@ def test_pi_model_families_share_formulation_selected_loss_path() -> None:
     Cross both PI model families with both allowed continuity formulations.
 
     Model kind may vary, but the semantic loss class and selected residual mapping
-    stay fixed; the opposite continuity key must never enter optimization components.
+    stay fixed. The opposite continuity key must never enter optimization components.
     """
     for model_kind in ("fno", "uno"):
         for continuity in ("div_velocity", "div_eps_velocity"):
@@ -244,7 +249,7 @@ class _IdentityScaleModel(torch.nn.Module):
     """
     Expose one trainable scalar for epoch-aggregation tests.
 
-    Callers use zero learning rate so predictions reveal only batch weighting;
+    Callers use zero learning rate so predictions reveal only batch weighting.
     this helper is not a model-accuracy fixture.
     """
 
@@ -389,8 +394,13 @@ class _ManufacturedMonitorModel(torch.nn.Module):
         self.samples_seen += int(inputs.shape[0])
         self.inference_modes.append(torch.is_inference_mode_enabled())
         self.grad_modes.append(torch.is_grad_enabled())
-        zeros = torch.zeros_like(inputs[:, 0])
-        return torch.stack((zeros, 1e-5 * inputs[:, 0], zeros), dim=1)
+        coordinate = next(field.name for field in _TASK.inputs if field.role == "coordinate")
+        coordinate_values = inputs[:, _TASK.input_names.index(coordinate)]
+        zeros = torch.zeros_like(coordinate_values)
+        velocity = next(group for group in _TASK.output_groups if group.id == "velocity")
+        prediction_by_field = dict.fromkeys(_TASK.output_names, zeros)
+        prediction_by_field[velocity.fields[0]] = 1e-5 * coordinate_values
+        return torch.stack([prediction_by_field[field] for field in _TASK.output_names], dim=1)
 
 
 def test_physics_monitor_is_bounded_and_reports_both_continuities() -> None:
@@ -406,8 +416,8 @@ def test_physics_monitor_is_bounded_and_reports_both_continuities() -> None:
 
     for model_kind in ("fno", "uno"):
         for physics_enabled in (False, True):
-            config = experiments.config.loader.load_and_resolve_config(
-                configs.experiment_config_path(
+            config = experiments.config.loader.resolve_config(
+                configs.direct_config(
                     model_kind=model_kind,
                     physics_enabled=physics_enabled,
                 ),

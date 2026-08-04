@@ -343,7 +343,7 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
         (
             "Continuity",
             physics["continuity"],
-            "Selected training form when enabled; both forms remain diagnostic",
+            "Selected training form when enabled. Both forms remain diagnostic",
         ),
         ("Interior crop", physics["interior_crop"], "Boundary cells excluded from residual diagnostics"),
     ]
@@ -481,7 +481,7 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                 (
                     "Monitor policy",
                     f"every {wandb['monitor']['interval']} epochs, at most {wandb['monitor']['max_cases']} cases",
-                    "Terminal-inclusive completed-epoch cadence; no epoch-zero history",
+                    "Terminal-inclusive completed-epoch cadence. No epoch-zero history",
                 ),
                 (
                     "Evaluation artifact upload",
@@ -684,7 +684,7 @@ def prepare_validation_presentation(
                 "Shape",
                 "Dtype",
                 "Fingerprint",
-                "Task digest",
+                "Data contract digest",
                 "Finite",
                 "Policy",
                 "Result",
@@ -701,7 +701,7 @@ def prepare_validation_presentation(
                     record.shape,
                     record.dtype,
                     record.fingerprint,
-                    record.task_digest,
+                    record.data_contract_digest,
                     record.finite,
                     record.policy,
                     record.result,

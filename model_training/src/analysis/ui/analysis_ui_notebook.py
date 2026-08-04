@@ -22,6 +22,7 @@ This module does NOT:
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -31,15 +32,13 @@ import pandas as pd
 from IPython.display import clear_output, display
 from matplotlib.figure import Figure
 
-from . import analysis_ui_viewers as viewers
-
 
 def _sanitize_name(name: str) -> str:
     """
     Convert a display label to the module's minimal export filename stem.
 
-    Text is lowercased; spaces become underscores; Unicode dashes become ASCII
-    hyphens; and forward slashes become underscores. No broader path-policy
+    Text is lowercased. Spaces become underscores. Unicode dashes become ASCII
+    hyphens, and forward slashes become underscores. No broader path-policy
     validation is performed here.
     """
     return name.lower().replace(" ", "_").replace("–", "-").replace("—", "-").replace("/", "_")  # noqa: RUF001
@@ -63,6 +62,26 @@ def _show_anything(result: Any) -> None:
         display(result)
 
 
+def _invoke_dropdown_entry(
+    plot_func: Callable[..., Any],
+    *,
+    export_state: dict[str, Any] | None,
+    export_plot_name: str,
+    export_title: str,
+) -> Any:
+    """Invoke one entry with explicit export context when it declares support."""
+    try:
+        parameters = signature(plot_func).parameters
+    except (TypeError, ValueError):
+        return plot_func()
+    context = {
+        "export_state": export_state,
+        "export_plot_name": export_plot_name,
+        "export_title": export_title,
+    }
+    return plot_func(**{name: value for name, value in context.items() if name in parameters})
+
+
 def make_dropdown_section(
     plots: list,
     *,
@@ -75,7 +94,7 @@ def make_dropdown_section(
     Parameters
     ----------
     plots : list
-        Ordered ``(title, zero-argument callable, export_name)`` entries.
+        Ordered ``(title, lazy callable, export_name)`` entries.
     export_state : dict | None, optional
         Shared mutable state receiving the current title/name and direct or
         viewer-rendered Matplotlib figure for later PDF export.
@@ -91,7 +110,7 @@ def make_dropdown_section(
     Notes
     -----
     Selecting the prompt clears output. A first-entry section remains lazy until
-    its tab opens. Before rendering, the prior export figure is cleared; non-figure
+    its tab opens. Before rendering, the prior export figure is cleared. Non-figure
     widgets may populate it later through viewer callbacks.
 
     """
@@ -99,25 +118,29 @@ def make_dropdown_section(
     dropdown = widgets.Dropdown(
         options=plot_options if select_first else [("Choose a view…", -1), *plot_options],
         value=None if select_first else -1,
-        description="View:",
+        description="" if select_first else "View:",
         style={"description_width": "initial"},
-        layout=widgets.Layout(width="360px"),
+        layout=widgets.Layout(width="230px" if select_first else "360px"),
     )
     output = widgets.Output()
     last_idx: dict[str, int | None] = {"idx": None}
 
     def on_plot_change(change: dict) -> None:
         """
-        Render a newly selected entry and synchronize shared export state.
+        Render a newly selected entry and synchronize panel-local export state.
 
         Repeated selection is ignored, the prompt clears output, and direct
         figures replace the export target while viewer widgets may update it
-        later through the shared viewer context.
+        later through the explicitly supplied viewer state.
         """
         idx = change["new"]
         if last_idx["idx"] == idx:
             return
         if idx == -1:
+            if export_state is not None:
+                export_state["fig"] = None
+                export_state["plot_name"] = None
+                export_state["title"] = None
             with output:
                 output.clear_output(wait=True)
             last_idx["idx"] = idx
@@ -127,14 +150,21 @@ def make_dropdown_section(
 
         with output:
             output.clear_output(wait=True)
-            plt.close("all")
 
-            # Tell analysis_ui_viewers where to store figures rendered inside viewers/callbacks
             if export_state is not None:
+                previous = export_state.get("fig")
+                if isinstance(previous, Figure):
+                    plt.close(previous)
                 export_state["fig"] = None
-                viewers.set_export_context(export_state, plot_name=plot_name, title=title)
+                export_state["plot_name"] = plot_name
+                export_state["title"] = title
 
-            result = plot_func()
+            result = _invoke_dropdown_entry(
+                plot_func,
+                export_state=export_state,
+                export_plot_name=plot_name,
+                export_title=title,
+            )
             if isinstance(result, tuple):
                 result = result[0]
 
@@ -144,7 +174,7 @@ def make_dropdown_section(
                 export_state["plot_name"] = plot_name
 
                 # Viewer callbacks may already have stored their rendered Figure
-                # through the shared export context; preserve it for non-Figure widgets.
+                # in this panel's explicit state. Preserve it for non-Figure widgets.
                 if isinstance(result, Figure):
                     export_state["fig"] = result
 
@@ -176,9 +206,10 @@ def make_toggle_shortcut(
     Returns
     -------
     Callable
-        Factory returning ``(title, zero-argument callable, export_name)``. A
-        ``datasets`` keyword is injected only when the target callable declares
-        that parameter; caller-supplied keyword arguments otherwise pass through.
+        Factory returning ``(title, lazy callable, export_name)``. The callable
+        accepts panel-local export context from :func:`make_dropdown_section`. A
+        ``datasets`` keyword is injected only when the target declares it. Other
+        caller-supplied keyword arguments pass through unchanged.
 
     Notes
     -----
@@ -191,27 +222,36 @@ def make_toggle_shortcut(
     # normalize dfs to dict[str, DataFrame]
     dataset_map = dfs if isinstance(dfs, dict) else {f"df{i}": df for i, df in enumerate(dfs)}
 
-    def toggle(title: str, func: Callable[..., Any], plot_name: str | None = None, **kwargs: Any) -> tuple[str, Callable[[], Any], str]:
-        """
-        Bind one target callable and its export identity into a lazy entry.
-
-        The normalized dataset mapping is injected only for callables declaring a
-        ``datasets`` local/parameter name; invocation remains deferred.
-        """
-        # auto-generate plot name
+    def toggle(title: str, func: Callable[..., Any], plot_name: str | None = None, **kwargs: Any) -> tuple[str, Callable[..., Any], str]:
+        """Bind one target callable and panel-local export identity lazily."""
         if plot_name is None:
-            plot_name = f"plot_{counter['i']:03d}"
+            resolved_plot_name = f"plot_{counter['i']:03d}"
             counter["i"] += 1
         else:
-            plot_name = _sanitize_name(plot_name)
+            resolved_plot_name = _sanitize_name(plot_name)
 
-        # inject datasets if viewer supports it
-        fn_args = func.__code__.co_varnames
-        if "datasets" in fn_args:
-            kwargs.setdefault("datasets", dataset_map)
+        parameters = signature(func).parameters
+        bound_kwargs = dict(kwargs)
+        if "datasets" in parameters:
+            bound_kwargs.setdefault("datasets", dataset_map)
 
-        # wrap function call for dropdown section
-        return (title, lambda: func(**kwargs), plot_name)
+        def invoke(
+            *,
+            export_state: dict[str, Any] | None = None,
+            export_plot_name: str | None = None,
+            export_title: str | None = None,
+        ) -> Any:
+            """Invoke the target with context only when its API declares it."""
+            call_kwargs = dict(bound_kwargs)
+            context = {
+                "export_state": export_state,
+                "export_plot_name": export_plot_name,
+                "export_title": export_title,
+            }
+            call_kwargs.update({name: value for name, value in context.items() if name in parameters})
+            return func(**call_kwargs)
+
+        return title, invoke, resolved_plot_name
 
     return toggle
 
@@ -232,7 +272,7 @@ def make_lazy_panel_with_tabs(
     Parameters
     ----------
     sections : Sequence[ipywidgets.Widget]
-        Already constructed tab contents; scientific views inside them may remain
+        Already constructed tab contents. Scientific views inside them may remain
         lazy according to their own dropdown/viewer contract.
     tab_titles : Sequence[str] | None, optional
         Tab labels, or generated ``Tab N`` names when omitted.
@@ -242,7 +282,7 @@ def make_lazy_panel_with_tabs(
         Shared mutable mapping expected to contain ``fig`` and optional
         ``plot_name`` for the current Matplotlib export target.
     export_dir : str, optional
-        Directory created on export; an empty string resolves to the process
+        Directory created on export. An empty string resolves to the process
         working directory.
     export_btn_text : str, optional
         PDF-export button label.
@@ -256,7 +296,7 @@ def make_lazy_panel_with_tabs(
     -----
     Opening/closing replaces notebook output but preserves tab/widget state.
     Export is user-triggered, creates the directory, and writes a UTC-timestamped
-    PDF from the current figure; missing state is reported without writing.
+    PDF from the current figure. Missing state is reported without writing.
 
     """
     main_out = widgets.Output()
@@ -284,18 +324,18 @@ def make_lazy_panel_with_tabs(
         Write the current export figure to a UTC-timestamped PDF on button click.
 
         Directory creation and file publication occur only when shared state holds
-        a figure; otherwise the callback reports status without filesystem writes.
+        a figure. Otherwise the callback reports status without filesystem writes.
         """
         with status_out:
             status_out.clear_output(wait=True)
 
             if export_state is None:
-                print("[Export] export_state ist None.")
+                print("[Export] Export is unavailable for this panel.")
                 return
 
             fig = export_state.get("fig", None)
             if fig is None:
-                print("[Export] Kein Matplotlib-Figure Objekt verfuegbar (zuerst einen Plot anzeigen).")
+                print("[Export] No figure is selected. Render a plot first.")
                 return
 
             out_dir = Path(export_dir)
@@ -306,15 +346,28 @@ def make_lazy_panel_with_tabs(
             out_path = out_dir / f"{stem}_{ts}.pdf"
 
             fig.savefig(out_path, bbox_inches="tight")
-            print(f"[Export] Gespeichert: {out_path}")
+            print(f"[Export] Saved: {out_path}")
 
     export_btn.on_click(do_export)
 
     header = widgets.HBox([close_btn, export_btn])
     panel = widgets.VBox([header, status_out, tabs])
 
+    initialized_tabs: set[int] = set()
+    tab_export_states = [{"fig": None, "plot_name": None, "title": None} for _ in sections]
+
+    def _snapshot_tab(index: int | None) -> None:
+        """Preserve the current view's export target before it is hidden."""
+        if export_state is None or index is None or not 0 <= index < len(tab_export_states):
+            return
+        tab_export_states[index] = {
+            "fig": export_state.get("fig"),
+            "plot_name": export_state.get("plot_name"),
+            "title": export_state.get("title"),
+        }
+
     def activate_selected_view(_: object = None) -> None:
-        """Activate the first view of the selected opt-in section once."""
+        """Render a tab's first view once, or restore its preserved export target."""
         selected_index = tabs.selected_index
         if selected_index is None:
             return
@@ -322,23 +375,37 @@ def make_lazy_panel_with_tabs(
         if not section_children or not isinstance(section_children[0], widgets.Dropdown):
             return
         dropdown = section_children[0]
-        if dropdown.index is None and dropdown.options:
-            dropdown.index = 0
+        if selected_index not in initialized_tabs:
+            if dropdown.index is None and dropdown.options:
+                dropdown.index = 0
+            initialized_tabs.add(selected_index)
+            _snapshot_tab(selected_index)
+            return
+        if export_state is not None:
+            export_state.update(tab_export_states[selected_index])
 
     def show_panel(_: None = None) -> None:
-        """Display the expanded panel with its selected tab ready to use."""
+        """Display the expanded panel with the active tab already rendered."""
+        _snapshot_tab(tabs.selected_index)
         activate_selected_view()
         with main_out:
             clear_output()
             display(panel)
 
     def show_open(_: None = None) -> None:
-        """Display the collapsed open button."""
+        """Display the collapsed open button without discarding tab state."""
+        _snapshot_tab(tabs.selected_index)
         with main_out:
             clear_output()
             display(open_btn)
 
-    tabs.observe(activate_selected_view, names="selected_index")
+    def on_tab_change(change: dict[str, object]) -> None:
+        """Snapshot the hidden tab and immediately initialize or restore the new tab."""
+        old_index = change.get("old")
+        _snapshot_tab(old_index if isinstance(old_index, int) else None)
+        activate_selected_view()
+
+    tabs.observe(on_tab_change, names="selected_index")
     open_btn.on_click(show_panel)
     close_btn.on_click(show_open)
     show_open()

@@ -13,14 +13,14 @@ Responsibilities:
 
 Design principles:
   - Inference mirrors the saved training configuration
-  - The exact normalizer state admitted by completed-run validation is reconstructed without refitting
+  - The exact normalizer state admitted by evaluable-run validation is reconstructed without refitting
   - Saved split indices are applied before evaluation loaders are built
   - Field order checks fail fast on incompatible artifacts
 
 This module does NOT:
-  - Train or optimize models; ``learning.training`` owns execution
-  - Generate analysis artifacts; ``analysis.artifacts`` owns publication
-  - Allocate or transition run directories; ``experiments.run`` owns lifecycle state
+  - Train or optimize models. ``learning.training`` owns execution
+  - Generate analysis artifacts. ``analysis.artifacts`` owns publication
+  - Allocate or transition run directories. ``experiments.run`` owns lifecycle state
 
 Saved-run contract:
   - This module assumes the current saved-run contract:
@@ -101,7 +101,7 @@ class IndexedSubset(Dataset[dict[str, Any]]):
 
     Construction copies a unique, non-empty, in-bounds integer index vector to
     CPU. Each returned mapping preserves the underlying sample and adds its
-    immutable ``source_index`` plus contiguous ``split_local_index``; callers can
+    immutable ``source_index`` plus contiguous ``split_local_index``. Callers can
     therefore distinguish dataset identity from evaluation order.
 
     Parameters
@@ -147,7 +147,7 @@ class IndexedSubset(Dataset[dict[str, Any]]):
         max_index = int(normalized_indices.max().item())
         dataset_size = len(cast("Sized", dataset))
         if min_index < 0 or max_index >= dataset_size:
-            msg = f"source_indices are out of bounds for dataset size {dataset_size}; index range is {min_index}..{max_index}."
+            msg = f"source_indices are out of bounds for dataset size {dataset_size}. The observed index range is {min_index}..{max_index}."
             raise IndexError(msg)
 
         self.dataset = dataset
@@ -205,7 +205,7 @@ def _configured_dataset_ids(config: Mapping[str, Any]) -> dict[SplitRole, str]:
     """
     Resolve logical train, evaluation, and OOD dataset IDs from ``config.yaml``.
 
-    Train and evaluation intentionally share the saved training dataset; OOD
+    Train and evaluation intentionally share the saved training dataset. OOD
     requires the sole current-contract logical ID. All names pass central path
     validation before they can participate in filesystem resolution.
     """
@@ -268,8 +268,8 @@ def _split_settings(config: Mapping[str, Any]) -> tuple[float, float, int]:
     """
     Recover the exact saved split ratios and stable split subseed.
 
-    The subseed is re-derived from ``run.seed`` through the maintained seed plan;
-    missing run/data mappings or split settings fail instead of defaulting.
+    The subseed is re-derived from ``run.seed`` through the maintained seed plan.
+    Missing run/data mappings or split settings fail instead of defaulting.
     """
     data_cfg = _data_section(config)
     run_cfg = config.get("run")
@@ -300,7 +300,7 @@ def _select_split(
     Bind one requested split role to saved membership and a current dataset path.
 
     Saved split ratios, subseed, and logical dataset identity must agree with
-    ``config.yaml``. An explicit ``dataset_path`` changes location only; later
+    ``config.yaml``. An explicit ``dataset_path`` changes location only. Later
     fingerprint validation still prevents it from substituting different data.
     """
     role = _validate_split_role(split)
@@ -366,8 +366,8 @@ def _model_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """
     Return the resolved model section after validating its required shape.
 
-    ``model.kind`` and a mapping-valued ``model.params`` must already exist;
-    reconstruction never supplies architecture defaults for a saved run.
+    ``model.kind`` and a mapping-valued ``model.params`` must already exist.
+    Reconstruction never supplies architecture defaults for a saved run.
     """
     model_cfg = config.get("model")
     if not isinstance(model_cfg, Mapping):
@@ -480,7 +480,7 @@ def load_inference_context_with_resolution(
         Defaults to the current central dataset-root resolution.
     split : {"train", "eval", "ood"}, optional
         Saved split role to load. `eval` and `train` use the saved training
-        dataset membership; `ood` uses saved OOD membership against the OOD
+        dataset membership. ``ood`` uses saved OOD membership against the OOD
         final dataset recorded by training. Default is `eval`.
     batch_size : int, optional
         Evaluation batch size. Default is 1.
@@ -506,7 +506,7 @@ def load_inference_context_with_resolution(
     ValueError
         If the requested split role is unknown or has invalid membership.
     FileNotFoundError
-        If a required completed-run or dataset artifact is absent.
+        If required evaluable-run evidence or a dataset artifact is absent.
 
     """
     if not isinstance(device_resolution, learning_device.DeviceResolution):
@@ -516,10 +516,10 @@ def load_inference_context_with_resolution(
     run_dir = Path(run_dir)
     requested_dataset_path = Path(dataset_path).expanduser() if dataset_path is not None else None
     current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_training_raw_root()
-    completed_run = experiments.run.validate_completed_run(run_dir)
+    evaluable_run = experiments.run.validate_evaluable_run(run_dir)
 
-    cfg = completed_run["config"]
-    split_indices = completed_run["split_indices"]
+    cfg = evaluable_run["config"]
+    split_indices = evaluable_run["split_indices"]
     input_channels, output_channels = _field_contract(cfg)
     seed_plan = experiments.run.configure_reproducibility(cfg, device=device)
     split_selection = _select_split(
@@ -543,11 +543,11 @@ def load_inference_context_with_resolution(
         msg = f"out_channels mismatch: model.out_channels={model.out_channels} vs field contract={len(output_channels)} ({output_channels})"
         raise RuntimeError(msg)
 
-    best_checkpoint = completed_run["best_checkpoint"]
+    best_checkpoint = evaluable_run["best_checkpoint"]
     model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
     model = model.to(device)
 
-    processor = datasets.base.data_processor_from_state(completed_run["normalizer_state"], device=device)
+    processor = datasets.base.data_processor_from_state(evaluable_run["normalizer_state"], device=device)
 
     task = experiments.config.loader.validate_resolved_task_contract(cfg)
     source_dataset = datasets.simulation.create_task_dataset(
@@ -603,15 +603,15 @@ def load_inference_context(
     split : {"train", "eval", "ood"}, optional
         Saved split role.
     batch_size : int, optional
-        Deterministic inference batch size.
+        Inference batch size.
     device_policy : {"auto", "cuda", "cpu"}, optional
-        Runtime policy. Auto selects usable CUDA then CPU; CUDA is strict; CPU
-        avoids CUDA queries.
+        Runtime policy. Auto selects usable CUDA and then CPU. CUDA is strict.
+        CPU avoids CUDA queries.
 
     Returns
     -------
     tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]
-        Loaded model, deterministic loader, saved processor, and concrete device.
+        Loaded model, saved-membership-ordered loader, saved processor, and concrete device.
 
     """
     resolution = learning_device.resolve_device(

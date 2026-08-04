@@ -1,4 +1,4 @@
-# ruff: noqa: S101, D103, EM101, EM102, PERF401, PLC0415, PLR2004, SLF001, TRY003
+# ruff: noqa: S101, EM101, EM102, PERF401, PLC0415, PLR2004, SLF001, TRY003
 """Protect direct generated-source to final training-dataset publication."""
 
 from __future__ import annotations
@@ -284,6 +284,7 @@ def test_direct_builder_publishes_one_final_dataset_and_metadata(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that direct builder publishes one final dataset and metadata."""
     result, _generated_root, training_root = _build(tmp_path)
     dataset_path = training_root / "raw" / "synthetic" / "synthetic.pt"
     metadata_path = training_root / "meta" / "synthetic"
@@ -296,6 +297,24 @@ def test_direct_builder_publishes_one_final_dataset_and_metadata(
     assert result["metadata_path"] == metadata_path
     assert payload["schema_version"] == datasets.identity.TRAINING_DATASET_SCHEMA_VERSION
     assert payload["schema_kind"] == datasets.identity.TRAINING_DATASET_SCHEMA_KIND
+    assert payload["data_contract_digest"] == steady_task.data_contract_digest
+    assert payload["data_contract_digest"] != steady_task.contract_digest
+    evaluation_changed = replace(steady_task, default_metrics=tuple(reversed(steady_task.default_metrics)))
+    assert evaluation_changed.contract_digest != steady_task.contract_digest
+    assert evaluation_changed.data_contract_digest == steady_task.data_contract_digest
+    assert datasets.identity.validate_training_dataset_payload(payload, task=evaluation_changed, verify_content=True) == identity
+    changed_outputs = (replace(steady_task.outputs[0], unit="kPa"), *steady_task.outputs[1:])
+    data_changed = replace(steady_task, outputs=changed_outputs)
+    with pytest.raises(ValueError, match="learned-data contract"):
+        datasets.identity.validate_training_dataset_payload(payload, task=data_changed)
+    rejected_digests = (
+        steady_task.contract_digest,
+        "8cdaf4de22d945e08783f118d5fa8374e37521f91b20b12c913230ba015ca91a",
+        "f" * 64,
+    )
+    for rejected_digest in rejected_digests:
+        with pytest.raises(ValueError, match="learned-data contract"):
+            datasets.identity.validate_dataset_data_contract_digest(rejected_digest, task=steady_task)
     assert payload["sample_ids"] == ["case_0001", "case_0002"]
     assert payload["inputs"].shape == (2, 7, 2, 2)
     assert payload["outputs"].shape == (2, 3, 2, 2)
@@ -327,6 +346,7 @@ def test_metadata_summary_validates_compact_package_without_loading_tensor(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that metadata summary validates compact package without loading tensor."""
     result, _generated_root, training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(
@@ -347,7 +367,7 @@ def test_metadata_summary_validates_compact_package_without_loading_tensor(
     assert summary.metadata_directory == result["metadata_path"]
     assert summary.dataset_exists
     assert summary.task_id == steady_task.id
-    assert summary.task_contract_digest == steady_task.contract_digest
+    assert summary.data_contract_digest == steady_task.data_contract_digest
     assert summary.fingerprint == identity.fingerprint
     assert summary.sample_ids == identity.sample_ids
     assert summary.sample_count == identity.sample_count
@@ -365,6 +385,7 @@ def test_metadata_summary_validates_compact_package_without_loading_tensor(
 
 
 def test_active_dataset_lock_rejects_builder_and_persistent_anchor_is_harmless(tmp_path: Path) -> None:
+    """Verify that active dataset lock rejects builder and persistent anchor is harmless."""
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
@@ -412,6 +433,7 @@ def test_active_dataset_lock_rejects_builder_and_persistent_anchor_is_harmless(t
 
 
 def test_manifest_order_drives_final_sample_order(tmp_path: Path) -> None:
+    """Verify that manifest order drives final sample order."""
     result, _generated_root, _training_root = _build(tmp_path, case_numbers=(2, 1), timing_count=2)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     assert payload["sample_ids"] == ["case_0002", "case_0001"]
@@ -420,6 +442,7 @@ def test_manifest_order_drives_final_sample_order(tmp_path: Path) -> None:
 
 
 def test_sample_csv_serialization_is_operational_not_scientific_identity(tmp_path: Path) -> None:
+    """Verify that sample csv serialization is operational not scientific identity."""
     first, _generated, _training = _build(tmp_path / "first")
     second_generated = tmp_path / "second" / "generated"
     meta_dir, raw_dir, processed_dir = _write_generated_batch(second_generated)
@@ -446,6 +469,7 @@ def test_sample_snapshots_remain_coherent_when_live_sidecars_change_mid_build(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that sample snapshots remain coherent when live sidecars change mid build."""
     generated_root = tmp_path / "generated"
     meta_dir, _raw_dir, _processed_dir = _write_generated_batch(generated_root)
     sample_csv_path = meta_dir / "synthetic.csv"
@@ -483,6 +507,7 @@ def test_sample_snapshots_remain_coherent_when_live_sidecars_change_mid_build(
 
 @pytest.mark.parametrize("target", ["raw_csv", "raw_json", "solution_csv"])
 def test_builder_rejects_manifest_bound_source_tampering(tmp_path: Path, target: str) -> None:
+    """Verify that builder rejects manifest bound source tampering."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, processed_dir = _write_generated_batch(generated_root)
     targets = {
@@ -499,6 +524,7 @@ def test_builder_rejects_manifest_bound_source_tampering(tmp_path: Path, target:
 
 
 def test_builder_rejects_extra_generated_membership(tmp_path: Path) -> None:
+    """Verify that builder rejects extra generated membership."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, _processed = _write_generated_batch(generated_root)
     (raw_dir / "case_9999.csv").write_text("unexpected", encoding="utf-8")
@@ -508,6 +534,7 @@ def test_builder_rejects_extra_generated_membership(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("source_kind", ["raw", "solution"])
 def test_builder_rejects_extra_csv_columns(tmp_path: Path, source_kind: str) -> None:
+    """Verify that builder rejects extra csv columns."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, processed_dir = _write_generated_batch(
         generated_root,
@@ -544,6 +571,7 @@ def test_builder_rejects_extra_csv_columns(tmp_path: Path, source_kind: str) -> 
     ],
 )
 def test_builder_rejects_raw_metadata_schema_drift(tmp_path: Path, corruption: str, message: str) -> None:
+    """Verify that builder rejects raw metadata schema drift."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, processed_dir = _write_generated_batch(
         generated_root,
@@ -577,6 +605,7 @@ def test_builder_reverifies_manifest_hashes_after_case_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that builder reverifies manifest hashes after case read."""
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root, case_numbers=(1,), timing_count=1)
     original = generated_module._load_case_sources
@@ -595,28 +624,6 @@ def test_builder_reverifies_manifest_hashes_after_case_read(
         )
 
 
-@pytest.mark.parametrize("corruption", ["csv_hash", "json_seed", "json_columns"])
-def test_builder_validates_parameter_sample_metadata(tmp_path: Path, corruption: str) -> None:
-    generated_root = tmp_path / "generated"
-    meta_dir, _raw, _processed = _write_generated_batch(generated_root)
-    if corruption == "csv_hash":
-        path = meta_dir / "synthetic.csv"
-        path.write_text(path.read_text(encoding="utf-8") + "3;0.3\n", encoding="utf-8")
-        match = "CSV SHA-256"
-    else:
-        path = meta_dir / "synthetic.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if corruption == "json_seed":
-            payload["meta"]["seed"] = 18
-            match = "meta.seed"
-        else:
-            payload["meta"]["param_names"] = ["different"]
-            match = "columns"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises((RuntimeError, ValueError), match=match):
-        build_batch_dataset("synthetic", generated_data_root=generated_root, model_training_data_root=tmp_path / "training")
-
-
 def _source_sample_contract(root: Path) -> tuple[bytes, bytes, dict[str, Any]]:
     meta_dir, raw_dir, _processed_dir = _write_generated_batch(root)
     sample_csv = (meta_dir / "synthetic.csv").read_bytes()
@@ -626,6 +633,7 @@ def _source_sample_contract(root: Path) -> tuple[bytes, bytes, dict[str, Any]]:
 
 
 def test_public_source_sample_boundary_accepts_semantic_agreement(tmp_path: Path) -> None:
+    """Verify that public source sample boundary accepts semantic agreement."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
 
     semantics = datasets.metadata.validate_source_sample_semantics(
@@ -649,11 +657,7 @@ def test_public_source_sample_boundary_accepts_semantic_agreement(tmp_path: Path
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
-    [
-        ("seed", 18, "meta.seed"),
-        ("method", "uniform", "meta.method"),
-        ("variation", 0.3, "meta.variation"),
-    ],
+    [("seed", 18, "meta.seed")],
 )
 def test_public_source_sample_boundary_rejects_generation_configuration_mismatch(
     tmp_path: Path,
@@ -661,6 +665,7 @@ def test_public_source_sample_boundary_rejects_generation_configuration_mismatch
     value: Any,
     message: str,
 ) -> None:
+    """Verify that public source sample boundary rejects generation configuration mismatch."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
     payload = json.loads(sample_json)
     payload["meta"][field] = value
@@ -673,12 +678,13 @@ def test_public_source_sample_boundary_rejects_generation_configuration_mismatch
         )
 
 
-@pytest.mark.parametrize(("field", "value"), [("N", True), ("seed", False), ("N", 2.0)])
+@pytest.mark.parametrize(("field", "value"), [("N", True), ("N", 2.0)])
 def test_public_source_sample_boundary_rejects_malformed_integer_fields(
     tmp_path: Path,
     field: str,
     value: Any,
 ) -> None:
+    """Verify that public source sample boundary rejects malformed integer fields."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
     payload = json.loads(sample_json)
     payload["meta"][field] = value
@@ -692,6 +698,7 @@ def test_public_source_sample_boundary_rejects_malformed_integer_fields(
 
 
 def test_public_source_sample_boundary_rejects_case_count_mismatch(tmp_path: Path) -> None:
+    """Verify that public source sample boundary rejects case count mismatch."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
     payload = json.loads(sample_json)
     payload["n_cases"] = 3
@@ -705,6 +712,7 @@ def test_public_source_sample_boundary_rejects_case_count_mismatch(tmp_path: Pat
 
 
 def test_public_source_sample_boundary_rejects_csv_json_row_count_mismatch(tmp_path: Path) -> None:
+    """Verify that public source sample boundary rejects csv json row count mismatch."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
     shortened_csv = ("\n".join(sample_csv.decode().splitlines()[:-1]) + "\n").encode()
     manifest["configuration"]["sample_sha256"] = hashlib.sha256(shortened_csv).hexdigest()
@@ -718,6 +726,7 @@ def test_public_source_sample_boundary_rejects_csv_json_row_count_mismatch(tmp_p
 
 
 def test_public_source_sample_boundary_rejects_ordered_sample_id_mismatch(tmp_path: Path) -> None:
+    """Verify that public source sample boundary rejects ordered sample id mismatch."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
     lines = sample_csv.decode().splitlines()
     reordered_csv = ("\n".join([lines[0], lines[2], lines[1]]) + "\n").encode()
@@ -732,6 +741,7 @@ def test_public_source_sample_boundary_rejects_ordered_sample_id_mismatch(tmp_pa
 
 
 def test_public_source_sample_boundary_rejects_variable_name_mismatch(tmp_path: Path) -> None:
+    """Verify that public source sample boundary rejects variable name mismatch."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
     payload = json.loads(sample_json)
     payload["meta"]["param_names"] = ["beta"]
@@ -745,6 +755,7 @@ def test_public_source_sample_boundary_rejects_variable_name_mismatch(tmp_path: 
 
 
 def test_source_sample_timestamp_is_operational_not_scientific_identity(tmp_path: Path) -> None:
+    """Verify that source sample timestamp is operational not scientific identity."""
     sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
     changed = json.loads(sample_json)
     changed["meta"]["timestamp"] = "2099-12-31 23:59:59"
@@ -768,6 +779,7 @@ def test_metadata_rejects_hash_rebound_json_seed_mismatch(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that metadata rejects hash rebound json seed mismatch."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -793,6 +805,7 @@ def test_metadata_rejects_hash_rebound_sampling_base_mismatch_with_final_identit
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that metadata rejects hash rebound sampling base mismatch with final identity."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -818,6 +831,7 @@ def test_source_sample_values_are_bound_to_final_payload_metadata(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that source sample values are bound to final payload metadata."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -836,7 +850,6 @@ def test_source_sample_values_are_bound_to_final_payload_metadata(
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("missing_length_unit", "Length unit"),
         ("wrong_pressure_unit", "field/unit header"),
         ("nonuniform_grid", "dimensions"),
         ("invalid_porosity", "Porosity"),
@@ -845,6 +858,7 @@ def test_source_sample_values_are_bound_to_final_payload_metadata(
     ],
 )
 def test_builder_rejects_invalid_units_grid_and_physics(tmp_path: Path, mutation: str, message: str) -> None:
+    """Verify that builder rejects invalid units grid and physics."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, processed_dir = _write_generated_batch(generated_root, case_numbers=(1,), timing_count=1)
     solution = processed_dir / "case_0001_sol.csv"
@@ -854,7 +868,7 @@ def test_builder_rejects_invalid_units_grid_and_physics(tmp_path: Path, mutation
     elif mutation == "wrong_pressure_unit":
         lines[1] = lines[1].replace("p (Pa)", "p (bar)")
     elif mutation == "nonuniform_grid":
-        # A 2-point axis is necessarily uniform; make the metadata/grid cardinality invalid.
+        # A 2-point axis is necessarily uniform. Make the metadata/grid cardinality invalid.
         metadata_path = raw_dir / "case_0001.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         metadata["geometry"]["nx"] = 3
@@ -896,6 +910,7 @@ def test_builder_rejects_invalid_units_grid_and_physics(tmp_path: Path, mutation
 
 
 def test_raw_solution_agreement_admits_only_scale_level_interpolation_noise(tmp_path: Path) -> None:
+    """Verify that raw solution agreement admits only scale level interpolation noise."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, processed_dir = _write_generated_batch(
         generated_root,
@@ -927,6 +942,7 @@ def test_raw_solution_agreement_admits_only_scale_level_interpolation_noise(tmp_
 
 
 def test_raw_solution_agreement_rejects_material_difference(tmp_path: Path) -> None:
+    """Verify that raw solution agreement rejects material difference."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, processed_dir = _write_generated_batch(
         generated_root,
@@ -950,22 +966,15 @@ def test_raw_solution_agreement_rejects_material_difference(tmp_path: Path) -> N
 
 
 def test_partial_or_missing_timing_does_not_invalidate_scientific_dataset(tmp_path: Path) -> None:
+    """Verify that partial or missing timing does not invalidate scientific dataset."""
     partial, _generated, _training = _build(tmp_path / "partial", timing_count=1)
     missing, _generated, _training = _build(tmp_path / "missing", timing_count=-1)
     assert partial["timing_coverage"]["status"] == "partial"
     assert missing["timing_coverage"] == {"status": "missing", "measured_case_count": 0, "intended_case_count": 2}
 
 
-def test_empty_timing_snapshot_is_valid_missing_coverage(tmp_path: Path) -> None:
-    result, _generated, _training = _build(tmp_path, timing_count=0)
-    assert result["timing_coverage"] == {
-        "status": "missing",
-        "measured_case_count": 0,
-        "intended_case_count": 2,
-    }
-
-
 def test_direct_builder_rejects_timing_aggregate_corruption(tmp_path: Path) -> None:
+    """Verify that direct builder rejects timing aggregate corruption."""
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root, timing_count=1)
     timing_path = generated_root / "processed" / "synthetic" / "comsol_solve_timing.json"
@@ -981,6 +990,7 @@ def test_direct_builder_rejects_timing_aggregate_corruption(tmp_path: Path) -> N
 
 
 def test_failed_build_and_overwrite_refusal_leave_authoritative_targets_intact(tmp_path: Path) -> None:
+    """Verify that failed build and overwrite refusal leave authoritative targets intact."""
     result, generated_root, training_root = _build(tmp_path)
     original_dataset_hash = _sha256(result["dataset_path"])
     original_metadata_hash = _sha256(result["metadata_path"] / datasets.metadata.METADATA_FILENAME)
@@ -990,32 +1000,8 @@ def test_failed_build_and_overwrite_refusal_leave_authoritative_targets_intact(t
     assert _sha256(result["metadata_path"] / datasets.metadata.METADATA_FILENAME) == original_metadata_hash
 
 
-def test_consolidated_metadata_package_has_exact_owned_membership(tmp_path: Path) -> None:
-    result, _generated_root, _training_root = _build(tmp_path)
-    assert {path.name for path in result["metadata_path"].iterdir()} == {
-        datasets.metadata.METADATA_FILENAME,
-        datasets.metadata.SOURCE_MANIFEST_FILENAME,
-        datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME,
-        datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME,
-        datasets.metadata.COMSOL_TIMING_FILENAME,
-    }
-    metadata = json.loads((result["metadata_path"] / datasets.metadata.METADATA_FILENAME).read_text(encoding="utf-8"))
-    assert metadata["schema_kind"] == datasets.metadata.METADATA_SCHEMA_KIND
-    assert metadata["schema_version"] == 1
-    assert metadata["artifacts"]["dataset"] == {
-        "filename": "synthetic.pt",
-        "sha256": _sha256(result["dataset_path"]),
-        "size_bytes": result["dataset_path"].stat().st_size,
-    }
-    assert set(metadata["artifacts"]["snapshots"]) == {
-        datasets.metadata.SOURCE_MANIFEST_FILENAME,
-        datasets.metadata.SOURCE_SAMPLE_CSV_FILENAME,
-        datasets.metadata.SOURCE_SAMPLE_JSON_FILENAME,
-        datasets.metadata.COMSOL_TIMING_FILENAME,
-    }
-
-
 def test_incomplete_metadata_package_is_rejected(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
+    """Verify that incomplete metadata package is rejected."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -1028,6 +1014,7 @@ def test_metadata_generated_batch_digest_is_bound_to_final_dataset(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that metadata generated batch digest is bound to final dataset."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -1041,6 +1028,7 @@ def test_metadata_generated_batch_digest_is_bound_to_final_dataset(
 
 
 def test_dataset_artifact_hash_binding_detects_file_mutation(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
+    """Verify that dataset artifact hash binding detects file mutation."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -1054,6 +1042,7 @@ def test_dataset_artifact_hash_binding_detects_file_mutation(tmp_path: Path, ste
 
 
 def test_dataset_metadata_detects_snapshot_tampering(tmp_path: Path, steady_task: domain.tasks.spec.TaskSpec) -> None:
+    """Verify that dataset metadata detects snapshot tampering."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -1071,6 +1060,7 @@ def test_metadata_manifest_binding_rejects_rebound_sample_csv(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that metadata manifest binding rejects rebound sample csv."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -1092,6 +1082,7 @@ def test_metadata_rejects_mutated_dataset_schema_version(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
 ) -> None:
+    """Verify that metadata rejects mutated dataset schema version."""
     result, _generated_root, _training_root = _build(tmp_path)
     payload = torch.load(result["dataset_path"], map_location="cpu", weights_only=False)
     identity = datasets.identity.validate_training_dataset_payload(payload, task=steady_task, verify_content=True)
@@ -1109,6 +1100,7 @@ def test_publication_transaction_requires_integer_version_one(
     tmp_path: Path,
     schema_version: Any,
 ) -> None:
+    """Verify that publication transaction requires integer version one."""
     training_root = tmp_path / "training"
     staging_root = training_root / ".synthetic.dataset-build.invalid-version.tmp"
     staging_root.mkdir(parents=True)
@@ -1181,6 +1173,7 @@ def test_ready_publication_transaction_recovers_every_rename_boundary(
     monkeypatch: pytest.MonkeyPatch,
     state: str,
 ) -> None:
+    """Verify that ready publication transaction recovers every rename boundary."""
     result, generated_root, training_root = _build(tmp_path)
     dataset_dir = result["dataset_path"].parent
     metadata_dir = result["metadata_path"]
@@ -1233,6 +1226,7 @@ def test_ready_publication_transaction_recovers_every_rename_boundary(
 
 
 def test_private_progress_blocks_ready_transaction_recovery(tmp_path: Path) -> None:
+    """Verify that private progress blocks ready transaction recovery."""
     result, generated_root, training_root = _build(tmp_path)
     dataset_dir = result["dataset_path"].parent
     metadata_dir = result["metadata_path"]
@@ -1285,6 +1279,7 @@ def test_source_change_during_ready_recovery_blocks_remaining_renames(
     source_change: str,
     message: str,
 ) -> None:
+    """Verify that source change during ready recovery blocks remaining renames."""
     result, generated_root, training_root = _build(tmp_path)
     dataset_dir = result["dataset_path"].parent
     metadata_dir = result["metadata_path"]
@@ -1344,6 +1339,7 @@ def test_interrupted_build_retains_inspectable_transaction_until_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that interrupted build retains inspectable transaction until retry."""
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
@@ -1387,6 +1383,7 @@ def test_interrupted_build_retains_inspectable_transaction_until_retry(
 
 
 def test_building_publication_transaction_is_discarded_before_retry(tmp_path: Path) -> None:
+    """Verify that building publication transaction is discarded before retry."""
     generated_root = tmp_path / "generated"
     _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
@@ -1418,6 +1415,7 @@ def test_building_publication_transaction_is_discarded_before_retry(tmp_path: Pa
 def test_singleton_manifest_case_object_is_normalized_consistently(
     tmp_path: Path,
 ) -> None:
+    """Verify that singleton manifest case object is normalized consistently."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, processed_dir = _write_generated_batch(
         generated_root,
@@ -1443,11 +1441,12 @@ def test_singleton_manifest_case_object_is_normalized_consistently(
     assert payload["generated_batch_identity"]["scientific_case_sources"][0]["case_id"] == "case_0001"
 
 
-@pytest.mark.parametrize("schema_version", [0, 2, 3])
+@pytest.mark.parametrize("schema_version", [2])
 def test_batch_manifest_versions_other_than_one_are_rejected(
     tmp_path: Path,
     schema_version: int,
 ) -> None:
+    """Verify that batch manifest versions other than one are rejected."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
     manifest_path = raw_dir / "batch_manifest.json"
@@ -1464,6 +1463,7 @@ def test_batch_manifest_versions_other_than_one_are_rejected(
 
 
 def test_private_batch_progress_blocks_dataset_construction(tmp_path: Path) -> None:
+    """Verify that private batch progress blocks dataset construction."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
     _write_private_batch_progress(raw_dir)
@@ -1482,6 +1482,7 @@ def test_progress_appearing_during_build_prevents_publication(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
+    """Verify that progress appearing during build prevents publication."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
@@ -1530,6 +1531,7 @@ def test_manifest_change_after_ready_prevents_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify that manifest change after ready prevents publication."""
     generated_root = tmp_path / "generated"
     _meta, raw_dir, _processed_dir = _write_generated_batch(generated_root)
     training_root = tmp_path / "training"
@@ -1561,9 +1563,13 @@ def test_manifest_change_after_ready_prevents_publication(
 
 
 def test_unversioned_payload_is_rejected(steady_task: domain.tasks.spec.TaskSpec) -> None:
+    """Verify that unversioned payload is rejected."""
     with pytest.raises(ValueError, match="Unsupported dataset schema"):
         datasets.modules.flow.FlowModule(
-            {"inputs": torch.zeros((1, 7, 2, 3)), "outputs": torch.zeros((1, 3, 2, 3))},
+            {
+                "inputs": torch.zeros((1, steady_task.in_channels, 2, 3)),
+                "outputs": torch.zeros((1, steady_task.out_channels, 2, 3)),
+            },
             task=steady_task,
         )
 

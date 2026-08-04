@@ -5,17 +5,19 @@ cli_train.py
 Parse training CLI arguments and delegate to the reusable run service.
 
 Responsibilities:
-  - Parse config, resume, device, and output-root arguments
-  - Return a non-zero process result for lifecycle failures
+  - Parse config, resume, device, output-root, and artifact opt-out arguments
+  - Orchestrate completed-run artifact preparation after training ownership ends
+  - Return a non-zero process result for training or post-processing failures
 
 Design principles:
   - Parser and dispatch code stays thin and import-light
   - Runtime overrides are forwarded without semantic reinterpretation
+  - Training completion and artifact post-processing remain separate facts
   - Material lifecycle failures remain visible to shell and queue callers
 
 This module does NOT:
-  - Allocate, seed, persist, resume, or train runs; ``experiments.run`` owns lifecycle
-  - Eagerly import command modules through the import-free ``experiments.cli`` package
+  - Allocate, seed, persist, resume, or train runs. ``experiments.run`` owns lifecycle
+  - Discover artifact roles, rebuild incompatible targets, or upload to W&B
 ===============================================================================
 """
 
@@ -43,7 +45,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-root",
         type=str,
         default=None,
-        help="Override outputs only; dataset lookup remains bound to dataset_root",
+        help="Override outputs only. Dataset lookup remains bound to dataset_root",
+    )
+    parser.add_argument(
+        "--no-build-artifacts",
+        action="store_true",
+        help="Skip only the default post-training generation or reuse of run-bundle evaluation artifacts",
     )
     return parser
 
@@ -80,7 +87,7 @@ def _print_existing_run_admission(report: dict[str, object]) -> None:
     print(f"Reason: {report.get('reason')}", file=sys.stderr)
 
     if compatibility == "completed":
-        print("Run already completed; no training was started.", file=sys.stderr)
+        print("Run already completed. No training was started.", file=sys.stderr)
         print(f"Completed epoch: {completed if completed is not None else 'unknown'} / {target}", file=sys.stderr)
     elif compatibility == "compatible":
         config_path = shlex.quote(str(report.get("config_path")))
@@ -92,6 +99,19 @@ def _print_existing_run_admission(report: dict[str, object]) -> None:
         )
 
 
+def _artifact_action_label(role_actions: dict[str, str]) -> str:
+    """Summarize ID and OOD artifact actions without role-level verbosity."""
+    actions = set(role_actions.values())
+    if actions == {"generated"}:
+        return "generated"
+    if actions == {"reused"}:
+        return "reused"
+    if actions and actions.issubset({"generated", "reused"}):
+        return "mixed"
+    msg = f"Unexpected automatic artifact actions: {sorted(actions)}."
+    raise RuntimeError(msg)
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     Execute a fresh or explicit-resume run and return its process result.
@@ -99,18 +119,19 @@ def main(argv: list[str] | None = None) -> int:
     Parameters
     ----------
     argv : list[str] | None, optional
-        Explicit argument vector; ``None`` uses the process arguments.
+        Explicit argument vector. ``None`` uses the process arguments.
 
     Returns
     -------
     int
-        ``0`` after a completed run, ``1`` for a caught lifecycle failure, and
-        ``130`` when training is interrupted.
+        ``0`` after completed training and requested post-processing, ``1``
+        for a caught training or artifact failure, and ``130`` when interrupted.
 
     Notes
     -----
     The reusable run service owns allocation, persistence, device resolution,
-    training, and resume. Parser usage errors raise ``SystemExit`` directly.
+    training, and resume. The artifact service owns role discovery, validation,
+    generation, and reuse. Parser usage errors raise ``SystemExit`` directly.
 
     """
     args = _build_parser().parse_args(argv)
@@ -133,15 +154,48 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(error, run_service.ExistingRunAdmissionError):
             _print_existing_run_admission(error.report)
             return 1
-        print("Training failed; sanitized traceback follows.", file=sys.stderr, flush=True)
+        print("Training failed. Sanitized traceback follows.", file=sys.stderr, flush=True)
         experiments_console.print_sanitized_traceback(error)
         return 1
 
     result = outcome["result"]
-    print(f"Run directory: {outcome['run_dir']}")
+    run_dir = outcome["run_dir"]
+    device_resolution = outcome["device_resolution"]
+    print("Training status: completed")
+    print(f"Run directory: {run_dir}")
+    print("Best checkpoint: best_checkpoint.pt")
     print(f"Best epoch: {result['best_epoch']}")
     print(f"Best metric: {result['best_metric']:.6f}")
-    print("Status: completed")
+    if args.no_build_artifacts:
+        print("Post-training artifacts: skipped by --no-build-artifacts")
+        return 0
+
+    try:
+        from src import analysis  # noqa: PLC0415
+
+        experiments_run.validate_completed_run(run_dir)
+        analysis.artifacts.service.cleanup_runtime(device_resolution.device)
+        prepared = analysis.artifacts.service.load_or_build_run_artifacts(
+            run_dir,
+            device_resolution=device_resolution,
+        )
+        artifact_status = _artifact_action_label(prepared.role_actions)
+    except KeyboardInterrupt:
+        print("Post-training artifacts: failed", file=sys.stderr)
+        print(f"Run directory: {run_dir}", file=sys.stderr)
+        print("Recovery: run the artifact CLI or evaluation notebook later", file=sys.stderr)
+        return 130
+    except Exception as error:  # noqa: BLE001
+        from src.experiments import experiments_console  # noqa: PLC0415
+
+        print("Post-training artifacts: failed", file=sys.stderr)
+        print(f"Artifact error: {type(error).__name__}: {experiments_console.sanitized_exception_message(error)}", file=sys.stderr)
+        print(f"Run directory: {run_dir}", file=sys.stderr)
+        print("Recovery: run the artifact CLI or evaluation notebook later", file=sys.stderr)
+        return 1
+
+    print(f"Post-training artifacts: {artifact_status}")
+    print(f"Artifact device: {device_resolution.device}")
     return 0
 
 

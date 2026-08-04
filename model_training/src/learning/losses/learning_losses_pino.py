@@ -16,9 +16,9 @@ Design principles:
   - Warmup is deterministic at completed-epoch boundaries
 
 This module does NOT:
-  - Define equations, derivatives, residuals, or boundaries; ``domain`` owns them
-  - Parse semantic config or select implementations; ``losses.factory`` owns selection
-  - Define or aggregate dataset metrics; ``learning.metrics`` owns evaluation
+  - Define equations, derivatives, residuals, or boundaries. ``domain`` owns them
+  - Parse semantic config or select implementations. ``losses.factory`` owns selection
+  - Define or aggregate dataset metrics. ``learning.metrics`` owns evaluation
 ===============================================================================
 """
 
@@ -94,7 +94,7 @@ class LinearWarmup:
         """
         Return the applied zero-to-one fraction at a zero-based epoch position.
 
-        A zero-length schedule returns ``1.0`` immediately; active schedules
+        A zero-length schedule returns ``1.0`` immediately. Active schedules
         start at zero and clamp at one. Negative epoch positions raise
         ``ValueError``.
         """
@@ -109,7 +109,7 @@ class LinearWarmup:
         """
         Return the scheduled weight for a zero-based epoch position.
 
-        Epoch zero has zero physics weight when warmup is active; ``epochs``
+        Epoch zero has zero physics weight when warmup is active. ``epochs``
         and later use the complete target. A zero-length warmup uses the target
         immediately.
         """
@@ -188,7 +188,7 @@ class SemanticComposedLoss(nn.Module):
         self.output_fields = tuple(output_fields)
         self.continuity = domain.physics.contracts.validate_continuity_kind(continuity)
         if boundary != domain.physics.contracts.PRESSURE_BOUNDARY_KIND:
-            msg = f"Unknown pressure boundary identifier {boundary!r}; expected {domain.physics.contracts.PRESSURE_BOUNDARY_KIND!r}."
+            msg = f"Unknown pressure boundary identifier {boundary!r}. Expected {domain.physics.contracts.PRESSURE_BOUNDARY_KIND!r}."
             raise ValueError(msg)
         self.boundary = boundary
         self.derivatives = derivatives
@@ -358,7 +358,7 @@ class SemanticComposedLoss(nn.Module):
         y : torch.Tensor
             Normalized supervised target tensor.
         epoch : int or None, optional
-            Explicit warmup position; defaults to ``current_epoch``.
+            Explicit warmup position. Defaults to ``current_epoch``.
 
         Returns
         -------
@@ -411,7 +411,7 @@ class SemanticComposedLoss(nn.Module):
         """
         Return the scalar total while caching detached named components.
 
-        ``y`` is mandatory; physics-enabled compositions additionally require
+        ``y`` is mandatory. Physics-enabled compositions additionally require
         ``x`` through :meth:`compute_components`. Extra keyword arguments are
         accepted because the generic training loop supplies shared loss arguments.
         """

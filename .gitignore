@@ -1,23 +1,30 @@
 # ================================
-# Project-specific files
+# Project-specific local files
 # ================================
-mlenv/
-.claude/
-_llm_workflow/
-AGENTS.md
+/mlenv/
+/.claude/
+/_llm_workflow/
+/AGENTS.md
+/DEVELOPMENT_STYLE.md
+
 # ================================
-# IDE / Editor files
+# IDE / editor files
 # ================================
 .idea/
 *.iml
-.mypy_cache/
 
 # ================================
-# Python bytecode & caches
+# Python bytecode, caches & reports
 # ================================
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # ================================
 # Jupyter notebook checkpoints
@@ -29,6 +36,8 @@ __pycache__/
 # ================================
 .env
 *.env
+.venv/
+venv/
 mamba-lock.yaml
 
 # ================================
@@ -46,12 +55,13 @@ dist/
 *.pid
 
 # ================================
-# Data folders
+# Generated data
 # ================================
 /data_generation/data/
 /model_training/data/
+
 # ================================
-# Logs, temp & system files
+# Logs, temporary & system files
 # ================================
 *.log
 *.out
@@ -60,7 +70,6 @@ dist/
 Thumbs.db
 
 # ================================
-# Weights & Biases logs & cache
+# Weights & Biases logs and cache
 # ================================
 wandb/
-**/wandb/

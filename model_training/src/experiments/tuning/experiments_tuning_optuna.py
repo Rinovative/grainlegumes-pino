@@ -13,15 +13,15 @@ Responsibilities:
 
 Design principles:
   - Reopening preserves history but each invocation allocates only additional fresh trials
-  - Embedded requests use the generic experiment structure; wrappers own study/search policy
+  - Embedded requests use the generic experiment structure. Wrappers own study/search policy
   - Wrapper objective and direction derive from the embedded resolved experiment objective
   - Device, output, tracking, and invocation count remain outside scientific identity
-  - Local trial state is authoritative; W&B is an optional post-publication observer
+  - Local trial state is authoritative. W&B is an optional post-publication observer
   - Optuna imports stay lazy for help and dry-run validation
 
 This module does NOT:
-  - Parse search-space schemas; ``experiments.tuning.search_space`` owns admission
-  - Execute training epochs; ``learning.training.loop`` owns model optimization
+  - Parse search-space schemas. ``experiments.tuning.search_space`` owns admission
+  - Execute training epochs. ``learning.training.loop`` owns model optimization
   - Clean repository or run state
 ===============================================================================
 """
@@ -47,8 +47,8 @@ from src import common, datasets, experiments, learning
 
 from . import experiments_tuning_search_space as search_space
 
-STUDY_SIGNATURE_SCHEMA_VERSION = 2
-TRIAL_LIFECYCLE_SCHEMA_VERSION = 2
+STUDY_SIGNATURE_SCHEMA_VERSION = 1
+TRIAL_LIFECYCLE_SCHEMA_VERSION = 1
 _STUDY_SIGNATURE_ATTR = "semantic_signature"
 _STUDY_SIGNATURE_PAYLOAD_ATTR = "semantic_signature_payload"
 _STUDY_SIGNATURE_SCHEMA_ATTR = "semantic_signature_schema_version"
@@ -73,8 +73,8 @@ class RecoverableTrialError(RuntimeError):
     """
     Represent an explicitly recoverable trial-local execution failure.
 
-    Only this project exception is supplied to ``study.optimize(catch=...)``;
-    programming, identity, storage, tracking, and arbitrary runtime errors remain
+    Only this project exception is supplied to ``study.optimize(catch=...)``.
+    Programming, identity, storage, tracking, and arbitrary runtime errors remain
     fatal to the invocation.
     """
 
@@ -255,7 +255,7 @@ class OptunaEpochReporter:
             raise TypeError(msg)
         expected_epoch = self._expected_epoch()
         if epoch != expected_epoch:
-            msg = f"Optuna reports must follow interval-or-terminal completed epochs; expected {expected_epoch}, got {epoch}."
+            msg = f"Optuna reports must follow interval-or-terminal completed epochs. Expected {expected_epoch}, received {epoch}."
             raise ValueError(msg)
         metric_key = f"id/{self.objective_id}"
         if metric_key not in metrics:
@@ -330,6 +330,21 @@ def _require_nonempty_string(value: Any, *, label: str) -> str:
     return value
 
 
+def _normalise_study_role(value: Any) -> str | None:
+    """Return the canonical optional study role after strict allowlist validation."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        msg = f"study.role must be null or a string, got: {value!r}"
+        raise TypeError(msg)
+    if not value.strip():
+        return None
+    if value not in _STUDY_ROLES:
+        msg = f"study.role must be null or one of {sorted(_STUDY_ROLES)}, got {value!r}."
+        raise ValueError(msg)
+    return value
+
+
 def _require_exact_int(value: Any, *, label: str, minimum: int | None = None) -> int:
     """Return one exact integer with an optional inclusive minimum."""
     if type(value) is not int:
@@ -353,12 +368,12 @@ def _normalise_sampler_config(value: Any) -> dict[str, Any]:
     """
     Validate and isolate one exact semantic sampler mapping.
 
-    Only ``random`` and ``tpe`` are accepted; multivariate mode belongs only to
+    Only ``random`` and ``tpe`` are accepted. Multivariate mode belongs only to
     TPE and must be an exact boolean. String shorthand, unknown keys, and scalar
     coercion are deliberately rejected.
     """
     if isinstance(value, str):
-        msg = "study.sampler must be a mapping with a semantic kind; string shorthand is unsupported."
+        msg = "study.sampler must be a mapping with a semantic kind. String shorthand is unsupported."
         raise TypeError(msg)
     sampler = dict(copy.deepcopy(_as_mapping(value, label="study.sampler")))
     allowed = {"kind", "multivariate"}
@@ -394,7 +409,7 @@ def _normalise_pruner_config(value: Any) -> dict[str, Any]:
     silently ignoring them.
     """
     if isinstance(value, str):
-        msg = "study.pruner must be a mapping with a semantic kind; string shorthand is unsupported."
+        msg = "study.pruner must be a mapping with a semantic kind. String shorthand is unsupported."
         raise TypeError(msg)
     pruner = dict(copy.deepcopy(_as_mapping(value, label="study.pruner")))
     allowed = {"kind", "n_startup_trials", "n_warmup_steps", "interval_steps"}
@@ -462,10 +477,7 @@ def _validate_study_settings(study: Mapping[str, Any]) -> None:
         _require_nonempty_string(study.get("name"), label="study.name"),
         label="study.name",
     )
-    role = _require_nonempty_string(study.get("role"), label="study.role")
-    if role not in _STUDY_ROLES:
-        msg = f"study.role must be one of {sorted(_STUDY_ROLES)}, got {role!r}."
-        raise ValueError(msg)
+    _normalise_study_role(study.get("role"))
     _require_nonempty_string(study.get("objective"), label="study.objective")
     direction = _require_nonempty_string(study.get("direction"), label="study.direction")
     if direction not in {"minimize", "maximize"}:
@@ -501,7 +513,7 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
 
     study = dict(copy.deepcopy(raw_study))
     study.setdefault("name", source_path.stem)
-    study.setdefault("role", "production")
+    study.setdefault("role", None)
     study.setdefault("seed", base_config.get("run", {}).get("seed", 9))
     study.setdefault("n_trials", 30)
     study.setdefault(
@@ -520,10 +532,7 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
         _require_nonempty_string(study["name"], label="study.name"),
         label="study.name",
     )
-    study["role"] = _require_nonempty_string(study["role"], label="study.role")
-    if study["role"] not in _STUDY_ROLES:
-        msg = f"study.role must be one of {sorted(_STUDY_ROLES)}, got {study['role']!r}."
-        raise ValueError(msg)
+    study["role"] = _normalise_study_role(study["role"])
     study["seed"] = _require_exact_int(study["seed"], label="study.seed")
     study["n_trials"] = _require_exact_int(study["n_trials"], label="study.n_trials", minimum=1)
     study["sampler"] = _normalise_sampler_config(study["sampler"])
@@ -694,7 +703,10 @@ def _validate_study_contract(config: OptunaStudyConfig) -> tuple[OptunaStudyConf
     every declared candidate must agree. A defensive replacement containing the
     revalidated base config is returned with the canonical objective.
     """
-    _validate_study_settings(config.study)
+    normalized_study = copy.deepcopy(config.study)
+    normalized_study["role"] = _normalise_study_role(normalized_study.get("role"))
+    _validate_study_settings(normalized_study)
+    config = replace(config, study=normalized_study)
     base_config = experiments.config.loader.validate_resolved_config(config.base_config)
     reporting_interval = _validate_reporting_contract(base_config)
     pruner = _normalise_pruner_config(config.study["pruner"])
@@ -722,7 +734,7 @@ def _scientific_base_config(base_config: Mapping[str, Any]) -> dict[str, Any]:
     """
     Project the resolved base config into invocation-independent science identity.
 
-    Paths, W&B policy, device, generated run name, prefix, and suffix are removed.
+    Paths, W&B policy, device, generated run name, and suffix are removed.
     Task, data, model, loss, objective, optimizer, scheduler, duration, seed, and
     deterministic semantics remain signature-bearing.
     """
@@ -730,7 +742,7 @@ def _scientific_base_config(base_config: Mapping[str, Any]) -> dict[str, Any]:
     scientific.pop("paths", None)
     scientific.pop("tracking", None)
     run = dict(_as_mapping(scientific.get("run"), label="base_config.run"))
-    for key in ("device", "name", "prefix", "suffix"):
+    for key in ("device", "name", "suffix"):
         run.pop(key, None)
     scientific["run"] = run
     return scientific
@@ -762,7 +774,7 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
 
     Notes
     -----
-    Device/output location and W&B settings are operational and excluded; every
+    Device/output location and W&B settings are operational and excluded. Every
     model-selection or training semantic participates in the digest. Construction
     is deterministic and does not mutate ``config`` or touch study storage.
 
@@ -911,7 +923,7 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
             "metadata_dir": str(summary.metadata_directory),
             "validation": "metadata_package_and_artifact_stat",
             "task": summary.task_id,
-            "task_contract_digest": summary.task_contract_digest,
+            "data_contract_digest": summary.data_contract_digest,
             "fingerprint": summary.fingerprint,
             "sample_count": summary.sample_count,
         }
@@ -956,9 +968,9 @@ def _sampler_seed(study: Mapping[str, Any]) -> int:
 
 def _build_sampler(study: Mapping[str, Any]) -> Any:
     """
-    Build a deterministic Optuna sampler from validated semantic policy.
+    Build a seeded Optuna sampler from validated semantic policy.
 
-    Both random and TPE receive the explicit persisted 32-bit study seed; only
+    Both random and TPE receive the explicit persisted 32-bit study seed. Only
     TPE accepts the normalized multivariate flag. Optuna remains lazily imported.
     """
     sampler_cfg = _normalise_sampler_config(study.get("sampler"))
@@ -1004,7 +1016,7 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
     }
     context = {
         "study_name": str(study_config.study["name"]),
-        "study_role": str(study_config.study["role"]),
+        "study_role": study_config.study["role"],
         "trial_number": trial_number,
         "training_seed": training_seed,
         "sampler_seed": sampler_seed,
@@ -1071,7 +1083,7 @@ def _failure_epoch(error: BaseException, reporter: OptunaEpochReporter) -> int |
     """
     Recover an explicit failure epoch without inventing progress.
 
-    A maintained ``" at epoch N:"`` message marker takes precedence; otherwise
+    A maintained ``" at epoch N:"`` message marker takes precedence. Otherwise
     only the reporter's last successfully published completed epoch is returned.
     """
     marker = " at epoch "
@@ -1172,7 +1184,7 @@ def _write_summary(
 
     All statuses share objective, sampled parameters, reporting progress, timing,
     and bounded failure context. Completed trials additionally require checkpoint
-    identity and all authoritative artifact digests; non-completed trials publish
+    identity and all authoritative artifact digests. Non-completed trials publish
     only checkpoints proven durable by the reporter. The run state machine owns
     final atomic summary replacement.
     """
@@ -1186,6 +1198,7 @@ def _write_summary(
         "task": config["task"],
         "model_kind": config["model"]["kind"],
         "study_name": context["study_name"],
+        "study_role": context["study_role"],
         "trial_number": context["trial_number"],
         "sampled_parameters": context["overrides"],
         "search_signature": context["search_signature"],
@@ -1325,7 +1338,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
     experiments.console.optuna_trial_event(
         "started",
         study=str(context["study_name"]),
-        study_role=str(context["study_role"]),
+        study_role=context["study_role"],
         trial=int(context["trial_number"]),
         run_name=str(config["run"]["name"]),
         sampled=context["analysis_parameters"],
@@ -1381,7 +1394,11 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
                 out_normalizer=data_processor.out_normalizer,
             )
         data_processor.to(device)
-        eval_metrics = learning.metrics.metrics.build_evaluation_metrics(config, device=device)
+        eval_metrics = learning.metrics.metrics.build_evaluation_metrics(
+            config,
+            device=device,
+            output_standard_deviations=data_processor.out_normalizer.std,
+        )
         optimizer = learning.training.optim.build_optimizer(model, config)
         scheduler = learning.training.optim.build_scheduler(optimizer, config)
         checkpoint_identity = learning.training.checkpoint.build_checkpoint_identity(
@@ -1761,7 +1778,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
         experiments.console.optuna_trial_event(
             "completed",
             study=str(context["study_name"]),
-            study_role=str(context["study_role"]),
+            study_role=context["study_role"],
             trial=int(context["trial_number"]),
             run_name=str(config["run"]["name"]),
             sampled=context["analysis_parameters"],
@@ -1783,7 +1800,7 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
             experiments.console.optuna_trial_event(
                 tracking_status,
                 study=str(context["study_name"]),
-                study_role=str(context["study_role"]),
+                study_role=context["study_role"],
                 trial=int(context["trial_number"]),
                 run_name=str(config["run"]["name"]),
                 sampled=context["analysis_parameters"],
@@ -1936,8 +1953,8 @@ def _validate_existing_study(
     """
     Admit an existing study only when direction and semantic metadata match.
 
-    Missing signature fields, payload drift, or objective drift are rejected;
-    name and storage identity alone never authorize adding fresh trials.
+    Missing signature fields, payload drift, or objective drift are rejected.
+    Name and storage identity alone never authorize adding fresh trials.
     """
     actual_direction = str(study.direction.name).lower()
     if actual_direction != objective["direction"]:
@@ -2200,7 +2217,7 @@ def run_optuna_study(
 
     Notes
     -----
-    Reopening adds fresh trial numbers; it never resumes partial run directories.
+    Reopening adds fresh trial numbers. It never resumes partial run directories.
 
     """
     study_config = load_optuna_study_config(config) if isinstance(config, (str, Path)) else config

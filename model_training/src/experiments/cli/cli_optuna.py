@@ -15,8 +15,8 @@ Design principles:
   - Runtime overrides are explicit command-line options
 
 This module does NOT:
-  - Create, reopen, or optimize studies; ``experiments.tuning.optuna`` owns lifecycle
-  - Parse trial search schemas; ``experiments.tuning.search_space`` owns admission
+  - Create, reopen, or optimize studies. ``experiments.tuning.optuna`` owns lifecycle
+  - Parse trial search schemas. ``experiments.tuning.search_space`` owns admission
 ===============================================================================
 """
 
@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     Parameters
     ----------
     argv : list[str] | None, optional
-        Explicit argument vector; ``None`` uses the process arguments.
+        Explicit argument vector. ``None`` uses the process arguments.
 
     Returns
     -------

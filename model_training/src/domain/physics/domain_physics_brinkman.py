@@ -68,7 +68,7 @@ class ContinuityResiduals:
     Hold both continuity residual fields and the selected training formulation.
 
     ``divergence_velocity`` is ``div(u)`` and
-    ``divergence_porosity_velocity`` is ``div(eps*u)``; both have units 1/s.
+    ``divergence_porosity_velocity`` is ``div(eps*u)``. Both have units 1/s.
     ``selected`` aliases exactly the field identified by ``kind`` without
     removing the other diagnostic.
 
@@ -161,7 +161,7 @@ class BrinkmanDiagnostics:
         """
         Return formulation-explicit residual arrays and scalar diagnostics.
 
-        ``Rx`` and ``Ry`` have units Pa/m; ``div_u`` and ``div_eps_u`` have
+        ``Rx`` and ``Ry`` have units Pa/m. ``div_u`` and ``div_eps_u`` have
         units 1/s. Canonical residual MSEs use ``interior_crop`` while pressure
         boundary diagnostics use inlet/outlet masks on the full grid.
 
@@ -221,7 +221,7 @@ def continuity_residuals(
     -------
     ContinuityResiduals
         Full-grid ``div(u)`` and ``div(eps*u)`` fields in 1/s plus the exact
-        selected alias; no crop or scalar reduction is applied.
+        selected alias. No crop or scalar reduction is applied.
 
     Raises
     ------
@@ -270,7 +270,7 @@ def _inverse_permeability_components(
     Invert the symmetric 2D permeability representation with explicit floors.
 
     Diagonal components are physical m² values. The stored cross channel is the
-    dimensionless ratio ``Kxy / sqrt(Kxx*Kyy)``; it is clipped before inversion.
+    dimensionless ratio ``Kxy / sqrt(Kxx*Kyy)``. It is clipped before inversion.
     The geometric scale and normalized determinant are floored independently,
     yielding ``(K^-1_xx, K^-1_xy, K^-1_yy)`` in 1/m² without materializing a
     matrix tensor.
@@ -337,7 +337,7 @@ def brinkman_momentum_residuals(
     viscosity : float, optional
         Dynamic viscosity in Pa s.
     porosity_floor : float, optional
-        Lower clamp applied to dimensionless porosity; the canonical default is
+        Lower clamp applied to dimensionless porosity. The canonical default is
         positive.
     permeability_scale_floor : float, optional
         Lower clamp for the permeability geometric mean in m².
@@ -363,7 +363,7 @@ def brinkman_momentum_residuals(
     -----
     The deviatoric stress uses the three-dimensional ``2/3 div(u)`` trace
     removal convention on a two-dimensional flow slice. Stabilization clamps
-    affect porosity and permeability inversion only; inputs are not mutated.
+    affect porosity and permeability inversion only. Inputs are not mutated.
 
     """
     fields = (
@@ -423,7 +423,7 @@ def _field_mapping(
 
     ``tensor`` must expose batch and channel as its first two axes. The complete
     declared ``fields`` sequence must match the channel count and be duplicate
-    free; every required steady-flow role is returned as ``tensor[:, index]``,
+    free. Every required steady-flow role is returned as ``tensor[:, index]``,
     preserving batch/spatial storage as a view.
 
     Raises
@@ -470,15 +470,15 @@ def evaluate_steady_2d_brinkman(
     inputs, outputs : torch.Tensor
         Task-ordered BCHW tensors. Output channels are physical ``p``/``u``/``v``
         values. Input ``x``, ``y``, ``eps``, and ``p_bc`` retain physical/stored
-        values; diagonal permeability channels are log10 ratios to 1 m² and are
+        values. Diagonal permeability channels are log10 ratios to 1 m² and are
         exponentiated, while ``kxy`` is the dimensionless geometric-mean ratio.
     input_fields, output_fields : Sequence[str]
         Exact task-owned field declarations used for name-based binding.
     derivatives : DerivativeOperator
         Explicit physical or spectral derivative backend.
     continuity : str
-        Training-selected continuity identifier used for the selected aggregate;
-        both plain and porosity-weighted formulations are always evaluated.
+        Training-selected continuity identifier used for the selected aggregate.
+        Both plain and porosity-weighted formulations are always evaluated.
     boundary : str
         Semantic pressure boundary formulation.
     interior_crop : int, optional
@@ -506,12 +506,12 @@ def evaluate_steady_2d_brinkman(
     Notes
     -----
     Both continuity formulations are always computed. ``continuity`` selects
-    only selected aggregate properties used by training; formulation-explicit fields
+    only selected aggregate properties used by training. Formulation-explicit fields
     and scalars remain available regardless of that selection.
 
     """
     if boundary != physics_contracts.PRESSURE_BOUNDARY_KIND:
-        msg = f"Unknown pressure boundary identifier {boundary!r}; expected {physics_contracts.PRESSURE_BOUNDARY_KIND!r}."
+        msg = f"Unknown pressure boundary identifier {boundary!r}. Expected {physics_contracts.PRESSURE_BOUNDARY_KIND!r}."
         raise ValueError(msg)
     input_values = _field_mapping(
         inputs,
@@ -607,7 +607,7 @@ def resolve_physics_evaluator(kind: str) -> PhysicsEvaluator:
     Returns
     -------
     PhysicsEvaluator
-        Registered evaluator callable; resolution performs no computation.
+        Registered evaluator callable. Resolution performs no computation.
 
     Raises
     ------

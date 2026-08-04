@@ -1,13 +1,10 @@
-# Recreated from named run: M-UNO_m64x64_h32_l7_s1-05-05-1-1-2-2_mr0p495_20260116_022222
-# Source config: model_training/data/processed/safe/M-UNO_m64x64_h32_l7_s1-05-05-1-1-2-2_mr0p495_20260116_022222/config.json
-
 task: steady_flow
 
 run:
   seed: 9
   deterministic: false
   device: auto
-  suffix: lr_0p00013299285908562213
+  suffix: best_of_class
 
 data:
   train_dataset: lhs_var80_seed3001
@@ -43,11 +40,11 @@ loss:
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw
-  lr: 1.3299285908562213e-4
+  lr: 5.319714363424885e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

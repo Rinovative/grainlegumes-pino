@@ -46,7 +46,7 @@ class DerivativeOperator(Protocol):
     Define the reusable physical-field derivative interface used by equations.
 
     Implementations accept real floating tensors with explicit ``(y, x)`` axes
-    and positive physical spacing. ``gradient`` returns ``(d/dx, d/dy)``;
+    and positive physical spacing. ``gradient`` returns ``(d/dx, d/dy)``.
     ``divergence`` returns ``d(field_x)/dx + d(field_y)/dy`` without cropping or
     scalar reduction.
     """
@@ -161,7 +161,7 @@ def _spacing_float(spacing: float | Tensor, *, reference: Tensor, label: str) ->
     """
     Return validated physical spacing as the host scalar required by FFT grids.
 
-    Validation and dtype conversion first follow ``reference``; transferring the
+    Validation and dtype conversion first follow ``reference``. Transferring the
     scalar to the host does not move or copy the differentiated field.
     """
     value = _spacing_tensor(spacing, reference=reference, label=label)
@@ -294,7 +294,7 @@ def crop_interior(field: Tensor, crop: int, *, axes: SpatialAxes = (-2, -1)) -> 
     Returns
     -------
     torch.Tensor
-        A view of the requested interior; ``crop=0`` returns ``field`` itself.
+        A view of the requested interior. ``crop=0`` returns ``field`` itself.
 
     Raises
     ------
@@ -337,7 +337,7 @@ class PhysicalDerivatives:
     axes : tuple[int, int]
         Declared ``(y, x)`` axes, normalized and validated when an operation runs.
     kind : Literal["physical", "spectral"]
-        Semantic metadata identifier; the canonical factory value is
+        Semantic metadata identifier. The canonical factory value is
         ``"physical"``.
     extension : Literal["none", "reflect"]
         Must be ``"none"`` for this implementation.
@@ -393,7 +393,7 @@ class PhysicalDerivatives:
         Notes
         -----
         ``torch.gradient`` supplies centered interior differences and its
-        supported one-sided edge stencil; no boundary cells are cropped.
+        supported one-sided edge stencil. No boundary cells are cropped.
 
         """
         y_axis, x_axis = _validate_field(field, self.axes)
@@ -424,7 +424,7 @@ class PhysicalDerivatives:
         Returns
         -------
         torch.Tensor
-            Divergence with the component shape, dtype, and device; units are
+            Divergence with the component shape, dtype, and device. Units are
             component units per spacing unit when both components share units.
 
         Raises
@@ -449,17 +449,17 @@ class SpectralDerivatives:
     Compute FFT derivatives with explicit periodic or reflected extension.
 
     Frequencies are scaled by physical spacing. Reflected extension mirrors both
-    spatial axes before differentiation and crops back to the original domain;
-    stable internal FFT precision is cast back to the caller dtype/device.
+    spatial axes before differentiation and crops back to the original domain.
+    Stable internal FFT precision is cast back to the caller dtype/device.
 
     Attributes
     ----------
     extension : Literal["none", "reflect"]
-        ``"none"`` assumes periodic input; ``"reflect"`` mirrors both axes.
+        ``"none"`` assumes periodic input. ``"reflect"`` mirrors both axes.
     axes : tuple[int, int]
         Declared ``(y, x)`` axes, normalized and validated per operation.
     kind : Literal["physical", "spectral"]
-        Semantic metadata identifier; the canonical factory value is
+        Semantic metadata identifier. The canonical factory value is
         ``"spectral"``.
 
     Raises
@@ -476,7 +476,7 @@ class SpectralDerivatives:
     def __post_init__(self) -> None:
         """Validate the spectral extension identifier."""
         if self.extension not in {"none", "reflect"}:
-            msg = f"Unknown spectral extension {self.extension!r}; expected 'none' or 'reflect'."
+            msg = f"Unknown spectral extension {self.extension!r}. Expected 'none' or 'reflect'."
             raise ValueError(msg)
 
     @staticmethod
@@ -546,7 +546,7 @@ class SpectralDerivatives:
         Notes
         -----
         Arbitrary spatial axes move to trailing y/x positions internally and are
-        restored on return. ``extension="none"`` assumes periodic data;
+        restored on return. ``extension="none"`` assumes periodic data.
         ``"reflect"`` mirrors both axes and crops back to the original domain.
 
         """

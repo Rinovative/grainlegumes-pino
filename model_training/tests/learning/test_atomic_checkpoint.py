@@ -4,7 +4,7 @@ Protect atomic checkpoint publication when serialization fails mid-write.
 
 Injected writer failures prove an existing destination remains byte-identical and
 a first publication leaves neither final nor temporary files. Checkpoint schema,
-roles, and resume-state equivalence are covered by ``test_checkpoint_resume``;
+roles, and resume-state equivalence are covered by ``test_checkpoint_resume``.
 this module isolates only the filesystem transaction.
 """
 

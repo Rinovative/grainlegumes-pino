@@ -4,7 +4,7 @@ Provide reusable strict task and dataset fixtures for the CPU contract suite.
 The factories model current TaskSpec field order, schema identity, and small
 in-memory tensors while deliberately avoiding production storage and training
 workloads. Scientific equations and lifecycle failures are exercised by their
-own focused modules; these fixtures should not be treated as benchmark data.
+own focused modules. These fixtures should not be treated as benchmark data.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def steady_task() -> domain.tasks.spec.TaskSpec:
     Return the registered immutable steady-flow contract used by production.
 
     This fixture is appropriate when a test must exercise the exact seven-input,
-    three-output fields; genericity tests should request ``synthetic_task`` instead.
+    three-output fields. Genericity tests should request ``synthetic_task`` instead.
     """
     return domain.tasks.registry.get_task("steady_flow")
 

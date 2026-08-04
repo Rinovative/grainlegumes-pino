@@ -5,17 +5,17 @@ analysis_artifact_service.py
 Discover, validate, rebuild, generate, and reuse split-aware run artifacts.
 
 Responsibilities:
-  - Admit only completed and fully validated runs
-  - Bind caches to task/config/checkpoint/dataset/split/evaluator identity
+  - Admit completed or evidence-valid terminal runs by explicit current path
+  - Bind caches to exact checkpoint/config/normalizer/dataset/split identity
   - Reject partial or semantically mismatched caches without substitution
-  - Provide an explicit exact-target rebuild operation
-  - Propagate every material generation failure to callers
-  - Orchestrate explicitly enabled provenance and curated tracking uploads
+  - Rebuild only explicit exact targets and propagate every material failure
+  - Load valid artifacts or generate only missing roles through one public service
 
 Design principles:
   - Saved split membership is always required
   - Provenance is published last as the cache completion marker
   - Rebuild publishes a validated replacement only for the requested target
+  - Local notebook orchestration never invokes tracking uploads
 
 This module does NOT:
   - Parse CLI arguments or choose which runs a user intends to process
@@ -49,11 +49,10 @@ from src import common, domain, experiments
 from . import contracts, generation, timing
 
 if TYPE_CHECKING:
+    from src.analysis.evaluation.evaluation_artifact_loader import LoadedRunArtifacts
     from src.datasets.dataset_identity import DatasetIdentity
     from src.datasets.dataset_metadata import DatasetMetadata
     from src.learning.learning_device import DeviceResolution
-
-DEFAULT_BATCH_SIZE = 1
 
 ArtifactSplit = Literal["eval", "ood"]
 _SPLIT_INDEX_KEYS: dict[ArtifactSplit, str] = {
@@ -88,12 +87,12 @@ class ArtifactCacheError(RuntimeError):
 @dataclass(frozen=True)
 class RunArtifactPlan:
     """
-    Bind one completed run to the exact ID and OOD datasets it persisted.
+    Bind one evaluable run to the exact ID and OOD datasets it persisted.
 
     Parameters
     ----------
     run_dir : pathlib.Path
-        Current completed run whose config and saved split metadata were validated.
+        Current evaluable run whose config and saved split metadata were validated.
     id_dataset_name : str
         Logical training dataset supplying the saved evaluation membership.
     ood_dataset_name : str
@@ -108,6 +107,9 @@ class RunArtifactPlan:
     run_dir: Path
     id_dataset_name: str
     ood_dataset_name: str
+    lifecycle_status: str
+    is_completed: bool
+    scientific_run_name: str
 
 
 @dataclass(frozen=True)
@@ -122,7 +124,9 @@ class ArtifactRequest:
         generation, and runtime request evidence. Generated aggregate/results
         are deliberately absent until artifact publication.
     source_indices : tuple[int, ...]
-        Exact ordered final-dataset indices selected from the saved split.
+        Exact complete ordered final-dataset membership saved by the run.
+    batch_size : int
+        Saved resolved evaluation batch size used by online and artifact inference.
 
     Notes
     -----
@@ -133,6 +137,7 @@ class ArtifactRequest:
 
     provenance: dict[str, Any]
     source_indices: tuple[int, ...]
+    batch_size: int
     case_ids: tuple[str, ...] = ()
     dataset_metadata: DatasetMetadata | None = None
 
@@ -148,6 +153,14 @@ class _EvaluatorArtifactContract:
         Exact task identity copied from ``provenance.run.task``.
     input_fields, output_fields, output_units : tuple[str, ...]
         Ordered names and output units required in every Parquet row and NPZ.
+    output_groups : tuple[tuple[str, tuple[str, ...]], ...]
+        Ordered task-owned physical output groups.
+    train_standard_deviations : dict[str, float]
+        Exact raw output scales from the saved training normalizer.
+    normalization_denominator_floor : float
+        Saved transform denominator addition used to validate normalized evidence.
+    group_metric_columns : tuple[str, ...]
+        Task-declared per-case physical and normalized group diagnostics.
     physics_kind : str
         Physics contract selecting generic versus steady-Brinkman payload rules.
 
@@ -157,12 +170,34 @@ class _EvaluatorArtifactContract:
     input_fields: tuple[str, ...]
     output_fields: tuple[str, ...]
     output_units: tuple[str, ...]
+    output_groups: tuple[tuple[str, tuple[str, ...]], ...]
+    train_standard_deviations: dict[str, float]
+    normalization_denominator_floor: float
+    group_metric_columns: tuple[str, ...]
     physics_kind: str
 
     @property
     def is_steady_brinkman(self) -> bool:
         """Return whether the concrete steady-flow diagnostic schema applies."""
         return self.physics_kind == domain.physics.contracts.STEADY_BRINKMAN_KIND
+
+    @property
+    def velocity_unit(self) -> str:
+        """Return the shared unit of the task-owned velocity output group."""
+        matching_groups = tuple(fields for group_id, fields in self.output_groups if group_id == "velocity")
+        if len(matching_groups) != 1:
+            msg = "Steady artifact validation requires one task-owned velocity output group."
+            raise ArtifactCacheError(msg)
+        unit_by_field = dict(zip(self.output_fields, self.output_units, strict=True))
+        try:
+            units = {unit_by_field[field] for field in matching_groups[0]}
+        except KeyError as error:
+            msg = "Steady artifact velocity-group fields must be declared outputs."
+            raise ArtifactCacheError(msg) from error
+        if len(units) != 1:
+            msg = f"Steady artifact velocity-group fields must share one unit, got {sorted(units)}."
+            raise ArtifactCacheError(msg)
+        return next(iter(units))
 
 
 # ======================================================================
@@ -198,76 +233,44 @@ def cleanup_runtime(device: torch.device) -> None:
         torch.cuda.ipc_collect()
 
 
-def _contains_current_run_marker(path: Path) -> bool:
-    """Return whether one directory contains any current run-contract marker."""
+def _contains_evaluable_run_marker(path: Path) -> bool:
+    """Return whether one directory contains any evaluation-contract marker."""
     return path.is_dir() and any((path / filename).exists() for filename in common.paths.CURRENT_RUN_REQUIRED_FILES)
 
 
 def iter_run_dirs(root: Path, *, run_names: Iterable[str] | None = None) -> Iterable[Path]:
     """
-    Iterate over current-contract run directories in sorted order.
+    Iterate over terminal evidence-valid run directories in deterministic order.
 
-    A directory is considered a valid current run when it contains the complete
-    config, split, normalizer, best-checkpoint, last-checkpoint, and summary contract.
-
-    Parameters
-    ----------
-    root : Path
-        Directory containing run subdirectories, or a single current run
-        directory when no run names are provided.
-    run_names : Iterable[str] | None, optional
-        Optional run names to select under root. Requested runs must satisfy
-        the current run contract.
-
-    Yields
-    ------
-    pathlib.Path
-        Completed current-contract run directories. Container discovery is sorted;
-        explicit ``run_names`` preserve caller order.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the discovery root or a required completed-run file is absent.
-    TypeError, ValueError, RuntimeError
-        If a requested logical name or discovered run violates the current
-        completed-run contract. Invalid runs are never silently skipped once
-        they expose a current run marker.
-
+    Explicit names below ``root`` are storage aliases. Internal scientific run
+    names are validated independently and never inferred from directory leaves.
     """
-    root = Path(root)
+    root = Path(root).expanduser()
     selected_run_names = list(run_names or [])
-
     if selected_run_names:
-        for selected_run_name in selected_run_names:
-            run_name = common.paths.validate_logical_name(selected_run_name, label="run_name")
-            run_dir = root / run_name
-            experiments.run.validate_completed_run(run_dir)
-            yield run_dir
+        for selected_storage_alias in selected_run_names:
+            storage_alias = common.paths.validate_logical_name(selected_storage_alias, label="run_name")
+            run_dir = root / storage_alias
+            experiments.run.validate_evaluable_run(run_dir)
+            yield run_dir.resolve()
         return
 
-    if common.paths.is_current_run_dir(root):
-        experiments.run.validate_completed_run(root)
-        yield root
+    if common.paths.is_evaluable_run_dir(root):
+        experiments.run.validate_evaluable_run(root)
+        yield root.resolve()
         return
-
     if not root.is_dir():
         msg = f"Run discovery root not found: {root}"
         raise FileNotFoundError(msg)
-
-    if _contains_current_run_marker(root):
-        experiments.run.validate_completed_run(root)
-        msg = f"Run validation returned without identifying a current run: {root}"
+    if _contains_evaluable_run_marker(root):
+        experiments.run.validate_evaluable_run(root)
+        msg = f"Run validation returned without identifying an evaluable run: {root}"
         raise RuntimeError(msg)
-
     for candidate in sorted(root.iterdir()):
-        if not _contains_current_run_marker(candidate):
+        if not _contains_evaluable_run_marker(candidate):
             continue
-        experiments.run.validate_completed_run(candidate)
-        if not common.paths.is_current_run_dir(candidate):
-            msg = f"Run validation returned without identifying a current run: {candidate}"
-            raise RuntimeError(msg)
-        yield candidate
+        experiments.run.validate_evaluable_run(candidate)
+        yield candidate.resolve()
 
 
 def _dataset_name_from_identity(metadata: Mapping[str, Any], *, identity_key: str) -> str:
@@ -296,8 +299,8 @@ def _load_split_contract(run_dir: Path) -> Mapping[str, Any]:
     """
     Load the authoritative saved split mapping on CPU without tensor-only mode.
 
-    The complete mapping, including metadata and dataset identities, is required;
-    non-mapping payloads fail before artifact path or membership derivation.
+    The complete mapping, including metadata and dataset identities, is required.
+    Non-mapping payloads fail before artifact path or membership derivation.
     """
     split_indices_path = common.paths.resolve_split_indices_path(run_dir)
     split_indices = torch.load(
@@ -363,12 +366,12 @@ def _required_config_ood_dataset_name(data_cfg: Mapping[str, Any]) -> str:
 
 def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
     """
-    Resolve the exact ID and OOD artifact datasets owned by a completed run.
+    Resolve the exact ID and OOD artifact datasets owned by an evaluable run.
 
     Parameters
     ----------
     run_dir : pathlib.Path
-        Current completed run containing config, split, normalizer, checkpoints,
+        Current evaluable run containing config, split, normalizer, best checkpoint,
         and summary evidence.
 
     Returns
@@ -384,12 +387,12 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
 
     Notes
     -----
-    Output naming therefore uses the same saved identity consumed by inference;
-    config text alone never retargets artifacts.
+    Output naming therefore uses the same saved identity consumed by inference.
+    Config text alone never retargets artifacts.
 
     """
-    run_dir = Path(run_dir)
-    experiments.run.validate_completed_run(run_dir)
+    run_dir = Path(run_dir).expanduser().resolve()
+    admitted = experiments.run.validate_evaluable_run(run_dir)
     data_cfg = _load_data_config(run_dir)
     split_metadata = _load_split_metadata(run_dir)
 
@@ -419,6 +422,9 @@ def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
         run_dir=run_dir,
         id_dataset_name=id_dataset_name,
         ood_dataset_name=ood_dataset_name,
+        lifecycle_status=str(admitted["lifecycle_status"]),
+        is_completed=bool(admitted["is_completed"]),
+        scientific_run_name=str(admitted["scientific_run_name"]),
     )
 
 
@@ -520,13 +526,11 @@ def _load_bound_dataset_metadata(
     return package
 
 
-def _build_artifact_request(
+def _build_artifact_request(  # noqa: C901, PLR0915
     *,
     run_dir: Path,
     dataset_name: str,
     split: ArtifactSplit,
-    max_cases: int | None,
-    batch_size: int,
     device_resolution: DeviceResolution,
     dataset_root: Path,
     metadata_root: Path,
@@ -534,7 +538,7 @@ def _build_artifact_request(
     """
     Build and validate the complete semantic request for one artifact cache.
 
-    This boundary admits the completed run, its exact saved split membership,
+    This boundary admits the evaluable run, its exact saved split membership,
     the source dataset identity, the resolved task/objective, model capacity,
     normalizer, physics semantics, and runtime device decision. Filesystem
     locations, mtimes, and byte sizes are intentionally excluded from the
@@ -543,15 +547,11 @@ def _build_artifact_request(
     Parameters
     ----------
     run_dir : pathlib.Path
-        Completed run whose immutable evidence owns the artifacts.
+        Evaluable run whose immutable evidence owns the artifacts.
     dataset_name : str
         Dataset identity expected for the selected split role.
     split : {"eval", "ood"}
         Saved split membership to materialize.
-    max_cases : int | None
-        Optional deterministic prefix length from the saved split order.
-    batch_size : int
-        Positive generation batch size recorded as runtime provenance.
     device_resolution : DeviceResolution
         Already resolved execution-device decision.
     dataset_root : pathlib.Path
@@ -562,7 +562,7 @@ def _build_artifact_request(
     Returns
     -------
     ArtifactRequest
-        Exact provenance document and ordered effective source membership.
+        Exact provenance document and complete ordered source membership.
 
     Raises
     ------
@@ -571,14 +571,11 @@ def _build_artifact_request(
         semantics disagree or are incomplete.
 
     """
-    run_dir = Path(run_dir)
-    if max_cases is not None and max_cases <= 0:
-        msg = f"max_cases must be positive when provided, got {max_cases}."
-        raise ValueError(msg)
-    completed = experiments.run.validate_completed_run(run_dir)
-    split_contract = completed["split_indices"]
-    run_config = completed["config"]
-    summary = completed["summary"]
+    run_dir = Path(run_dir).expanduser().resolve()
+    admitted = experiments.run.validate_evaluable_run(run_dir)
+    split_contract = admitted["split_indices"]
+    run_config = admitted["config"]
+    summary = admitted["summary"]
     metadata = _split_metadata(split_contract, run_dir=run_dir)
     data_cfg = run_config.get("data")
     run_cfg = run_config.get("run")
@@ -599,10 +596,21 @@ def _build_artifact_request(
     if not isinstance(device_resolution, learning.device.DeviceResolution):
         msg = "Artifact provenance requires one resolved runtime device decision."
         raise TypeError(msg)
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
-        msg = f"Artifact batch_size must be a positive integer, got {batch_size!r}."
-        raise ValueError(msg)
+    raw_batch_size = data_cfg.get("batch_size")
+    if isinstance(raw_batch_size, bool) or not isinstance(raw_batch_size, Integral) or int(raw_batch_size) <= 0:
+        msg = "Evaluable run config data.batch_size must be a positive integer."
+        raise TypeError(msg)
+    batch_size = int(raw_batch_size)
     task = experiments.config.loader.validate_resolved_task_contract(run_config)
+    output_groups = contracts.output_group_payload(task.output_groups)
+    normalizer_state = admitted.get("normalizer_state")
+    if not isinstance(normalizer_state, Mapping):
+        msg = "Evaluable run must contain the validated saved normalizer state."
+        raise TypeError(msg)
+    train_standard_deviations = contracts.output_standard_deviations_from_state(
+        normalizer_state,
+        output_fields=task.output_names,
+    )
     from src import datasets  # noqa: PLC0415
 
     dataset_path = common.paths.resolve_dataset_path(dataset_name, dataset_root=dataset_root)
@@ -635,9 +643,9 @@ def _build_artifact_request(
         msg = f"Saved {full_count_key!r} does not match the verified dataset sample count."
         raise RuntimeError(msg)
 
-    effective_count = len(full_source_indices) if max_cases is None else min(len(full_source_indices), max_cases)
-    effective_source_indices = full_source_indices[:effective_count]
-    effective_case_ids = tuple(expected_identity.sample_ids[index] for index in effective_source_indices)
+    effective_count = len(full_source_indices)
+    effective_source_indices = full_source_indices
+    effective_case_ids = tuple(expected_identity.sample_ids[index] for index in full_source_indices)
     dataset_metadata = _load_bound_dataset_metadata(
         source_dataset,
         dataset_name=dataset_name,
@@ -725,60 +733,70 @@ def _build_artifact_request(
         }
 
     raw_parameter_counts = summary.get("model_parameter_counts")
-    if not isinstance(raw_parameter_counts, Mapping):
-        msg = "Completed run summary must contain exact model_parameter_counts."
-        raise TypeError(msg)
-    parameter_counts: dict[str, int] = {}
-    for name in ("total", "trainable"):
-        value = raw_parameter_counts.get(name)
-        if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
-            msg = "Completed run model_parameter_counts must contain positive integer total and trainable values."
+    parameter_counts: dict[str, int] | None = None
+    if raw_parameter_counts is not None:
+        if not isinstance(raw_parameter_counts, Mapping):
+            msg = "Run summary model_parameter_counts must be a mapping when recorded."
             raise TypeError(msg)
-        parameter_counts[name] = int(value)
+        parameter_counts = {}
+        for name in ("total", "trainable"):
+            value = raw_parameter_counts.get(name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+                msg = "Run model_parameter_counts must contain positive integer total and trainable values."
+                raise TypeError(msg)
+            parameter_counts[name] = int(value)
     architecture = model_cfg.get("params")
     if not isinstance(architecture, Mapping):
         msg = "Resolved config model.params must be a mapping."
         raise TypeError(msg)
 
+    model_provenance: dict[str, Any] = {
+        "kind": model_cfg.get("kind"),
+        "architecture": dict(architecture),
+        "physics_enabled": physics_cfg.get("enabled") is True,
+    }
+    if parameter_counts is not None:
+        model_provenance["parameter_counts"] = parameter_counts
     provenance: dict[str, Any] = {
         "provenance_schema_version": contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
         "artifact_schema_version": contracts.ARTIFACT_SCHEMA_VERSION,
         "run": {
-            "name": run_cfg.get("name"),
+            "name": admitted["scientific_run_name"],
             "task": task.id,
             "task_contract_digest": task.contract_digest,
-            "effective_config_digest": summary["effective_config_digest"],
-            "best_checkpoint_sha256": summary["best_checkpoint_sha256"],
-            "normalizer_sha256": summary["normalizer_sha256"],
+            "effective_config_digest": admitted["effective_config_digest"],
+            "best_checkpoint_sha256": admitted["selected_checkpoint_sha256"],
+            "best_checkpoint_epoch": admitted["selected_checkpoint_epoch"],
+            "normalizer_sha256": admitted["normalizer_sha256"],
+            "lifecycle_status": admitted["lifecycle_status"],
+            "is_completed": admitted["is_completed"],
+            "is_provisional": admitted["is_provisional"],
+            "selected_checkpoint_role": admitted["selected_checkpoint_role"],
         },
-        "model": {
-            "kind": model_cfg.get("kind"),
-            "architecture": dict(architecture),
-            "parameter_counts": parameter_counts,
-            "physics_enabled": physics_cfg.get("enabled") is True,
-        },
+        "model": model_provenance,
         "split_role": split,
         "dataset": {
             "name": dataset_name,
             "full_case_count": dataset_full_count,
             "fingerprint": expected_identity.fingerprint,
-            "task_contract_digest": expected_identity.task_contract_digest,
+            "data_contract_digest": expected_identity.data_contract_digest,
             "saved_membership_digest": membership_digests[split],
         },
         "selection": {
             "index_key": _SPLIT_INDEX_KEYS[split],
             "full_selected_case_count": len(full_source_indices),
             "effective_case_count": effective_count,
-            "generation_limit": max_cases,
+            "generation_limit": None,
             "full_ordered_source_indices_sha256": _indices_sha256(full_source_indices),
             "effective_ordered_source_indices_sha256": _indices_sha256(effective_source_indices),
         },
         "normalizer": {
-            "sha256": summary["normalizer_sha256"],
+            "sha256": admitted["normalizer_sha256"],
             "identity": "saved_run_normalizer.pt",
             "fit_split": task.preprocessing.fit_split,
             "output_normalization": task.preprocessing.output_normalization,
             "denominator_floor": 1e-7,
+            "output_standard_deviations": train_standard_deviations,
         },
         "evaluator": {
             "metrics": metrics,
@@ -787,20 +805,24 @@ def _build_artifact_request(
             "input_units": {field.name: field.unit for field in task.inputs},
             "output_fields": list(task.output_names),
             "output_units": {field.name: field.unit for field in task.outputs},
+            "output_groups": output_groups,
             "physics_kind": task.physics.kind,
-            "normalized_evidence": {
+            "group_objective_evidence": {
                 "squared_error_accumulation_dtype": "float64",
-                "per_case_columns": {field: list(contracts.normalized_statistic_columns(field)) for field in task.output_names},
-                "dataset_reduction": "sum field SSE/count, finalize field RMSE, arithmetic field mean",
+                "per_case_physical_columns": {field: list(contracts.physical_statistic_columns(field)) for field in task.output_names},
+                "per_case_normalized_columns": {field: list(contracts.normalized_statistic_columns(field)) for field in task.output_names},
+                "train_scale_source": "saved_run_normalizer.output_standard_deviations",
+                "dataset_reduction": ("sum physical field SSE/count, finalize shared-scale group RMSE, equal macro mean over output groups"),
             },
             "predictive_metrics": {
                 "rel_l2": "per-case arithmetic mean of physical per-field relative L2 ratios",
                 "rel_h1": "per-case arithmetic mean of physical per-field relative H1 ratios on the declared artifact region where available",
-                "physical_rmse_columns": {field: f"rmse_{field}" for field in task.output_names},
+                "physical_rmse_columns": {field: contracts.physical_statistic_columns(field)[2] for field in task.output_names},
             },
         },
         "generation": {
-            "effective_case_limit": max_cases,
+            "effective_case_limit": None,
+            "inference_batch_size": batch_size,
             "compression": "numpy savez_compressed",
         },
         "runtime": {
@@ -813,6 +835,7 @@ def _build_artifact_request(
     return ArtifactRequest(
         provenance=provenance,
         source_indices=effective_source_indices,
+        batch_size=batch_size,
         case_ids=effective_case_ids,
         dataset_metadata=dataset_metadata,
     )
@@ -842,14 +865,26 @@ def _scientific_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
     """
     Isolate the scientific request identity used to compare cache provenance.
 
-    Operational runtime selection, generated aggregate values, and output
-    digests are excluded so equivalent device/batch executions can reuse the
-    same scientifically identified cache while payload results validate separately.
+    Operational device facts, generated aggregate values, and output digests
+    are excluded. The saved online-evaluation batch size remains under generation
+    provenance because batch-sensitive operators must reproduce that exact path.
     """
     identity = dict(provenance)
     identity.pop("runtime", None)
     identity.pop("aggregate", None)
     identity.pop("outputs", None)
+    run = identity.get("run")
+    if isinstance(run, Mapping) and run.get("is_provisional") is not True:
+        normalized_run = dict(run)
+        for field in (
+            "best_checkpoint_epoch",
+            "lifecycle_status",
+            "is_completed",
+            "is_provisional",
+            "selected_checkpoint_role",
+        ):
+            normalized_run.pop(field, None)
+        identity["run"] = normalized_run
     return identity
 
 
@@ -881,7 +916,7 @@ def _runtime_identities(request: ArtifactRequest) -> tuple[dict[str, Any], dict[
         {
             "name": dataset.get("name"),
             "fingerprint": dataset.get("fingerprint"),
-            "task_contract_digest": dataset.get("task_contract_digest"),
+            "data_contract_digest": dataset.get("data_contract_digest"),
             "saved_membership_digest": dataset.get("saved_membership_digest"),
             "effective_ordered_source_indices_sha256": selection.get("effective_ordered_source_indices_sha256"),
         },
@@ -906,6 +941,9 @@ def _validate_runtime_comparison_request(
         raise ArtifactCacheError(msg)
     if validated["split_role"] != request.provenance.get("split_role"):
         msg = "Runtime comparison disagrees with the saved split role."
+        raise ArtifactCacheError(msg)
+    if validated["measurement"]["batch_size"] != request.batch_size:
+        msg = "Runtime comparison disagrees with the saved evaluation batch size."
         raise ArtifactCacheError(msg)
     if [case["case_id"] for case in validated["cases"]] != list(request.case_ids):
         msg = "Runtime comparison case IDs disagree with saved membership."
@@ -952,8 +990,8 @@ def _report_runtime_comparison(
         )
     except (ArtifactCacheError, RuntimeError, TypeError, ValueError) as error:
         print(
-            "[TIMING] runtime timing is unavailable or incompatible; "
-            "scientific artifacts remain valid; use an explicit --rebuild "
+            "[TIMING] runtime timing is unavailable or incompatible. "
+            "Scientific artifacts remain valid. Use an explicit --rebuild "
             f"to measure again: {error}"
         )
     else:
@@ -1036,8 +1074,9 @@ def _evaluator_artifact_contract(provenance: Mapping[str, Any]) -> _EvaluatorArt
     """
     Resolve the exact evaluator payload contract from admitted provenance.
 
-    Task identity, unique input/output order, complete output units, and physics
-    kind are validated once and frozen for every subsequent Parquet/NPZ check.
+    Task identity, unique input/output order, units, task-owned output groups,
+    raw saved training scales, declared group diagnostics, and physics kind are
+    validated once and frozen for every subsequent Parquet/NPZ check.
     """
     evaluator = provenance.get("evaluator")
     if not isinstance(evaluator, Mapping):
@@ -1060,6 +1099,58 @@ def _evaluator_artifact_contract(provenance: Mapping[str, Any]) -> _EvaluatorArt
     if any(not isinstance(raw_units[name], str) or not raw_units[name] for name in output_fields):
         msg = "Artifact provenance evaluator.output_units values must be non-empty strings."
         raise ArtifactCacheError(msg)
+    try:
+        group_payload = contracts.output_group_payload(evaluator.get("output_groups", ()))
+    except (TypeError, ValueError) as error:
+        msg = f"Artifact evaluator output groups are invalid: {error}"
+        raise ArtifactCacheError(msg) from error
+    grouped_fields = tuple(field for group in group_payload for field in group["fields"])
+    if grouped_fields != output_fields:
+        msg = "Artifact evaluator output groups do not partition declared outputs in order."
+        raise ArtifactCacheError(msg)
+
+    normalizer = provenance.get("normalizer")
+    raw_scales = normalizer.get("output_standard_deviations") if isinstance(normalizer, Mapping) else None
+    denominator_floor = normalizer.get("denominator_floor") if isinstance(normalizer, Mapping) else None
+    if (
+        isinstance(denominator_floor, bool)
+        or not isinstance(denominator_floor, Real)
+        or not np.isfinite(float(denominator_floor))
+        or float(denominator_floor) < 0.0
+    ):
+        msg = "Artifact normalizer denominator_floor must be finite and non-negative."
+        raise ArtifactCacheError(msg)
+    if not isinstance(raw_scales, Mapping) or set(raw_scales) != set(output_fields):
+        msg = "Artifact normalizer output_standard_deviations must map exactly the output fields."
+        raise ArtifactCacheError(msg)
+    train_standard_deviations: dict[str, float] = {}
+    for field in output_fields:
+        value = raw_scales[field]
+        if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(float(value)) or float(value) <= 0.0:
+            msg = f"Artifact train standard deviation for {field!r} must be finite and strictly positive."
+            raise ArtifactCacheError(msg)
+        train_standard_deviations[field] = float(value)
+
+    raw_metrics = evaluator.get("metrics")
+    if not isinstance(raw_metrics, list):
+        msg = "Artifact evaluator metrics must be a list."
+        raise ArtifactCacheError(msg)
+    group_fields = {tuple(group["fields"]) for group in group_payload}
+    group_metric_columns: list[str] = []
+    for metric in raw_metrics:
+        if not isinstance(metric, Mapping) or metric.get("kind") not in {"group_rmse", "vector_rmse"}:
+            continue
+        metric_id = metric.get("id")
+        raw_metric_fields = metric.get("fields")
+        metric_fields = output_fields if raw_metric_fields == "all" else tuple(raw_metric_fields or ())
+        if not isinstance(metric_id, str) or not metric_id or metric_fields not in group_fields:
+            msg = "Artifact evaluator contains an invalid output-group diagnostic metric."
+            raise ArtifactCacheError(msg)
+        group_metric_columns.append(metric_id)
+    if len(group_metric_columns) != len(set(group_metric_columns)):
+        msg = "Artifact evaluator contains duplicate output-group diagnostic ids."
+        raise ArtifactCacheError(msg)
+
     physics_kind = evaluator.get("physics_kind")
     if not isinstance(physics_kind, str) or not physics_kind:
         msg = "Artifact provenance evaluator.physics_kind must be a non-empty string."
@@ -1069,6 +1160,10 @@ def _evaluator_artifact_contract(provenance: Mapping[str, Any]) -> _EvaluatorArt
         input_fields=input_fields,
         output_fields=output_fields,
         output_units=tuple(raw_units[name] for name in output_fields),
+        output_groups=tuple((str(group["id"]), tuple(group["fields"])) for group in group_payload),
+        train_standard_deviations=train_standard_deviations,
+        normalization_denominator_floor=float(denominator_floor),
+        group_metric_columns=tuple(group_metric_columns),
         physics_kind=physics_kind,
     )
 
@@ -1208,7 +1303,7 @@ def _validate_npz_payload(
         label=f"Cached NPZ {path} artifact_units",
     )
     expected_artifact_fields = (*contract.output_fields, "U") if contract.is_steady_brinkman else contract.output_fields
-    expected_artifact_units = (*contract.output_units, "m/s") if contract.is_steady_brinkman else contract.output_units
+    expected_artifact_units = (*contract.output_units, contract.velocity_unit) if contract.is_steady_brinkman else contract.output_units
     if (
         input_fields != contract.input_fields
         or output_fields != contract.output_fields
@@ -1308,9 +1403,10 @@ def _parquet_schema(contract: _EvaluatorArtifactContract) -> tuple[set[str], tup
     """
     Derive the closed Parquet schema and numeric validation set for one task.
 
-    Generic tasks receive task-named predictive and normalized evidence columns;
-    the steady-Brinkman contract additionally requires speed, permeability names,
-    dual-continuity, momentum, and pressure-boundary diagnostics.
+    Generic tasks receive task-named physical and normalized sufficient evidence,
+    predictive diagnostics, and declared group metrics. The steady-Brinkman
+    contract additionally requires speed, permeability, residual, continuity,
+    momentum, and pressure-boundary diagnostics.
     """
     common = {
         "artifact_schema_version",
@@ -1324,24 +1420,31 @@ def _parquet_schema(contract: _EvaluatorArtifactContract) -> tuple[set[str], tup
         "meta",
         "inference_time_ms",
     }
+    physical_columns = tuple(column for field in contract.output_fields for column in contracts.physical_statistic_columns(field))
     normalized_columns = tuple(column for field in contract.output_fields for column in contracts.normalized_statistic_columns(field))
-    physical_metrics = tuple(f"rmse_{field}" for field in contract.output_fields)
     if contract.is_steady_brinkman:
         metrics: tuple[str, ...] = (
             "rel_l2",
             "rel_h1",
-            *physical_metrics,
-            "rmse_U",
+            *physical_columns,
+            *normalized_columns,
+            *contract.group_metric_columns,
+            "physical_rmse_speed_magnitude",
             "momentum_residual_mse",
             "div_velocity_mse",
             "div_eps_velocity_mse",
             "pressure_boundary_mse",
             "pressure_inlet_mse",
             "pressure_outlet_mean_square",
-            *normalized_columns,
         )
         return common | set(metrics) | {"kappa_names"}, metrics
-    metrics = ("rel_l2", "rel_h1", *physical_metrics, *normalized_columns)
+    metrics = (
+        "rel_l2",
+        "rel_h1",
+        *physical_columns,
+        *normalized_columns,
+        *contract.group_metric_columns,
+    )
     return common | set(metrics), metrics
 
 
@@ -1361,7 +1464,6 @@ def _load_validated_artifact_cache(  # noqa: C901, PLR0912, PLR0915
     parquet_path: Path,
     npz_dir: Path,
     request: ArtifactRequest,
-    published_npz_dir: Path | None = None,
 ) -> pd.DataFrame:
     """
     Load an artifact cache only after validating all persisted evidence.
@@ -1378,9 +1480,6 @@ def _load_validated_artifact_cache(  # noqa: C901, PLR0912, PLR0915
         Exact cache root and its staged or published payload locations.
     request : ArtifactRequest
         Current semantic identity and ordered source membership.
-    published_npz_dir : pathlib.Path | None
-        Optional final NPZ location used when validating a staging tree whose
-        Parquet paths already name the eventual publication target.
 
     Returns
     -------
@@ -1466,39 +1565,44 @@ def _load_validated_artifact_cache(  # noqa: C901, PLR0912, PLR0915
             msg = f"Cached Parquet row {row_position} output fields/units do not match evaluator provenance."
             raise ArtifactCacheError(msg)
 
+    output_groups = [{"id": group_id, "fields": list(fields)} for group_id, fields in contract.output_groups]
     try:
-        computed_aggregate = contracts.aggregate_normalized_macro_rmse(
+        computed_aggregate = contracts.aggregate_normalized_group_macro_rmse(
             df,
-            output_fields=contract.output_fields,
+            output_groups=output_groups,
+            train_standard_deviations=contract.train_standard_deviations,
+            normalization_denominator_floor=contract.normalization_denominator_floor,
         )
     except (KeyError, TypeError, ValueError, RuntimeError, FloatingPointError) as error:
-        msg = f"Cached Parquet normalized objective evidence is invalid: {error}"
+        msg = f"Cached Parquet group-objective evidence is invalid: {error}"
         raise ArtifactCacheError(msg) from error
     if stored_aggregate != computed_aggregate:
-        msg = "Artifact aggregate does not match the exact normalized Parquet sufficient statistics."
+        msg = "Artifact aggregate does not match physical Parquet sufficient statistics and saved train scales."
         raise ArtifactCacheError(msg)
     evaluator = request.provenance.get("evaluator")
     objective = evaluator.get("objective") if isinstance(evaluator, Mapping) else None
-    if isinstance(objective, Mapping) and objective.get("id") == "normalized_macro_rmse":
-        objective_fields = objective.get("fields")
-        resolved_objective_fields = contract.output_fields if objective_fields == "all" else tuple(objective_fields or ())
-        expected_semantics = {
-            "id": computed_aggregate["objective_id"],
-            "kind": "macro_rmse",
-            "space": computed_aggregate["space"],
-            "reduction": computed_aggregate["reduction"],
-            "direction": computed_aggregate["direction"],
-        }
-        actual_semantics = {key: objective.get(key) for key in expected_semantics}
-        if actual_semantics != expected_semantics or resolved_objective_fields != contract.output_fields:
-            msg = "Artifact aggregate definition contradicts the resolved primary objective."
-            raise ArtifactCacheError(msg)
+    if not isinstance(objective, Mapping):
+        msg = "Artifact evaluator must declare the resolved primary objective."
+        raise ArtifactCacheError(msg)
+    objective_fields = objective.get("fields")
+    resolved_objective_fields = contract.output_fields if objective_fields == "all" else tuple(objective_fields or ())
+    expected_semantics = {
+        "id": computed_aggregate["objective_id"],
+        "kind": computed_aggregate["kind"],
+        "space": computed_aggregate["space"],
+        "reduction": computed_aggregate["reduction"],
+        "direction": computed_aggregate["direction"],
+    }
+    actual_semantics = {key: objective.get(key) for key in expected_semantics}
+    if actual_semantics != expected_semantics or resolved_objective_fields != contract.output_fields:
+        msg = "Artifact aggregate definition contradicts the resolved primary objective."
+        raise ArtifactCacheError(msg)
 
     expected_source_indices = request.source_indices
     expected_split_local_indices = tuple(range(len(expected_source_indices)))
     expected_case_indices = tuple(source_index + 1 for source_index in expected_source_indices)
     if len(df) != len(expected_source_indices):
-        msg = f"Cached Parquet has {len(df)} rows; expected {len(expected_source_indices)}."
+        msg = f"Cached Parquet has {len(df)} rows, but {len(expected_source_indices)} were expected."
         raise ArtifactCacheError(msg)
     if _require_identity_values(df, "source_index") != expected_source_indices:
         msg = "Cached Parquet ordered source_index values do not match the selected saved split."
@@ -1511,27 +1615,33 @@ def _load_validated_artifact_cache(  # noqa: C901, PLR0912, PLR0915
         raise ArtifactCacheError(msg)
 
     expected_npz_paths = tuple(npz_dir / f"case_{case_index:04d}.npz" for case_index in expected_case_indices)
-    row_npz_dir = npz_dir if published_npz_dir is None else published_npz_dir
-    expected_row_npz_paths = tuple(row_npz_dir / f"case_{case_index:04d}.npz" for case_index in expected_case_indices)
     actual_npz_paths = tuple(sorted(npz_dir.glob("*.npz")))
     if {_normalise_path(path) for path in actual_npz_paths} != {_normalise_path(path) for path in expected_npz_paths}:
         msg = f"Cached NPZ membership/count does not match the selected split: expected {len(expected_npz_paths)}, found {len(actual_npz_paths)}."
         raise ArtifactCacheError(msg)
 
-    for row_position, (source_index, split_local_index, case_index, expected_npz_path, expected_row_npz_path) in enumerate(
+    for row_position, (source_index, split_local_index, case_index, expected_npz_path) in enumerate(
         zip(
             expected_source_indices,
             expected_split_local_indices,
             expected_case_indices,
             expected_npz_paths,
-            expected_row_npz_paths,
             strict=True,
         )
     ):
         row = df.iloc[row_position]
         raw_npz_path = row.loc["npz_path"]
-        if not isinstance(raw_npz_path, str) or _normalise_path(Path(raw_npz_path)) != _normalise_path(expected_row_npz_path):
-            msg = f"Cached Parquet npz_path mismatch at row {row_position}: {raw_npz_path!r}."
+        try:
+            resolved_npz_path = contracts.resolve_case_payload_path(
+                save_root,
+                raw_npz_path,
+                expected_filename=expected_npz_path.name,
+            )
+        except (FileNotFoundError, TypeError, ValueError) as error:
+            msg = f"Cached Parquet npz_path mismatch at row {row_position}: {raw_npz_path!r}: {error}"
+            raise ArtifactCacheError(msg) from error
+        if _normalise_path(resolved_npz_path) != _normalise_path(expected_npz_path):
+            msg = f"Cached Parquet npz_path resolves outside current membership at row {row_position}."
             raise ArtifactCacheError(msg)
         parquet_metadata = _require_metadata_without_identity(
             row.loc["meta"],
@@ -1556,6 +1666,7 @@ def _load_validated_artifact_cache(  # noqa: C901, PLR0912, PLR0915
                 msg = f"Cached Parquet and NPZ kappa_names differ at row {row_position}."
                 raise ArtifactCacheError(msg)
 
+    df.loc[:, "npz_path"] = [str(path.resolve()) for path in expected_npz_paths]
     df.attrs["artifact_root"] = str(save_root.resolve())
     df.attrs["artifact_provenance"] = {
         **stored_provenance,
@@ -1581,7 +1692,7 @@ def _publish_staged_artifact(*, run_dir: Path, save_root: Path, staging_root: Pa
     Atomically publish one validated sibling stage at an exact run-owned target.
 
     The stage must carry its provenance completion marker. An existing target is
-    first renamed to a unique backup; if publication fails, that backup is moved
+    first renamed to a unique backup. If publication fails, that backup is moved
     back before the exception escapes. A successful replacement removes the
     backup on a best-effort basis.
 
@@ -1658,13 +1769,13 @@ def rebuild_artifact_target(*, run_dir: Path, save_root: Path) -> None:
 
     Notes
     -----
-    This destructive helper is used only by explicit ``--rebuild`` handling; it
+    This destructive helper is used only by explicit ``--rebuild`` handling. It
     never scans or removes sibling cache targets.
 
     """
     lock_path = _artifact_lock_path(run_dir=run_dir, save_root=save_root)
     with (
-        experiments.run.run_writer_lease(run_dir, blocking=True),
+        experiments.run.run_reader_lease(run_dir),
         common.locking.exclusive_file_lock(lock_path, blocking=True),
     ):
         _rebuild_artifact_target_locked(run_dir=run_dir, save_root=save_root)
@@ -1675,8 +1786,6 @@ def _run_or_load_artifacts_locked(
     run_dir: Path,
     dataset_name: str,
     split: ArtifactSplit,
-    max_cases: int | None,
-    batch_size: int,
     device_resolution: DeviceResolution,
     dataset_root: Path,
     metadata_root: Path,
@@ -1697,11 +1806,7 @@ def _run_or_load_artifacts_locked(
     dataset_name : str
         Logical dataset name used for artifact file naming.
     split : {"eval", "ood"}
-        Saved split role to load. ID evaluation uses "eval"; OOD uses "ood".
-    max_cases : int or None
-        Maximum cases to process. If None, processes the entire saved split.
-    batch_size : int
-        Inference DataLoader batch size.
+        Saved split role to load. ID evaluation uses "eval", while OOD uses "ood".
     device_resolution : DeviceResolution
         Immutable device decision resolved once at the artifact boundary.
     dataset_root : Path
@@ -1724,9 +1829,6 @@ def _run_or_load_artifacts_locked(
     - Inference and generation failures propagate to the caller.
 
     """
-    if max_cases is not None and max_cases <= 0:
-        msg = f"max_cases must be positive when provided, got {max_cases}."
-        raise ValueError(msg)
     dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
 
     save_root = _artifact_save_root(run_dir=run_dir, dataset_name=dataset_name, split=split)
@@ -1737,8 +1839,6 @@ def _run_or_load_artifacts_locked(
         run_dir=run_dir,
         dataset_name=dataset_name,
         split=split,
-        max_cases=max_cases,
-        batch_size=batch_size,
         device_resolution=device_resolution,
         dataset_root=dataset_root,
         metadata_root=metadata_root,
@@ -1774,7 +1874,7 @@ def _run_or_load_artifacts_locked(
             device_resolution=device_resolution,
             dataset_root=dataset_root,
             split=split,
-            batch_size=batch_size,
+            batch_size=request.batch_size,
         )
         try:
             if timing_enabled:
@@ -1789,7 +1889,7 @@ def _run_or_load_artifacts_locked(
                     )
                 except (KeyError, OSError, RuntimeError, StopIteration, TypeError, ValueError) as error:
                     timing_enabled = False
-                    print(f"[TIMING] warmup unavailable; scientific generation continues: {error}")
+                    print(f"[TIMING] warmup unavailable. Scientific generation continues: {error}")
             generation.generate_artifacts(
                 task=task,
                 model=model,
@@ -1800,7 +1900,6 @@ def _run_or_load_artifacts_locked(
                 publication_root=save_root,
                 dataset_name=dataset_name,
                 provenance=request.provenance,
-                max_cases=max_cases,
                 timing_cases=timing_cases if timing_enabled else None,
                 timing_case_ids=request.case_ids if timing_enabled else None,
             )
@@ -1816,6 +1915,7 @@ def _run_or_load_artifacts_locked(
                             device_metadata=device_resolution.as_dict(),
                             model=model,
                         ),
+                        batch_size=request.batch_size,
                         cases=timing_cases,
                         comsol_timing=comsol_payload,
                         batch_manifest_sha256=manifest_sha256,
@@ -1823,7 +1923,7 @@ def _run_or_load_artifacts_locked(
                     )
                     timing.write_runtime_comparison(staging_root, comparison)
                 except (ArtifactCacheError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-                    print(f"[TIMING] sidecar publication unavailable; scientific generation continues: {error}")
+                    print(f"[TIMING] sidecar publication unavailable. Scientific generation continues: {error}")
         finally:
             del model, loader, processor
             cleanup_runtime(device)
@@ -1832,7 +1932,6 @@ def _run_or_load_artifacts_locked(
             save_root=staging_root,
             parquet_path=staging_parquet_path,
             npz_dir=staging_npz_dir,
-            published_npz_dir=npz_dir,
             request=request,
         )
         _publish_staged_artifact(
@@ -1947,7 +2046,7 @@ def upload_completed_artifact(
     artifact_root : pathlib.Path
         Exact current artifact root validated before any remote operation.
     media_files : Mapping[str, pathlib.Path] | None, optional
-        Caller-rendered curated media; no files are discovered implicitly.
+        Caller-rendered curated media. No files are discovered implicitly.
     tables : Mapping[str, Any] | None, optional
         Caller-built curated table payloads.
 
@@ -1980,8 +2079,6 @@ def run_or_load_artifacts(
     run_dir: Path,
     dataset_name: str,
     split: ArtifactSplit,
-    max_cases: int | None,
-    batch_size: int,
     device_resolution: DeviceResolution,
     dataset_root: Path,
     metadata_root: Path,
@@ -1993,15 +2090,11 @@ def run_or_load_artifacts(
     Parameters
     ----------
     run_dir : pathlib.Path
-        Current completed run with immutable config/checkpoint/split identity.
+        Current evaluable run with immutable config/checkpoint/split identity.
     dataset_name : str
         Logical dataset required by the saved split metadata.
     split : {"eval", "ood"}
-        Saved membership role; ``eval`` publishes under ``analysis/id``.
-    max_cases : int | None
-        Positive ordered-prefix limit, or the complete saved membership.
-    batch_size : int
-        Operational inference batch size; output remains one row/NPZ per case.
+        Saved membership role. ``eval`` publishes under ``analysis/id``.
     device_resolution : DeviceResolution
         Device decision resolved once before any inference allocation.
     dataset_root : pathlib.Path
@@ -2022,7 +2115,7 @@ def run_or_load_artifacts(
     ArtifactCacheError
         If existing schema, identity, aggregate, or payload evidence is invalid.
     FileNotFoundError
-        If a required completed-run or final-dataset artifact is absent.
+        If required evaluable-run evidence or a final-dataset artifact is absent.
     TypeError, ValueError, RuntimeError
         If request semantics, saved membership, device resolution, or generated
         payloads violate the current contract.
@@ -2030,8 +2123,8 @@ def run_or_load_artifacts(
     Notes
     -----
     Both the run writer lease and target-specific lock serialize publication.
-    Rebuilds generate and validate a sibling stage before replacing the target;
-    provenance remains the final completion marker.
+    Rebuilds generate and validate a sibling stage before replacing the target.
+    Provenance remains the final completion marker.
 
     """
     logical_dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
@@ -2044,7 +2137,7 @@ def run_or_load_artifacts(
     observed_completion = _completion_marker_identity(completion_path) if rebuild else None
     lock_path = _artifact_lock_path(run_dir=run_dir, save_root=save_root)
     with (
-        experiments.run.run_writer_lease(run_dir, blocking=True),
+        experiments.run.run_reader_lease(run_dir),
         common.locking.exclusive_file_lock(lock_path, blocking=True),
     ):
         current_completion = _completion_marker_identity(completion_path)
@@ -2053,8 +2146,6 @@ def run_or_load_artifacts(
             run_dir=run_dir,
             dataset_name=logical_dataset_name,
             split=split,
-            max_cases=max_cases,
-            batch_size=batch_size,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
             metadata_root=metadata_root,
@@ -2069,7 +2160,9 @@ def _upload_published_artifacts(
     id_frame: pd.DataFrame,
     ood_frame: pd.DataFrame,
 ) -> None:
-    """Upload only explicitly enabled evaluation provenance and curated media."""
+    """Upload only explicitly enabled completed-run provenance and curated media."""
+    if not plan.is_completed:
+        return
     config = _load_run_config(plan.run_dir)
     settings = config.get("tracking", {}).get("wandb")
     if not isinstance(settings, Mapping):
@@ -2176,14 +2269,115 @@ def _upload_published_artifacts(
                 raise
 
 
+@dataclass(frozen=True)
+class PreparedRunArtifacts:
+    """
+    Report path-based artifact loading and any explicit local generation.
+
+    Parameters
+    ----------
+    loaded_run : LoadedRunArtifacts
+        Validated run and the selected role-local artifacts.
+    role_actions : dict[str, str]
+        Selected role to ``reused``, ``generated``, or ``rebuilt`` action.
+    artifact_device : str | None
+        Exact concrete device supplied to or resolved for generation. ``None``
+        means every role was reused without a supplied device decision.
+
+    """
+
+    loaded_run: LoadedRunArtifacts
+    role_actions: dict[str, str]
+    artifact_device: str | None
+
+
+def load_or_build_run_artifacts(
+    run_dir: Path | str,
+    *,
+    artifact_roles: tuple[Literal["id", "ood"], ...] = ("id", "ood"),
+    dataset_root: Path | str | None = None,
+    metadata_root: Path | str | None = None,
+    auto_build_missing: bool = True,
+    rebuild_incompatible: bool = False,
+    device_policy: str = "cpu",
+    device_resolution: DeviceResolution | None = None,
+) -> PreparedRunArtifacts:
+    """
+    Load selected valid artifacts or generate only missing roles locally.
+
+    Existing valid roles are admitted through the read-only path loader before
+    any model reconstruction. Missing roles use ``device_resolution`` unchanged
+    when supplied; otherwise the explicit device policy is resolved once. Partial,
+    corrupt, stale, or incompatible roles fail unless ``rebuild_incompatible``
+    deliberately authorizes exact-target replacement. This service never uploads
+    to W&B or changes lifecycle status.
+    """
+    from src import learning  # noqa: PLC0415
+    from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
+
+    roles = tuple(artifact_roles)
+    if not roles or len(set(roles)) != len(roles) or set(roles).difference({"id", "ood"}):
+        msg = "artifact_roles must contain unique values from {'id', 'ood'}."
+        raise ValueError(msg)
+    path = Path(run_dir).expanduser().resolve()
+    current_dataset_root = Path(dataset_root) if dataset_root is not None else common.paths.get_training_raw_root()
+    current_metadata_root = Path(metadata_root) if metadata_root is not None else common.paths.get_training_meta_root()
+    actions: dict[str, str] = {}
+    if device_resolution is not None and not isinstance(device_resolution, learning.device.DeviceResolution):
+        msg = f"device_resolution must be a DeviceResolution, got {device_resolution!r}."
+        raise TypeError(msg)
+    resolution = device_resolution
+    split_by_role: dict[str, ArtifactSplit] = {"id": "eval", "ood": "ood"}
+
+    for _attempt in range(len(roles) + 1):
+        try:
+            loaded = artifact_loader.load_run_artifacts(path, artifact_roles=roles)
+            for role in roles:
+                actions.setdefault(role, "reused")
+            return PreparedRunArtifacts(
+                loaded_run=loaded,
+                role_actions=actions,
+                artifact_device=(str(resolution.device) if resolution is not None else None),
+            )
+        except artifact_loader.MissingEvaluationArtifactsError as error:
+            split_role = getattr(error, "role", None)
+            selected_role = "id" if split_role == "eval" else "ood" if split_role == "ood" else None
+            if not auto_build_missing or selected_role not in roles:
+                raise
+            rebuild = False
+            action = "generated"
+        except artifact_loader.IncompatibleEvaluationArtifactsError as error:
+            split_role = getattr(error, "role", None)
+            selected_role = "id" if split_role == "eval" else "ood" if split_role == "ood" else None
+            if not rebuild_incompatible or selected_role not in roles:
+                raise
+            rebuild = True
+            action = "rebuilt"
+
+        if resolution is None:
+            resolution = learning.device.resolve_device(device_policy, path="device_policy")
+        plan = load_run_artifact_plan(path)
+        dataset_name = plan.id_dataset_name if selected_role == "id" else plan.ood_dataset_name
+        run_or_load_artifacts(
+            run_dir=path,
+            dataset_name=dataset_name,
+            split=split_by_role[selected_role],
+            device_resolution=resolution,
+            dataset_root=current_dataset_root,
+            metadata_root=current_metadata_root,
+            rebuild=rebuild,
+        )
+        actions[selected_role] = action
+    msg = f"Artifact preparation did not converge for selected roles {roles}: {path}"
+    raise RuntimeError(msg)
+
+
 def build_artifacts(
     *,
     runs_root: Path,
     dataset_root: Path,
     metadata_root: Path | None = None,
     run_names: Iterable[str] | None = None,
-    max_cases: int | None = None,
-    batch_size: int = DEFAULT_BATCH_SIZE,
     device_policy: str = "auto",
     rebuild: bool = False,
 ) -> dict[str, dict[str, pd.DataFrame]]:
@@ -2193,20 +2387,16 @@ def build_artifacts(
     Parameters
     ----------
     runs_root : Path
-        One completed run or a container of run directories.
+        One evaluable run or a container of run directories.
     dataset_root : Path
         Derived raw root containing immutable final task datasets.
     metadata_root : Path | None, optional
-        Bounded validated metadata-root override; defaults to training ``meta``.
+        Bounded validated metadata-root override. Defaults to training ``meta``.
     run_names : Iterable[str] | None, optional
         Explicit run names under ``runs_root``.
-    max_cases : int | None, optional
-        Positive effective saved-split case limit.
-    batch_size : int, optional
-        Positive inference batch size; artifacts remain one row and NPZ per case.
     device_policy : {"auto", "cuda", "cpu"}, optional
-        Runtime policy. Auto selects usable CUDA then CPU; CUDA is strict; CPU
-        avoids CUDA queries.
+        Runtime policy. Auto selects usable CUDA and then CPU. CUDA is strict.
+        CPU avoids CUDA queries.
     rebuild : bool, optional
         Stage and validate a replacement for each exact selected target. A newer
         concurrent publication is preserved and validated instead.
@@ -2244,8 +2434,6 @@ def build_artifacts(
             run_dir=plan.run_dir,
             dataset_name=plan.id_dataset_name,
             split="eval",
-            max_cases=max_cases,
-            batch_size=batch_size,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
             metadata_root=resolved_metadata_root,
@@ -2255,8 +2443,6 @@ def build_artifacts(
             run_dir=plan.run_dir,
             dataset_name=plan.ood_dataset_name,
             split="ood",
-            max_cases=max_cases,
-            batch_size=batch_size,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
             metadata_root=resolved_metadata_root,

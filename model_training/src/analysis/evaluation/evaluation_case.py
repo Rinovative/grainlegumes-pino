@@ -28,7 +28,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -81,7 +81,7 @@ class EvaluationCase:
     fields, units : tuple[str, ...]
         Learned TaskSpec output fields and physical units in declared order.
     prediction, reference, error : numpy.ndarray
-        Finite learned-output arrays with shape ``(field, y, x)``; ``error`` is
+        Finite learned-output arrays with shape ``(field, y, x)``. ``error`` is
         validated as prediction minus reference.
     coordinates : numpy.ndarray
         Coordinate grids with shape ``(2, y, x)``. Pixel coordinates are used
@@ -131,17 +131,41 @@ class EvaluationCase:
 
     @property
     def shape(self) -> tuple[int, int]:
-        """Return the shared spatial grid shape."""
+        """
+        Return the shared spatial grid shape.
+
+        Returns
+        -------
+        tuple[int, int]
+            Grid height followed by grid width.
+
+        """
         return int(self.prediction.shape[-2]), int(self.prediction.shape[-1])
 
     @property
     def field_units(self) -> dict[str, str]:
-        """Return learned field units in declared order."""
+        """
+        Return learned field units in declared order.
+
+        Returns
+        -------
+        dict[str, str]
+            Learned field names mapped to their physical units.
+
+        """
         return dict(zip(self.fields, self.units, strict=True))
 
     @property
     def input_field_units(self) -> dict[str, str]:
-        """Return input field units in declared order."""
+        """
+        Return input field units in declared order.
+
+        Returns
+        -------
+        dict[str, str]
+            Input field names mapped to their physical units.
+
+        """
         return dict(zip(self.input_fields, self.input_units, strict=True))
 
 
@@ -154,7 +178,7 @@ def _string_vector(
     """
     Decode one rank-one non-empty NPZ string vector.
 
-    Every element must stringify to non-empty text; field-name vectors additionally
+    Every element must stringify to non-empty text. Field-name vectors additionally
     reject duplicates while unit vectors may repeat physical units.
     """
     if value.ndim != 1:
@@ -171,7 +195,27 @@ def _string_vector(
 
 
 def _scalar_integer(value: np.ndarray, *, label: str) -> int:
-    """Return one exact non-boolean integer scalar."""
+    """
+    Return one exact non-boolean integer scalar.
+
+    Parameters
+    ----------
+    value : numpy.ndarray
+        Candidate scalar loaded from an NPZ payload.
+    label : str
+        Field name included in validation errors.
+
+    Returns
+    -------
+    int
+        Exact validated integer value.
+
+    Raises
+    ------
+    TypeError
+        If the payload is not a scalar integer or is a boolean.
+
+    """
     raw = value.item() if value.ndim == 0 else None
     if isinstance(raw, bool) or not isinstance(raw, Integral):
         msg = f"{label} must be an integer scalar."
@@ -203,7 +247,25 @@ def _finite_array(
 
 
 def _provenance(frame: pd.DataFrame) -> Mapping[str, Any] | None:
-    """Return optional validated provenance carried by the DataFrame."""
+    """
+    Return optional validated provenance carried by the DataFrame.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        Evaluation frame that may carry artifact provenance.
+
+    Returns
+    -------
+    collections.abc.Mapping | None
+        Provenance mapping when present, otherwise ``None``.
+
+    Raises
+    ------
+    TypeError
+        If the provenance attribute exists but is not a mapping.
+
+    """
     value = frame.attrs.get("artifact_provenance")
     if value is None:
         return None
@@ -214,7 +276,20 @@ def _provenance(frame: pd.DataFrame) -> Mapping[str, Any] | None:
 
 
 def _coordinate_units(frame: pd.DataFrame) -> tuple[str, str]:
-    """Return x/y units from artifact provenance when available."""
+    """
+    Return x and y units from artifact provenance when available.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        Evaluation frame with optional artifact provenance.
+
+    Returns
+    -------
+    tuple[str, str]
+        Declared coordinate units or explicit index-unit fallbacks.
+
+    """
     provenance = _provenance(frame)
     evaluator = provenance.get("evaluator") if provenance is not None else None
     raw_units = evaluator.get("input_units") if isinstance(evaluator, Mapping) else None
@@ -234,7 +309,7 @@ def _coordinates(
     Resolve validated physical coordinates or a disclosed pixel-index fallback.
 
     An explicit ``coordinates`` payload wins. Otherwise declared ``x``/``y``
-    input channels may supply the grid; only when neither exact shape is
+    input channels may supply the grid. Only when neither exact shape is
     available is a unit-index mesh synthesized and flagged as non-physical.
     """
     if "coordinates" in payload:
@@ -283,7 +358,7 @@ def _metadata(value: np.ndarray) -> Mapping[str, Any]:
     return parsed
 
 
-def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:  # noqa: C901, PLR0912, PLR0915
+def _load_case_uncached(frame: pd.DataFrame, row_position: int) -> EvaluationCase:  # noqa: C901, PLR0912, PLR0915
     """
     Load one NPZ case by deterministic DataFrame row position.
 
@@ -459,6 +534,45 @@ def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:  # noqa
     )
 
 
+def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:
+    """
+    Load one case through a bound session or the uncached contract reader.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        Admitted evaluation artifact frame with exact saved membership.
+    row_position : int
+        Zero-based position in persisted frame order.
+
+    Returns
+    -------
+    EvaluationCase
+        Fully validated physical case. Session-owned results are immutable.
+
+    Raises
+    ------
+    IndexError, FileNotFoundError, KeyError, TypeError, ValueError
+        If the row or persisted NPZ payload violates the case contract.
+    EvaluationSessionClosedError, EvaluationArtifactChangedError
+        If an attached session ended or detects changed artifact identity.
+
+    Notes
+    -----
+    A live session attached by the public load-only workflow owns selected-case
+    reuse. Direct callers retain the exact uncached behavior.
+
+    """
+    session = frame.attrs.get("_evaluation_session")
+    if session is not None:
+        loader = getattr(session, "load_case", None)
+        if not callable(loader):
+            msg = "Evaluation DataFrame contains an invalid session accessor."
+            raise TypeError(msg)
+        return cast("EvaluationCase", loader(frame, row_position))
+    return _load_case_uncached(frame, row_position)
+
+
 def iter_cases(
     frame: pd.DataFrame,
     *,
@@ -508,7 +622,7 @@ def grid_extent(case: EvaluationCase) -> tuple[float, float, float, float]:
     Return the physical image extent in x-min, x-max, y-min, y-max order.
 
     The values come from the case coordinate fields and therefore retain their
-    declared coordinate units; no pixel-center or half-cell padding is added.
+    declared coordinate units. No pixel-center or half-cell padding is added.
     """
     x_values, y_values = case.coordinates
     return (
@@ -524,8 +638,8 @@ def grid_spacing(case: EvaluationCase) -> tuple[float, float]:
     Return positive median physical x/y grid spacing for spectral frequencies.
 
     Differences are taken along the declared Cartesian x and y axes. Degenerate
-    or non-finite coordinates fail instead of silently falling back to pixels;
-    the only unit-spacing fallback applies to an axis with no differences.
+    or non-finite coordinates fail instead of silently falling back to pixels.
+    The only unit-spacing fallback applies to an axis with no differences.
     """
     x_values, y_values = case.coordinates
     dx_values = np.abs(np.diff(x_values, axis=1)).ravel()

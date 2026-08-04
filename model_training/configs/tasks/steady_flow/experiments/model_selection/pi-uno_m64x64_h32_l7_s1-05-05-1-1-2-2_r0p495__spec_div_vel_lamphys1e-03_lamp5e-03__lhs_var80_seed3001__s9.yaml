@@ -1,13 +1,10 @@
-# Recreated from named run: S-PI-FNO-divu-PS_m12x12_h24_l4_lamPhys1e-03_lamP5e-03_20260117_212344
-# Source config: model_training/data/processed/safe/S-PI-FNO-divu-PS_m12x12_h24_l4_lamPhys1e-03_lamP5e-03_20260117_212344/config.json
-
 task: steady_flow
 
 run:
   seed: 9
-  deterministic: true
+  deterministic: false
   device: auto
-  suffix: low_capacity_lr_0p000625
+  suffix: null
 
 data:
   train_dataset: lhs_var80_seed3001
@@ -16,16 +13,22 @@ data:
   batch_size: 32
 
 model:
-  kind: fno
+  kind: uno
   params:
-    n_modes: [12, 12]
-    hidden_channels: 24
-    n_layers: 4
-    lifting_channel_ratio: 2
-    projection_channel_ratio: 2
-    fno_skip: linear
-    channel_mlp_skip: soft-gating
-    implementation: factorized
+    modes_x: 64
+    modes_y: 64
+    hidden_channels: 32
+    n_layers: 7
+    mode_ratio: 0.4951318201313778
+    uno_scalings:
+      - [1.0, 1.0]
+      - [0.5, 0.5]
+      - [0.5, 0.5]
+      - [1.0, 1.0]
+      - [1.0, 1.0]
+      - [2.0, 2.0]
+      - [2.0, 2.0]
+    channel_mlp_skip: linear
 
 loss:
   data:
@@ -36,27 +39,27 @@ loss:
     enabled: true
     continuity: div_velocity
     derivatives:
-      kind: physical
-      extension: none
-    interior_crop: 0
+      kind: spectral
+      extension: reflect
+    interior_crop: 2
     residual_weight:
       target: 1.0e-3
       warmup:
         kind: linear
-        epochs: 1
+        epochs: 300
     boundary_weight:
       target: 5.0e-3
       warmup:
         kind: linear
-        epochs: 1
+        epochs: 300
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw
-  lr: 6.25e-4
+  lr: 2.6598571817124426e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

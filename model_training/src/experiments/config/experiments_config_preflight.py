@@ -54,8 +54,8 @@ def _classify_root(raw: dict[str, object]) -> str:
     optuna_keys = keys.intersection(optuna.OPTUNA_ROOT_KEYS)
     if experiment_keys and optuna_keys:
         msg = (
-            "Configuration root mixes normal experiment and Optuna wrapper sections; "
-            f"experiment-owned={sorted(experiment_keys)}, optuna-owned={sorted(optuna_keys)}."
+            "Configuration root mixes normal experiment and Optuna wrapper sections. "
+            f"Experiment-owned={sorted(experiment_keys)}, optuna-owned={sorted(optuna_keys)}."
         )
         raise loader.ConfigError(msg)
     if optuna_keys:

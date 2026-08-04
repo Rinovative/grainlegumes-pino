@@ -2,7 +2,7 @@
 ===============================================================================
 analysis_presentation_registry.py
 ===============================================================================
-Declare user-facing EDA and evaluation section and plot presentation order.
+Declare user-facing EDA section and plot presentation order.
 
 Responsibilities:
   - Keep section keys, tab names, plot keys, and display names reviewable together
@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
+_MINIMUM_SECTION_PLOT_CHOICES = 2
+
 
 @dataclass(frozen=True)
 class PlotPresentation:
@@ -37,7 +39,7 @@ class PlotPresentation:
     Parameters
     ----------
     key : str
-        Stable callable-registry identifier; numbering never participates.
+        Stable callable-registry identifier. Numbering never participates.
     name : str
         Human-readable name before hierarchical numbering is derived.
 
@@ -63,11 +65,11 @@ class SectionPresentation:
     name : str
         Unnumbered user-facing tab name.
     plots : tuple[PlotPresentation, ...]
-        Non-empty plot specifications in display order.
+        At least two plot specifications in display order.
 
     Notes
     -----
-    Instances are frozen; tuple order is the sole source of display numbering.
+    Instances are frozen. Tuple order is the sole source of display numbering.
 
     """
 
@@ -97,79 +99,6 @@ EDA_SECTIONS = (
     ),
 )
 
-EVALUATION_SECTIONS = (
-    SectionPresentation(
-        key="run_summary",
-        name="Run summary",
-        plots=(
-            PlotPresentation("authoritative_run_summary", "Authoritative run summary"),
-            PlotPresentation("accuracy_physics_pareto", "Accuracy versus physics Pareto"),
-        ),
-    ),
-    SectionPresentation(
-        key="global_error_analysis",
-        name="Global error analysis",
-        plots=(
-            PlotPresentation("predictive_error_distributions", "Predictive error distributions"),
-            PlotPresentation("mean_reference_prediction", "Mean reference and prediction fields"),
-            PlotPresentation("spatial_error_statistics", "Spatial error statistics"),
-        ),
-    ),
-    SectionPresentation(
-        key="error_decomposition",
-        name="Error decomposition",
-        plots=(
-            PlotPresentation("case_mean_bias", "Case-mean prediction bias"),
-            PlotPresentation("target_magnitude_error", "Error versus target magnitude"),
-            PlotPresentation("boundary_distance_error", "Boundary-distance error"),
-        ),
-    ),
-    SectionPresentation(
-        key="physical_consistency",
-        name="Physical consistency",
-        plots=(
-            PlotPresentation("residual_distributions", "Residual distributions"),
-            PlotPresentation("residual_maps", "Momentum and dual-continuity maps"),
-            PlotPresentation("pressure_boundary_drop", "Pressure boundary and drop diagnostics"),
-        ),
-    ),
-    SectionPresentation(
-        key="spectral_fidelity",
-        name="Spectral fidelity",
-        plots=(PlotPresentation("output_spectra_transfer", "Reference, prediction, error, and transfer spectra"),),
-    ),
-    SectionPresentation(
-        key="architecture_capacity",
-        name="Architecture & capacity",
-        plots=(PlotPresentation("parameter_count_accuracy", "Exact parameter count versus accuracy"),),
-    ),
-    SectionPresentation(
-        key="input_sensitivity",
-        name="Input sensitivity",
-        plots=(
-            PlotPresentation("metadata_error_associations", "Metadata-error associations"),
-            PlotPresentation("metadata_error_trends", "Binned metadata trends with counts"),
-        ),
-    ),
-    SectionPresentation(
-        key="sample_viewer",
-        name="Sample viewer",
-        plots=(
-            PlotPresentation("shared_case_comparison", "Shared-case model comparison"),
-            PlotPresentation("permeability_error_overlay", "Permeability and local-error overlay"),
-        ),
-    ),
-    SectionPresentation(
-        key="outliers_extremes",
-        name="Outliers & extreme cases",
-        plots=(
-            PlotPresentation("outlier_extreme_tables", "Outlier and extreme-case tables"),
-            PlotPresentation("worst_case_fields", "Worst-case field viewer"),
-            PlotPresentation("extreme_input_fields", "Extreme-input field viewer"),
-        ),
-    ),
-)
-
 
 def section_display_label(section_index: int, name: str) -> str:
     """
@@ -180,7 +109,7 @@ def section_display_label(section_index: int, name: str) -> str:
     section_index : int
         Positive one-based section position.
     name : str
-        Non-empty unnumbered section name; surrounding whitespace is removed.
+        Non-empty unnumbered section name. Surrounding whitespace is removed.
 
     Returns
     -------
@@ -211,7 +140,7 @@ def plot_display_label(section_index: int, plot_index: int, name: str) -> str:
     section_index, plot_index : int
         Positive one-based hierarchy positions.
     name : str
-        Non-empty unnumbered plot name; surrounding whitespace is removed.
+        Non-empty unnumbered plot name. Surrounding whitespace is removed.
 
     Returns
     -------
@@ -236,7 +165,7 @@ def plot_display_label(section_index: int, plot_index: int, name: str) -> str:
 
 def validate_registry(sections: Sequence[SectionPresentation]) -> None:
     """
-    Validate stable keys, user-facing names, and non-empty ordered sections.
+    Validate stable keys, names, and multi-choice ordered sections.
 
     Parameters
     ----------
@@ -248,7 +177,8 @@ def validate_registry(sections: Sequence[SectionPresentation]) -> None:
     TypeError
         If a registry entry has the wrong immutable presentation type.
     ValueError
-        If the registry is empty or contains empty/duplicate keys or names.
+        If the registry is empty, exposes a singleton section, or contains
+        empty/duplicate keys or names.
 
     """
     if not sections:
@@ -260,8 +190,8 @@ def validate_registry(sections: Sequence[SectionPresentation]) -> None:
         if not isinstance(section, SectionPresentation):
             message = "Presentation registries must contain SectionPresentation entries."
             raise TypeError(message)
-        if not section.key or not section.name.strip() or not section.plots:
-            message = "Every presentation section requires a key, name, and at least one plot."
+        if not section.key or not section.name.strip() or len(section.plots) < _MINIMUM_SECTION_PLOT_CHOICES:
+            message = "Every visible presentation section requires a key, name, and at least two plot choices."
             raise ValueError(message)
         if section.key in section_keys:
             message = f"Duplicate presentation section key: {section.key!r}."
@@ -305,4 +235,3 @@ def numbered_registry(
 
 
 validate_registry(EDA_SECTIONS)
-validate_registry(EVALUATION_SECTIONS)

@@ -60,16 +60,14 @@ def _emit(event: str, /, **fields: object) -> None:
     print(" ".join(parts), file=sys.stderr if raw_to_stderr else sys.stdout, flush=True)
 
 
-def _metric_summary(metrics: Mapping[str, float], *, prefix: str) -> str:
-    """Format key canonical fields from an already computed metric payload."""
-    keys = (
-        "normalized_macro_rmse",
-        "normalized_rmse_p",
-        "normalized_rmse_u",
-        "normalized_rmse_v",
-        "normalized_relative_h1",
-    )
-    return ",".join(f"{key}:{_value(metrics[f'{prefix}{key}'])}" for key in keys if f"{prefix}{key}" in metrics)
+def _metric_summary(
+    metrics: Mapping[str, float],
+    *,
+    prefix: str,
+    metric_ids: tuple[str, ...],
+) -> str:
+    """Format resolved evaluation metrics from an already computed payload."""
+    return ",".join(f"{metric_id}:{_value(metrics[f'{prefix}{metric_id}'])}" for metric_id in metric_ids if f"{prefix}{metric_id}" in metrics)
 
 
 def _loss_composition(config: Mapping[str, Any]) -> str:
@@ -106,6 +104,12 @@ class ConsoleReporter:
         """Return the explicitly resolved selection metric ID."""
         return str(self.config["evaluation"]["objective"]["id"])
 
+    @property
+    def metric_ids(self) -> tuple[str, ...]:
+        """Return the objective first, followed by resolved diagnostic metrics."""
+        declared = tuple(str(metric["id"]) for metric in self.config["evaluation"]["metrics"])
+        return (self.objective_id, *(metric_id for metric_id in declared if metric_id != self.objective_id))
+
     def startup(self, *, resolved_device: str) -> None:
         """Emit one resolved-run line and one active-loss-composition line."""
         run = self.config["run"]
@@ -133,6 +137,7 @@ class ConsoleReporter:
             deterministic=run["deterministic"],
             train_dataset=data["train_dataset"],
             id_membership="saved_eval_split",
+            id_interpretation="validation",
             ood_datasets=data["ood_datasets"],
             batch_size=data["batch_size"],
             workers=data["num_workers"],
@@ -199,10 +204,11 @@ class ConsoleReporter:
                 run_name=self.config["run"]["name"],
                 epoch=epoch,
                 membership="id",
+                interpretation="validation",
                 cases=int(metrics.get("system/id_evaluation_case_count", 0.0)),
                 objective_id=self.objective_id,
                 objective=metrics[id_key],
-                metrics=_metric_summary(metrics, prefix="id/"),
+                metrics=_metric_summary(metrics, prefix="id/", metric_ids=self.metric_ids),
                 duration_seconds=metrics.get("system/id_evaluation_duration_seconds"),
                 new_best=bool(metrics.get("checkpoint/new_best", 0.0)),
             )
@@ -217,7 +223,7 @@ class ConsoleReporter:
                 cases=int(metrics.get("system/ood_evaluation_case_count", 0.0)),
                 objective_id=self.objective_id,
                 objective=metrics[ood_key],
-                metrics=_metric_summary(metrics, prefix="ood/"),
+                metrics=_metric_summary(metrics, prefix="ood/", metric_ids=self.metric_ids),
                 duration_seconds=metrics.get("system/ood_evaluation_duration_seconds"),
             )
         physics_key = "physics/id/momentum_residual_mse"
@@ -298,6 +304,11 @@ class ConsoleReporter:
             wandb_status=status,
         )
         print_sanitized_traceback(error)
+
+
+def sanitized_exception_message(error: BaseException) -> str:
+    """Return one bounded, single-line, secret-redacted exception message."""
+    return _clean(error)
 
 
 def print_sanitized_traceback(error: BaseException) -> None:

@@ -5,7 +5,7 @@ Verify manufactured Darcy-Brinkman momentum, continuity, and boundary equations.
 Constant and linear physical fields establish analytic residual values, both
 continuity selections, per-sample outlet reduction, and name-based channel
 binding. Numerical derivative backends are tested in
-``test_physics_derivatives``; training weights and warmup belong to loss tests.
+``test_physics_derivatives``. Training weights and warmup belong to loss tests.
 """
 
 from __future__ import annotations
@@ -29,34 +29,31 @@ def _grid(height: int = 9, width: int = 11) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def _steady_tensors() -> tuple[torch.Tensor, torch.Tensor, tuple[str, ...], tuple[str, ...]]:
-    """
-    Build one zero-pressure, zero-velocity state in steady-flow channel order.
-
-    Inputs contain the physical grid, zero stored permeability channels, porosity
-    one-half, and a zero pressure boundary. Returned names bind the BCHW channels
-    explicitly so the manufactured baseline must produce zero residuals.
-    """
+    """Build one zero state in authoritative steady-flow channel order."""
+    task = domain.tasks.registry.get_task("steady_flow")
     x_grid, y_grid = _grid()
     zeros = torch.zeros_like(x_grid)
-    inputs = torch.stack(
-        (
-            x_grid,
-            y_grid,
-            zeros,
-            zeros,
-            zeros,
-            torch.full_like(x_grid, 0.5),
-            zeros,
-        ),
-        dim=1,
+    coordinate_values = iter((x_grid, y_grid))
+    input_by_field: dict[str, torch.Tensor] = {}
+    for field in task.inputs:
+        if field.role == "coordinate":
+            input_by_field[field.name] = next(coordinate_values)
+        elif field.role == "permeability":
+            input_by_field[field.name] = zeros
+        elif field.role == "porosity":
+            input_by_field[field.name] = torch.full_like(x_grid, 0.5)
+        elif field.role == "boundary":
+            input_by_field[field.name] = zeros
+        else:
+            msg = f"unsupported steady-flow fixture role: {field.role}"
+            raise AssertionError(msg)
+    inputs = torch.stack([input_by_field[field] for field in task.input_names], dim=1)
+    outputs = torch.zeros(
+        (x_grid.shape[0], task.out_channels, *x_grid.shape[1:]),
+        dtype=x_grid.dtype,
+        device=x_grid.device,
     )
-    outputs = torch.stack((zeros, zeros, zeros), dim=1)
-    return (
-        inputs,
-        outputs,
-        ("x", "y", "kxx", "kxy", "kyy", "eps", "p_bc"),
-        ("p", "u", "v"),
-    )
+    return inputs, outputs, task.input_names, task.output_names
 
 
 def test_zero_velocity_constant_pressure_has_zero_residual() -> None:

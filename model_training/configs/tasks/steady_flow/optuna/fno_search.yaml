@@ -1,15 +1,25 @@
+# Supervised FNO hyperparameter search.
+#
+# Searches:
+#   - Fourier modes
+#   - hidden channels
+#   - network depth
+#   - learning rate
+#   - batch size
+
 study:
-  name: steady_flow_fno_search_v2
-  role: production
+  name: steady_flow_fno_search
   seed: 9
   n_trials: 30
+
   sampler:
     kind: tpe
-    multivariate: false
+    multivariate: true
+
   pruner:
     kind: median
     n_startup_trials: 5
-    n_warmup_steps: 25
+    n_warmup_steps: 100
     interval_steps: 5
 
 experiment:
@@ -26,16 +36,13 @@ experiment:
     ood_datasets:
       - lhs_var120_seed4001
     batch_size: 32
-    num_workers: 0
-    pin_memory: true
-    persistent_workers: false
 
   model:
     kind: fno
     params:
       n_modes:
-      - 128
-      - 160
+        - 128
+        - 160
       hidden_channels: 64
       n_layers: 3
 
@@ -44,12 +51,13 @@ experiment:
       kind: relative_h1
       space: normalized
       weight: 1.0
+
     physics:
       enabled: false
 
   evaluation:
     objective:
-      id: normalized_macro_rmse
+      id: normalized_group_macro_rmse
 
   optimizer:
     kind: adamw
@@ -62,7 +70,7 @@ experiment:
     patience: 20
 
   training:
-    epochs: 400
+    epochs: 600
     evaluation_interval: 5
     ood_evaluation_interval: 5
     mixed_precision: false
@@ -75,42 +83,49 @@ experiment:
         interval: 5
 
 search_space:
+  # FNO architecture.
   model.params.n_modes.0:
     name: modes_x
     kind: categorical
     values:
-    - 64
-    - 96
-    - 128
+      - 64
+      - 96
+      - 128
+
   model.params.n_modes.1:
     name: modes_y
     kind: categorical
     values:
-    - 96
-    - 128
-    - 160
+      - 96
+      - 128
+      - 160
+
   model.params.hidden_channels:
     name: hidden_channels
     kind: categorical
     values:
-    - 32
-    - 64
-    - 96
+      - 32
+      - 64
+      - 96
+
   model.params.n_layers:
     name: n_layers
     kind: categorical
     values:
-    - 3
-    - 4
+      - 3
+      - 4
+
+  # Optimisation.
   optimizer.lr:
     name: lr
     kind: float
     low: 0.0001
     high: 0.003
     log: true
+
   data.batch_size:
     name: batch_size
     kind: categorical
     values:
-    - 16
-    - 32
+      - 16
+      - 32

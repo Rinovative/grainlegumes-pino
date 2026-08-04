@@ -42,7 +42,7 @@ class PressureBoundaryMasks:
 
     Both frozen boolean tensors match the coordinate field shape. ``inlet``
     selects each sample's spatial y-min boundary and ``outlet`` selects y-max within half a
-    validated grid spacing; no batch or spatial reduction is encoded.
+    validated grid spacing. No batch or spatial reduction is encoded.
 
     Attributes
     ----------
@@ -106,7 +106,7 @@ def _normalized_axes(ndim: int, axes: SpatialAxes) -> SpatialAxes:
     Normalize exactly two distinct spatial axes for a tensor rank.
 
     Negative axes are translated relative to ``ndim``. The returned order is
-    preserved for downstream reductions; duplicates and out-of-range axes fail
+    preserved for downstream reductions. Duplicates and out-of-range axes fail
     before any boundary mask is constructed.
 
     Raises
@@ -202,7 +202,7 @@ def pressure_boundary_residuals(
     PressureBoundaryResiduals
         Selected boundary values, per-sample reductions, and scalar batch-mean
         properties. ``mse`` is inlet MSE plus the mean squared per-sample outlet
-        gauge; outlet means are squared before batch aggregation.
+        gauge. Outlet means are squared before batch aggregation.
 
     Raises
     ------
@@ -215,7 +215,7 @@ def pressure_boundary_residuals(
     """
     if pressure.shape != prescribed_pressure.shape or pressure.shape != y_coordinate.shape:
         msg = (
-            "Pressure, prescribed pressure, and y-coordinate shapes must match; "
+            "Pressure, prescribed pressure, and y-coordinate shapes must match. "
             f"got {tuple(pressure.shape)}, {tuple(prescribed_pressure.shape)}, and {tuple(y_coordinate.shape)}."
         )
         raise ValueError(msg)

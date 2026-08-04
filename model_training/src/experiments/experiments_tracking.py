@@ -15,7 +15,7 @@ Responsibilities:
 Design principles:
   - Local config, split, normalizer, checkpoints, summaries and artifacts win
   - W&B observes training and artifacts but never chooses or reconstructs them
-  - Normal histories contain genuine completed epochs only; final results are summaries
+  - Normal histories contain genuine completed epochs only. Final results are summaries
   - Fresh and exact-resume sessions have strict fail-closed identity semantics
   - Secrets, arbitrary environment state and incidental absolute paths are absent
 
@@ -69,16 +69,27 @@ AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
     "Diagnostics",
     "Optuna",
 )
-ACCURACY_HISTORY_METRIC_IDS = (
-    "normalized_rmse_p",
-    "normalized_rmse_u",
-    "normalized_rmse_v",
-    "normalized_relative_l2",
-    "normalized_relative_h1",
-    "physical_rmse_p",
-    "physical_rmse_u",
-    "physical_rmse_v",
-)
+
+
+def _accuracy_history_metric_ids(
+    evaluation_metrics: Sequence[Mapping[str, Any]],
+    *,
+    objective_id: str,
+) -> tuple[str, ...]:
+    """Select ordered predictive diagnostics from resolved metric semantics."""
+    selected: list[str] = []
+    for metric in evaluation_metrics:
+        metric_id = str(metric["id"])
+        if metric_id == objective_id:
+            continue
+        kind = str(metric["kind"])
+        fields = metric["fields"]
+        field_count = len(fields) if isinstance(fields, Sequence) and not isinstance(fields, str) else 0
+        if kind in {"group_rmse", "vector_rmse", "relative_l2", "relative_h1"} or (kind == "rmse" and field_count == 1):
+            selected.append(metric_id)
+    return tuple(selected)
+
+
 _PHYSICS_ID_SOURCE_KEYS = (
     "physics/id/momentum_residual_mse",
     "physics/id/continuity_div_velocity_mse",
@@ -117,8 +128,9 @@ def _definition(
 
 
 def automatic_history_metric_definitions(
-    evaluation_metric_ids: Sequence[str],
+    evaluation_metrics: Sequence[Mapping[str, Any]],
     *,
+    objective_id: str,
     physics_training_enabled: bool,
     continuity: str,
     physics_monitor_enabled: bool,
@@ -134,26 +146,27 @@ def automatic_history_metric_definitions(
     Diagnostics registration order. W&B itself does not guarantee that a
     personal workspace will preserve registration order in its UI.
     """
-    metric_ids = frozenset(evaluation_metric_ids)
+    metric_ids = frozenset(str(metric["id"]) for metric in evaluation_metrics)
+    accuracy_metric_ids = _accuracy_history_metric_ids(evaluation_metrics, objective_id=objective_id)
     definitions: list[HistoryMetricDefinition] = []
     evaluation_owner = "src.learning.training.learning_training_loop.eval_one_epoch"
     training_owner = "src.learning.training.learning_training_loop.train_one_epoch"
     loop_owner = "src.learning.training.learning_training_loop.train_loop"
     monitor_owner = "src.learning.training.learning_training_loop.evaluate_physics_monitor"
 
-    if "normalized_macro_rmse" in metric_ids:
+    if objective_id in metric_ids:
         definitions.extend(
             (
                 _definition(
-                    "id/normalized_macro_rmse",
-                    "Overview/ID/normalized_macro_rmse",
+                    f"id/{objective_id}",
+                    f"Overview/ID/{objective_id}",
                     owner=evaluation_owner,
                     computation_cost="existing ID evaluation pass",
-                    scientific_question="Is authoritative in-distribution performance improving?",
+                    scientific_question="Is authoritative in-distribution validation performance improving?",
                 ),
                 _definition(
-                    "ood/normalized_macro_rmse",
-                    "Overview/OOD/normalized_macro_rmse",
+                    f"ood/{objective_id}",
+                    f"Overview/OOD/{objective_id}",
                     owner=evaluation_owner,
                     computation_cost="existing OOD diagnostic pass",
                     scientific_question="Is out-of-distribution generalization improving or degrading?",
@@ -196,7 +209,7 @@ def automatic_history_metric_definitions(
     for role in ("ID", "OOD"):
         source_role = role.lower()
         pass_cost = "existing ID evaluation pass" if role == "ID" else "existing OOD diagnostic pass"
-        for metric_id in ACCURACY_HISTORY_METRIC_IDS:
+        for metric_id in accuracy_metric_ids:
             if metric_id not in metric_ids:
                 continue
             definitions.append(
@@ -310,7 +323,7 @@ class TrackingError(RuntimeError):
     Base class for failures owned by the optional tracking boundary.
 
     These errors describe observer initialization, local offline persistence, or
-    upload-admission failure; they never represent local scientific-run validity.
+    upload-admission failure. They never represent local scientific-run validity.
     """
 
 
@@ -318,7 +331,7 @@ class TrackingInitializationError(TrackingError):
     """
     Represent failure to initialize an explicitly enabled session before epoch one.
 
-    Raised after sanitized failure facts are persisted locally; no training
+    Raised after sanitized failure facts are persisted locally. No training
     telemetry has been accepted by the observer at this boundary.
     """
 
@@ -414,7 +427,7 @@ def _safe_error(error: BaseException) -> dict[str, str]:
 
     Active W&B keys, key-like assignments, and the current home path are
     redacted before truncation. Only the exception class and sanitized message
-    are returned; traceback, environment, and arbitrary object state are absent.
+    are returned. Traceback, environment, and arbitrary object state are absent.
     """
     message = str(error)
     secret = os.environ.get("WANDB_API_KEY")
@@ -469,7 +482,7 @@ def _git_metadata() -> dict[str, Any]:
     Return read-only commit and dirty-state facts without repository identity.
 
     Fixed local Git commands run with a short timeout. Missing Git, command
-    errors, or timeouts return unknown values; no remote URL, branch, author,
+    errors, or timeouts return unknown values. No remote URL, branch, author,
     path, or environment state is collected.
     """
     project_root = Path(__file__).resolve().parents[3]
@@ -502,7 +515,7 @@ def _git_metadata() -> dict[str, Any]:
     }
 
 
-TRACKING_INTEGRATION_VERSION = 3
+TRACKING_INTEGRATION_VERSION = 1
 
 
 def model_parameter_counts(model: Any) -> dict[str, int]:
@@ -566,7 +579,7 @@ def build_semantic_config(
                 "fingerprint",
                 "sample_count",
                 "spatial_shape",
-                "task_contract_digest",
+                "data_contract_digest",
             )
         }
 
@@ -626,6 +639,7 @@ def build_semantic_config(
     training_config = cast("Mapping[str, Any]", config["training"])
     evaluation_payload["roles"] = {
         "selection": "id",
+        "id_interpretation": "in_distribution_validation",
         "diagnostic": ["ood", "physics"],
         "event_model": "completed_epoch_interval_or_terminal",
         "id_interval_epochs": int(training_config["evaluation_interval"]),
@@ -705,7 +719,7 @@ def build_monitor_membership(
     -------
     dict[str, Any] | None
         Source indices, sample IDs, membership digests, and configured bound when
-        monitoring is enabled; otherwise ``None``.
+        monitoring is enabled. Otherwise ``None``.
 
     Notes
     -----
@@ -867,7 +881,7 @@ class WandbSession:
             msg = "W&B completed-epoch history requires an integer epoch >= 1."
             raise TrackingError(msg)
         if self._last_logged_epoch is not None and epoch <= self._last_logged_epoch:
-            msg = f"W&B completed-epoch history cannot rewrite epoch {epoch}; last successful epoch is {self._last_logged_epoch}."
+            msg = f"W&B completed-epoch history cannot rewrite epoch {epoch}. The last successful epoch is {self._last_logged_epoch}."
             raise TrackingError(msg)
 
         payload: dict[str, float | int] = {"epoch": epoch}
@@ -1042,6 +1056,7 @@ class WandbSession:
             "run/name": self.run_name,
             "objective/id": self.objective_id,
             "objective/direction": self.objective_direction,
+            "objective/selection_role": "id_validation",
             "tracking/status": "failed" if self._observer_failed else "finished",
             "tracking/mode": self.mode,
             "tracking/run_id": self.run_id,
@@ -1177,15 +1192,14 @@ class WandbSession:
 
 
 def _runtime_wandb_tags(settings: Mapping[str, Any], semantic_config: Mapping[str, Any] | None) -> list[str]:
-    """Add the explicit Optuna production/smoke role without repeating it in history."""
-    tags = list(cast("Sequence[str]", settings["tags"]))
-    if settings.get("workflow") != "optuna_trial" or not isinstance(semantic_config, Mapping):
-        return tags
-    tuning = semantic_config.get("tuning")
-    role = tuning.get("study_role") if isinstance(tuning, Mapping) else None
-    if role not in {"production", "smoke"}:
-        return tags
-    return [f"optuna-{role}" if tag == "optuna" else str(tag) for tag in tags]
+    """Keep role-less Optuna tags canonical and qualify only explicit study roles."""
+    tags = [str(tag) for tag in cast("Sequence[str]", settings["tags"])]
+    if settings.get("workflow") == "optuna_trial" and isinstance(semantic_config, Mapping):
+        tuning = semantic_config.get("tuning")
+        role = tuning.get("study_role") if isinstance(tuning, Mapping) else None
+        if role in {"production", "smoke"}:
+            tags = [f"optuna-{role}" if tag == "optuna" else tag for tag in tags]
+    return list(dict.fromkeys(tags))
 
 
 def initialize_wandb(
@@ -1269,7 +1283,7 @@ def initialize_wandb(
         state_updater(base_state)
 
     if mode == "online" and not os.environ.get("WANDB_API_KEY", "").strip():
-        error = RuntimeError("WANDB_API_KEY is missing or blank; online tracking requires non-interactive environment authentication.")
+        error = RuntimeError("WANDB_API_KEY is missing or blank. Online tracking requires non-interactive environment authentication.")
         context = _safe_error(error)
         if state_updater is not None:
             state_updater(
@@ -1294,7 +1308,8 @@ def initialize_wandb(
         resolved_device is None and isinstance(requested_device, str) and requested_device.startswith("cuda")
     )
     history_definitions = automatic_history_metric_definitions(
-        tuple(str(metric["id"]) for metric in evaluation_metrics),
+        evaluation_metrics,
+        objective_id=objective_id,
         physics_training_enabled=bool(physics_config["enabled"]),
         continuity=str(physics_config["continuity"]),
         physics_monitor_enabled=bool(monitor_settings["enabled"]),

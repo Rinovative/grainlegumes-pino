@@ -15,8 +15,8 @@ Design principles:
   - Unsupported types fail fast
 
 This module does NOT:
-  - Execute gradients or epochs; ``learning.training.loop`` owns training
-  - Persist optimizer or scheduler state; checkpoint services own restoration
+  - Execute gradients or epochs. ``learning.training.loop`` owns training
+  - Persist optimizer or scheduler state. Checkpoint services own restoration
 ===============================================================================
 """
 

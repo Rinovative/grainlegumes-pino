@@ -172,7 +172,7 @@ def _validate_objective(value: Any, *, label: str) -> dict[str, Any]:
     missing = sorted(_OBJECTIVE_KEYS.difference(objective))
     unknown = sorted(set(objective).difference(_OBJECTIVE_KEYS))
     if missing or unknown:
-        msg = f"Checkpoint {label} objective keys do not match. Missing: {missing}; unknown: {unknown}."
+        msg = f"Checkpoint {label} objective keys do not match. Missing: {missing}. Unknown: {unknown}."
         raise ValueError(msg)
     for key in ("id", "kind", "space", "reduction"):
         if not isinstance(objective[key], str) or not objective[key]:
@@ -203,7 +203,7 @@ def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
     missing = sorted(_CHECKPOINT_IDENTITY_KEYS.difference(identity))
     unknown = sorted(set(identity).difference(_CHECKPOINT_IDENTITY_KEYS))
     if missing or unknown:
-        msg = f"Checkpoint {label} keys do not match. Missing: {missing}; unknown: {unknown}."
+        msg = f"Checkpoint {label} keys do not match. Missing: {missing}. Unknown: {unknown}."
         raise ValueError(msg)
     for key in (
         "task",
@@ -549,11 +549,11 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     missing = sorted(_CHECKPOINT_KEYS.difference(payload))
     unknown = sorted(set(payload).difference(_CHECKPOINT_KEYS))
     if missing or unknown:
-        msg = f"Checkpoint schema mismatch. Missing keys: {missing}; unknown keys: {unknown}."
+        msg = f"Checkpoint schema mismatch. Missing keys: {missing}. Unknown keys: {unknown}."
         raise ValueError(msg)
     schema_version = payload["schema_version"]
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != CHECKPOINT_SCHEMA_VERSION:
-        msg = f"Unsupported checkpoint schema_version {schema_version!r}; expected integer {CHECKPOINT_SCHEMA_VERSION}."
+        msg = f"Unsupported checkpoint schema_version {schema_version!r}. Expected integer {CHECKPOINT_SCHEMA_VERSION}."
         raise ValueError(msg)
     if payload["checkpoint_role"] != expected_role:
         msg = f"Checkpoint role mismatch: expected {expected_role!r}, got {payload['checkpoint_role']!r}."

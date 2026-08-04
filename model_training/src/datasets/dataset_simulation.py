@@ -15,9 +15,9 @@ Design principles:
   - Source metadata is copied so callers cannot mutate persisted payload state
 
 This module does NOT:
-  - Build or publish final datasets; ``data_generation`` owns construction
-  - Fit normalizers or split memberships; dataset-base services own those steps
-  - Resolve logical dataset names or storage roots; ``common.paths`` owns paths
+  - Build or publish final datasets. ``data_generation`` owns construction
+  - Fit normalizers or split memberships. Dataset-base services own those steps
+  - Resolve logical dataset names or storage roots. ``common.paths`` owns paths
 ===============================================================================
 """
 

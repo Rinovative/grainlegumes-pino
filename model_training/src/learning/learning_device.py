@@ -17,8 +17,8 @@ Design principles:
   - Physical CUDA indices are operational metadata, not scientific identity
 
 This module does NOT:
-  - Parse semantic config paths; ``experiments.config.loader`` owns config validation
-  - Persist or forward runtime facts; top-level service boundaries own publication
+  - Parse semantic config paths. ``experiments.config.loader`` owns config validation
+  - Persist or forward runtime facts. Top-level service boundaries own publication
   - Construct or execute models, losses, metrics, checkpoints, or training loops
 ===============================================================================
 """
@@ -176,7 +176,7 @@ def _cuda_resolution(policy: _policy.DevicePolicy, *, path: str) -> DeviceResolu
     Construct an indexed CUDA decision or fail without device substitution.
 
     The active visible device index and name are queried together. Initialization
-    errors or invalid metadata become ``DeviceResolutionError``; this helper
+    errors or invalid metadata become ``DeviceResolutionError``. This helper
     never chooses CPU, including when the originating policy was ``auto``.
     """
     try:
@@ -244,12 +244,12 @@ def resolve_device(policy: Any, *, path: str = "device") -> DeviceResolution:
         available = bool(torch.cuda.is_available())
     except Exception as error:
         if requested == "cuda":
-            msg = f"{path} requested 'cuda', but CUDA availability could not be established; strict CUDA never falls back to CPU: {error}"
+            msg = f"{path} requested 'cuda', but CUDA availability could not be established. Strict CUDA never falls back to CPU: {error}"
             raise DeviceResolutionError(msg) from error
         return _cpu_resolution(requested)
     if not available:
         if requested == "cuda":
-            msg = f"{path} requested 'cuda', but CUDA is unavailable; strict CUDA never falls back to CPU."
+            msg = f"{path} requested 'cuda', but CUDA is unavailable. Strict CUDA never falls back to CPU."
             raise DeviceResolutionError(msg)
         return _cpu_resolution(requested)
 
@@ -291,5 +291,5 @@ def validate_mixed_precision_device(
         msg = f"{path} must be boolean, got {enabled!r}."
         raise TypeError(msg)
     if enabled and resolution.device_type != "cuda":
-        msg = f"{path}=true requires a resolved CUDA device; CPU autocast is not supported by this runtime contract."
+        msg = f"{path}=true requires a resolved CUDA device. CPU autocast is not supported by this runtime contract."
         raise DeviceResolutionError(msg)

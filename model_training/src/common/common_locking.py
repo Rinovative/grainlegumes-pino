@@ -146,6 +146,53 @@ def file_lock_is_active(path: Path | str) -> bool:
 
 
 @contextmanager
+def shared_file_lock(
+    path: Path | str,
+    *,
+    blocking: bool,
+) -> Iterator[Path]:
+    """Hold a shared advisory reader lock, optionally failing on an active writer."""
+    lock_path = Path(path).expanduser().resolve(strict=False)
+    held = _THREAD_LOCK_STATE.locks.get(lock_path)
+    if held is not None:
+        held.depth += 1
+        try:
+            yield lock_path
+        finally:
+            held.depth -= 1
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _OPEN_LOCK_DESCRIPTORS_GUARD:
+        descriptor = _open_lock_file(lock_path)
+        _OPEN_LOCK_DESCRIPTORS.add(descriptor)
+    operation = fcntl.LOCK_SH if blocking else fcntl.LOCK_SH | fcntl.LOCK_NB
+    try:
+        fcntl.flock(descriptor, operation)
+    except OSError as error:
+        with _OPEN_LOCK_DESCRIPTORS_GUARD:
+            _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
+            os.close(descriptor)
+        if error.errno in {errno.EACCES, errno.EAGAIN}:
+            msg = f"Shared file lock is blocked by an active writer: {lock_path}"
+            raise FileLockUnavailableError(msg) from error
+        raise
+
+    held = _HeldLock(descriptor=descriptor)
+    _THREAD_LOCK_STATE.locks[lock_path] = held
+    try:
+        yield lock_path
+    finally:
+        del _THREAD_LOCK_STATE.locks[lock_path]
+        with _OPEN_LOCK_DESCRIPTORS_GUARD:
+            _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+@contextmanager
 def exclusive_file_lock(
     path: Path | str,
     *,
@@ -159,7 +206,7 @@ def exclusive_file_lock(
     path : Path | str
         Persistent lock-file path. Its parent directory is created.
     blocking : bool
-        Wait for the current owner when true; fail immediately when false.
+        Wait for the current owner when true. Fail immediately when false.
 
     Yields
     ------
@@ -177,7 +224,7 @@ def exclusive_file_lock(
     Notes
     -----
     Re-entry is recognized only for the same canonical path in the owning
-    thread. The persistent lock file is not deleted on release; kernel lock
+    thread. The persistent lock file is not deleted on release. Kernel lock
     ownership, not file existence, is authoritative. The descriptor and lock
     are released when the context exits, including during exception unwinding.
 

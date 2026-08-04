@@ -30,7 +30,7 @@ loss:
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw

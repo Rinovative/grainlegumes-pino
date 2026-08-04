@@ -15,9 +15,9 @@ Design principles:
   - The module retains no implicit path or split policy
 
 This module does NOT:
-  - Read dataset files or copy source metadata; ``dataset_simulation`` owns that
-  - Create fingerprints or schemas; ``dataset_identity`` owns those contracts
-  - Normalize, batch, or shuffle samples; dataset-base services own those steps
+  - Read dataset files or copy source metadata. ``dataset_simulation`` owns that
+  - Create fingerprints or schemas. ``dataset_identity`` owns those contracts
+  - Normalize, batch, or shuffle samples. Dataset-base services own those steps
 ===============================================================================
 """
 
@@ -40,7 +40,7 @@ class FlowModule:
         self.task = task
         schema_kind = data.get("schema_kind")
         if schema_kind != identity.TRAINING_DATASET_SCHEMA_KIND:
-            msg = f"Unsupported dataset schema. Expected schema_kind {identity.TRAINING_DATASET_SCHEMA_KIND!r}; got {schema_kind!r}."
+            msg = f"Unsupported dataset schema. Expected schema_kind {identity.TRAINING_DATASET_SCHEMA_KIND!r}. Received {schema_kind!r}."
             raise ValueError(msg)
         self.dataset_identity = identity.validate_training_dataset_payload(
             data,

@@ -132,7 +132,7 @@ def run_writer_lease(
 
     The lock file lives below ``MODEL_TRAINING_DATA_ROOT/.state/runs/locks`` so
     fresh allocation and resume prevalidation can use the same lease before touching run contents.
-    Training fails fast by default; coordinated artifact readers may wait for
+    Training fails fast by default. Coordinated artifact readers may wait for
     the current run writer by setting ``blocking=True``.
 
     Parameters
@@ -140,7 +140,7 @@ def run_writer_lease(
     run_dir : Path | str
         Canonical run leaf, which need not exist yet for fresh allocation.
     blocking : bool, optional
-        Wait for the current owner when true; otherwise fail immediately.
+        Wait for the current owner when true. Otherwise fail immediately.
 
     Yields
     ------
@@ -155,7 +155,7 @@ def run_writer_lease(
     Notes
     -----
     The persistent state-root anchor is not run content and is not removed when
-    the lease closes; the underlying OS lock, rather than file existence, owns exclusion.
+    the lease closes. The underlying OS lock, rather than file existence, owns exclusion.
 
     """
     path = Path(run_dir).expanduser().resolve(strict=False)
@@ -239,7 +239,7 @@ def configure_determinism(enabled: bool) -> None:
     """
     Apply one exact deterministic policy to implemented Torch controls.
 
-    The function mutates deterministic-algorithm and cuDNN process globals; when
+    The function mutates deterministic-algorithm and cuDNN process globals. When
     enabled it also sets the cuBLAS workspace environment contract. It performs
     no device selection and rejects non-boolean settings.
     """
@@ -275,31 +275,74 @@ def configure_reproducibility(
     return seed_plan
 
 
+def _strict_deterministic_cuda_conflicts(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return operation-level conflicts in one resolved training configuration."""
+    conflicts: list[str] = []
+    model = config.get("model")
+    if isinstance(model, Mapping):
+        uno_uses_bicubic = model.get("kind") == "uno" and learning.models.factory.UNO_RESAMPLING_MODE == "bicubic"
+        if uno_uses_bicubic:
+            conflicts.append(
+                "the maintained UNO 2D resampling path uses bicubic interpolation, whose CUDA backward "
+                "has no strict deterministic implementation in the supported environment"
+            )
+
+    loss = config.get("loss")
+    physics = loss.get("physics") if isinstance(loss, Mapping) else None
+    derivatives = physics.get("derivatives") if isinstance(physics, Mapping) else None
+    reflected_spectral_physics = (
+        isinstance(physics, Mapping)
+        and bool(physics.get("enabled"))
+        and isinstance(derivatives, Mapping)
+        and derivatives.get("kind") == "spectral"
+        and derivatives.get("extension") == "reflect"
+    )
+    if reflected_spectral_physics:
+        conflicts.append(
+            "enabled spectral physics with extension 'reflect' invokes torch.nn.functional.pad(mode='reflect'), "
+            "whose reflection_pad2d_backward_cuda operation has no strict deterministic implementation"
+        )
+    return tuple(conflicts)
+
+
 def validate_deterministic_model_device_policy(
     config: Mapping[str, Any],
     resolution: learning.device.DeviceResolution,
 ) -> None:
     """
-    Reject only the current UNO bicubic CUDA strict-determinism conflict.
+    Reject resolved strict-deterministic CUDA requests with known conflicts.
 
-    Canonical FNO/PI-FNO requests retain strict determinism. Canonical UNO/PI-UNO
-    CUDA requests retain fixed seeds and controlled state with non-strict algorithms;
-    CPU UNO is not rejected by this architecture-bound check.
+    The check uses effective model, physics, derivative, and device properties.
+    It runs before fresh-run or Optuna trial-run directory allocation. CPU requests,
+    non-strict CUDA requests, and strict CUDA requests without a known conflict
+    are admitted unchanged.
+
+    Raises
+    ------
+    learning.device.DeviceResolutionError
+        If strict CUDA would reach an operation without a deterministic backward
+        implementation.
+
+    Notes
+    -----
+    Rejection never changes model interpolation, derivative boundary semantics,
+    seeds, or the resolved determinism policy. Authored configurations intended
+    for these CUDA paths must set ``run.deterministic: false`` explicitly.
+
     """
-    model = config.get("model")
     run = config.get("run")
-    if not isinstance(model, Mapping) or not isinstance(run, Mapping):
+    if not isinstance(run, Mapping) or resolution.device.type != "cuda" or not bool(run.get("deterministic")):
         return
-    current_uno_uses_bicubic = learning.models.factory.UNO_RESAMPLING_MODE == "bicubic"
-    unsupported = model.get("kind") == "uno" and resolution.device.type == "cuda" and bool(run.get("deterministic")) and current_uno_uses_bicubic
-    if not unsupported:
+    conflicts = _strict_deterministic_cuda_conflicts(config)
+    if not conflicts:
         return
+    details = "\n".join(f"- {conflict}." for conflict in conflicts)
     msg = (
-        "Strict deterministic CUDA execution is unsupported for the current UNO/PI-UNO architecture: "
-        "its maintained 2D resampling path uses bicubic interpolation, and bicubic CUDA backward has no "
-        "strict deterministic implementation in the supported environment. Set run.deterministic: false; "
-        "the configured seed remains active for controlled reproducibility. Changing interpolation would "
-        "alter UNO model semantics and is not an automatic fallback."
+        "Strict deterministic CUDA execution is incompatible with the resolved configuration:\n"
+        f"{details}\n"
+        "Set run.deterministic: false to retain explicit seeds with best-effort CUDA reproducibility, "
+        "or select a device and scientific configuration whose operations support strict determinism. "
+        "The runtime will not change interpolation, derivative boundary semantics, or determinism silently."
     )
     raise learning.device.DeviceResolutionError(msg)
 
@@ -438,7 +481,7 @@ def update_runtime_session(
 
     The exact ``session_id`` must already exist. The run writer lease prevents
     concurrent training, resume, artifact, or observer updates from losing
-    summary state; immutable run identity and status are not changed here.
+    summary state. Immutable run identity and status are not changed here.
     """
     with run_writer_lease(run_dir):
         return _update_runtime_session_locked(run_dir, session_id, updates)
@@ -449,7 +492,7 @@ def initial_tracking_state(config: Mapping[str, Any]) -> dict[str, Any]:
     Build safe initial observer facts before any SDK import or initialization.
 
     The result records configured project, local workflow, mode, tags, and status
-    status only. It performs no credential access, network operation, W&B import,
+    only. It performs no credential access, network operation, W&B import,
     or mutation of the resolved config.
     """
     settings = cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["tracking"])["wandb"])
@@ -519,7 +562,7 @@ def allocate_run_directory(run_dir: Path | str) -> Path:
     Raises
     ------
     FileExistsError
-        If the leaf already exists; callers must use explicit resume instead.
+        If the leaf already exists. Callers must use explicit resume instead.
 
     """
     path = Path(run_dir).expanduser()
@@ -527,7 +570,7 @@ def allocate_run_directory(run_dir: Path | str) -> Path:
     try:
         path.mkdir(exist_ok=False)
     except FileExistsError as error:
-        msg = f"Fresh run directory already exists; use explicit --resume to open it: {path}"
+        msg = f"Fresh run directory already exists. Use explicit --resume to open it: {path}"
         raise FileExistsError(msg) from error
     return path.resolve()
 
@@ -700,8 +743,6 @@ def _config_comparison_view(config: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(run, dict):
         run.pop("device", None)
         run.pop("name", None)
-        run.pop("prefix", None)
-        run.pop("suffix", None)
     training = view.get("training")
     if isinstance(training, dict):
         training.pop("epochs", None)
@@ -727,8 +768,10 @@ def validate_resume_config(
     Validate resume semantics and return the requested terminal epoch.
 
     ``training.epochs`` may remain equal or increase. Decreases and every
-    task/data/model/loss/optimizer/scheduler change are rejected. ``run.device``
-    and resolved paths are runtime metadata handled separately.
+    task/data/model/loss/optimizer/scheduler change are rejected. The requested
+    derived ``run.name`` may differ from a historical saved naming version; the
+    saved name remains authoritative. ``run.device`` and resolved paths are
+    runtime metadata handled separately.
     """
     differences = _different_fields(
         _config_comparison_view(requested_config),
@@ -742,7 +785,7 @@ def validate_resume_config(
     requested_epochs = int(requested_config["training"]["epochs"])
     saved_epochs = int(saved_config["training"]["epochs"])
     if requested_epochs < saved_epochs:
-        msg = f"Resume may only retain or increase training.epochs; requested {requested_epochs}, saved {saved_epochs}."
+        msg = f"Resume may only retain or increase training.epochs. Requested {requested_epochs}, saved {saved_epochs}."
         raise ValueError(msg)
     return requested_epochs
 
@@ -804,8 +847,9 @@ def inspect_existing_run_admission(
 
     if state["config"]:
         try:
-            saved_config = config_loader.load_yaml(config_file)
-            config_loader.validate_resolved_task_contract(saved_config)
+            saved_config = config_loader.validate_resolved_config(
+                config_loader.load_yaml(config_file),
+            )
             validate_resume_config(requested_config, saved_config)
         except (OSError, KeyError, TypeError, ValueError) as error:
             issues.append(str(error))
@@ -828,7 +872,7 @@ def inspect_existing_run_admission(
         if completed_epoch is not None and completed_epoch >= target_epoch:
             reason = "The existing run already completed the requested target epoch."
         else:
-            reason = "The existing run is completed; no automatic extension is admitted."
+            reason = "The existing run is completed. No automatic extension is admitted."
     elif status not in {"running", "interrupted"}:
         compatibility = "incompatible"
         reason = f"Lifecycle status {status!r} is not eligible for explicit checkpoint resume."
@@ -873,19 +917,10 @@ def _validate_resume_output_root(
     saved_config: Mapping[str, Any],
     output_root: Path | str | None,
 ) -> None:
-    """
-    Reject a resume output override that resolves away from the saved run leaf.
-
-    ``None`` preserves the existing location. An explicit root is combined with
-    saved task/run identity and must resolve to the exact resumed directory.
-    """
-    if output_root is None:
-        return
-    task = str(saved_config["task"])
-    run_name = str(saved_config["run"]["name"])
-    expected = common.paths.resolve_run_output_dir(task, run_name, output_root=output_root).resolve()
-    if expected != run_dir.resolve():
-        msg = f"--output-root resolves to {expected}, but --resume identifies {run_dir}."
+    """Keep the explicit current resume directory authoritative."""
+    del saved_config
+    if output_root is not None:
+        msg = f"--resume already identifies the authoritative current run directory {run_dir}. Do not combine it with --output-root."
         raise ValueError(msg)
 
 
@@ -949,7 +984,7 @@ def prepare_fresh_run(
     config : Mapping[str, Any]
         Fully resolved immutable experiment config.
     run_dir : Path | str | None, optional
-        Exact fresh leaf override; otherwise resolve from task, run name, and
+        Exact fresh leaf override. Otherwise resolve from task, run name, and
         output root.
     summary_extra : Mapping[str, Any] | None, optional
         Additional caller-owned lifecycle facts for the initial summary.
@@ -963,7 +998,7 @@ def prepare_fresh_run(
     Raises
     ------
     FileExistsError
-        If the leaf already exists; only explicit resume may reopen it.
+        If the leaf already exists. Only explicit resume may reopen it.
     RunLifecycleError
         If another writer owns the destination or initialization cannot publish
         an allowed summary transition.
@@ -974,7 +1009,7 @@ def prepare_fresh_run(
     -----
     The destination is allocated before its initial files are written. A
     post-allocation failure is re-raised after best-effort publication of a
-    terminal failed summary; the incomplete leaf is retained for diagnosis and
+    terminal failed summary. The incomplete leaf is retained for diagnosis and
     never treated as loadable.
 
     """
@@ -1024,7 +1059,7 @@ def _validate_reused_data_state(
     Verify object-identical processor and tensor-identical split reuse on resume.
 
     Dataloader reconstruction must retain the admitted saved processor instance
-    and exact train/eval/OOD membership; replacement or drift raises before model
+    and exact train/eval/OOD membership. Replacement or drift raises before model
     training or checkpoint restoration.
     """
     if data_processor is not restored_data_processor:
@@ -1067,8 +1102,8 @@ def _execute_prepared_run_locked(
     are admitted before optional W&B initialization. Local files and checkpoint
     state remain authoritative when a requested observer fails closed.
 
-    Fresh execution atomically publishes fitted normalizer and split artifacts;
-    resume requires object-identical processor reuse and unchanged membership.
+    Fresh execution atomically publishes fitted normalizer and split artifacts.
+    Resume requires object-identical processor reuse and unchanged membership.
     The helper owns status transitions, factories, checkpoint execution, terminal
     digests, observer finalization, and best-effort failure publication while its
     caller retains the exclusive writer lease.
@@ -1151,7 +1186,11 @@ def _execute_prepared_run_locked(
                 out_normalizer=data_processor.out_normalizer,
             )
         data_processor.to(device)
-        eval_metrics = learning.metrics.metrics.build_evaluation_metrics(config, device=device)
+        eval_metrics = learning.metrics.metrics.build_evaluation_metrics(
+            config,
+            device=device,
+            output_standard_deviations=data_processor.out_normalizer.std,
+        )
         optimizer = learning.training.optim.build_optimizer(model, config)
         scheduler = learning.training.optim.build_scheduler(optimizer, config)
         identity = learning.training.checkpoint.build_checkpoint_identity(
@@ -1350,7 +1389,7 @@ def execute_prepared_run(
     run_dir : pathlib.Path
         Already initialized run leaf whose lifecycle this call exclusively owns.
     persisted_config : Mapping[str, Any] | None, optional
-        Immutable saved config used for checkpoint identity; defaults to
+        Immutable saved config used for checkpoint identity. Defaults to
         ``config`` for fresh execution.
     saved_split_indices : dict[str, Any] | None, optional
         Admitted saved membership reused during explicit resume.
@@ -1361,7 +1400,7 @@ def execute_prepared_run(
         fresh training state.
     epoch_end_callback : Callable[[int, dict[str, float]], None] | None, optional
         Local authoritative callback invoked after every completed epoch,
-        before the optional tracking observer; evaluation keys follow cadence.
+        before the optional tracking observer. Evaluation keys follow cadence.
     summary_extra : Mapping[str, Any] | None, optional
         Caller-owned facts merged into lifecycle publications.
     device_resolution : learning.device.DeviceResolution
@@ -1385,7 +1424,7 @@ def execute_prepared_run(
     -----
     Fresh execution atomically publishes split and normalizer state before model
     construction. Resume reuses those immutable artifacts and restores only the
-    last checkpoint; the best checkpoint remains the selected inference source.
+    last checkpoint. The best checkpoint remains the selected inference source.
     Local summary/checkpoint publication is authoritative. Any failure in an
     explicitly requested online or offline W&B session follows the tracking
     contract and propagates.
@@ -1406,6 +1445,189 @@ def execute_prepared_run(
             summary_extra=summary_extra,
             device_resolution=device_resolution,
         )
+
+
+def _evaluable_run_result(
+    *,
+    path: Path,
+    summary: Mapping[str, Any],
+    config: Mapping[str, Any],
+    split_indices: Mapping[str, Any],
+    normalizer_state: Mapping[str, Any],
+    checkpoint_identity: Mapping[str, Any],
+    best_checkpoint: Mapping[str, Any],
+    lifecycle_status: str,
+    is_completed: bool,
+) -> dict[str, Any]:
+    """Build the common immutable evaluation-admission result."""
+    scientific_run_name = str(config["run"]["name"])
+    checkpoint_path = common.paths.resolve_best_checkpoint_file(path)
+    normalizer_path = common.paths.resolve_normalizer_path(path)
+    return {
+        "run_dir": path,
+        "summary": dict(summary),
+        "config": dict(config),
+        "split_indices": dict(split_indices),
+        "normalizer_state": dict(normalizer_state),
+        "checkpoint_identity": dict(checkpoint_identity),
+        "best_checkpoint": dict(best_checkpoint),
+        "lifecycle_status": lifecycle_status,
+        "is_completed": is_completed,
+        "is_provisional": not is_completed,
+        "scientific_run_name": scientific_run_name,
+        "storage_alias": path.name,
+        "selected_checkpoint_role": "best",
+        "selected_checkpoint_epoch": int(best_checkpoint["best_epoch"]),
+        "selected_checkpoint_sha256": common.serialization.file_sha256(checkpoint_path),
+        "normalizer_sha256": common.serialization.file_sha256(normalizer_path),
+        "effective_config_digest": checkpoint_identity["effective_config_digest"],
+    }
+
+
+def _validate_evaluable_run_unlocked(run_dir: Path | str) -> dict[str, Any]:
+    """Validate terminal evaluation evidence while the caller excludes writers."""
+    path = Path(run_dir).expanduser().resolve()
+    missing = common.paths.missing_evaluable_run_files(path)
+    if missing:
+        names = ", ".join(item.name for item in missing)
+        if common.paths.resolve_best_checkpoint_file(path) in missing:
+            msg = f"Evaluable run has no valid best checkpoint: {path}. Missing: {names}."
+        else:
+            msg = f"Run lacks required evaluation evidence: {path}. Missing: {names}."
+        raise RunLifecycleError(msg)
+
+    summary = read_run_summary(path)
+    status = summary.get("status")
+    if status not in _TERMINAL_RUN_STATUSES:
+        msg = f"Run must be terminal and inactive for evaluation, got status {status!r}: {path}"
+        raise RunLifecycleError(msg)
+    history = summary.get("status_history")
+    if not isinstance(history, list) or not history or not isinstance(history[-1], Mapping) or history[-1].get("status") != status:
+        msg = "Run summary status history does not end at its declared terminal status."
+        raise RunLifecycleError(msg)
+    if status == "completed":
+        completed = validate_completed_run(path)
+        return {
+            **completed,
+            **_evaluable_run_result(
+                path=path,
+                summary=completed["summary"],
+                config=completed["config"],
+                split_indices=completed["split_indices"],
+                normalizer_state=completed["normalizer_state"],
+                checkpoint_identity=completed["checkpoint_identity"],
+                best_checkpoint=completed["best_checkpoint"],
+                lifecycle_status="completed",
+                is_completed=True,
+            ),
+        }
+
+    config_path = common.paths.resolve_run_config_path(path)
+    split_path = common.paths.resolve_split_indices_path(path)
+    normalizer_path = common.paths.resolve_normalizer_path(path)
+    checkpoint_path = common.paths.resolve_best_checkpoint_file(path)
+    config = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
+    split_indices = _load_mapping_artifact(split_path, label="split indices")
+    normalizer_state = _load_mapping_artifact(normalizer_path, label="normalizer")
+    _validate_saved_data_contract(config, split_indices, normalizer_state)
+    identity = learning.training.checkpoint.build_checkpoint_identity(
+        config,
+        split_indices,
+        persisted_config=config,
+    )
+    scientific_run_name = config["run"]["name"]
+    expected_summary = {
+        "task": config["task"],
+        "run_name": scientific_run_name,
+    }
+    for label, expected in expected_summary.items():
+        if summary.get(label) != expected:
+            msg = f"Evaluable run summary {label!r} does not match its scientific configuration."
+            raise RunLifecycleError(msg)
+    if "objective" in summary and summary.get("objective") != config["evaluation"]["objective"]:
+        msg = "Evaluable run summary objective does not match config.yaml."
+        raise RunLifecycleError(msg)
+
+    current_digests = {
+        "config_sha256": common.serialization.file_sha256(config_path),
+        "split_indices_sha256": common.serialization.file_sha256(split_path),
+        "normalizer_sha256": common.serialization.file_sha256(normalizer_path),
+        "best_checkpoint_sha256": common.serialization.file_sha256(checkpoint_path),
+        "effective_config_digest": identity["effective_config_digest"],
+    }
+    for label, actual in current_digests.items():
+        recorded = summary.get(label)
+        if recorded is not None and recorded != actual:
+            msg = f"Evaluable run recorded {label} does not match current bundle-local evidence."
+            raise RunLifecycleError(msg)
+    if "best_checkpoint" in summary and summary.get("best_checkpoint") != common.paths.RUN_BEST_CHECKPOINT_FILENAME:
+        msg = "Evaluable run summary best_checkpoint must identify best_checkpoint.pt."
+        raise RunLifecycleError(msg)
+
+    amp_enabled = bool(config["training"]["mixed_precision"])
+    if "amp_enabled" in summary and summary.get("amp_enabled") is not amp_enabled:
+        msg = "Evaluable run summary AMP state does not match config.yaml."
+        raise RunLifecycleError(msg)
+    try:
+        best = learning.training.checkpoint.load_checkpoint(
+            checkpoint_path,
+            expected_identity=identity,
+            expected_role="best",
+            scheduler_expected=config.get("scheduler") is not None,
+            amp_expected=amp_enabled,
+            require_best=True,
+        )
+    except (FileNotFoundError, TypeError, ValueError, RuntimeError) as error:
+        msg = f"Evaluable run has no valid best checkpoint at {checkpoint_path}: {error}"
+        raise RunLifecycleError(msg) from error
+    if "best_metric" in summary and summary.get("best_metric") != best["best_metric"]:
+        msg = "Evaluable run summary best_metric disagrees with best_checkpoint.pt."
+        raise RunLifecycleError(msg)
+    if "best_epoch" in summary and summary.get("best_epoch") != best["best_epoch"]:
+        msg = "Evaluable run summary best_epoch disagrees with best_checkpoint.pt."
+        raise RunLifecycleError(msg)
+    return _evaluable_run_result(
+        path=path,
+        summary=summary,
+        config=config,
+        split_indices=split_indices,
+        normalizer_state=normalizer_state,
+        checkpoint_identity=identity,
+        best_checkpoint=best,
+        lifecycle_status=str(status),
+        is_completed=False,
+    )
+
+
+@contextmanager
+def run_reader_lease(run_dir: Path | str) -> Iterator[Path]:
+    """Hold a shared fail-fast reader lease that excludes lifecycle writers."""
+    path = Path(run_dir).expanduser().resolve(strict=False)
+    try:
+        with common.locking.shared_file_lock(_run_writer_lock_path(path), blocking=False):
+            yield path
+    except common.locking.FileLockUnavailableError as error:
+        msg = f"Run has an active writer lease and cannot be evaluated: {path}"
+        raise RunLifecycleError(msg) from error
+
+
+@contextmanager
+def evaluable_run_lease(run_dir: Path | str) -> Iterator[dict[str, Any]]:
+    """Hold a shared read lease and yield validated terminal evaluation evidence."""
+    with run_reader_lease(run_dir) as path:
+        yield _validate_evaluable_run_unlocked(path)
+
+
+def validate_evaluable_run(run_dir: Path | str) -> dict[str, Any]:
+    """
+    Validate a terminal inactive run for best-checkpoint evaluation.
+
+    Unlike :func:`validate_completed_run`, this contract does not require a last
+    checkpoint or fabricated completion evidence. It admits only evidence-valid
+    terminal bundles and reports non-completed lifecycle states as provisional.
+    """
+    with evaluable_run_lease(run_dir) as admitted:
+        return admitted
 
 
 def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
@@ -1452,7 +1674,7 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
     config_path = common.paths.resolve_run_config_path(path)
     split_path = common.paths.resolve_split_indices_path(path)
     normalizer_path = common.paths.resolve_normalizer_path(path)
-    config = config_loader.load_yaml(config_path)
+    config = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
     split_indices = _load_mapping_artifact(split_path, label="split indices")
     normalizer_state = _load_mapping_artifact(normalizer_path, label="normalizer")
     _validate_saved_data_contract(config, split_indices, normalizer_state)
@@ -1520,13 +1742,17 @@ def validate_completed_run(run_dir: Path | str) -> dict[str, Any]:
             msg = f"Completed run summary {label!r} mismatch."
             raise RunLifecycleError(msg)
     return {
-        "run_dir": path,
-        "summary": summary,
-        "config": config,
-        "split_indices": split_indices,
-        "normalizer_state": normalizer_state,
-        "checkpoint_identity": identity,
-        "best_checkpoint": best,
+        **_evaluable_run_result(
+            path=path,
+            summary=summary,
+            config=config,
+            split_indices=split_indices,
+            normalizer_state=normalizer_state,
+            checkpoint_identity=identity,
+            best_checkpoint=best,
+            lifecycle_status="completed",
+            is_completed=True,
+        ),
         "last_checkpoint": last,
     }
 
@@ -1554,24 +1780,24 @@ def run_experiment(
         Existing run directory explicitly continued from ``last_checkpoint.pt``.
         ``None`` requires exclusive allocation of a new run leaf.
     device : {"auto", "cuda", "cpu"} | None, optional
-        Runtime policy override. Strict ``cuda`` never falls back; ``None`` keeps
+        Runtime policy override. Strict ``cuda`` never falls back. ``None`` keeps
         the YAML policy. The concrete resolution is recorded per runtime session.
     output_root : pathlib.Path | str | None, optional
         Fresh-run destination override. On resume it must resolve to the exact
-        saved task/run leaf; dataset roots remain unchanged.
+        saved task/run leaf. Dataset roots remain unchanged.
 
     Returns
     -------
     dict[str, Any]
-        ``run_dir`` and the completed training-loop ``result`` containing the
-        resolved objective, selected best state, completed epoch, and history.
+        Exact ``run_dir``, completed training-loop ``result``, and the immutable
+        ``device_resolution`` used by training.
 
     Raises
     ------
     FileNotFoundError
         If the YAML, explicit resume leaf, or a required resume artifact is absent.
     FileExistsError
-        If a fresh destination already exists; reopening requires ``resume``.
+        If a fresh destination already exists. Reopening requires ``resume``.
     config_loader.ConfigError
         If YAML or an override violates the semantic experiment schema.
     learning.device.DeviceResolutionError
@@ -1590,7 +1816,7 @@ def run_experiment(
     inputs, then trains under one writer lease. Resume preserves those inputs,
     permits only continuation-safe runtime/duration changes, and validates best
     versus last checkpoint roles before mutation. ``best_checkpoint.pt`` remains
-    the inference/artifact source; ``last_checkpoint.pt`` is the sole continuation
+    the inference/artifact source. ``last_checkpoint.pt`` is the sole continuation
     source.
 
     Training or admission failures publish failed/interrupted state best-effort
@@ -1652,7 +1878,7 @@ def run_experiment(
                 persisted_config=requested,
                 device_resolution=device_resolution,
             )
-        return {"run_dir": run_dir, "result": result}
+        return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution}
 
     run_dir = Path(resume).expanduser().resolve()
     if not run_dir.is_dir():
@@ -1726,4 +1952,4 @@ def run_experiment(
             resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
             device_resolution=device_resolution,
         )
-        return {"run_dir": run_dir, "result": result}
+        return {"run_dir": run_dir, "result": result, "device_resolution": device_resolution}

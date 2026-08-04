@@ -2,22 +2,26 @@
 ===============================================================================
 evaluation_plot_spectral_fidelity.py
 ===============================================================================
-Compare prediction and reference spectra in task output space.
+Restore historical output-spectrum presentation on current bounded reducers.
 
 Responsibilities:
   - Compute Hann-windowed radial spectra from physical coordinate spacing
-  - Compare reference, prediction, and error energy for each learned field
-  - Show transfer ratios with casewise uncertainty over bounded saved prefixes
+  - Compare reference, prediction, and error spectra for p, u, v, and |u|
+  - Plot prediction-to-reference transfer ratios with casewise uncertainty
+  - Apply explicit channel selection and optional per-case normalization
   - Mask ratios where reference energy is too small for stable interpretation
 
 Design principles:
-  - The transform is architecture-independent and never hooks latent activations
-  - Frequencies use inverse coordinate units and field powers retain squared units
-  - Learned fields are analyzed separately; incompatible output units never mix
+  - Spectral evidence is architecture-independent and session-owned
+  - Frequencies use inverse coordinate units and field power retains squared units
+  - TaskSpec vector magnitude is derived explicitly from declared components
+  - Channels remain separate and incompatible physical units never mix
 
 This module does NOT:
-  - Parse artifact cases or silently invent physical coordinate spacing
-  - Answer dataset-only spectral questions or inspect latent model activations
+  - Parse artifact cases or invent physical coordinate spacing
+  - Inspect learned layers, latent activations, or model internals
+  - Restore the intentionally omitted learned-layer or latent spectral hooks
+  - Own notebook controls or public panel composition
 ===============================================================================
 """
 
@@ -27,20 +31,23 @@ from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
-from src.analysis.evaluation import evaluation_case as cases
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_presentation as presentation
+from src.analysis.evaluation import evaluation_session as sessions
+from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     import pandas as pd
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
-_DEFAULT_CASE_LIMIT = 64
-_MIN_SPECTRAL_SIZE = 2
+_DEFAULT_CASE_LIMIT = 50
 _REFERENCE_ENERGY_FLOOR = 1e-12
+_SPECTRAL_DIMENSIONS = 2
 
 
 def radial_power_spectrum(
@@ -50,68 +57,12 @@ def radial_power_spectrum(
     dy: float,
     n_bins: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute a Hann-windowed radial mean-power spectrum in physical frequency.
-
-    Parameters
-    ----------
-    field : numpy.ndarray
-        Finite two-dimensional physical output field.
-    dx, dy : float
-        Positive physical x/y grid spacing.
-    n_bins : int | None, optional
-        Number of equal-width radial-frequency bins; defaults to half the shorter
-        grid dimension with a minimum of two.
-
-    Returns
-    -------
-    tuple[numpy.ndarray, numpy.ndarray]
-        Bin-center spatial frequencies and mean power; empty bins are retained as
-        zeros to preserve alignment.
-
-    Raises
-    ------
-    ValueError
-        If field rank/shape/finiteness, spacing, or bin count is invalid.
-
-    Notes
-    -----
-    The transform removes the field mean, applies a separable Hann window, and
-    uses ``abs(fft2(...))**2 / field.size``. Frequencies have inverse-coordinate
-    units and power retains squared field units.
-
-    """
-    values = np.asarray(field, dtype=float)
-    if values.ndim != _MIN_SPECTRAL_SIZE or min(values.shape) < _MIN_SPECTRAL_SIZE or not np.isfinite(values).all():
-        msg = "radial_power_spectrum requires one finite 2D field with both dimensions >= 2."
-        raise ValueError(msg)
-    if not np.isfinite(dx) or not np.isfinite(dy) or dx <= 0.0 or dy <= 0.0:
-        msg = "Spectral grid spacing must be finite and positive."
-        raise ValueError(msg)
-    bins = max(_MIN_SPECTRAL_SIZE, min(values.shape) // _MIN_SPECTRAL_SIZE) if n_bins is None else n_bins
-    if isinstance(bins, bool) or not isinstance(bins, int) or bins < _MIN_SPECTRAL_SIZE:
-        msg = "n_bins must be an integer >= 2."
-        raise ValueError(msg)
-
-    window = np.outer(np.hanning(values.shape[0]), np.hanning(values.shape[1]))
-    transformed = np.fft.fft2((values - np.mean(values)) * window)
-    power = np.abs(transformed) ** 2 / values.size
-    kx = np.fft.fftfreq(values.shape[1], d=dx)
-    ky = np.fft.fftfreq(values.shape[0], d=dy)
-    kx_grid, ky_grid = np.meshgrid(kx, ky)
-    radial = np.hypot(kx_grid, ky_grid).ravel()
-    energy = power.ravel()
-    edges = np.linspace(0.0, float(np.max(radial)), bins + 1)
-    assignments = np.clip(np.digitize(radial, edges, right=False) - 1, 0, bins - 1)
-    sums = np.bincount(assignments, weights=energy, minlength=bins)
-    counts = np.bincount(assignments, minlength=bins)
-    means = sums / np.maximum(counts, 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    return centers, means
+    """Return the maintained Hann-windowed radial physical-frequency spectrum."""
+    return sessions.radial_power_spectrum(field, dx=dx, dy=dy, n_bins=n_bins)
 
 
 def _quantiles(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return q10, median, and q90 without accepting a wholly masked column."""
+    """Return q10, median, and q90 while preserving wholly masked bins."""
     valid_columns = np.isfinite(values).any(axis=0)
     q10 = np.full(values.shape[1], np.nan)
     median = np.full(values.shape[1], np.nan)
@@ -124,71 +75,278 @@ def _quantiles(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return q10, median, q90
 
 
-def _case_spectra(
-    frame: pd.DataFrame,
-    *,
-    field_index: int,
-    max_cases: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
-    """
-    Stack aligned reference, prediction, and error spectra for one output field.
+def _normalize(values: np.ndarray) -> np.ndarray:
+    """Normalize every case spectrum to unit sum, preserving zero spectra."""
+    denominator = np.sum(values, axis=1, keepdims=True)
+    return np.divide(values, denominator, out=np.array(values, copy=True), where=denominator > 0.0)
 
-    The bounded saved prefix is loaded through the shared case reader. Every case
-    within a frame must retain identical shape, coordinate spacing, and derived
-    frequency bins; no interpolation masks grid drift.
-    """
-    loaded = list(cases.iter_cases(frame, max_cases=min(max_cases, len(frame))))
-    first = loaded[0]
-    dx, dy = cases.grid_spacing(first)
-    spectra: dict[str, list[np.ndarray]] = {"reference": [], "prediction": [], "error": []}
-    k_reference: np.ndarray | None = None
-    for case in loaded:
-        case_dx, case_dy = cases.grid_spacing(case)
-        if case.shape != first.shape or not np.isclose(case_dx, dx) or not np.isclose(case_dy, dy):
-            msg = "Spectral aggregation requires a shared grid and spacing within each artifact."
-            raise dataframe.ComparisonCompatibilityError(msg)
-        for name, array in (
-            ("reference", case.reference[field_index]),
-            ("prediction", case.prediction[field_index]),
-            ("error", case.error[field_index]),
-        ):
-            k_values, energy = radial_power_spectrum(array, dx=dx, dy=dy)
-            if k_reference is None:
-                k_reference = k_values
-            elif not np.allclose(k_values, k_reference):
-                msg = "Spectral bins changed within one artifact."
-                raise dataframe.ComparisonCompatibilityError(msg)
-            spectra[name].append(energy)
-    if k_reference is None:
-        msg = "Spectral aggregation requires at least one case."
+
+def _log_spectral_transfer(
+    reference: np.ndarray,
+    prediction: np.ndarray,
+    frequencies: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return supported log10 prediction/GT transfer and per-bin support."""
+    reference_values = np.asarray(reference, dtype=float)
+    prediction_values = np.asarray(prediction, dtype=float)
+    frequency_values = np.asarray(frequencies, dtype=float)
+    if reference_values.ndim != _SPECTRAL_DIMENSIONS or prediction_values.shape != reference_values.shape:
+        msg = "Reference and prediction spectra must have equal (case, frequency) shape."
         raise ValueError(msg)
-    coordinate_unit = first.coordinate_units[0]
-    return (
-        k_reference,
-        np.stack(spectra["reference"]),
-        np.stack(spectra["prediction"]),
-        np.stack(spectra["error"]),
-        coordinate_unit,
+    if frequency_values.shape != (reference_values.shape[1],):
+        msg = "Frequencies must align with the spectral-bin dimension."
+        raise ValueError(msg)
+    if (
+        not np.isfinite(reference_values).all()
+        or not np.isfinite(prediction_values).all()
+        or not np.isfinite(frequency_values).all()
+        or np.any(reference_values < 0.0)
+        or np.any(prediction_values < 0.0)
+    ):
+        msg = "Spectra and frequencies must be finite and non-negative."
+        raise ValueError(msg)
+    case_floor = _REFERENCE_ENERGY_FLOOR * np.max(reference_values, axis=1, keepdims=True)
+    support = (frequency_values[None, :] > 0.0) & (reference_values > case_floor)
+    transfer = np.full(reference_values.shape, np.nan, dtype=float)
+    stabilized_prediction = np.maximum(prediction_values, case_floor)
+    np.log10(
+        np.divide(
+            stabilized_prediction,
+            reference_values,
+            out=np.ones_like(reference_values),
+            where=support,
+        ),
+        out=transfer,
+        where=support,
     )
+    support_count = np.sum(support, axis=0, dtype=int)
+    support_fraction = support_count.astype(float) / reference_values.shape[0]
+    return transfer, support_fraction, support_count
 
 
 def _plot_band(
     axis: Axes,
-    k_values: np.ndarray,
+    frequencies: np.ndarray,
     values: np.ndarray,
     *,
-    label: str,
     color: object,
-    linestyle: str = "-",
+    linestyle: str,
+    linewidth: float = 2.2,
 ) -> None:
-    """Plot a finite positive median spectrum with q10-q90 case bands."""
+    """Plot current casewise median and q10-q90 band in historical styling."""
     q10, median, q90 = _quantiles(values)
-    valid = (k_values > 0.0) & np.isfinite(median) & (median > 0.0)
+    valid = (frequencies > 0.0) & np.isfinite(median) & (median > 0.0)
     if not valid.any():
         return
-    axis.plot(k_values[valid], median[valid], color=color, linestyle=linestyle, label=label)
+    axis.plot(frequencies[valid], median[valid], color=color, linestyle=linestyle, linewidth=linewidth, alpha=0.95)
     band = valid & np.isfinite(q10) & np.isfinite(q90) & (q10 > 0.0)
-    axis.fill_between(k_values[band], q10[band], q90[band], color=color, alpha=0.14)
+    axis.fill_between(frequencies[band], q10[band], q90[band], color=color, alpha=0.12)
+
+
+def _summaries(
+    datasets: Mapping[str, pd.DataFrame],
+    max_cases: int,
+) -> dict[int, sessions.PrefixEvaluationSummary]:
+    """Return one validated bounded-prefix summary per current frame."""
+    dataframe.validate_comparison(datasets)
+    if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
+        msg = "max_cases must be a positive integer."
+        raise ValueError(msg)
+    with sessions.scoped_session(datasets) as active_session:
+        return {id(frame): active_session.prefix_summary(frame, max_cases) for frame in datasets.values()}
+
+
+def _spectral(
+    summary: sessions.PrefixEvaluationSummary,
+    field: presentation.DisplayField,
+) -> sessions.SpectralFieldSummary:
+    """Return learned-field or TaskSpec magnitude spectral evidence."""
+    if field.is_magnitude:
+        return summary.magnitudes[field.key.removesuffix("_magnitude")].spectrum
+    return summary.spectra[field.component_fields[0]]
+
+
+def _active_fields(
+    datasets: Mapping[str, pd.DataFrame],
+    channels: Sequence[str],
+) -> tuple[presentation.DisplayField, ...]:
+    """Resolve a non-empty ordered historical channel checkbox selection."""
+    fields = presentation.shared_display_fields(tuple(datasets.values()))
+    by_label = {field.label: field for field in fields}
+    magnitude = next((field for field in fields if field.key == "velocity_magnitude"), None)
+    if magnitude is not None:
+        by_label["U"] = magnitude
+    selected = tuple(channels)
+    if not selected or any(channel not in by_label for channel in selected):
+        visible = tuple(field.label for field in fields)
+        msg = f"Select at least one channel from {visible}."  # noqa: S608
+        raise ValueError(msg)
+    return tuple(by_label[channel] for channel in selected)
+
+
+def _colors(fields: Sequence[presentation.DisplayField]) -> dict[str, tuple[float, float, float, float]]:
+    """Return stable channel colors in selected historical order."""
+    cmap = plt.get_cmap("tab10")
+    return {field.label: cmap(index % cmap.N) for index, field in enumerate(fields)}
+
+
+def plot_spectral_demand_prediction_error(
+    *,
+    datasets: Mapping[str, pd.DataFrame],
+    max_cases: int = _DEFAULT_CASE_LIMIT,
+    channels: Sequence[str] = ("p", "u", "v", "U"),
+    normalize: bool = True,
+) -> Figure:
+    """Restore two-row dataset columns for demand/prediction and error spectra."""
+    fields = _active_fields(datasets, channels)
+    summaries = _summaries(datasets, max_cases)
+    colors = _colors(fields)
+    figure_title, count_headings = layout.aggregate_title_context(
+        "Spectral demand vs prediction and error",
+        {label: summaries[id(frame)].case_count for label, frame in datasets.items()},
+    )
+    figure = plt.figure(figsize=(6.0 * len(datasets) + 2.8, 7.0))
+    grid = figure.add_gridspec(
+        2,
+        len(datasets) + 1,
+        width_ratios=(*([1.0] * len(datasets)), 0.35),
+        wspace=0.25,
+        hspace=0.25,
+    )
+    top_axes = [figure.add_subplot(grid[0, index]) for index in range(len(datasets))]
+    bottom_axes = [figure.add_subplot(grid[1, index]) for index in range(len(datasets))]
+    legend_axis = figure.add_subplot(grid[:, -1])
+    legend_axis.axis("off")
+    for dataset_index, (label, frame) in enumerate(datasets.items()):
+        top_axis = top_axes[dataset_index]
+        bottom_axis = bottom_axes[dataset_index]
+        summary = summaries[id(frame)]
+        for field in fields:
+            spectrum = _spectral(summary, field)
+            reference = _normalize(spectrum.reference) if normalize else spectrum.reference
+            prediction = _normalize(spectrum.prediction) if normalize else spectrum.prediction
+            error = _normalize(spectrum.error) if normalize else spectrum.error
+            _plot_band(top_axis, spectrum.frequencies, reference, color=colors[field.label], linestyle="--", linewidth=2.0)
+            _plot_band(top_axis, spectrum.frequencies, prediction, color=colors[field.label], linestyle="-")
+            _plot_band(bottom_axis, spectrum.frequencies, error, color=colors[field.label], linestyle="-")
+        for axis in (top_axis, bottom_axis):
+            axis.set_xscale("log")
+            axis.set_yscale("log")
+            axis.grid(True, which="both", linestyle="--", alpha=0.3)
+        top_axis.set_title(count_headings[label] or label)
+        if dataset_index == 0:
+            suffix = " (normalised)" if normalize else ""
+            top_axis.set_ylabel(f"Spectral power{suffix}")
+            bottom_axis.set_ylabel(f"Error spectral power{suffix}")
+        bottom_axis.set_xlabel(f"Spatial frequency k [1/{summary.coordinate_unit}]")
+    curve_handles = (
+        Line2D([0], [0], color="black", linewidth=2.2, linestyle="--", label="GT demand"),
+        Line2D([0], [0], color="black", linewidth=2.2, linestyle="-", label="Prediction"),
+        Line2D([0], [0], color="black", linewidth=2.2, linestyle="-", label="Error"),
+    )
+    curve_legend = legend_axis.legend(handles=curve_handles, title="Curves", loc="upper left")
+    legend_axis.add_artist(curve_legend)
+    channel_handles = [Line2D([0], [0], color=colors[field.label], linewidth=2.6, label=field.matplotlib_label) for field in fields]
+    legend_axis.legend(
+        channel_handles,
+        [field.matplotlib_label for field in fields],
+        title="Channels",
+        loc="upper left",
+        bbox_to_anchor=(0.0, 0.80),
+    )
+    figure.subplots_adjust(top=0.92, bottom=0.10, left=0.06, right=0.98)
+    layout.title_over_axes(figure, figure_title, (*top_axes, *bottom_axes), y=0.97)
+    return figure
+
+
+def plot_spectral_transfer_ratio(
+    *,
+    datasets: Mapping[str, pd.DataFrame],
+    max_cases: int = _DEFAULT_CASE_LIMIT,
+    channels: Sequence[str] = ("p", "u", "v", "U"),
+) -> Figure:
+    """Plot supported log spectral transfer with one compact right sidebar."""
+    fields = _active_fields(datasets, channels)
+    summaries = _summaries(datasets, max_cases)
+    colors = _colors(fields)
+    figure_title, count_headings = layout.aggregate_title_context(
+        "Log spectral transfer with q10-q90 uncertainty and support",
+        {label: summaries[id(frame)].case_count for label, frame in datasets.items()},
+    )
+    figure = plt.figure(figsize=(12.2, 1.2 + 3.6 * len(datasets)))
+    outer_grid = figure.add_gridspec(
+        len(datasets),
+        2,
+        width_ratios=(1.0, 0.28),
+        hspace=0.28,
+        wspace=0.18,
+    )
+    transfer_axes = []
+    support_axes = []
+    for dataset_index, (label, frame) in enumerate(datasets.items()):
+        group_grid = outer_grid[dataset_index, 0].subgridspec(2, 1, height_ratios=(3.0, 1.0), hspace=0.06)
+        transfer_axis = figure.add_subplot(group_grid[0, 0])
+        support_axis = figure.add_subplot(group_grid[1, 0], sharex=transfer_axis)
+        transfer_axes.append(transfer_axis)
+        support_axes.append(support_axis)
+        summary = summaries[id(frame)]
+        for field in fields:
+            spectrum = _spectral(summary, field)
+            transfer, support_fraction, _support_count = _log_spectral_transfer(
+                spectrum.reference,
+                spectrum.prediction,
+                spectrum.frequencies,
+            )
+            q10, median, q90 = _quantiles(transfer)
+            valid = (spectrum.frequencies > 0.0) & np.isfinite(median)
+            transfer_axis.plot(spectrum.frequencies[valid], median[valid], color=colors[field.label], linewidth=2.2)
+            band = valid & np.isfinite(q10) & np.isfinite(q90)
+            transfer_axis.fill_between(
+                spectrum.frequencies[band],
+                q10[band],
+                q90[band],
+                color=colors[field.label],
+                alpha=0.14,
+            )
+            support_axis.plot(
+                spectrum.frequencies[valid],
+                support_fraction[valid],
+                color=colors[field.label],
+                linewidth=1.8,
+            )
+        transfer_axis.axhline(0.0, linewidth=1.6, linestyle="--", color="black", alpha=0.6)
+        transfer_axis.set_xscale("log")
+        support_axis.set_xscale("log")
+        transfer_axis.grid(True, which="both", linestyle="--", alpha=0.3)
+        support_axis.grid(True, which="both", linestyle="--", alpha=0.3)
+        support_axis.set_ylim(0.0, 1.05)
+        support_axis.set_xlabel(f"Spatial frequency k [1/{summary.coordinate_unit}]")
+        transfer_axis.tick_params(labelbottom=False)
+        transfer_axis.set_title(count_headings[label] or label, loc="left", fontsize=11)
+        transfer_axis.set_ylabel(r"$\log_{10}(S_{pred}/S_{GT})$ [-]")
+        support_axis.set_ylabel("Supported fraction")
+
+    legend_axis = figure.add_subplot(outer_grid[:, 1])
+    legend_axis.axis("off")
+    handles = [Line2D([0], [0], color="black", linewidth=1.6, linestyle="--")]
+    labels = ["equal spectral power"]
+    handles.extend(Line2D([0], [0], color=colors[field.label], linewidth=2.6) for field in fields)
+    labels.extend(field.matplotlib_label for field in fields)
+    legend_axis.legend(handles, labels, title="Transfer curves", loc="upper left", frameon=True)
+    explanation_y = max(0.05, 0.95 - 0.04 * (len(labels) + 1))
+    legend_axis.text(
+        0.0,
+        explanation_y,
+        "Support requires k > 0 and GT power above 10⁻¹² x its case maximum. Zero predictions use that numerical floor.",
+        transform=legend_axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        wrap=True,
+    )
+    figure.subplots_adjust(top=0.88, bottom=0.11, left=0.10, right=0.98)
+    layout.title_over_axes(figure, figure_title, (*transfer_axes, *support_axes), y=0.97)
+    return figure
 
 
 def plot_spectral_fidelity(
@@ -196,106 +354,9 @@ def plot_spectral_fidelity(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
 ) -> Figure:
-    """
-    Plot output-space spectra and masked prediction/reference transfer.
-
-    Parameters
-    ----------
-    datasets : Mapping[str, pandas.DataFrame]
-        Provenance-compatible frames with shared task outputs and physical units.
-    max_cases : int, optional
-        Positive bound on the saved ordered prefix aggregated per frame.
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        Per-field reference, prediction, and error power plus transfer-ratio
-        panels with q10--q90 case bands and disclosed case counts.
-
-    Raises
-    ------
-    ComparisonCompatibilityError, FileNotFoundError, TypeError, ValueError
-        If comparison identity, case grids, finite arrays, spacing, spectral bins,
-        or the positive prefix contract fails.
-
-    Notes
-    -----
-    Transfer is masked where reference power is at most ``1e-12`` of that case's
-    maximum. Learned fields remain separate so power with incompatible units is
-    never aggregated.
-
-    """
-    dataframe.validate_comparison(datasets)
-    if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
-        msg = "max_cases must be a positive integer."
-        raise ValueError(msg)
-    first_frame = next(iter(datasets.values()))
-    fields = tuple(first_frame.attrs["output_fields"])
-    units = dataframe.field_units(first_frame)
-    figure, axes = plt.subplots(
-        len(fields),
-        2,
-        figsize=(13, max(4.2 * len(fields), 4.5)),
-        squeeze=False,
-        constrained_layout=True,
+    """Retain a direct current spectral entry point outside approved panel scope."""
+    return plot_spectral_demand_prediction_error(
+        datasets=datasets,
+        max_cases=max_cases,
+        normalize=False,
     )
-    colors = plt.get_cmap("tab10")
-    for field_index, field in enumerate(fields):
-        spectrum_axis, transfer_axis = axes[field_index]
-        coordinate_units: set[str] = set()
-        for dataset_index, (label, frame) in enumerate(datasets.items()):
-            k_values, reference, prediction, error, coordinate_unit = _case_spectra(
-                frame,
-                field_index=field_index,
-                max_cases=max_cases,
-            )
-            coordinate_units.add(coordinate_unit)
-            color = colors(dataset_index % colors.N)
-            disclosed = f"{label} ({dataframe.dataset_role(frame)}), n={min(max_cases, len(frame))}"
-            _plot_band(spectrum_axis, k_values, reference, label=f"{disclosed} reference", color=color)
-            _plot_band(
-                spectrum_axis,
-                k_values,
-                prediction,
-                label=f"{disclosed} prediction",
-                color=color,
-                linestyle="--",
-            )
-            _plot_band(
-                spectrum_axis,
-                k_values,
-                error,
-                label=f"{disclosed} error",
-                color=color,
-                linestyle=":",
-            )
-
-            reference_floor = _REFERENCE_ENERGY_FLOOR * np.max(reference, axis=1, keepdims=True)
-            transfer = np.full_like(reference, np.nan)
-            safe = reference > reference_floor
-            np.divide(prediction, reference, out=transfer, where=safe)
-            q10, median, q90 = _quantiles(transfer)
-            valid = (k_values > 0.0) & np.isfinite(median) & (median > 0.0)
-            transfer_axis.plot(k_values[valid], median[valid], color=color, label=disclosed)
-            band = valid & np.isfinite(q10) & np.isfinite(q90) & (q10 > 0.0)
-            transfer_axis.fill_between(k_values[band], q10[band], q90[band], color=color, alpha=0.18)
-
-        coordinate_label = next(iter(coordinate_units)) if len(coordinate_units) == 1 else "coordinate-unit"
-        spectrum_axis.set_xscale("log")
-        spectrum_axis.set_yscale("log")
-        spectrum_axis.set_title(f"{field}: radial spectral fidelity")
-        spectrum_axis.set_xlabel(f"spatial frequency [1/{coordinate_label}]")
-        spectrum_axis.set_ylabel(f"windowed radial mean power [{units[field]}^2]")
-        spectrum_axis.grid(alpha=0.25, which="both")
-        spectrum_axis.legend(fontsize=6)
-
-        transfer_axis.axhline(1.0, color="black", linestyle="--", linewidth=1)
-        transfer_axis.set_xscale("log")
-        transfer_axis.set_yscale("log")
-        transfer_axis.set_title(f"{field}: prediction/reference transfer")
-        transfer_axis.set_xlabel(f"spatial frequency [1/{coordinate_label}]")
-        transfer_axis.set_ylabel("power ratio [1]")
-        transfer_axis.grid(alpha=0.25, which="both")
-        transfer_axis.legend(fontsize=7)
-    figure.suptitle("Output-space spectral fidelity; bands=q10-q90 across cases; transfer masks reference power <= 1e-12 of each case maximum")
-    return figure

@@ -4,7 +4,7 @@ Protect named field selection, normalized/physical tensor routing, and metric un
 
 Synthetic processors show physical RMSE uses inverse-transformed channels and
 TaskSpec units while incompatible mixed-unit aggregates are rejected. Exact
-macro sufficient-statistic algebra is covered by ``test_metric_reduction``;
+macro sufficient-statistic algebra is covered by ``test_metric_reduction``.
 these fixtures do not model training normalization quality.
 """
 
@@ -14,10 +14,17 @@ import copy
 
 import pytest
 import torch
-from src import experiments, learning
+from src import domain, experiments, learning
 from support import configs
 
-_CONFIG = configs.acceptance_config_path()
+_TASK = domain.tasks.registry.get_task("steady_flow")
+_GROUP_OBJECTIVE = next(metric for metric in _TASK.default_metrics if metric.kind == "group_macro_rmse")
+_NORMALIZED_AGGREGATE = next(
+    metric for metric in _TASK.default_metrics if metric.kind == "rmse" and metric.space == "normalized" and metric.fields == _TASK.output_names
+)
+_PHYSICAL_FIELD_METRICS = tuple(
+    metric for metric in _TASK.default_metrics if metric.kind == "rmse" and metric.space == "physical" and len(metric.fields) == 1
+)
 
 
 class AffineNormalizer:
@@ -29,7 +36,7 @@ class AffineNormalizer:
     mean : float
         Shared physical offset for every synthetic output channel.
     standard_deviation : float
-        Shared scale; tests use a positive value and do not model fitted statistics.
+        Shared scale. Tests use a positive value and do not model fitted statistics.
 
     """
 
@@ -51,7 +58,7 @@ class SyntheticProcessor:
     """
     Provide the minimal evaluation data-processor surface.
 
-    The helper preserves physical targets and exposes only an output normalizer;
+    The helper preserves physical targets and exposes only an output normalizer.
     it is not a production preprocessor and owns no learned or serialized state.
     """
 
@@ -68,19 +75,26 @@ class SyntheticProcessor:
 
 
 class UnitErrorModel(torch.nn.Module):
-    """Return a normalized prediction exactly one above a zero target."""
+    """Return a unit normalized error for every TaskSpec output channel."""
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Return three output channels of normalized ones."""
-        return torch.ones((inputs.shape[0], 3, *inputs.shape[-2:]), device=inputs.device)
+        """Return task-derived output channels of normalized ones."""
+        return torch.ones(
+            (inputs.shape[0], _TASK.out_channels, *inputs.shape[-2:]),
+            device=inputs.device,
+        )
 
 
 def _metrics(*metric_ids: str) -> dict[str, learning.metrics.metrics.DatasetMetric]:
     """Build a selected subset of resolved default metrics."""
-    config = experiments.config.loader.load_and_resolve_config(_CONFIG)
+    config = experiments.config.loader.resolve_config(configs.direct_config())
     selected = [metric for metric in config["evaluation"]["metrics"] if metric["id"] in metric_ids]
     config["evaluation"]["metrics"] = selected
-    return learning.metrics.metrics.build_evaluation_metrics(config, device=torch.device("cpu"))
+    return learning.metrics.metrics.build_evaluation_metrics(
+        config,
+        device=torch.device("cpu"),
+        output_standard_deviations=torch.full((_TASK.out_channels,), 2.0),
+    )
 
 
 def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
@@ -91,17 +105,15 @@ def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
     two exactly once, protecting against missing or duplicate inverse transforms.
     """
     metrics = _metrics(
-        "normalized_macro_rmse",
-        "normalized_rmse",
-        "physical_rmse_p",
-        "physical_rmse_u",
-        "physical_rmse_v",
+        _GROUP_OBJECTIVE.id,
+        _NORMALIZED_AGGREGATE.id,
+        *(metric.id for metric in _PHYSICAL_FIELD_METRICS),
     )
     normalizer = AffineNormalizer(mean=10.0, standard_deviation=2.0)
     processor = SyntheticProcessor(normalizer)
     raw_batch = {
-        "x": torch.zeros((2, 7, 3, 4)),
-        "y": torch.full((2, 3, 3, 4), 10.0),
+        "x": torch.zeros((2, _TASK.in_channels, 3, 4)),
+        "y": torch.full((2, _TASK.out_channels, 3, 4), 10.0),
     }
     values = learning.training.loop.eval_one_epoch(
         UnitErrorModel(),
@@ -111,41 +123,39 @@ def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
         processor,
     )
 
-    assert values["normalized_macro_rmse"] == pytest.approx(1.0)
-    assert values["normalized_rmse"] == pytest.approx(1.0)
-    assert values["physical_rmse_p"] == pytest.approx(2.0)
-    assert values["physical_rmse_u"] == pytest.approx(2.0)
-    assert values["physical_rmse_v"] == pytest.approx(2.0)
+    assert values[_GROUP_OBJECTIVE.id] == pytest.approx(1.0)
+    assert values[_NORMALIZED_AGGREGATE.id] == pytest.approx(1.0)
+    assert {metric.id: values[metric.id] for metric in _PHYSICAL_FIELD_METRICS} == pytest.approx(
+        {metric.id: 2.0 for metric in _PHYSICAL_FIELD_METRICS}
+    )
 
 
 def test_physical_units_and_named_channel_selection() -> None:
     """
-    Give pressure and velocity channels distinct constant physical errors.
+    Give every task output a distinct constant physical error.
 
-    Each named metric must select the matching channel and TaskSpec unit, while
-    a normalized-space update must fail instead of mixing tensor spaces.
+    Each TaskSpec-derived field metric must select the matching channel and unit,
+    while a normalized-space update fails instead of mixing tensor spaces.
     """
-    metrics = _metrics("physical_rmse_p", "physical_rmse_u", "physical_rmse_v")
-    target = torch.zeros((1, 3, 2, 2))
+    metrics = _metrics(*(metric.id for metric in _PHYSICAL_FIELD_METRICS))
+    target = torch.zeros((1, _TASK.out_channels, 2, 2))
+    errors = {field: float(2 + 3 * index) for index, field in enumerate(_TASK.output_names)}
     pred = torch.stack(
-        (
-            torch.full((1, 2, 2), 2.0),
-            torch.full((1, 2, 2), 5.0),
-            torch.full((1, 2, 2), 7.0),
-        ),
+        tuple(torch.full((1, 2, 2), errors[field]) for field in _TASK.output_names),
         dim=1,
     )
     for metric in metrics.values():
         metric.update(pred, target, space="physical", batch_index=0)
 
-    assert metrics["physical_rmse_p"].unit == "Pa"
-    assert metrics["physical_rmse_u"].unit == "m/s"
-    assert metrics["physical_rmse_v"].unit == "m/s"
-    assert metrics["physical_rmse_p"].compute() == pytest.approx(2.0)
-    assert metrics["physical_rmse_u"].compute() == pytest.approx(5.0)
-    assert metrics["physical_rmse_v"].compute() == pytest.approx(7.0)
+    for definition in _PHYSICAL_FIELD_METRICS:
+        field = definition.fields[0]
+        metric = metrics[definition.id]
+        assert metric.unit == _TASK.field(field).unit
+        assert metric.compute() == pytest.approx(errors[field])
+
+    first_metric = metrics[_PHYSICAL_FIELD_METRICS[0].id]
     with pytest.raises(ValueError, match="expects 'physical'"):
-        metrics["physical_rmse_p"].update(pred, target, space="normalized", batch_index=1)
+        first_metric.update(pred, target, space="normalized", batch_index=1)
 
 
 def test_incompatible_physical_aggregate_is_rejected() -> None:
@@ -155,14 +165,14 @@ def test_incompatible_physical_aggregate_is_rejected() -> None:
     Configuration must reject the mixed-unit reduction before runtime so a single
     scalar cannot falsely imply a coherent physical unit.
     """
-    raw = experiments.config.loader.load_yaml(_CONFIG)
+    raw = configs.direct_config()
     defaults = experiments.config.defaults.get_task_defaults(str(raw["task"]))
     aggregate = copy.deepcopy(
-        next(metric for metric in defaults["evaluation"]["metrics"] if metric["id"] == "physical_rmse_p"),
+        next(metric for metric in defaults["evaluation"]["metrics"] if metric["id"] == _PHYSICAL_FIELD_METRICS[0].id),
     )
     aggregate.pop("direction")
     aggregate["id"] = "physical_rmse_all"
-    aggregate["fields"] = ["p", "u", "v"]
+    aggregate["fields"] = list(_TASK.output_names)
     raw["evaluation"] = {
         "metrics": [aggregate],
         "objective": {"id": "physical_rmse_all"},

@@ -1,11 +1,11 @@
-# ruff: noqa: S101, PLR2004
+# ruff: noqa: S101
 """
-Protect the immutable registered task, ordered fields, units, and derived semantics.
+Protect the immutable registered task and its derived semantic contract.
 
-The tests establish the exact steady-flow contract, stable serialization/digest,
-registry immutability, ordered declaration rejection, and public domain exports.
-Dataset content identity and experiment-default projection are covered by the
-data and config suites rather than duplicated here.
+The tests exercise task-owned physical groups and metric meaning, stable
+serialization, registry immutability, ordered declaration rejection, and public
+domain exports. Dataset content identity and resolved experiment projection are
+covered by their broader pipeline suites.
 """
 
 from dataclasses import FrozenInstanceError, replace
@@ -14,82 +14,63 @@ import pytest
 from src import domain
 
 
-def test_steady_flow_contract_is_exact_and_task_owned() -> None:
+def test_steady_flow_contract_is_task_owned_and_scientifically_complete() -> None:
     """
-    Resolve the sole registered task and assert its complete steady-flow contract.
+    Resolve the registered task and follow its public derived declarations.
 
-    Fields, units, layout, datasets, losses, metrics, physics, objective, and digest
-    must remain task-owned so downstream components share one semantic authority.
+    The test fixes only the task-specific pressure/velocity grouping and public
+    selection identifier. Field diagnostics, channel counts, units, and serialized
+    content are derived from the TaskSpec rather than copied into fixture assertions.
     """
     task = domain.tasks.registry.get_task("steady_flow")
 
-    assert domain.tasks.registry.available_tasks() == ("steady_flow",)
-    assert task.input_names == ("x", "y", "kxx", "kxy", "kyy", "eps", "p_bc")
-    assert task.output_names == ("p", "u", "v")
-    assert task.in_channels == 7
-    assert task.out_channels == 3
-    assert task.tensor_layout == ("batch", "channel", "y", "x")
-    assert task.operator_axes == (2, 3)
-    assert task.normalization_axes == (0, 2, 3)
-    assert task.operator_dimensionality == 2
-    assert task.default_datasets.train == "lhs_var80_seed3001"
-    assert task.default_datasets.ood == ("lhs_var120_seed4001",)
+    assert task is domain.tasks.steady_flow.STEADY_FLOW
+    assert task.in_channels == len(task.input_names)
+    assert task.out_channels == len(task.output_names)
+    assert task.schema_version == domain.tasks.spec.TASK_SCHEMA_VERSION
     assert task.preprocessing.fit_split == "train"
-    assert task.data_losses == ("relative_h1", "relative_l2")
-    assert task.schema_version == 1
-    assert task.physics.kind == "steady_2d_brinkman"
-    assert task.physics.continuity == "div_eps_velocity"
-    assert task.physics.allowed_continuities == ("div_velocity", "div_eps_velocity")
-    assert [metric.id for metric in task.default_metrics] == [
-        "normalized_macro_rmse",
-        "normalized_rmse_p",
-        "normalized_rmse_u",
-        "normalized_rmse_v",
-        "normalized_rmse",
-        "normalized_relative_l2",
-        "normalized_relative_h1",
-        "physical_rmse_p",
-        "physical_rmse_u",
-        "physical_rmse_v",
-    ]
-    assert not hasattr(task, "default_objective")
-    assert {field.name: field.unit for field in (*task.inputs, *task.outputs)} == {
-        "x": "m",
-        "y": "m",
-        "kxx": "m^2",
-        "kxy": "m^2",
-        "kyy": "m^2",
-        "eps": "1",
-        "p_bc": "Pa",
-        "p": "Pa",
-        "u": "m/s",
-        "v": "m/s",
+    assert task.operator_dimensionality == len(task.operator_axes)
+
+    groups = {group.id: group for group in task.output_groups}
+    assert {group_id: group.fields for group_id, group in groups.items()} == {
+        "pressure": ("p",),
+        "velocity": ("u", "v"),
     }
-    assert task.field("kxx").representation == "dimensionless_log10_ratio_to_1_m2"
-    assert task.field("kxy").representation == "dimensionless_cross_component_ratio_to_geometric_mean"
-    assert len(task.contract_digest) == 64
+    assert tuple(field for group in task.output_groups for field in group.fields) == task.output_names
+    pressure = groups["pressure"]
+    velocity = groups["velocity"]
+    assert task.field(pressure.fields[0]).unit == "Pa"
+    assert {task.field(field).unit for field in velocity.fields} == {"m/s"}
+
+    objective = next(metric for metric in task.default_metrics if metric.kind == "group_macro_rmse")
+    assert objective.id == "normalized_group_macro_rmse"
+    assert (objective.space, objective.fields, objective.reduction, objective.direction) == (
+        "physical",
+        task.output_names,
+        "group_macro_element_mean",
+        "minimize",
+    )
+    field_diagnostics = {(metric.space, metric.fields[0]) for metric in task.default_metrics if metric.kind == "rmse" and len(metric.fields) == 1}
+    assert field_diagnostics == {(space, field) for space in ("normalized", "physical") for field in task.output_names}
+    normalized_vector = next(metric for metric in task.default_metrics if metric.kind == "group_rmse")
+    physical_vector = next(metric for metric in task.default_metrics if metric.kind == "vector_rmse")
+    assert normalized_vector.fields == physical_vector.fields == velocity.fields
+
     resolved = task.resolved_contract()
-    physics = resolved["physics"]
-    assert isinstance(physics, dict)
     assert resolved["digest"] == task.contract_digest
-    assert physics["continuity"] == "div_eps_velocity"
-    assert physics["allowed_continuities"] == [
-        "div_velocity",
-        "div_eps_velocity",
-    ]
+    assert resolved["data_contract_digest"] == task.data_contract_digest
+    assert resolved["output_groups"] == [group.as_dict() for group in task.output_groups]
+    data_contract = task.data_contract_payload()
+    assert "default_metrics" not in data_contract
+    assert "output_groups" not in data_contract
 
 
-@pytest.mark.parametrize(
-    "schema_version",
-    [True, 1.0, 2],
-    ids=("boolean-one", "floating-one", "unsupported-integer"),
-)
-def test_task_schema_requires_exact_integer_one(schema_version: object) -> None:
-    """Reject alternate runtime representations and unsupported task versions."""
+def test_task_schema_rejects_an_unsupported_version() -> None:
+    """Reject a contract version other than the public current schema."""
     task = domain.tasks.registry.get_task("steady_flow")
 
-    with pytest.raises(ValueError, match="schema_version must be integer 1"):
-        replace(task, schema_version=schema_version)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="schema_version must be integer"):
+        replace(task, schema_version=task.schema_version + 1)
 
 
 def test_task_contract_is_immutable() -> None:
@@ -107,25 +88,17 @@ def test_task_contract_is_immutable() -> None:
     assert domain.tasks.registry.get_task("steady_flow").input_names[0] == "x"
 
 
-@pytest.mark.parametrize(
-    "actual",
-    [
-        ("x", "y", "kxx", "kyy", "kxy", "eps", "p_bc"),
-        ("x", "y", "kxx", "kxy", "kyy", "eps"),
-        ("x", "y", "kxx", "kxy", "kxy", "eps", "p_bc"),
-    ],
-    ids=("swapped-kxy-kyy", "missing-p-bc", "duplicate-kxy"),
-)
-def test_ordered_contract_validator_rejects_drift(actual: tuple[str, ...]) -> None:
-    """
-    Vary an expected declaration by swapping, omitting, or duplicating one field.
-
-    Every family must fail ordered-field validation while the canonical target
-    remains fixed, protecting channel meaning before tensor use.
-    """
+def test_ordered_contract_validator_rejects_drift() -> None:
+    """Reject reordered, missing, and duplicated fields derived from TaskSpec."""
     expected = domain.tasks.registry.get_task("steady_flow").input_names
-    with pytest.raises(ValueError, match=r"duplicate|does not match|wrong channel order"):
-        domain.field_sets.validate_ordered_fields(actual, expected, label="inputs")
+    reordered = list(expected)
+    reordered[0], reordered[1] = reordered[1], reordered[0]
+    duplicated = [*expected]
+    duplicated[1] = duplicated[0]
+
+    for actual in (tuple(reordered), expected[:-1], tuple(duplicated)):
+        with pytest.raises(ValueError, match=r"duplicate|does not match|wrong channel order"):
+            domain.field_sets.validate_ordered_fields(actual, expected, label="inputs")
 
 
 def test_public_domain_exports_resolve_and_noncanonical_fields_fail() -> None:

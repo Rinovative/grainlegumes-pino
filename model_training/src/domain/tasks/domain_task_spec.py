@@ -7,7 +7,7 @@ Define immutable semantic contracts for learned operator tasks.
 Responsibilities:
   - Describe fields, datasets, preprocessing, metrics, and physics selection
   - Validate task structure, exact field membership, and tensor axes
-  - Produce deterministic resolved contracts and contract digests
+  - Produce deterministic resolved, data, and complete contract digests
 
 Design principles:
   - Task-fixed semantics have one immutable source of truth
@@ -38,14 +38,28 @@ FieldRole = Literal[
     "state",
 ]
 MetricSpace = Literal["normalized", "physical"]
-MetricReduction = Literal["sample_mean", "element_mean", "field_macro_element_mean"]
+MetricReduction = Literal[
+    "sample_mean",
+    "element_mean",
+    "group_element_mean",
+    "group_macro_element_mean",
+    "vector_element_mean",
+]
 OptimizationDirection = Literal["minimize", "maximize"]
 _SUPPORTED_TENSOR_LAYOUT = ("batch", "channel", "y", "x")
 _SUPPORTED_OPERATOR_AXES = (2, 3)
 _SUPPORTED_NORMALIZATION_AXES = (0, 2, 3)
 _FIELD_ROLES = frozenset({"coordinate", "permeability", "porosity", "boundary", "state"})
 _METRIC_SPACES = frozenset({"normalized", "physical"})
-_METRIC_REDUCTIONS = frozenset({"sample_mean", "element_mean", "field_macro_element_mean"})
+_METRIC_REDUCTIONS = frozenset(
+    {
+        "sample_mean",
+        "element_mean",
+        "group_element_mean",
+        "group_macro_element_mean",
+        "vector_element_mean",
+    }
+)
 _OPTIMIZATION_DIRECTIONS = frozenset({"minimize", "maximize"})
 
 
@@ -173,7 +187,7 @@ class PreprocessingSpec:
     output_normalization : str
         Semantic output normalization strategy.
     fit_split : str
-        Dataset split used to fit preprocessing statistics; only ``"train"`` is
+        Dataset split used to fit preprocessing statistics. Only ``"train"`` is
         supported so evaluation membership cannot influence fitted state.
 
     Raises
@@ -218,6 +232,55 @@ class PreprocessingSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class OutputGroupSpec:
+    """
+    Describe one physical output quantity represented by one or more fields.
+
+    Attributes
+    ----------
+    id : str
+        Canonical group identifier.
+    fields : tuple[str, ...]
+        Ordered output fields that jointly represent the physical quantity.
+
+    Raises
+    ------
+    ValueError
+        If the identifier is empty or fields are empty or duplicated.
+
+    """
+
+    id: str
+    fields: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Reject empty identifiers and ambiguous field membership."""
+        if not isinstance(self.id, str) or not self.id:
+            msg = "Output group id must be a non-empty string."
+            raise ValueError(msg)
+        if (
+            not isinstance(self.fields, tuple)
+            or not self.fields
+            or any(not isinstance(field, str) or not field for field in self.fields)
+            or len(set(self.fields)) != len(self.fields)
+        ):
+            msg = f"Output group {self.id!r} fields must be a unique non-empty tuple of strings."
+            raise ValueError(msg)
+
+    def as_dict(self) -> dict[str, object]:
+        """
+        Return a JSON-serializable output-group declaration.
+
+        Returns
+        -------
+        dict[str, object]
+            Group identifier and ordered member fields.
+
+        """
+        return {"id": self.id, "fields": list(self.fields)}
+
+
+@dataclass(frozen=True, slots=True)
 class MetricSpec:
     """
     Describe one semantic evaluation metric selected by a task.
@@ -234,9 +297,10 @@ class MetricSpec:
         Ordered task output fields evaluated by the metric.
     reduction : MetricReduction
         Aggregation contract. ``sample_mean`` averages independently computed
-        per-sample values; ``element_mean`` pools selected elements before the
-        metric's final transform; ``field_macro_element_mean`` pools elements
-        per field and then gives each finalized field value equal weight.
+        per-sample values. ``element_mean`` pools selected elements before the
+        metric's final transform. Group reductions consume task-owned physical
+        output groups, and ``vector_element_mean`` combines component mean
+        squared errors.
     direction : OptimizationDirection
         Objective optimization direction.
 
@@ -403,6 +467,9 @@ class TaskSpec:
         Default semantic evaluation metrics. Declaration order has no model-selection meaning.
     physics : PhysicsSpec
         Task-owned physics selector.
+    output_groups : tuple[OutputGroupSpec, ...]
+        Ordered physical output quantities. When declared, the groups form an
+        exact ordered partition of the task outputs.
 
     Raises
     ------
@@ -417,7 +484,7 @@ class TaskSpec:
     -----
     Contract payloads and SHA-256 digests preserve metric declaration order and
     contain no mutable runtime state. Executable requests select objectives by
-    exact metric ID; tuple position never selects a model.
+    exact metric ID. Tuple position never selects a model.
 
     """
 
@@ -433,6 +500,7 @@ class TaskSpec:
     data_losses: tuple[str, ...]
     default_metrics: tuple[MetricSpec, ...]
     physics: PhysicsSpec
+    output_groups: tuple[OutputGroupSpec, ...] = ()
 
     def __post_init__(self) -> None:
         """Reject structurally ambiguous task declarations."""
@@ -470,6 +538,9 @@ class TaskSpec:
         if not isinstance(self.physics, PhysicsSpec):
             msg = f"Task {self.id!r} physics must be a PhysicsSpec declaration."
             raise TypeError(msg)
+        if not isinstance(self.output_groups, tuple) or any(not isinstance(group, OutputGroupSpec) for group in self.output_groups):
+            msg = f"Task {self.id!r} output_groups must be an OutputGroupSpec tuple."
+            raise TypeError(msg)
         if not isinstance(self.data_losses, tuple) or not self.data_losses:
             msg = f"Task {self.id!r} must declare at least one semantic data loss."
             raise ValueError(msg)
@@ -488,6 +559,19 @@ class TaskSpec:
         if len(names) != len(set(names)):
             msg = f"Task {self.id!r} contains duplicate field names: {names!r}."
             raise ValueError(msg)
+
+        if self.output_groups:
+            group_ids = tuple(group.id for group in self.output_groups)
+            if len(group_ids) != len(set(group_ids)):
+                msg = f"Task {self.id!r} contains duplicate output group ids: {group_ids!r}."
+                raise ValueError(msg)
+            grouped_fields = tuple(field for group in self.output_groups for field in group.fields)
+            if grouped_fields != self.output_names:
+                msg = (
+                    f"Task {self.id!r} output groups must partition outputs in declared order: "
+                    f"expected {self.output_names!r}, got {grouped_fields!r}."
+                )
+                raise ValueError(msg)
 
         metric_ids = tuple(metric.id for metric in self.default_metrics)
         if len(metric_ids) != len(set(metric_ids)):
@@ -590,9 +674,54 @@ class TaskSpec:
         msg = f"Unknown field {name!r} for task {self.id!r}. Available fields: {available}."
         raise ValueError(msg)
 
+    def data_contract_payload(self) -> dict[str, object]:
+        """
+        Return the canonical learned-data compatibility contract.
+
+        Returns
+        -------
+        dict[str, object]
+            Task identity, fields, tensor/normalization axes, and preprocessing
+            semantics that determine whether stored tensors remain compatible.
+
+        Notes
+        -----
+        Metrics, output groups, losses, physics choices, and dataset defaults do
+        not alter learned tensor content and therefore remain outside this digest.
+
+        """
+        return {
+            "task": self.id,
+            "inputs": [field.as_dict() for field in self.inputs],
+            "outputs": [field.as_dict() for field in self.outputs],
+            "tensor_layout": list(self.tensor_layout),
+            "operator_axes": list(self.operator_axes),
+            "normalization_axes": list(self.normalization_axes),
+            "preprocessing": self.preprocessing.as_dict(),
+        }
+
+    @property
+    def data_contract_digest(self) -> str:
+        """
+        Return a stable SHA-256 digest of learned-data compatibility semantics.
+
+        Returns
+        -------
+        str
+            Lowercase hexadecimal SHA-256 digest independent of evaluation policy.
+
+        """
+        canonical = json.dumps(
+            self.data_contract_payload(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
     def contract_payload(self) -> dict[str, object]:
         """
-        Return the canonical payload used for persistence and hashing.
+        Return the canonical complete task payload used for persistence and hashing.
 
         Returns
         -------
@@ -605,6 +734,7 @@ class TaskSpec:
             "schema_version": self.schema_version,
             "inputs": [field.as_dict() for field in self.inputs],
             "outputs": [field.as_dict() for field in self.outputs],
+            "output_groups": [group.as_dict() for group in self.output_groups],
             "tensor_layout": list(self.tensor_layout),
             "operator_axes": list(self.operator_axes),
             "normalization_axes": list(self.normalization_axes),
@@ -647,6 +777,7 @@ class TaskSpec:
         """
         payload = self.contract_payload()
         payload["digest"] = self.contract_digest
+        payload["data_contract_digest"] = self.data_contract_digest
         payload["in_channels"] = self.in_channels
         payload["out_channels"] = self.out_channels
         return payload

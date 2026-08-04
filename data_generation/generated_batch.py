@@ -223,7 +223,7 @@ def require_exact_mapping_keys(value: Any, expected: frozenset[str], *, label: s
     missing = sorted(expected.difference(value))
     unexpected = sorted(set(value).difference(expected))
     if missing or unexpected:
-        msg = f"{label} keys do not match: missing={missing}; unexpected={unexpected}."
+        msg = f"{label} keys do not match: missing={missing}, unexpected={unexpected}."
         raise ValueError(msg)
     return value
 
@@ -432,8 +432,8 @@ def assert_generation_batch_idle(raw_dir: Path) -> None:
     progress_path = raw_dir / "batch_progress.json"
     if progress_path.exists() or progress_path.is_symlink():
         msg = (
-            "Generated batch has active or interrupted COMSOL progress; "
-            f"resume or finish the MATLAB batch before dataset construction: {progress_path}"
+            "Generated batch has active or interrupted COMSOL progress. "
+            f"Resume or finish the MATLAB batch before dataset construction: {progress_path}"
         )
         raise RuntimeError(msg)
 
@@ -614,8 +614,8 @@ def _numeric_field(
     """
     Return one finite real source column in canonical grid shape.
 
-    Values are converted to float64 for validation and scientific transforms;
-    their element count must exactly match ``spatial_shape``.
+    Values are converted to float64 for validation and scientific transforms.
+    Their element count must exactly match ``spatial_shape``.
 
     Raises
     ------
@@ -631,7 +631,7 @@ def _numeric_field(
         raise TypeError(msg)
     expected_count = int(np.prod(spatial_shape))
     if values.size != expected_count:
-        msg = f"Source column {column!r} has {values.size} values; expected {expected_count} for shape {spatial_shape}."
+        msg = f"Source column {column!r} has {values.size} values. Expected {expected_count} for shape {spatial_shape}."
         raise ValueError(msg)
     numeric = np.asarray(values, dtype=np.float64)
     if not np.isfinite(numeric).all():
@@ -709,7 +709,7 @@ def _build_permeability_fields(
 
     Symmetric off-diagonal COMSOL sources are averaged only after tolerance
     agreement. Every pointwise permeability tensor must be positive definite.
-    Diagonal components are stored as ``log10(k_ii)``; cross components are
+    Diagonal components are stored as ``log10(k_ii)``. Cross components are
     stored as ``k_ij / sqrt(k_ii * k_jj)`` in task-declared field order.
 
     Returns
@@ -809,8 +809,8 @@ def _build_fields(
     Build exact finite input and output mappings for one task case.
 
     Field names, source mappings, and order come only from ``task``. Porosity is
-    constrained to ``0 < eps <= 1``; permeability uses its declared stored
-    representation; all returned arrays are finite owned float32 values.
+    constrained to ``0 < eps <= 1``. Permeability uses its declared stored
+    representation. All returned arrays are finite owned float32 values.
 
     Returns
     -------

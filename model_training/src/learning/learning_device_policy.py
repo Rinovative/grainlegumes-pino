@@ -15,8 +15,8 @@ Design principles:
   - Torch is imported only by the concrete device resolver
 
 This module does NOT:
-  - Query CUDA or construct Torch devices; ``learning_device`` owns resolution
-  - Parse CLI arguments or config files; their boundary modules own parsing
+  - Query CUDA or construct Torch devices. ``learning_device`` owns resolution
+  - Parse CLI arguments or config files. Their boundary modules own parsing
   - Persist runtime metadata or select mixed-precision behavior
 ===============================================================================
 """
@@ -37,6 +37,6 @@ def validate_device_policy(policy: Any, *, path: str = "device") -> DevicePolicy
     """Validate and return one exact user-facing runtime-device policy."""
     if type(policy) is not str or policy not in DEVICE_POLICIES:
         allowed = ", ".join(DEVICE_POLICIES)
-        msg = f"{path} must be exactly one of: {allowed}; got {policy!r}."
+        msg = f"{path} must be exactly one of: {allowed}. Received {policy!r}."
         raise DevicePolicyError(msg)
     return cast("DevicePolicy", policy)

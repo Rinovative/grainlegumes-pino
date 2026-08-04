@@ -76,7 +76,7 @@ class DatasetMembershipRecord:
     shape: str
     dtype: str
     fingerprint: str
-    task_digest: str
+    data_contract_digest: str
     finite: bool
     policy: str
     result: ResultLabel
@@ -233,10 +233,15 @@ def _validate_tensor_contract(
     _require(source.input_fields == list(task.input_names), f"{role} input field order changed")
     _require(source.output_fields == list(task.output_names), f"{role} output field order changed")
     _require(identity.task == task.id, f"{role} task identity changed")
-    _require(
-        identity.task_contract_digest == task.contract_digest,
-        f"{role} TaskSpec digest changed",
-    )
+    try:
+        datasets.identity.validate_dataset_data_contract_digest(
+            identity.data_contract_digest,
+            task=task,
+            label=f"{role} dataset data_contract_digest",
+        )
+    except (TypeError, ValueError) as error:
+        detail = f"Full data-pipeline validation failed: {role} learned-data contract changed"
+        raise RuntimeError(detail) from error
     _require(
         len(identity.sample_ids) == len(source),
         f"{role} sample IDs do not match sample count",
@@ -358,7 +363,7 @@ def _membership_record(
         shape=shape,
         dtype=contract.dtype,
         fingerprint=contract.identity.fingerprint[:16],
-        task_digest=contract.identity.task_contract_digest[:16],
+        data_contract_digest=contract.identity.data_contract_digest[:16],
         finite=contract.finite,
         policy=policy,
         result="PASS",

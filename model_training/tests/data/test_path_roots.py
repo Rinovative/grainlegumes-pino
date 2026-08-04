@@ -77,8 +77,8 @@ def test_resolved_training_config_records_only_training_domain_paths(
     training_root = tmp_path / "training"
     monkeypatch.setenv("GENERATED_DATA_ROOT", str(generated_root))
     monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
-    config = experiments.config.loader.load_and_resolve_config(
-        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
+    config = experiments.config.loader.resolve_config(
+        configs.direct_config(model_kind="fno", physics_enabled=False),
     )
 
     assert config["paths"] == {
@@ -98,8 +98,8 @@ def test_output_override_cannot_relocate_dataset_inputs(
     training_root = tmp_path / "training"
     second_output_root = tmp_path / "bounded outputs"
     monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(training_root))
-    config = experiments.config.loader.load_and_resolve_config(
-        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
+    config = experiments.config.loader.resolve_config(
+        configs.direct_config(model_kind="fno", physics_enabled=False),
     )
     dataset_before = common.paths.resolve_dataset_path(
         config["data"]["train_dataset"],

@@ -15,14 +15,15 @@ Design principles:
   - Semantic identifiers remain independent of metric implementation classes
 
 This module does NOT:
-  - Construct normalized or physical tensor views; evaluation orchestration owns them
-  - Log or persist metric results; callers own observer and storage side effects
+  - Construct normalized or physical tensor views. Evaluation orchestration owns them
+  - Log or persist metric results. Callers own observer and storage side effects
 ===============================================================================
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Real
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -31,10 +32,18 @@ import numpy as np
 from src import domain
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import torch
 
 MetricSpace = Literal["normalized", "physical"]
-MetricReduction = Literal["sample_mean", "element_mean", "field_macro_element_mean"]
+MetricReduction = Literal[
+    "sample_mean",
+    "element_mean",
+    "group_element_mean",
+    "group_macro_element_mean",
+    "vector_element_mean",
+]
 MetricDirection = Literal["minimize", "maximize"]
 _MIN_METRIC_TENSOR_RANK = 3
 
@@ -83,10 +92,22 @@ _METRIC_KINDS = MappingProxyType(
             reductions=frozenset({"element_mean"}),
             direction="minimize",
         ),
-        "macro_rmse": MetricKindSpec(
-            kind="macro_rmse",
-            spaces=frozenset({"normalized"}),
-            reductions=frozenset({"field_macro_element_mean"}),
+        "group_macro_rmse": MetricKindSpec(
+            kind="group_macro_rmse",
+            spaces=frozenset({"physical"}),
+            reductions=frozenset({"group_macro_element_mean"}),
+            direction="minimize",
+        ),
+        "group_rmse": MetricKindSpec(
+            kind="group_rmse",
+            spaces=frozenset({"physical"}),
+            reductions=frozenset({"group_element_mean"}),
+            direction="minimize",
+        ),
+        "vector_rmse": MetricKindSpec(
+            kind="vector_rmse",
+            spaces=frozenset({"physical"}),
+            reductions=frozenset({"vector_element_mean"}),
             direction="minimize",
         ),
     }
@@ -165,10 +186,10 @@ def validate_metric_semantics(
     """
     spec = resolve_metric_kind(kind)
     if space not in spec.spaces:
-        msg = f"Metric {kind!r} does not support space {space!r}; expected one of {sorted(spec.spaces)}."
+        msg = f"Metric {kind!r} does not support space {space!r}. Expected one of {sorted(spec.spaces)}."
         raise ValueError(msg)
     if reduction not in spec.reductions:
-        msg = f"Metric {kind!r} does not support reduction {reduction!r}; expected one of {sorted(spec.reductions)}."
+        msg = f"Metric {kind!r} does not support reduction {reduction!r}. Expected one of {sorted(spec.reductions)}."
         raise ValueError(msg)
     return spec
 
@@ -194,13 +215,17 @@ class ResolvedMetric:
     field_indices : tuple[int, ...]
         Corresponding channel indices in the task output tensor.
     reduction : str
-        Sample, element, or field-macro sufficient-statistic reduction.
+        Sample, element, vector, or physical-group sufficient-statistic reduction.
     direction : {"minimize", "maximize"}
         Selection direction when used as an objective.
     unit : str
         Task-owned physical unit or dimensionless ``1``.
     operator_dimensionality : int
         Spatial dimensionality used by derivative-aware metrics.
+    groups : tuple[domain.tasks.spec.OutputGroupSpec, ...]
+        Task-owned physical groups selected by group-aware metrics.
+    field_standard_deviations : tuple[float, ...]
+        Raw train-fitted output standard deviations aligned with ``fields``.
 
     """
 
@@ -213,6 +238,8 @@ class ResolvedMetric:
     direction: MetricDirection
     unit: str
     operator_dimensionality: int
+    groups: tuple[domain.tasks.spec.OutputGroupSpec, ...]
+    field_standard_deviations: tuple[float, ...]
 
     def __post_init__(self) -> None:
         """Reject ambiguous field declarations before tensor accumulation."""
@@ -225,6 +252,131 @@ class ResolvedMetric:
         if len(self.field_indices) != len(set(self.field_indices)) or any(index < 0 for index in self.field_indices):
             msg = f"Metric {self.id!r} field indices must be unique non-negative integers."
             raise ValueError(msg)
+        if self.field_standard_deviations and len(self.field_standard_deviations) != len(self.fields):
+            msg = f"Metric {self.id!r} standard deviations must align with selected fields."
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class GroupRMSEValues:
+    """
+    Hold physical and normalized output-group RMSE values.
+
+    Attributes
+    ----------
+    physical : Mapping[str, float]
+        Root-sum-square physical component RMSE for each group.
+    normalized : Mapping[str, float]
+        Physical group error divided by its shared train-fitted vector scale.
+    normalized_macro : float
+        Equal arithmetic mean of normalized group errors.
+
+    """
+
+    physical: Mapping[str, float]
+    normalized: Mapping[str, float]
+    normalized_macro: float
+
+
+def finalize_group_rmse_statistics(
+    groups: tuple[domain.tasks.spec.OutputGroupSpec, ...],
+    *,
+    squared_error_sums: Mapping[str, float],
+    element_counts: Mapping[str, int],
+    train_standard_deviations: Mapping[str, float],
+) -> GroupRMSEValues:
+    """
+    Finalize global physical and shared-scale normalized group errors.
+
+    For each physical output group, this function first sums fieldwise physical
+    mean squared errors. Its square root is the physical vector error. Dividing
+    the same sum by the sum of raw train-fitted field variances before the square
+    root gives the dimensionless normalized group error. The macro value gives
+    every physical group equal weight and is lower-is-better, not a percentage.
+
+    Parameters
+    ----------
+    groups : tuple[domain.tasks.spec.OutputGroupSpec, ...]
+        Ordered task-owned output groups.
+    squared_error_sums : Mapping[str, float]
+        Global physical squared-error sum for every grouped field.
+    element_counts : Mapping[str, int]
+        Validated physical element count for every grouped field.
+    train_standard_deviations : Mapping[str, float]
+        Raw train-fitted output standard deviation for every grouped field.
+
+    Returns
+    -------
+    GroupRMSEValues
+        Physical and normalized values by group plus their normalized macro mean.
+
+    Raises
+    ------
+    TypeError
+        If a squared-error sum or train-fitted scale is not a real number.
+    ValueError
+        If groups or field statistics are missing, duplicated, negative, empty,
+        zero-scale, or non-finite.
+
+    """
+    if not groups:
+        msg = "Group RMSE finalization requires at least one task-owned output group."
+        raise ValueError(msg)
+    grouped_fields = tuple(field for group in groups for field in group.fields)
+    if len(grouped_fields) != len(set(grouped_fields)):
+        msg = "Group RMSE finalization received duplicate field membership."
+        raise ValueError(msg)
+
+    physical: dict[str, float] = {}
+    normalized: dict[str, float] = {}
+    for group in groups:
+        physical_mse_sum = 0.0
+        scale_squared_sum = 0.0
+        for field in group.fields:
+            try:
+                squared_error_sum = squared_error_sums[field]
+                element_count = element_counts[field]
+                standard_deviation = train_standard_deviations[field]
+            except KeyError as error:
+                msg = f"Group {group.id!r} is missing sufficient statistics for field {field!r}."
+                raise ValueError(msg) from error
+            if isinstance(squared_error_sum, bool) or not isinstance(squared_error_sum, Real):
+                msg = f"Field {field!r} squared-error sum must be a real number."
+                raise TypeError(msg)
+            squared_error_value = float(squared_error_sum)
+            if not np.isfinite(squared_error_value) or squared_error_value < 0.0:
+                msg = f"Field {field!r} squared-error sum must be finite and non-negative."
+                raise ValueError(msg)
+            if isinstance(element_count, bool) or not isinstance(element_count, int) or element_count <= 0:
+                msg = f"Field {field!r} element count must be a positive integer."
+                raise ValueError(msg)
+            if isinstance(standard_deviation, bool) or not isinstance(standard_deviation, Real):
+                msg = f"Field {field!r} train-fitted standard deviation must be a real number."
+                raise TypeError(msg)
+            scale = float(standard_deviation)
+            if not np.isfinite(scale) or scale <= 0.0:
+                msg = f"Field {field!r} train-fitted standard deviation must be finite and positive."
+                raise ValueError(msg)
+            physical_mse_sum += squared_error_value / element_count
+            scale_squared_sum += scale * scale
+
+        physical_value = float(np.sqrt(physical_mse_sum))
+        normalized_value = float(np.sqrt(physical_mse_sum / scale_squared_sum))
+        if not np.isfinite(physical_value) or not np.isfinite(normalized_value):
+            msg = f"Group {group.id!r} finalized to a non-finite RMSE value."
+            raise ValueError(msg)
+        physical[group.id] = physical_value
+        normalized[group.id] = normalized_value
+
+    normalized_macro = float(np.mean(tuple(normalized.values())))
+    if not np.isfinite(normalized_macro):
+        msg = "Normalized group-macro RMSE finalized to a non-finite value."
+        raise ValueError(msg)
+    return GroupRMSEValues(
+        physical=MappingProxyType(physical),
+        normalized=MappingProxyType(normalized),
+        normalized_macro=normalized_macro,
+    )
 
 
 class DatasetMetric:
@@ -234,7 +386,7 @@ class DatasetMetric:
     Implementations validate tensor space, shape ``(batch, channel, *spatial)``,
     concrete device, finiteness, and TaskSpec field selection on every update.
     Callers must reset once, update with every evaluation batch, and compute only
-    after the complete dataset; batching must not change the final value.
+    after the complete dataset. Batching must not change the final value.
 
     Parameters
     ----------
@@ -259,7 +411,7 @@ class DatasetMetric:
         """
         Validate device ownership and initialize empty sufficient statistics.
 
-        Construction performs no tensor transfer or normalization; the concrete
+        Construction performs no tensor transfer or normalization. The concrete
         device becomes an invariant checked on every update.
         """
         import torch  # noqa: PLC0415
@@ -309,7 +461,7 @@ class DatasetMetric:
 
         Prediction and target must share shape ``(batch, channel, *spatial)``,
         concrete device, requested tensor space, and finite values. Failures
-        include metric and batch identity; returned tensors preserve batch and
+        include metric and batch identity. Returned tensors preserve batch and
         spatial axes while selecting fields in declaration order.
         """
         import torch  # noqa: PLC0415
@@ -400,19 +552,11 @@ class RMSEMetric(DatasetMetric):
         return value
 
 
-class MacroRMSEMetric(DatasetMetric):
-    """
-    Accumulate global per-field RMSE values and take their macro mean.
-
-    Squared normalized errors and exact element counts are accumulated
-    independently for every TaskSpec output field over the complete evaluation
-    split. Finalization takes one global RMSE per field, then the unweighted
-    arithmetic mean of those field RMSEs. This differs from pooled overall RMSE,
-    whose final square root follows aggregation across fields.
-    """
+class _PhysicalGroupSSEMetric(DatasetMetric):
+    """Accumulate physical per-field SSE/count for task-owned output groups."""
 
     def reset(self) -> None:
-        """Clear independent per-field squared-error sums and element counts."""
+        """Clear physical per-field squared-error sums and element counts."""
         self._field_sums = [0.0] * len(self.fields)
         self._field_counts = [0] * len(self.fields)
 
@@ -425,10 +569,10 @@ class MacroRMSEMetric(DatasetMetric):
         batch_index: int,
     ) -> None:
         """
-        Add one batch to independent per-field sufficient statistics.
+        Add one physical batch to independent per-field sufficient statistics.
 
-        Each selected channel accumulates a double-precision squared-error sum
-        and exact element count; no field or batch receives an implicit weight.
+        Every selected component retains its exact global element count. Group
+        roots and weighting are deferred until complete-dataset finalization.
         """
         selected_pred, selected_target = self._validate_update(
             pred,
@@ -446,33 +590,59 @@ class MacroRMSEMetric(DatasetMetric):
             self._field_sums[field_index] += batch_sum
             self._field_counts[field_index] += field_error.numel()
 
-    def compute(self) -> float:
-        """
-        Finalize each global field RMSE and return their unweighted macro mean.
+    def _finalize_groups(self) -> GroupRMSEValues:
+        """Return shared physical and normalized group values from global state."""
+        return finalize_group_rmse_statistics(
+            self.definition.groups,
+            squared_error_sums=dict(zip(self.fields, self._field_sums, strict=True)),
+            element_counts=dict(zip(self.fields, self._field_counts, strict=True)),
+            train_standard_deviations=dict(
+                zip(
+                    self.fields,
+                    self.definition.field_standard_deviations,
+                    strict=True,
+                )
+            ),
+        )
 
-        Empty fields and non-finite field or aggregate values fail explicitly;
-        fields are not pooled before their square roots are taken.
-        """
-        field_values: list[float] = []
-        for field, squared_error_sum, element_count in zip(
-            self.fields,
-            self._field_sums,
-            self._field_counts,
-            strict=True,
-        ):
-            if element_count == 0:
-                msg = f"Metric {self.id!r} cannot finalize field {field!r} without evaluation elements."
-                raise RuntimeError(msg)
-            field_value = float(np.sqrt(squared_error_sum / element_count))
-            if not np.isfinite(field_value):
-                msg = f"Metric {self.id!r} finalized field {field!r} to a non-finite value."
-                raise FloatingPointError(msg)
-            field_values.append(field_value)
-        value = float(np.mean(field_values))
-        if not np.isfinite(value):
-            msg = f"Metric {self.id!r} finalized to a non-finite field-macro value."
-            raise FloatingPointError(msg)
-        return value
+
+class GroupMacroRMSEMetric(_PhysicalGroupSSEMetric):
+    """
+    Compute the equal macro mean over normalized physical output groups.
+
+    Each group combines physical component mean squared errors before one square
+    root and uses the root-sum-square of raw train-fitted component standard
+    deviations as its shared scale. Group count, not stored channel count,
+    determines final objective weighting.
+    """
+
+    def compute(self) -> float:
+        """Return the equal mean of complete-dataset normalized group errors."""
+        return self._finalize_groups().normalized_macro
+
+
+class GroupRMSEMetric(_PhysicalGroupSSEMetric):
+    """Compute one dimensionless physical-group error with a shared train scale."""
+
+    def compute(self) -> float:
+        """Return one complete-dataset normalized group error."""
+        values = self._finalize_groups().normalized
+        if len(values) != 1:
+            msg = f"Metric {self.id!r} requires exactly one output group."
+            raise RuntimeError(msg)
+        return next(iter(values.values()))
+
+
+class VectorRMSEMetric(_PhysicalGroupSSEMetric):
+    """Compute one physical vector RMSE from component mean squared errors."""
+
+    def compute(self) -> float:
+        """Return the root-sum-square physical component RMSE for one group."""
+        values = self._finalize_groups().physical
+        if len(values) != 1:
+            msg = f"Metric {self.id!r} requires exactly one output group."
+            raise RuntimeError(msg)
+        return next(iter(values.values()))
 
 
 class RelativeL2Metric(DatasetMetric):
@@ -480,7 +650,7 @@ class RelativeL2Metric(DatasetMetric):
     Accumulate one combined selected-field relative L2 value per sample.
 
     Each sample contributes ``||pred-target||_2 / (||target||_2 + 1e-8)`` after
-    named-channel selection; finalization takes the arithmetic sample mean.
+    named-channel selection. Finalization takes the arithmetic sample mean.
     """
 
     def update(
@@ -597,7 +767,7 @@ def _resolved_metric_fields(
     Return the exact ordered fields from an already resolved metric declaration.
 
     ``all`` expands to TaskSpec output order. Explicit lists must be non-empty,
-    unique, and task-known; failures retain the metric ID for config diagnostics.
+    unique, and task-known. Failures retain the metric ID for config diagnostics.
     """
     if raw_fields == "all":
         return task_fields
@@ -615,13 +785,72 @@ def _resolved_metric_fields(
     return fields
 
 
-def build_evaluation_metrics(config: dict[str, Any], *, device: torch.device) -> dict[str, DatasetMetric]:
+def _resolved_output_standard_deviations(
+    raw_scales: torch.Tensor | None,
+    *,
+    task_fields: tuple[str, ...],
+) -> dict[str, float]:
+    """Return raw fitted scale tensor values aligned with TaskSpec output order."""
+    if raw_scales is None:
+        return {}
+    import torch  # noqa: PLC0415
+
+    if not isinstance(raw_scales, torch.Tensor):
+        msg = "Output standard deviations must be the fitted output-normalizer tensor."
+        raise TypeError(msg)
+    flattened = raw_scales.detach().reshape(-1).cpu()
+    if flattened.numel() != len(task_fields):
+        msg = f"Output standard deviations must contain {len(task_fields)} TaskSpec channels, got {flattened.numel()}."
+        raise ValueError(msg)
+    resolved: dict[str, float] = {}
+    for index, field in enumerate(task_fields):
+        scale = float(flattened[index].item())
+        if not np.isfinite(scale) or scale <= 0.0:
+            msg = f"Output field {field!r} train-fitted standard deviation must be finite and positive."
+            raise ValueError(msg)
+        resolved[field] = scale
+    return resolved
+
+
+def _resolved_output_groups(
+    task: domain.tasks.spec.TaskSpec,
+    *,
+    kind: str,
+    fields: tuple[str, ...],
+    metric_id: str,
+) -> tuple[domain.tasks.spec.OutputGroupSpec, ...]:
+    """Bind one group-aware metric to exact task-owned output groups."""
+    if kind not in {"group_macro_rmse", "group_rmse", "vector_rmse"}:
+        return ()
+    if not task.output_groups:
+        msg = f"Metric {metric_id!r} requires task-owned output groups."
+        raise ValueError(msg)
+    if kind == "group_macro_rmse":
+        if fields != task.output_names:
+            msg = f"Metric {metric_id!r} must select every TaskSpec output field in declared order: {list(task.output_names)}."
+            raise ValueError(msg)
+        return task.output_groups
+    matches = tuple(group for group in task.output_groups if group.fields == fields)
+    if len(matches) != 1:
+        available = {group.id: list(group.fields) for group in task.output_groups}
+        msg = f"Metric {metric_id!r} fields must match one complete task output group. Available groups: {available}."
+        raise ValueError(msg)
+    return matches
+
+
+def build_evaluation_metrics(
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+    output_standard_deviations: torch.Tensor | None = None,
+) -> dict[str, DatasetMetric]:
     """
     Build explicit-space dataset accumulators from semantic config.
 
-    Metric implementations do not receive or own normalizers. Physical units
-    come from the resolved task field contract, and physical metrics select one
-    field so incompatible units can never be silently combined.
+    Metric implementations do not receive or own normalizers. Group-aware
+    metrics receive only raw train-fitted output standard deviations and consume
+    physical prediction/target views. Physical group membership comes from the
+    resolved task contract rather than metric IDs or field-name conditionals.
 
     Parameters
     ----------
@@ -629,6 +858,9 @@ def build_evaluation_metrics(config: dict[str, Any], *, device: torch.device) ->
         Fully resolved task and evaluation configuration.
     device : torch.device
         Concrete device required by all accumulator updates.
+    output_standard_deviations : torch.Tensor | None, optional
+        Raw fitted output-normalizer standard-deviation tensor in TaskSpec output
+        order. Required when any configured metric uses physical output groups.
 
     Returns
     -------
@@ -653,6 +885,10 @@ def build_evaluation_metrics(config: dict[str, Any], *, device: torch.device) ->
     if not isinstance(raw_metrics, list):
         msg = "evaluation.metrics must be a list."
         raise TypeError(msg)
+    resolved_scales = _resolved_output_standard_deviations(
+        output_standard_deviations,
+        task_fields=task.output_names,
+    )
 
     built: dict[str, DatasetMetric] = {}
     for raw_metric in raw_metrics:
@@ -672,13 +908,24 @@ def build_evaluation_metrics(config: dict[str, Any], *, device: torch.device) ->
             task_fields=task.output_names,
             metric_id=metric_id,
         )
-        if kind == "macro_rmse" and fields != task.output_names:
-            msg = f"Metric {metric_id!r} with kind 'macro_rmse' must select every TaskSpec output field in declared order: {list(task.output_names)}."
+        groups = _resolved_output_groups(
+            task,
+            kind=kind,
+            fields=fields,
+            metric_id=metric_id,
+        )
+        if groups and not resolved_scales:
+            msg = f"Metric {metric_id!r} requires raw train-fitted output standard deviations."
             raise ValueError(msg)
-        if space == "physical" and len(fields) != 1:
-            units = sorted({task.field(field).unit for field in fields})
-            msg = f"Physical metric {metric_id!r} must select exactly one field; selected units are {units}."
+        if space == "physical" and len(fields) != 1 and not groups:
+            selected_units = sorted({task.field(field).unit for field in fields})
+            msg = f"Physical metric {metric_id!r} must select exactly one field. Selected units are {selected_units}."
             raise ValueError(msg)
+        if kind == "vector_rmse":
+            vector_units = {task.field(field).unit for field in fields}
+            if len(vector_units) != 1:
+                msg = f"Physical vector metric {metric_id!r} fields must share one unit, got {sorted(vector_units)}."
+                raise ValueError(msg)
         direction = str(raw_metric.get("direction", kind_spec.direction))
         if direction != kind_spec.direction:
             msg = f"Metric {metric_id!r} direction {direction!r} contradicts {kind!r}."
@@ -691,13 +938,19 @@ def build_evaluation_metrics(config: dict[str, Any], *, device: torch.device) ->
             field_indices=tuple(task.output_names.index(field) for field in fields),
             reduction=cast("MetricReduction", reduction),
             direction=cast("MetricDirection", direction),
-            unit=task.field(fields[0]).unit if space == "physical" else "1",
+            unit=task.field(fields[0]).unit if kind == "vector_rmse" else (task.field(fields[0]).unit if space == "physical" and not groups else "1"),
             operator_dimensionality=task.operator_dimensionality,
+            groups=groups,
+            field_standard_deviations=tuple(resolved_scales[field] for field in fields) if groups else (),
         )
         if kind == "rmse":
             built[metric_id] = RMSEMetric(definition, device=device)
-        elif kind == "macro_rmse":
-            built[metric_id] = MacroRMSEMetric(definition, device=device)
+        elif kind == "group_macro_rmse":
+            built[metric_id] = GroupMacroRMSEMetric(definition, device=device)
+        elif kind == "group_rmse":
+            built[metric_id] = GroupRMSEMetric(definition, device=device)
+        elif kind == "vector_rmse":
+            built[metric_id] = VectorRMSEMetric(definition, device=device)
         elif kind == "relative_l2":
             built[metric_id] = RelativeL2Metric(definition, device=device)
         elif kind == "relative_h1":

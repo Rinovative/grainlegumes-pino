@@ -15,8 +15,8 @@ Design principles:
   - Parsing and config application remain independent of model implementations
 
 This module does NOT:
-  - Create studies or execute trials; ``experiments.tuning.optuna`` owns lifecycle
-  - Construct models or optimizers; learning factories own runtime objects
+  - Create studies or execute trials. ``experiments.tuning.optuna`` owns lifecycle
+  - Construct models or optimizers. Learning factories own runtime objects
 ===============================================================================
 """
 
@@ -387,7 +387,7 @@ def _parameter_contains_value(parameter: SearchSpaceParameter, value: Any) -> bo
     """
     Test whether a parsed domain contains the resolved base value exactly.
 
-    Categorical and fixed domains use equality; numeric domains require type,
+    Categorical and fixed domains use equality. Numeric domains require type,
     inclusive bounds, and step-grid alignment. This admission rule guarantees
     the embedded base experiment is itself a member of the declared study.
     """
@@ -458,7 +458,7 @@ def validate_search_space_paths(
             msg = f"Search-space path {parameter.path!r} is not approved for model={model_kind!r}, physics_enabled={physics.get('enabled') is True}."
             raise ValueError(msg)
         if parameter.kind not in allowed_kinds:
-            msg = f"Search-space path {parameter.path!r} does not support kind {parameter.kind!r}; allowed kinds are {sorted(allowed_kinds)}."
+            msg = f"Search-space path {parameter.path!r} does not support kind {parameter.kind!r}. Allowed kinds are {sorted(allowed_kinds)}."
             raise ValueError(msg)
         if model_kind == "uno" and parameter.path == "model.params.n_layers" and parameter.kind == "categorical":
             unsupported_depths = sorted(set(parameter.values).difference({5, 7}))
@@ -613,7 +613,7 @@ def set_config_path(config: dict[str, Any], path: str, value: Any) -> None:
 
     Notes
     -----
-    This function mutates ``config`` but never creates schema structure; callers
+    This function mutates ``config`` but never creates schema structure. Callers
     must revalidate the resulting resolved config.
 
     """

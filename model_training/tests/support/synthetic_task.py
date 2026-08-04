@@ -116,6 +116,10 @@ def build_synthetic_task() -> domain.tasks.spec.TaskSpec:
             spec.FieldSpec("response_a", "state", "unit_out_a", "identity"),
             spec.FieldSpec("response_b", "state", "unit_out_b", "identity"),
         ),
+        output_groups=(
+            spec.OutputGroupSpec("quantity_a", ("response_a",)),
+            spec.OutputGroupSpec("quantity_b", ("response_b",)),
+        ),
         tensor_layout=("batch", "channel", "y", "x"),
         operator_axes=(2, 3),
         normalization_axes=(0, 2, 3),
@@ -127,6 +131,14 @@ def build_synthetic_task() -> domain.tasks.spec.TaskSpec:
         ),
         data_losses=("relative_l2",),
         default_metrics=(
+            spec.MetricSpec(
+                id="normalized_group_macro_rmse",
+                kind="group_macro_rmse",
+                space="physical",
+                fields=("response_a", "response_b"),
+                reduction="group_macro_element_mean",
+                direction="minimize",
+            ),
             spec.MetricSpec(
                 id="normalized_relative_l2",
                 kind="relative_l2",

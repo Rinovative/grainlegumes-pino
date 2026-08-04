@@ -30,6 +30,8 @@ import ipywidgets as widgets
 import matplotlib.ticker as mticker
 import numpy as np
 
+from src.analysis.presentation.analysis_field_labels import field_label
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -51,8 +53,8 @@ class CheckboxGroup(Protocol):
 
     Notes
     -----
-    The concrete object is a private ``VBox`` subclass that owns this mapping;
-    callers depend only on this protocol and must not infer that implementation.
+    The concrete object is a private ``VBox`` subclass that owns this mapping.
+    Callers depend only on this protocol and must not infer that implementation.
 
     """
 
@@ -223,7 +225,7 @@ def _build_checkbox_group(
     defaults: list[str],
     description: str | None = None,
     n_cols: int = 2,
-) -> widgets.VBox:
+) -> _CheckboxGroupVBox:
     """
     Create internal generic checkbox group builder.
 
@@ -264,7 +266,7 @@ def _build_checkbox_group(
     }
 
     # -------------------------------------------------
-    # Layout: grid (e.g. p u / v U)
+    # Layout: grid (e.g. p u / v |u|)
     # -------------------------------------------------
     grid = widgets.GridBox(
         children=list(boxes.values()),
@@ -415,38 +417,25 @@ def ui_dropdown_dataset(names: list[str]) -> widgets.Dropdown:
         options=names,
         value=names[0],
         description="Select:",
-        width="auto",
+        width="240px",
     )
 
 
 def ui_dropdown_channel(
     *,
-    channels: list[str] | None = None,
-    default: str = "U",
+    channels: Sequence[str] | None = None,
+    default: str = "|u|",
 ) -> widgets.Dropdown:
-    """
-    Dropdown selector for data channels.
-
-    Parameters
-    ----------
-    channels : list[str] | None, optional
-        Available channels. If None, defaults to ["p", "u", "v", "U"].
-    default : str, optional
-        Default selected channel, by default "U".
-
-    Returns
-    -------
-    widgets.Dropdown
-        Configured channel dropdown.
-
-    """
-    channels = channels or ["p", "u", "v", "U"]
-
-    return _build_dropdown(
-        options=channels,
+    """Build the compact historical output-channel dropdown."""
+    resolved = list(channels or ("p", "u", "v", "|u|"))
+    if not resolved or default not in resolved:
+        msg = "Channel dropdown requires a non-empty option list containing its default."
+        raise ValueError(msg)
+    return widgets.Dropdown(
+        options=[(field_label(channel), channel) for channel in resolved],
         value=default,
         description="Channel:",
-        width="auto",
+        layout=widgets.Layout(width="auto"),
     )
 
 
@@ -515,7 +504,7 @@ def ui_radio_pred_scale_mode() -> widgets.RadioButtons:
     Options
     -------
     - "Independent" : pred and GT get their own scales (current behaviour)
-    - "Shared (GT)" : pred uses GT scale; pred outliers outside GT range are masked
+    - "Shared (GT)" : prediction uses the GT scale, with outliers outside that range masked
 
     Returns
     -------
@@ -567,36 +556,20 @@ def ui_checkbox_channels(
     *,
     channels: Sequence[str] | None = None,
     default_on: Sequence[str] | None = None,
-) -> widgets.VBox:
-    """
-    Build a checkbox group for task output channels.
-
-    Parameters
-    ----------
-    channels : Sequence[str] | None, optional
-        Available channel labels; defaults to ``p``, ``u``, ``v``, and ``U``.
-    default_on : Sequence[str] | None, optional
-        Initially enabled labels; omitted or empty input enables every channel.
-
-    Returns
-    -------
-    ipywidgets.VBox
-        Checkbox group exposing the public ``boxes`` mapping required by
-        :class:`CheckboxGroup`.
-
-    Notes
-    -----
-    The widget owns only selection state; field validation and plot semantics
-    remain with the consuming analysis view.
-
-    """
-    resolved_channels = list(channels or ["p", "u", "v", "U"])
-    resolved_defaults = list(default_on or resolved_channels)
-
-    return _build_checkbox_group(
-        options=resolved_channels,
-        defaults=resolved_defaults,
+) -> _CheckboxGroupVBox:
+    """Build the compact historical multi-channel checkbox grid."""
+    resolved = list(channels or ("p", "u", "v", "|u|"))
+    defaults = list(resolved if default_on is None else default_on)
+    if not resolved or not set(defaults).issubset(resolved):
+        msg = "Channel checkbox defaults must be drawn from a non-empty option list."
+        raise ValueError(msg)
+    group = _build_checkbox_group(
+        options=resolved,
+        defaults=defaults,
     )
+    for channel, checkbox in group.boxes.items():
+        checkbox.description = field_label(channel)
+    return group
 
 
 def ui_checkbox_datasets(

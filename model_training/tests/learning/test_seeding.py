@@ -4,7 +4,7 @@ Protect labeled subseeds and pre-construction process reproducibility controls.
 
 Python, NumPy, Torch, model initialization, deterministic flags, and call-order
 independence are exercised with CPU-safe stubs. Exact checkpoint RNG restoration is
-covered by ``test_checkpoint_resume``; this module does not assert bitwise behavior
+covered by ``test_checkpoint_resume``. This module does not assert bitwise behavior
 across different library or hardware versions.
 """
 
@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from src import experiments, learning
+from src import datasets, experiments, learning
 
 
 def test_labeled_subseeds_are_stable_distinct_and_reproducible() -> None:
@@ -61,6 +61,46 @@ def test_process_seed_reproduces_python_numpy_torch_and_model_init() -> None:
     assert first[1] == second[1]
     assert torch.equal(first[2], second[2])
     assert torch.equal(first[3], second[3])
+
+
+def test_non_strict_cuda_reproducibility_keeps_process_and_worker_seed_owners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep every process and DataLoader worker seed owner active without strict algorithms."""
+    process_calls: list[tuple[str, int]] = []
+    deterministic_calls: list[bool] = []
+    monkeypatch.setattr(experiments.run, "configure_determinism", deterministic_calls.append)
+    monkeypatch.setattr(experiments.run.random, "seed", lambda seed: process_calls.append(("python", seed)))
+    monkeypatch.setattr(experiments.run.np.random, "seed", lambda seed: process_calls.append(("numpy", seed)))
+    monkeypatch.setattr(experiments.run.torch, "manual_seed", lambda seed: process_calls.append(("torch_cpu", seed)))
+    monkeypatch.setattr(experiments.run.torch.cuda, "manual_seed_all", lambda seed: process_calls.append(("torch_cuda", seed)))
+
+    plan = experiments.run.configure_reproducibility(
+        {"run": {"seed": 9, "deterministic": False}},
+        device=torch.device("cuda:0"),
+    )
+
+    assert deterministic_calls == [False]
+    assert process_calls == [
+        ("python", plan["process"]),
+        ("numpy", plan["process"] % (2**32)),
+        ("torch_cpu", plan["process"]),
+        ("torch_cuda", plan["process"]),
+    ]
+    assert plan == experiments.run.build_seed_plan(9)
+
+    worker_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(datasets.base.random, "seed", lambda seed: worker_calls.append(("python", seed)))
+    monkeypatch.setattr(datasets.base.np.random, "seed", lambda seed: worker_calls.append(("numpy", seed)))
+    monkeypatch.setattr(datasets.base.torch, "manual_seed", lambda seed: worker_calls.append(("torch", seed)))
+    worker_id = 3
+    datasets.base._make_worker_init_fn(plan["worker"])(worker_id)  # noqa: SLF001
+    expected_worker_seed = plan["worker"] + worker_id
+    assert worker_calls == [
+        ("python", expected_worker_seed),
+        ("numpy", expected_worker_seed % (2**32)),
+        ("torch", expected_worker_seed),
+    ]
 
 
 def test_run_deterministic_controls_torch_settings() -> None:

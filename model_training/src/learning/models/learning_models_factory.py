@@ -17,9 +17,9 @@ Design principles:
   - Device placement happens only when requested by the caller
 
 This module does NOT:
-  - Implement FNO or UNO architectures; ``neuraloperator`` supplies them
-  - Orchestrate training; ``learning.training.loop`` owns execution
-  - Derive task channels or axes; task contracts and config resolution own them
+  - Implement FNO or UNO architectures. ``neuraloperator`` supplies them
+  - Orchestrate training. ``learning.training.loop`` owns execution
+  - Derive task channels or axes. Task contracts and config resolution own them
 ===============================================================================
 """
 
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import io
+import math
 import sys
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
@@ -44,7 +45,59 @@ _UNO_LAYERS_5 = 5
 _UNO_LAYERS_7 = 7
 _MIN_UNO_MODE = 8
 _FNO_MODE_DIMENSIONS = 2
+_UNO_SPATIAL_DIMENSIONS = 2
 UNO_RESAMPLING_MODE = "bicubic"
+
+
+def resolve_uno_scalings(
+    n_layers: int,
+    uno_scalings: list[list[float]] | None,
+) -> list[list[float]]:
+    """Return validated explicit or layer-derived UNO spatial scalings."""
+    if n_layers == _UNO_LAYERS_5:
+        defaults = [
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [1.0, 1.0],
+            [1.0, 1.0],
+            [2.0, 2.0],
+        ]
+    elif n_layers == _UNO_LAYERS_7:
+        defaults = [
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            [1.0, 1.0],
+            [1.0, 1.0],
+            [2.0, 2.0],
+            [2.0, 2.0],
+        ]
+    else:
+        msg = f"UNO supports exactly {_UNO_LAYERS_5} or {_UNO_LAYERS_7} layers, got {n_layers}."
+        raise ValueError(msg)
+
+    selected = defaults if uno_scalings is None else uno_scalings
+    if len(selected) != n_layers:
+        msg = f"uno_scalings length must match n_layers={n_layers}, got {len(selected)}."
+        raise ValueError(msg)
+
+    resolved: list[list[float]] = []
+    for index, pair in enumerate(selected):
+        if not isinstance(pair, (list, tuple)) or len(pair) != _UNO_SPATIAL_DIMENSIONS:
+            msg = f"uno_scalings[{index}] must contain exactly two spatial scaling values, got {pair!r}."
+            raise ValueError(msg)
+        values: list[float] = []
+        for axis, value in zip(("x", "y"), pair, strict=True):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                msg = f"uno_scalings[{index}][{axis}] must be a finite positive number, got {value!r}."
+                raise TypeError(msg)
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric <= 0:
+                msg = f"uno_scalings[{index}][{axis}] must be a finite positive number, got {value!r}."
+                raise ValueError(msg)
+            values.append(numeric)
+        resolved.append(values)
+    return resolved
 
 
 def _validate_skip(name: str, value: str) -> _SkipConnection:
@@ -192,29 +245,7 @@ def build_uno(
         msg = f"UNO supports exactly {_UNO_LAYERS_5} or {_UNO_LAYERS_7} layers, got {n_layers}."
         raise ValueError(msg)
 
-    # Auto-compute mode schedule if not provided
-    if uno_scalings is None:
-        if n_layers == _UNO_LAYERS_5:
-            uno_scalings = [
-                [1.0, 1.0],
-                [0.5, 0.5],
-                [1.0, 1.0],
-                [1.0, 1.0],
-                [2.0, 2.0],
-            ]
-        elif n_layers == _UNO_LAYERS_7:
-            uno_scalings = [
-                [1.0, 1.0],
-                [0.5, 0.5],
-                [0.5, 0.5],
-                [1.0, 1.0],
-                [1.0, 1.0],
-                [2.0, 2.0],
-                [2.0, 2.0],
-            ]
-    elif len(uno_scalings) != n_layers:
-        msg = f"uno_scalings length must match n_layers={n_layers}, got {len(uno_scalings)}."
-        raise ValueError(msg)
+    uno_scalings = resolve_uno_scalings(n_layers, uno_scalings)
 
     # Compute mode schedule from base modes and ratio
     mid_x = max(_MIN_UNO_MODE, int(modes_x * mode_ratio))
@@ -478,6 +509,7 @@ def validate_model_params(
         if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers not in (_UNO_LAYERS_5, _UNO_LAYERS_7):
             msg = f"UNO supports exactly {_UNO_LAYERS_5} or {_UNO_LAYERS_7} layers, got {n_layers!r}."
             raise ValueError(msg)
+        resolve_uno_scalings(n_layers, params.get("uno_scalings"))
 
 
 def build_model(config: dict[str, Any], *, device: torch.device) -> torch.nn.Module:

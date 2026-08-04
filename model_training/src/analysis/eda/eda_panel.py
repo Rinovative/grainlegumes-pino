@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import ipywidgets as widgets
+
 from src.analysis import ui
 from src.analysis.presentation import registry as presentation
 
@@ -32,7 +34,6 @@ from . import plots
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    import ipywidgets as widgets
     import pandas as pd
 
 
@@ -41,6 +42,7 @@ def _spectral_viewer(
     datasets: dict[str, pd.DataFrame],
     single_plot_function: Callable[..., Any],
     aggregate_plot_function: Callable[..., Any] | None,
+    controls: Mapping[str, widgets.ValueWidget] | None = None,
 ) -> widgets.VBox:
     """Build an automatic spectral viewer over actual manifest case IDs."""
     case_numbers = {name: plots.spectral.available_case_numbers(frame) for name, frame in datasets.items()}
@@ -49,6 +51,7 @@ def _spectral_viewer(
         case_numbers_by_dataset=case_numbers,
         single_plot_func=single_plot_function,
         aggregate_plot_func=aggregate_plot_function,
+        controls=controls,
         start_cases=100,
         step_size=50,
     )
@@ -73,11 +76,22 @@ def _directional_viewer(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
 
 
 def _evolution_viewer(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
-    """Build plot 2-3 with synchronized dataset-local case navigation."""
+    """Build plot 2-3 with a local automatically updating orientation control."""
+    orientation = widgets.Dropdown(
+        options=(
+            ("Cross-stream spectrum k_x along flow direction y", "cross_stream_along_flow"),
+            ("Flow-direction spectrum k_y across cross-stream direction x", "flow_across_cross_stream"),
+        ),
+        value="cross_stream_along_flow",
+        description="Orientation:",
+        style={"description_width": "initial"},
+        layout=widgets.Layout(width="auto"),
+    )
     return _spectral_viewer(
         datasets=datasets,
         single_plot_function=plots.spectral.plot_vertical_spectral_case,
         aggregate_plot_function=None,
+        controls={"orientation": orientation},
     )
 
 

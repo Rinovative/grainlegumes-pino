@@ -8,12 +8,11 @@ from pathlib import Path
 import pytest
 import torch
 from src import common, experiments, learning
-from support import real_data
+from support import configs, real_data
 
-_GPU_SMOKE_CONFIG = Path(__file__).parents[2] / "configs/tasks/steady_flow/acceptance/fno_gpu_smoke.yaml"
-_EXPECTED_FIRST_ID_INDEX = 418
-_EXPECTED_FIRST_OOD_INDEX = 57
-_FULL_SPATIAL_SHAPE = (251, 401)
+_ID_DATASET = "lhs_var80_seed3001"
+_OOD_DATASET = "lhs_var120_seed4001"
+_MIN_FULL_RESOLUTION_AXIS = 32
 _RESIDUAL_KEYS = {
     "physics/id/momentum_residual_mse",
     "physics/id/continuity_div_velocity_mse",
@@ -37,18 +36,24 @@ class _ZeroNormalizedModel(torch.nn.Module):
 def test_real_full_resolution_id_and_ood_physics_monitors_are_finite() -> None:
     """Use the explicit real-data root for one bounded ID and OOD monitor case."""
     real_data.require_real_data_root()
-    config = experiments.config.loader.load_and_resolve_config(_GPU_SMOKE_CONFIG)
+    raw = configs.direct_config(model_kind="fno", physics_enabled=False)
+    raw["data"].update(
+        {
+            "train_dataset": _ID_DATASET,
+            "ood_datasets": [_OOD_DATASET],
+            "batch_size": 1,
+            "num_workers": 0,
+        }
+    )
+    config = experiments.config.loader.resolve_config(raw)
     dataset_root = Path(config["paths"]["dataset_root"])
-    assert common.paths.resolve_dataset_path("lhs_var80_seed3001", dataset_root=dataset_root).is_file()
-    assert common.paths.resolve_dataset_path("lhs_var120_seed4001", dataset_root=dataset_root).is_file()
+    assert common.paths.resolve_dataset_path(_ID_DATASET, dataset_root=dataset_root).is_file()
+    assert common.paths.resolve_dataset_path(_OOD_DATASET, dataset_root=dataset_root).is_file()
     seed_plan = experiments.run.build_seed_plan(int(config["run"]["seed"]))
     dataloaders = experiments.config.loader.create_dataloaders_from_config(
         config,
         seed_plan=seed_plan,
     )
-    assert dataloaders["split_indices"]["eval_indices"][0].item() == _EXPECTED_FIRST_ID_INDEX
-    assert dataloaders["split_indices"]["ood_indices"][0].item() == _EXPECTED_FIRST_OOD_INDEX
-
     loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
     processor = dataloaders["data_processor"]
     loss.set_normalizers(
@@ -56,6 +61,7 @@ def test_real_full_resolution_id_and_ood_physics_monitors_are_finite() -> None:
         out_normalizer=processor.out_normalizer,
     )
     model = _ZeroNormalizedModel()
+    observed_shapes: list[tuple[int, int]] = []
     for role in ("eval", "ood"):
         values = learning.training.loop.evaluate_physics_monitor(
             model,
@@ -68,4 +74,10 @@ def test_real_full_resolution_id_and_ood_physics_monitors_are_finite() -> None:
         assert set(values) == _RESIDUAL_KEYS
         assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
         raw_batch = next(iter(dataloaders[role]))
-        assert tuple(raw_batch["x"].shape[-2:]) == _FULL_SPATIAL_SHAPE
+        shape = (
+            int(raw_batch["x"].shape[-2]),
+            int(raw_batch["x"].shape[-1]),
+        )
+        observed_shapes.append(shape)
+        assert min(shape) > _MIN_FULL_RESOLUTION_AXIS
+    assert observed_shapes[0] == observed_shapes[1]

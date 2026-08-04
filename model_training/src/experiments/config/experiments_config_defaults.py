@@ -16,8 +16,8 @@ Design principles:
   - Semantic identifiers are distinct from Python implementation class names
 
 This module does NOT:
-  - Parse or strictly validate user config; ``experiments.config.loader`` owns admission
-  - Construct models, losses, metrics, or physics; their registries own construction
+  - Parse or strictly validate user config. ``experiments.config.loader`` owns admission
+  - Construct models, losses, metrics, or physics. Their registries own construction
   - Define dataset storage schemas or lifecycle behavior
 ===============================================================================
 """

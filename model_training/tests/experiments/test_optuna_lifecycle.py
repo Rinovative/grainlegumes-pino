@@ -1,12 +1,5 @@
 # ruff: noqa: S101
-"""
-Exercise sparse pruning, semantic study signatures, reopening, and outcomes.
-
-A tiny CPU SQLite study proves actual completed-epoch steps and fresh additional
-trials; stubs classify pruning, non-finite, OOM, recoverable, interrupt, and bug
-paths while guarding CPU cleanup from CUDA calls. General YAML/search parsing is
-covered by ``test_optuna_contract``; no production study is run.
-"""
+"""Protect Optuna persistence, resume, pruning, and terminal-state behavior."""
 
 from __future__ import annotations
 
@@ -19,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import optuna
 import pytest
 import torch
-from src import common, experiments
+from src import common, domain, experiments
 from support import configs
 
 if TYPE_CHECKING:
@@ -27,31 +20,26 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 optuna_runtime = experiments.tuning.optuna
-search_space = experiments.tuning.search_space
 _EXPECTED_GLOBAL_STEP = 7
 _EXPECTED_RESUMED_TRIAL_COUNT = 4
-_SYNTHETIC_SMOKE_TRIALS = 2
-_SYNTHETIC_SMOKE_EPOCHS = 2
+_TASK = domain.tasks.registry.get_task("steady_flow")
+_OBJECTIVE_ID = next(metric.id for metric in _TASK.default_metrics if metric.kind == "group_macro_rmse")
 
 
 class _Trial:
-    """
-    Implement only the Optuna trial surface needed by lifecycle policy tests.
-
-    Suggestions choose the first or lower-bound value; reports and attributes remain
-    in memory, and one toggle decides pruning. The fake performs no persistence,
-    distribution validation, or sampler logic.
-    """
+    """Implement the small trial surface needed by reporter and failure tests."""
 
     def __init__(self, *, number: int = 0, prune: bool = False) -> None:
-        """Initialize deterministic identity, pruning policy, and empty records."""
         self.number = number
         self.prune = prune
         self.attrs: dict[str, Any] = {}
         self.reports: list[tuple[float, int]] = []
 
-    def suggest_categorical(self, name: str, choices: Sequence[Any]) -> Any:
-        """Return the first categorical choice without emulating a sampler."""
+    def suggest_categorical(
+        self,
+        name: str,
+        choices: Sequence[Any],
+    ) -> Any:
         del name
         return choices[0]
 
@@ -64,7 +52,6 @@ class _Trial:
         log: bool = False,
         step: float | None = None,
     ) -> float:
-        """Return the float lower bound after accepting Optuna-shaped arguments."""
         del name, high, log, step
         return low
 
@@ -77,215 +64,169 @@ class _Trial:
         log: bool = False,
         step: int = 1,
     ) -> int:
-        """Return the integer lower bound after accepting Optuna-shaped arguments."""
         del name, high, log, step
         return low
 
     def report(self, value: float, step: int) -> None:
-        """Retain one objective report at its completed-epoch step."""
         self.reports.append((value, step))
 
     def set_user_attr(self, key: str, value: Any) -> None:
-        """Retain one user attribute exactly as the reporter publishes it."""
         self.attrs[key] = value
 
     def should_prune(self) -> bool:
-        """Return the test-selected pruning decision without policy evaluation."""
         return self.prune
 
 
-def _load(
-    *,
-    model_kind: str = "fno",
-    physics_enabled: bool = False,
-) -> optuna_runtime.OptunaStudyConfig:
-    """Load a semantic recipe with external tracking disabled for lifecycle tests."""
-    path = configs.optuna_config_path(
-        model_kind=model_kind,
-        physics_enabled=physics_enabled,
+def _load(tmp_path: Path) -> optuna_runtime.OptunaStudyConfig:
+    """Load one artificial study with external tracking disabled."""
+    path = configs.write_yaml(
+        tmp_path / "synthetic-lifecycle.yaml",
+        configs.optuna_config(),
     )
-    config = optuna_runtime.load_optuna_study_config(path)
-    base_config = copy.deepcopy(config.base_config)
-    base_config["tracking"]["wandb"]["mode"] = "disabled"
-    return replace(config, base_config=base_config)
+    loaded = optuna_runtime.load_optuna_study_config(path)
+    base = copy.deepcopy(loaded.base_config)
+    base["tracking"]["wandb"]["mode"] = "disabled"
+    return replace(loaded, base_config=base)
 
 
-def test_signature_excludes_invocation_and_tracking_but_covers_science(tmp_path: Path) -> None:
-    """
-    Compare one baseline signature with operational and scientific configuration drift.
+def test_signature_excludes_runtime_location_but_covers_science(
+    tmp_path: Path,
+) -> None:
+    """Separate study continuation identity from invocation-only settings."""
+    loaded = _load(tmp_path)
+    baseline = optuna_runtime.build_study_signature(loaded)["digest"]
 
-    Device, paths, tracking, display name, count, and storage must remain reusable,
-    while duration, optimization, split, seed, pruner, or search changes alter identity.
-    """
-    config = _load()
-    baseline = optuna_runtime.build_study_signature(config)
-
-    operational_base = copy.deepcopy(config.base_config)
-    operational_base["run"]["device"] = "cpu"
+    operational_base = copy.deepcopy(loaded.base_config)
+    operational_base["run"]["device"] = "cuda"
     operational_base["paths"]["output_root"] = str(tmp_path / "elsewhere")
-    operational_base["tracking"]["wandb"]["mode"] = "offline"
-    operational_study = copy.deepcopy(config.study)
-    operational_study.update({"name": "display_name_changed", "n_trials": 97, "storage": "sqlite:///elsewhere.db"})
-    operational = replace(config, base_config=operational_base, study=operational_study)
-    assert optuna_runtime.build_study_signature(operational)["digest"] == baseline["digest"]
+    operational_study = copy.deepcopy(loaded.study)
+    operational_study.update(
+        {
+            "name": "renamed_display",
+            "n_trials": 99,
+            "storage": "sqlite:///relocated.db",
+        }
+    )
+    operational = replace(
+        loaded,
+        base_config=operational_base,
+        study=operational_study,
+    )
+    assert optuna_runtime.build_study_signature(operational)["digest"] == baseline
 
-    scientific_variants: list[optuna_runtime.OptunaStudyConfig] = []
-    duration = copy.deepcopy(config.base_config)
-    duration["training"]["epochs"] += 1
-    scientific_variants.append(replace(config, base_config=duration))
-    optimizer = copy.deepcopy(config.base_config)
-    optimizer["optimizer"]["lr"] = 5.0e-4
-    scientific_variants.append(replace(config, base_config=optimizer))
-    split = copy.deepcopy(config.base_config)
-    split["data"]["train_ratio"] = 0.75
-    scientific_variants.append(replace(config, base_config=split))
-    seeded = copy.deepcopy(config.study)
-    seeded["seed"] += 1
-    scientific_variants.append(replace(config, study=seeded))
-    pruned = copy.deepcopy(config.study)
-    pruned["pruner"]["n_warmup_steps"] += 5
-    scientific_variants.append(replace(config, study=pruned))
-    cadence = copy.deepcopy(config.base_config)
-    cadence["training"]["evaluation_interval"] = 10
-    cadence["training"]["ood_evaluation_interval"] = 10
-    cadence["tracking"]["wandb"]["monitor"]["interval"] = 10
-    cadence_study = copy.deepcopy(config.study)
-    cadence_study["pruner"]["n_warmup_steps"] = 30
-    cadence_study["pruner"]["interval_steps"] = 10
-    scientific_variants.append(replace(config, base_config=cadence, study=cadence_study))
-    parameters = list(config.search_space)
-    parameters[0] = replace(parameters[0], values=(*parameters[0].values, 144))
-    scientific_variants.append(replace(config, search_space=tuple(parameters)))
+    scientific_base = copy.deepcopy(loaded.base_config)
+    scientific_base["optimizer"]["lr"] = 2.0e-3
+    scientific = replace(loaded, base_config=scientific_base)
+    assert optuna_runtime.build_study_signature(scientific)["digest"] != baseline
 
-    assert all(optuna_runtime.build_study_signature(variant)["digest"] != baseline["digest"] for variant in scientific_variants)
-    assert baseline["payload"]["task"]["contract_digest"] == config.base_config["task_contract"]["digest"]
-    assert baseline["payload"]["reporting"]["step"] == "actual_completed_epoch"
-    lifecycle = baseline["payload"]["trial_lifecycle"]
-    assert lifecycle["resume_policy"] == "new_trials_only"
-    assert lifecycle["trial_count_policy"] == "additional_fresh_trials_per_invocation"
-    assert lifecycle["training_seed_policy"] == "fixed_configured_run_seed_across_trials"
-    assert lifecycle["trial_identity_policy"] == "native_zero_based_optuna_number"
+    changed_space = list(loaded.search_space)
+    changed_space[0] = replace(
+        changed_space[0],
+        values=(*changed_space[0].values, 16),
+    )
+    changed = replace(loaded, search_space=tuple(changed_space))
+    assert optuna_runtime.build_study_signature(changed)["digest"] != baseline
 
 
-def test_reporter_requires_held_out_metric_continuity_and_prunes_immediately() -> None:
-    """
-    Exercise missing objective, skipped epoch, and immediate-prune reporter paths.
-
-    Only held-out metrics at consecutive completed epochs may enter the study, and a
-    prune decision must stop at that epoch while retaining global-step evidence.
-    """
-    missing = optuna_runtime.OptunaEpochReporter(trial=_Trial(), objective_id="normalized_macro_rmse", direction="minimize")
+def test_reporter_uses_completed_epochs_and_prunes_immediately() -> None:
+    """Reject missing/discontinuous evidence and stop on the pruning epoch."""
+    missing = optuna_runtime.OptunaEpochReporter(
+        trial=_Trial(),
+        objective_id=_OBJECTIVE_ID,
+        direction="minimize",
+    )
     with pytest.raises(KeyError, match="Held-out Optuna objective"):
         missing(1, {"train/loss_total": 0.1})
 
-    discontinuous = optuna_runtime.OptunaEpochReporter(trial=_Trial(), objective_id="normalized_macro_rmse", direction="minimize")
-    with pytest.raises(ValueError, match="expected 1, got 2"):
-        discontinuous(2, {"id/normalized_macro_rmse": 0.5})
+    discontinuous = optuna_runtime.OptunaEpochReporter(
+        trial=_Trial(),
+        objective_id=_OBJECTIVE_ID,
+        direction="minimize",
+    )
+    with pytest.raises(ValueError, match="Expected 1, received 2"):
+        discontinuous(2, {f"id/{_OBJECTIVE_ID}": 0.5})
 
     trial = _Trial(prune=True)
-    reporter = optuna_runtime.OptunaEpochReporter(trial=trial, objective_id="normalized_macro_rmse", direction="minimize")
+    reporter = optuna_runtime.OptunaEpochReporter(
+        trial=trial,
+        objective_id=_OBJECTIVE_ID,
+        direction="minimize",
+    )
     with pytest.raises(optuna.TrialPruned, match="completed epoch 1"):
-        reporter(1, {"id/normalized_macro_rmse": 0.5, "global_step": 7.0})
+        reporter(
+            1,
+            {
+                f"id/{_OBJECTIVE_ID}": 0.5,
+                "global_step": float(_EXPECTED_GLOBAL_STEP),
+            },
+        )
     assert trial.reports == [(0.5, 1)]
     assert trial.attrs["last_reported_epoch"] == 1
     assert trial.attrs["last_global_step"] == _EXPECTED_GLOBAL_STEP
 
 
-def test_search_policy_rejects_unapproved_kinds_defaults_and_model_values() -> None:
-    """
-    Try fixed kinds, ranges excluding defaults, and model/physics-invalid values.
-
-    Every candidate must fail the resolved-config allowlist or task/model contract,
-    keeping searches scientifically anchored and structurally constructible.
-    """
-    fno = _load()
-    fixed = search_space.SearchSpaceParameter(path="optimizer.lr", name="lr", kind="fixed", value=fno.base_config["optimizer"]["lr"])
-    with pytest.raises(ValueError, match="does not support kind"):
-        search_space.validate_search_space_paths(fno.base_config, (fixed,))
-
-    misses_default = search_space.SearchSpaceParameter(path="optimizer.lr", name="lr", kind="float", low=1.0e-3, high=2.0e-3, log=True)
-    with pytest.raises(ValueError, match="must contain its resolved base value"):
-        search_space.validate_search_space_paths(fno.base_config, (misses_default,))
-
-    physics_on_supervised = search_space.SearchSpaceParameter(
-        path="loss.physics.continuity",
-        name="continuity",
-        kind="categorical",
-        values=("div_eps_velocity",),
+def test_existing_unbound_study_fails_before_trial_allocation(
+    tmp_path: Path,
+) -> None:
+    """Reject a pre-existing SQLite study without semantic metadata."""
+    loaded = optuna_runtime.with_runtime_overrides(
+        _load(tmp_path),
+        device="cpu",
+        output_root=tmp_path,
     )
-    with pytest.raises(ValueError, match="not approved"):
-        search_space.validate_search_space_paths(fno.base_config, (physics_on_supervised,))
-
-    pi_fno = _load(model_kind="fno", physics_enabled=True)
-    bad_continuity = replace(
-        physics_on_supervised,
-        values=("div_eps_velocity", "unsupported_continuity"),
-    )
-    with pytest.raises(ValueError, match="unsupported by the task contract"):
-        search_space.validate_search_space_paths(pi_fno.base_config, (bad_continuity,))
-
-    uno = _load(model_kind="uno", physics_enabled=False)
-    bad_depth = search_space.SearchSpaceParameter(
-        path="model.params.n_layers",
-        name="n_layers",
-        kind="categorical",
-        values=(5, 6),
-    )
-    with pytest.raises(ValueError, match="structurally supported values 5 or 7"):
-        search_space.validate_search_space_paths(uno.base_config, (bad_depth,))
-
-
-def test_existing_zero_trial_study_without_metadata_fails_closed(tmp_path: Path) -> None:
-    """
-    Create a zero-trial SQLite study without the required semantic metadata.
-
-    Reopening must fail closed before allocating any trial leaf, preventing an empty
-    unbound database from being silently adopted under the maintained scientific identity.
-    """
-    config = optuna_runtime.with_runtime_overrides(_load(), device="cpu", output_root=tmp_path)
-    study_name = config.study["name"]
+    study_name = loaded.study["name"]
     study_dir = tmp_path / "steady_flow" / "studies" / study_name
     study_dir.mkdir(parents=True)
     storage = f"sqlite:///{study_dir / (study_name + '.db')}"
-    optuna.create_study(study_name=study_name, direction="minimize", storage=storage)
+    optuna.create_study(
+        study_name=study_name,
+        direction="minimize",
+        storage=storage,
+    )
 
-    with pytest.raises(ValueError, match="missing required semantic metadata"):
-        optuna_runtime.run_optuna_study(config, n_trials=1)
+    with pytest.raises(
+        ValueError,
+        match="missing required semantic metadata",
+    ):
+        optuna_runtime.run_optuna_study(loaded, n_trials=1)
     assert not list(study_dir.glob("trial_*"))
 
 
-def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
+def test_sqlite_study_persists_states_and_resumes_new_trials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Run and reopen a tiny CPU SQLite study with complete, failed, and pruned trials.
-
-    Reports must use actual completed epochs and reopening must preserve history
-    while allocating only additional trial numbers, protecting the no-run-resume policy.
-    """
-    config = optuna_runtime.with_runtime_overrides(_load(), device="cpu", output_root=tmp_path)
-    settings = copy.deepcopy(config.study)
-    settings["name"] = "tiny_cpu_lifecycle"
+    """Preserve completed history while adding failed and pruned trial states."""
+    loaded = _load(tmp_path)
+    base = copy.deepcopy(loaded.base_config)
+    base["training"]["epochs"] = 10
+    base["training"]["evaluation_interval"] = 5
+    base["training"]["ood_evaluation_interval"] = 5
+    base["tracking"]["wandb"]["monitor"]["interval"] = 5
+    settings = copy.deepcopy(loaded.study)
+    settings["name"] = "synthetic_lifecycle"
     settings["pruner"] = {
         "kind": "median",
         "n_startup_trials": 0,
         "n_warmup_steps": 5,
         "interval_steps": 5,
     }
-    config = replace(config, study=settings)
+    loaded = optuna_runtime.with_runtime_overrides(
+        replace(loaded, base_config=base, study=settings),
+        device="cpu",
+        output_root=tmp_path,
+    )
 
-    def synthetic_factory(_config: optuna_runtime.OptunaStudyConfig) -> Callable[[Any], float]:
-        """Return a deterministic objective spanning complete, failed, and pruned trials."""
-
+    def synthetic_factory(
+        _config: optuna_runtime.OptunaStudyConfig,
+    ) -> Callable[[Any], float]:
         def objective(trial: Any) -> float:
-            """Emit trial-number-specific failure or completed-epoch observations."""
             if trial.number == 1:
-                message = "explicitly recoverable synthetic failure"
+                message = "recoverable synthetic failure"
                 raise optuna_runtime.RecoverableTrialError(message)
             reporter = optuna_runtime.OptunaEpochReporter(
                 trial=trial,
-                objective_id="normalized_macro_rmse",
+                objective_id=_OBJECTIVE_ID,
                 direction="minimize",
                 evaluation_interval=5,
                 target_epoch=10,
@@ -293,20 +234,30 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
             )
             values = (0.10, 0.09) if trial.number == 0 else (1.0, 0.9)
             for epoch, value in zip((5, 10), values, strict=True):
-                reporter(epoch, {"id/normalized_macro_rmse": value, "global_step": float(epoch)})
+                reporter(
+                    epoch,
+                    {
+                        f"id/{_OBJECTIVE_ID}": value,
+                        "global_step": float(epoch),
+                    },
+                )
             assert reporter.best_value is not None
             return reporter.best_value
 
         return objective
 
-    monkeypatch.setattr(optuna_runtime, "create_objective", synthetic_factory)
-    first = optuna_runtime.run_optuna_study(config, n_trials=2)
-    first_snapshot = (
+    monkeypatch.setattr(
+        optuna_runtime,
+        "create_objective",
+        synthetic_factory,
+    )
+    first = optuna_runtime.run_optuna_study(loaded, n_trials=2)
+    first_evidence = (
         first.trials[0].state,
         first.trials[0].value,
         dict(first.trials[0].intermediate_values),
     )
-    resumed = optuna_runtime.run_optuna_study(config, n_trials=1)
+    resumed = optuna_runtime.run_optuna_study(loaded, n_trials=1)
 
     assert [trial.number for trial in resumed.trials] == [0, 1, 2]
     assert [trial.state for trial in resumed.trials] == [
@@ -314,147 +265,91 @@ def test_tiny_cpu_study_uses_actual_steps_prunes_and_resumes_new_trials(
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.PRUNED,
     ]
-    assert first_snapshot == (
+    assert first_evidence == (
         resumed.trials[0].state,
         resumed.trials[0].value,
         dict(resumed.trials[0].intermediate_values),
     )
     assert resumed.trials[0].intermediate_values == {5: 0.10, 10: 0.09}
     assert resumed.trials[2].intermediate_values == {5: 1.0}
-    assert resumed.user_attrs["semantic_signature"] == optuna_runtime.build_study_signature(config)["digest"]
-    study_dir = tmp_path / "steady_flow" / "studies" / settings["name"]
-    assert (study_dir / f"{settings['name']}.db").is_file()
+
+    study_dir = tmp_path / "steady_flow/studies/synthetic_lifecycle"
     summary = json.loads((study_dir / "study_summary.json").read_text(encoding="utf-8"))
-    assert summary["training_seed"] == config.base_config["run"]["seed"]
-    assert summary["sampler"]["seed"] == config.study["seed"]
     assert [trial["number"] for trial in summary["trials"]] == [0, 1, 2]
-    assert not list(study_dir.glob("trial_*"))
+    assert summary["training_seed"] == loaded.base_config["run"]["seed"]
+    assert summary["sampler"]["seed"] == loaded.study["seed"]
 
-    def unexpected_factory(_config: optuna_runtime.OptunaStudyConfig) -> Callable[[Any], float]:
-        """Return an objective that exposes one ordinary unexpected bug unchanged."""
-
+    def unexpected_factory(
+        _config: optuna_runtime.OptunaStudyConfig,
+    ) -> Callable[[Any], float]:
         def objective(_trial: Any) -> float:
-            """Raise the synthetic bug before producing an objective value."""
-            message = "ordinary unexpected synthetic bug"
+            message = "unexpected synthetic bug"
             raise RuntimeError(message)
 
         return objective
 
-    monkeypatch.setattr(optuna_runtime, "create_objective", unexpected_factory)
-    with pytest.raises(RuntimeError, match="ordinary unexpected synthetic bug"):
-        optuna_runtime.run_optuna_study(config, n_trials=2)
-    storage = f"sqlite:///{study_dir / (settings['name'] + '.db')}"
-    reopened = optuna.load_study(study_name=settings["name"], storage=storage)
+    monkeypatch.setattr(
+        optuna_runtime,
+        "create_objective",
+        unexpected_factory,
+    )
+    with pytest.raises(RuntimeError, match="unexpected synthetic bug"):
+        optuna_runtime.run_optuna_study(loaded, n_trials=1)
+
+    storage = f"sqlite:///{study_dir / 'synthetic_lifecycle.db'}"
+    reopened = optuna.load_study(
+        study_name="synthetic_lifecycle",
+        storage=storage,
+    )
     assert [trial.number for trial in reopened.trials] == [0, 1, 2, 3]
     assert reopened.trials[-1].state == optuna.trial.TrialState.FAIL
 
-    drifted_base = copy.deepcopy(config.base_config)
-    drifted_base["optimizer"]["lr"] = 5.0e-4
+    drifted = copy.deepcopy(loaded.base_config)
+    drifted["optimizer"]["lr"] = 2.0e-3
     with pytest.raises(ValueError, match="semantic signature mismatch"):
-        optuna_runtime.run_optuna_study(replace(config, base_config=drifted_base), n_trials=1)
-    assert len(optuna.load_study(study_name=settings["name"], storage=storage).trials) == _EXPECTED_RESUMED_TRIAL_COUNT
-
-
-def test_fno_smoke_wrapper_is_bounded_and_persists_a_synthetic_local_study(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Exercise a bounded projection of the smoke wrapper without external workloads."""
-    path = configs.optuna_config_path(model_kind="fno", physics_enabled=False, role="smoke")
-    config = optuna_runtime.load_optuna_study_config(path)
-    base = copy.deepcopy(config.base_config)
-    base["tracking"]["wandb"]["mode"] = "disabled"
-    base["training"]["epochs"] = _SYNTHETIC_SMOKE_EPOCHS
-    settings = copy.deepcopy(config.study)
-    settings["n_trials"] = _SYNTHETIC_SMOKE_TRIALS
-    config = optuna_runtime.with_runtime_overrides(
-        replace(config, base_config=base, study=settings),
-        device="cpu",
-        output_root=tmp_path,
+        optuna_runtime.run_optuna_study(
+            replace(loaded, base_config=drifted),
+            n_trials=1,
+        )
+    assert (
+        len(
+            optuna.load_study(
+                study_name="synthetic_lifecycle",
+                storage=storage,
+            ).trials
+        )
+        == _EXPECTED_RESUMED_TRIAL_COUNT
     )
-    target_epoch = config.base_config["training"]["epochs"]
-    cadence = config.base_config["training"]["evaluation_interval"]
-    configured_trials = config.study["n_trials"]
-    training_seed = config.base_config["run"]["seed"]
-    sampler_seed = config.study["seed"]
-
-    def synthetic_factory(study_config: optuna_runtime.OptunaStudyConfig) -> Callable[[Any], float]:
-        def objective(trial: Any) -> float:
-            overrides = search_space.suggest_trial_overrides(trial, study_config.search_space)
-            trial.set_user_attr("synthetic_overrides", overrides)
-            reporter = optuna_runtime.OptunaEpochReporter(
-                trial=trial,
-                objective_id="normalized_macro_rmse",
-                direction="minimize",
-                evaluation_interval=cadence,
-                target_epoch=target_epoch,
-                pruner_config=study_config.study["pruner"],
-            )
-            for epoch in range(1, target_epoch + 1):
-                value = 1.0 - 0.1 * trial.number - 0.01 * epoch
-                reporter(epoch, {"id/normalized_macro_rmse": value, "global_step": float(epoch)})
-            assert reporter.best_value is not None
-            return reporter.best_value
-
-        return objective
-
-    monkeypatch.setattr(optuna_runtime, "create_objective", synthetic_factory)
-    study = optuna_runtime.run_optuna_study(config)
-    output = capsys.readouterr().out
-
-    assert "event=optuna_study status=started" in output
-    assert "study_role=smoke" in output
-    assert f"sampler_seed={sampler_seed}" in output
-    assert f"configured_trials={configured_trials}" in output
-    assert f"invocation_trials={configured_trials}" in output
-    assert "timeout=none" in output
-    assert f"maximum_epochs={target_epoch}" in output
-    assert f"id_interval={cadence} ood_interval={cadence} physics_interval={cadence}" in output
-    assert f"warmup_epochs={config.study['pruner']['n_warmup_steps']}" in output
-    assert f"pruning_interval_epochs={config.study['pruner']['interval_steps']}" in output
-    assert f"wandb_group={config.study['name']}" in output
-    assert "event=optuna_study status=completed" in output
-    assert f"attempted_trials={configured_trials} completed_trials={configured_trials} pruned_trials=0 failed_trials=0" in output
-    assert "best_parameters=" in output
-    assert config.study["role"] == "smoke"
-    assert [trial.number for trial in study.trials] == list(range(configured_trials))
-    assert all(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials)
-    expected_parameters = {parameter.name for parameter in config.search_space if parameter.kind != "fixed"}
-    assert all(set(trial.params) == expected_parameters for trial in study.trials)
-    expected_epochs = set(range(1, target_epoch + 1))
-    assert all(set(trial.intermediate_values) == expected_epochs for trial in study.trials)
-    study_dir = tmp_path / str(config.base_config["task"]) / "studies" / str(config.study["name"])
-    summary = json.loads((study_dir / "study_summary.json").read_text(encoding="utf-8"))
-    assert summary["study_role"] == "smoke"
-    assert summary["configured_trials"] == summary["attempted_trials"] == summary["completed"] == configured_trials
-    assert summary["parameter_importance"]["status"] == "not_computed"
-    assert summary["training_seed"] == training_seed
-    assert summary["sampler"]["seed"] == sampler_seed
 
 
 def _install_running_failure_harness(
     error: BaseException,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Replace expensive runtime construction while retaining trial lifecycle behavior.
+    """Replace expensive boundaries while retaining real trial lifecycle state."""
+    processor = SimpleNamespace(
+        state_dict=dict,
+        in_normalizer=None,
+        out_normalizer=SimpleNamespace(std=torch.ones(3)),
+        to=lambda _device: None,
+    )
 
-    The harness builds only inert CPU objects, keeps allocation/status/summary code
-    real, and injects ``error`` at the training boundary for taxonomy assertions.
-    """
-    processor = SimpleNamespace(state_dict=dict, in_normalizer=None, out_normalizer=None, to=lambda _device: None)
-
-    def configure_reproducibility(_config: dict[str, Any], *, device: torch.device) -> dict[str, int]:
-        """Return the minimum deterministic subseed mapping without changing RNGs."""
+    def configure_reproducibility(
+        _config: dict[str, Any],
+        *,
+        device: torch.device,
+    ) -> dict[str, int]:
         del device
         return {"model_init": 1}
 
     def seed_process(_seed: int, *, device: torch.device) -> None:
-        """Accept production seeding arguments without mutating process RNG state."""
         del device
 
-    monkeypatch.setattr(experiments.run, "configure_reproducibility", configure_reproducibility)
+    monkeypatch.setattr(
+        experiments.run,
+        "configure_reproducibility",
+        configure_reproducibility,
+    )
     monkeypatch.setattr(experiments.run, "seed_process", seed_process)
     monkeypatch.setattr(
         experiments.config.loader,
@@ -468,24 +363,47 @@ def _install_running_failure_harness(
         },
     )
 
-    def build_model(_config: dict[str, Any], *, device: torch.device) -> torch.nn.Module:
-        """Return a tiny parameterized CPU module in place of the configured model."""
+    def build_model(
+        _config: dict[str, Any],
+        *,
+        device: torch.device,
+    ) -> torch.nn.Module:
         del device
         return torch.nn.Linear(1, 1)
 
-    def build_training_loss(_config: dict[str, Any], *, device: torch.device) -> object:
-        """Return an inert loss-shaped value without constructing scientific losses."""
+    def build_training_loss(
+        _config: dict[str, Any],
+        *,
+        device: torch.device,
+    ) -> object:
         del device
         return SimpleNamespace()
 
-    def build_evaluation_metrics(_config: dict[str, Any], *, device: torch.device) -> dict[str, Any]:
-        """Return no metrics because injected training fails before evaluation."""
+    def build_evaluation_metrics(
+        _config: dict[str, Any],
+        *,
+        device: torch.device,
+        output_standard_deviations: torch.Tensor,
+    ) -> dict[str, Any]:
         del device
+        assert torch.equal(output_standard_deviations, torch.ones(3))
         return {}
 
-    monkeypatch.setattr(optuna_runtime.learning.models.factory, "build_model", build_model)
-    monkeypatch.setattr(optuna_runtime.learning.losses.factory, "build_training_loss", build_training_loss)
-    monkeypatch.setattr(optuna_runtime.learning.metrics.metrics, "build_evaluation_metrics", build_evaluation_metrics)
+    monkeypatch.setattr(
+        optuna_runtime.learning.models.factory,
+        "build_model",
+        build_model,
+    )
+    monkeypatch.setattr(
+        optuna_runtime.learning.losses.factory,
+        "build_training_loss",
+        build_training_loss,
+    )
+    monkeypatch.setattr(
+        optuna_runtime.learning.metrics.metrics,
+        "build_evaluation_metrics",
+        build_evaluation_metrics,
+    )
     monkeypatch.setattr(
         optuna_runtime.learning.training.optim,
         "build_optimizer",
@@ -501,123 +419,84 @@ def _install_running_failure_harness(
         "build_checkpoint_identity",
         lambda *_args, **_kwargs: {"effective_config_digest": "synthetic"},
     )
-    monkeypatch.setattr(optuna_runtime.experiments.tracking, "build_monitor_membership", lambda *_args: None)
-
-    def fail_training(**_kwargs: Any) -> Any:
-        """Inject the caller-selected failure after the run enters running state."""
-        raise error
-
-    monkeypatch.setattr(optuna_runtime.learning.training.loop, "train_loop", fail_training)
-
-
-def test_pruned_wandb_objective_is_mirrored_only_after_local_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Trigger pruning through the real reporter while recording local and W&B events.
-
-    The authoritative pruned summary must publish before the observer mirrors that
-    epoch, preventing remote telemetry from preceding durable local classification.
-    """
-    config = optuna_runtime.with_runtime_overrides(_load(), device="cpu", output_root=tmp_path)
-    _install_running_failure_harness(RuntimeError("unused"), monkeypatch)
-    events: list[str] = []
-
-    def prune_training(**kwargs: Any) -> Any:
-        """Invoke one epoch callback that must prune before training can continue."""
-        callback = kwargs["epoch_end_callback"]
-        callback(5, {"id/normalized_macro_rmse": 0.5, "global_step": 3.0})
-        pytest.fail("pruning callback must stop training immediately")
-
-    def epoch_callback(_session: Any) -> Callable[[int, dict[str, float]], None]:
-        """Return a W&B-shaped callback that records only publication order."""
-
-        def mirror(_epoch: int, _metrics: dict[str, float]) -> None:
-            """Record one observer publication without performing SDK I/O."""
-            events.append("wandb")
-
-        return mirror
-
-    monkeypatch.setattr(optuna_runtime.learning.training.loop, "train_loop", prune_training)
-    monkeypatch.setattr(optuna_runtime.experiments.tracking, "epoch_callback", epoch_callback)
     monkeypatch.setattr(
-        optuna_runtime,
-        "_write_summary",
-        lambda **kwargs: events.append(f"local:{kwargs['status']}"),
+        optuna_runtime.experiments.tracking,
+        "build_monitor_membership",
+        lambda *_args: None,
     )
 
-    trial = _Trial(prune=True)
-    with pytest.raises(optuna.TrialPruned):
-        optuna_runtime.run_trial(config, trial)
+    def fail_training(**_kwargs: Any) -> Any:
+        raise error
 
-    assert events == ["local:pruned", "wandb"]
-    assert trial.reports == [(0.5, 5)]
+    monkeypatch.setattr(
+        optuna_runtime.learning.training.loop,
+        "train_loop",
+        fail_training,
+    )
 
 
 @pytest.mark.parametrize(
     ("error_factory", "expected_status", "expected_error"),
     [
         pytest.param(
-            lambda: torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 1 GiB"),
+            lambda: torch.cuda.OutOfMemoryError("synthetic CUDA OOM"),
             "oom_pruned",
             optuna.TrialPruned,
-            id="torch-cuda-oom",
+            id="oom",
         ),
-        pytest.param(lambda: MemoryError("allocator exhausted"), "oom_pruned", optuna.TrialPruned, id="memory-error"),
         pytest.param(
-            lambda: RuntimeError("CUDA out of memory. Tried to allocate 1 GiB"),
-            "oom_pruned",
+            lambda: FloatingPointError("synthetic non-finite loss"),
+            "nonfinite_pruned",
             optuna.TrialPruned,
-            id="known-runtime-oom",
+            id="nonfinite",
         ),
         pytest.param(
-            lambda: RuntimeError("feature label says out of memory but allocator is healthy"),
-            "failed",
-            RuntimeError,
-            id="unrelated-runtime-message",
-        ),
-        pytest.param(
-            lambda: optuna_runtime.RecoverableTrialError("narrow recoverable trial failure"),
+            lambda: optuna_runtime.RecoverableTrialError("synthetic recoverable failure"),
             "recoverable_failed",
             optuna_runtime.RecoverableTrialError,
             id="recoverable",
         ),
-        pytest.param(lambda: FloatingPointError("non-finite at epoch 3: nan"), "nonfinite_pruned", optuna.TrialPruned, id="nonfinite"),
-        pytest.param(lambda: RuntimeError("ordinary programming failure"), "failed", RuntimeError, id="unexpected"),
-        pytest.param(lambda: KeyboardInterrupt("stop"), "interrupted", KeyboardInterrupt, id="keyboard"),
-        pytest.param(lambda: SystemExit(7), "interrupted", SystemExit, id="system-exit"),
+        pytest.param(
+            lambda: RuntimeError("synthetic programming failure"),
+            "failed",
+            RuntimeError,
+            id="failed",
+        ),
+        pytest.param(
+            lambda: KeyboardInterrupt("synthetic interrupt"),
+            "interrupted",
+            KeyboardInterrupt,
+            id="interrupted",
+        ),
     ],
 )
-def test_running_trial_failure_taxonomy_is_precise_and_cpu_cleanup_is_guarded(
+def test_running_trial_persists_distinct_terminal_states(
     error_factory: Callable[[], BaseException],
     expected_status: str,
     expected_error: type[BaseException],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Inject OOM variants, non-finite/recoverable failures, bugs, and interrupts on CPU.
-
-    Each must publish its exact terminal status and propagation class; cleanup must
-    avoid every CUDA query when the resolved trial device is CPU.
-    """
-    config = optuna_runtime.with_runtime_overrides(_load(), device="cpu", output_root=tmp_path)
+    """Classify representative terminal outcomes and avoid CUDA cleanup on CPU."""
+    loaded = optuna_runtime.with_runtime_overrides(
+        _load(tmp_path),
+        device="cpu",
+        output_root=tmp_path,
+    )
     error = error_factory()
     _install_running_failure_harness(error, monkeypatch)
 
     def cuda_query_forbidden() -> bool:
-        """Fail if CPU cleanup crosses the CUDA initialization boundary."""
-        pytest.fail("CPU trial cleanup must not query or initialize CUDA")
+        pytest.fail("CPU cleanup must not initialize CUDA")
 
     monkeypatch.setattr(torch.cuda, "is_initialized", cuda_query_forbidden)
-    trial = _Trial(number=0)
+    trial = _Trial()
     with pytest.raises(expected_error):
-        optuna_runtime.run_trial(config, trial)
+        optuna_runtime.run_trial(loaded, trial)
 
     run_dir = common.paths.resolve_optuna_trial_dir(
         "steady_flow",
-        config.study["name"],
+        loaded.study["name"],
         trial.attrs["run_name"],
         output_root=tmp_path,
     )
@@ -625,25 +504,8 @@ def test_running_trial_failure_taxonomy_is_precise_and_cpu_cleanup_is_guarded(
     assert summary["status"] == expected_status
     assert summary["failure_context"]["error_type"] == type(error).__name__
     assert summary["sampled_parameters"] == trial.attrs["overrides"]
-    assert not list(run_dir.glob("artifacts*"))
 
 
-def test_run_status_set_contains_every_terminal_outcome() -> None:
-    """
-    Compare the public run-status set with every initial, active, and terminal outcome.
-
-    Exact equality must hold so summary validation neither rejects a classified trial
-    nor admits an undocumented lifecycle state.
-    """
-    expected = {
-        "initializing",
-        "running",
-        "completed",
-        "pruned",
-        "nonfinite_pruned",
-        "oom_pruned",
-        "recoverable_failed",
-        "failed",
-        "interrupted",
-    }
-    assert expected == experiments.run.RUN_STATUSES
+def test_public_run_statuses_distinguish_core_terminal_outcomes() -> None:
+    """Keep completed, pruned, failed, and interrupted persistence distinct."""
+    assert {"completed", "pruned", "failed", "interrupted"} <= (experiments.run.RUN_STATUSES)

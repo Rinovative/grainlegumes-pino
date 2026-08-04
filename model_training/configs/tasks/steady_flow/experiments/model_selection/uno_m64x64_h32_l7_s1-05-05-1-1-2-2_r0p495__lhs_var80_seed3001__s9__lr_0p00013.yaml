@@ -1,13 +1,10 @@
-# Recreated from named run: M-FNO_m48x48_h64_l4_20260110_085608
-# Source config: model_training/data/processed/safe/M-FNO_m48x48_h64_l4_20260110_085608/config.json
-
 task: steady_flow
 
 run:
   seed: 9
-  deterministic: true
+  deterministic: false
   device: auto
-  suffix: lr_0p01
+  suffix: lr_0p00013
 
 data:
   train_dataset: lhs_var80_seed3001
@@ -16,16 +13,22 @@ data:
   batch_size: 32
 
 model:
-  kind: fno
+  kind: uno
   params:
-    n_modes: [48, 48]
-    hidden_channels: 64
-    n_layers: 4
-    lifting_channel_ratio: 2
-    projection_channel_ratio: 2
-    fno_skip: linear
-    channel_mlp_skip: soft-gating
-    implementation: factorized
+    modes_x: 64
+    modes_y: 64
+    hidden_channels: 32
+    n_layers: 7
+    mode_ratio: 0.4951318201313778
+    uno_scalings:
+      - [1.0, 1.0]
+      - [0.5, 0.5]
+      - [0.5, 0.5]
+      - [1.0, 1.0]
+      - [1.0, 1.0]
+      - [2.0, 2.0]
+      - [2.0, 2.0]
+    channel_mlp_skip: linear
 
 loss:
   data:
@@ -37,11 +40,11 @@ loss:
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw
-  lr: 1.0e-2
+  lr: 1.3299285908562213e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

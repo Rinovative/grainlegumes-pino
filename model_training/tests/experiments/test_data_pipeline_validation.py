@@ -34,7 +34,7 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
         inputs: Tensor,
         outputs: Tensor,
         task_id: str,
-        task_digest: str,
+        data_digest: str,
         path: Path,
     ) -> None:
         """Store tensors, ordered field names, metadata, and exact identity."""
@@ -50,7 +50,7 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
         self.identity = datasets.identity.DatasetIdentity(
             dataset_id=dataset_id,
             task=task_id,
-            task_contract_digest=task_digest,
+            data_contract_digest=data_digest,
             fingerprint=("a" if dataset_id == "id_data" else "b") * 64,
             sample_ids=sample_ids,
             sample_count=len(sample_ids),
@@ -73,8 +73,9 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
 def _task() -> SimpleNamespace:
     """Return the TaskSpec attributes consumed by complete validation."""
     return SimpleNamespace(
-        id="steady_flow",
+        id="test_flow",
         contract_digest="d" * 64,
+        data_contract_digest="d" * 64,
         tensor_layout=("batch", "channel", "y", "x"),
         normalization_axes=(0, 2, 3),
         preprocessing=SimpleNamespace(fit_split="train"),
@@ -169,7 +170,7 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
         inputs=id_inputs,
         outputs=id_outputs,
         task_id=task.id,
-        task_digest=task.contract_digest,
+        data_digest=task.data_contract_digest,
         path=tmp_path / "id_data.pt",
     )
     ood_source = _SyntheticDataset(
@@ -177,7 +178,7 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
         inputs=ood_inputs,
         outputs=ood_outputs,
         task_id=task.id,
-        task_digest=task.contract_digest,
+        data_digest=task.data_contract_digest,
         path=tmp_path / "ood_data.pt",
     )
     config = {

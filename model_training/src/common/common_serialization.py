@@ -52,8 +52,8 @@ def _fsync_parent(path: Path) -> None:
     Best-effort flush a parent directory after atomic replacement.
 
     Some supported filesystems cannot open or synchronize directory
-    descriptors. Those platform limitations are ignored after ``os.replace``;
-    content atomicity still holds, but crash durability of the directory entry
+    descriptors. Those platform limitations are ignored after ``os.replace``.
+    Content atomicity still holds, but crash durability of the directory entry
     is then filesystem-dependent.
     """
     flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
@@ -96,7 +96,7 @@ def atomic_path_write(destination: Path | str, writer: PathWriter) -> Path:
 
     Notes
     -----
-    An existing destination is replaced; this helper owns no overwrite guard.
+    An existing destination is replaced. This helper owns no overwrite guard.
     Replacement is atomic when the destination filesystem honors ``os.replace``.
     The temporary file is always allocated in the same parent, flushed before
     publication, and removed on handled failure. Parent-directory flushing is
@@ -223,7 +223,7 @@ def atomic_write_json(
     Notes
     -----
     Keys are sorted, non-ASCII is escaped, and one final newline is appended.
-    An existing destination is replaced atomically; serialization and filesystem
+    An existing destination is replaced atomically. Serialization and filesystem
     failures propagate without damaging the previous published file.
 
     """
@@ -255,7 +255,7 @@ def atomic_torch_save(payload: Any, destination: Path | str) -> Path:
     Notes
     -----
     An existing destination is replaced through ``atomic_path_write``. PyTorch
-    serialization, flush, and filesystem failures propagate after cleanup; this
+    serialization, flush, and filesystem failures propagate after cleanup. This
     helper does not define or validate checkpoint/artifact schema.
 
     """
@@ -293,7 +293,7 @@ def canonical_json_sha256(payload: Any) -> str:
     -----
     Keys are sorted with compact separators and non-ASCII escaping. This helper
     follows Python JSON encoding semantics, including its default handling of
-    non-finite floating values; callers needing a stricter persistence schema
+    non-finite floating values. Callers needing a stricter persistence schema
     must validate it before hashing.
 
     """

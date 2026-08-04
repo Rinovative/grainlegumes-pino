@@ -15,8 +15,8 @@ Design principles:
   - Parsing records requested policy without resolving hardware
 
 This module does NOT:
-  - Validate or resolve runtime hardware; ``learning.device`` owns that boundary
-  - Apply service-specific overrides; each command entry point owns forwarding
+  - Validate or resolve runtime hardware. ``learning.device`` owns that boundary
+  - Apply service-specific overrides. Each command entry point owns forwarding
 ===============================================================================
 """
 
@@ -44,7 +44,7 @@ def add_device_argument(
     parser : argparse.ArgumentParser
         Command parser receiving the ``--device`` option.
     default : str | None
-        Default policy. ``None`` preserves the service config value; artifact
+        Default policy. ``None`` preserves the service config value. Artifact
         generation supplies ``auto`` because it has no experiment YAML input.
     help_prefix : str, optional
         Service-specific prefix prepended to the shared policy semantics.
@@ -54,5 +54,5 @@ def add_device_argument(
         "--device",
         choices=DEVICE_POLICIES,
         default=default,
-        help=(f"{help_prefix}: auto chooses CUDA when usable, otherwise CPU; cuda is strict and never falls back; cpu avoids CUDA use"),
+        help=(f"{help_prefix}: auto chooses CUDA when usable, otherwise CPU. cuda is strict and never falls back. cpu avoids CUDA use"),
     )

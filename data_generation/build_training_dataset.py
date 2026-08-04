@@ -114,7 +114,7 @@ def _stage_metadata_package(
         "dataset_schema_version": datasets.identity.TRAINING_DATASET_SCHEMA_VERSION,
         "dataset_fingerprint": dataset_identity.fingerprint,
         "task_id": task.id,
-        "task_contract_digest": task.contract_digest,
+        "data_contract_digest": dataset_identity.data_contract_digest,
         "source_batch_id": dataset_identity.dataset_id,
         "generated_batch_identity_sha256": manifest_identity_sha256,
         "sample_count": dataset_identity.sample_count,
@@ -425,7 +425,7 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
                 "metadata_path": metadata_destination,
                 "case_count": recovered_identity.sample_count,
                 "task": task.id,
-                "task_contract_digest": task.contract_digest,
+                "data_contract_digest": recovered_identity.data_contract_digest,
                 "timing_coverage": recovered_metadata.timing_summary,
                 "dataset_fingerprint": recovered_identity.fingerprint,
                 "status": "complete",
@@ -654,7 +654,7 @@ def build_batch_dataset(  # noqa: C901, PLR0912, PLR0915
         "metadata_path": metadata_destination,
         "case_count": len(case_ids),
         "task": task.id,
-        "task_contract_digest": task.contract_digest,
+        "data_contract_digest": task.data_contract_digest,
         "timing_coverage": timing_summary,
         "dataset_fingerprint": fingerprint,
         "status": "complete",
@@ -694,7 +694,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Destination dataset: {result['dataset_path']}")
     print(f"Metadata destination: {result['metadata_path']}")
     print(f"Case count: {result['case_count']}")
-    print(f"Task identity: {result['task']} ({result['task_contract_digest']})")
+    print(f"Task: {result['task']}")
+    print(f"Data contract digest: {result['data_contract_digest']}")
     coverage = result["timing_coverage"]
     print(f"COMSOL timing coverage: {coverage['measured_case_count']}/{coverage['intended_case_count']} ({coverage['status']})")
     print(f"Dataset fingerprint: {result['dataset_fingerprint']}")

@@ -45,6 +45,7 @@ RUNTIME_COMPARISON_SCHEMA_KIND = "comsol_neural_operator_runtime_comparison"
 SCHEMA_VERSION = 1
 WARMUP_PASSES = 1
 MEASUREMENT_CLOCK = "time.perf_counter_ns"
+CASE_DURATION_ATTRIBUTION = "equal_share_of_observed_batch_forward_duration"
 _SHA256_HEX_LENGTH = 64
 _SUMMARY_FIELDS = {"count", "mean", "median", "p10", "p90"}
 
@@ -105,7 +106,7 @@ def _validate_summary(value: Any, *, expected: Mapping[str, Any], label: str) ->
 
 
 def synchronize_device(device: torch.device) -> None:
-    """Synchronize one resolved CUDA device; CPU never accesses CUDA APIs."""
+    """Synchronize one resolved CUDA device. CPU never accesses CUDA APIs."""
     if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
         msg = f"Timing requires one concrete CPU or CUDA torch.device, got {device!r}."
         raise TypeError(msg)
@@ -119,9 +120,9 @@ def measure_forward(
     normalized_inputs: torch.Tensor,
     device: torch.device,
 ) -> tuple[Any, float]:
-    """Measure one direct batch-size-one model call on the resolved device."""
-    if not isinstance(normalized_inputs, torch.Tensor) or normalized_inputs.ndim == 0 or normalized_inputs.shape[0] != 1:
-        msg = "Authoritative neural-operator latency requires a size-one input batch."
+    """Measure one direct non-empty loader-batch model call on the device."""
+    if not isinstance(normalized_inputs, torch.Tensor) or normalized_inputs.ndim == 0 or normalized_inputs.shape[0] <= 0:
+        msg = "Authoritative neural-operator timing requires a non-empty input batch."
         raise ValueError(msg)
     model.eval()
     with torch.inference_mode():
@@ -130,7 +131,7 @@ def measure_forward(
         prediction = model(normalized_inputs)
         synchronize_device(device)
         elapsed_s = (time.perf_counter_ns() - started_ns) / 1_000_000_000.0
-    return prediction, _duration(elapsed_s, label="neural-operator forward duration")
+    return prediction, _duration(elapsed_s, label="neural-operator batch forward duration")
 
 
 def warm_up_forward(
@@ -141,17 +142,27 @@ def warm_up_forward(
     device: torch.device,
     passes: int = WARMUP_PASSES,
 ) -> None:
-    """Warm up a size-one forward path without publishing its duration."""
+    """Warm up the complete online-equivalent batch path without publishing it."""
     if isinstance(passes, bool) or not isinstance(passes, int) or passes <= 0:
         msg = "Warmup passes must be a positive integer."
         raise ValueError(msg)
-    raw_inputs = representative_batch.get("x")
-    if not isinstance(raw_inputs, torch.Tensor) or raw_inputs.ndim == 0 or raw_inputs.shape[0] < 1:
-        msg = "Forward warmup requires a non-empty tensor batch under key 'x'."
+    processor_eval = getattr(processor, "eval", None)
+    preprocess = getattr(processor, "preprocess", None)
+    if not callable(processor_eval) or not callable(preprocess):
+        msg = "Forward warmup requires an evaluation-capable data processor."
         raise TypeError(msg)
     model.eval()
     with torch.inference_mode():
-        normalized_inputs = processor.in_normalizer.transform(raw_inputs[:1].to(device))
+        processor_eval()
+        processed = preprocess(dict(representative_batch))
+        if not isinstance(processed, Mapping):
+            msg = "Forward warmup processor output must be a mapping."
+            raise TypeError(msg)
+        normalized_inputs = processed.get("x")
+        if not isinstance(normalized_inputs, torch.Tensor) or normalized_inputs.ndim == 0 or normalized_inputs.shape[0] <= 0:
+            msg = "Forward warmup requires a non-empty preprocessed tensor batch under key 'x'."
+            raise TypeError(msg)
+        normalized_inputs = normalized_inputs.to(device)
         for _ in range(passes):
             synchronize_device(device)
             model(normalized_inputs)
@@ -341,15 +352,19 @@ def build_runtime_comparison(
     dataset_identity: Mapping[str, Any],
     model_identity: Mapping[str, Any],
     neural_runtime: Mapping[str, Any],
+    batch_size: int,
     cases: Sequence[Mapping[str, Any]],
     comsol_timing: Mapping[str, Any] | None,
     batch_manifest_sha256: str | None,
     unavailable_reason: str | None,
     warmup_passes: int = WARMUP_PASSES,
 ) -> dict[str, Any]:
-    """Build one direct, case-matched solver-to-forward comparison."""
+    """Build one case-matched comparison from amortized loader-batch forwards."""
     if split_role not in {"eval", "ood"}:
         msg = "Runtime comparison split_role must be eval or ood."
+        raise ValueError(msg)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        msg = "Runtime comparison batch_size must be positive."
         raise ValueError(msg)
     if isinstance(warmup_passes, bool) or not isinstance(warmup_passes, int) or warmup_passes <= 0:
         msg = "Runtime comparison warmup_passes must be positive."
@@ -431,7 +446,8 @@ def build_runtime_comparison(
         "neural_runtime": dict(neural_runtime),
         "measurement": {
             "clock": MEASUREMENT_CLOCK,
-            "batch_size": 1,
+            "batch_size": batch_size,
+            "case_duration_attribution": CASE_DURATION_ATTRIBUTION,
             "warmup_passes": warmup_passes,
             "cuda_synchronized": neural_runtime.get("device_type") == "cuda",
         },
@@ -447,7 +463,7 @@ def build_runtime_comparison(
 
 
 def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
-    """Validate identities, direct measurements, matches, and aggregates."""
+    """Validate identities, amortized measurements, matches, and aggregates."""
     if not isinstance(value, Mapping):
         msg = "Runtime comparison must be a mapping."
         raise TypeError(msg)
@@ -479,7 +495,7 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
         fields={
             "name",
             "fingerprint",
-            "task_contract_digest",
+            "data_contract_digest",
             "saved_membership_digest",
             "effective_ordered_source_indices_sha256",
         },
@@ -492,11 +508,25 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     )
     runtime = _validate_neural_runtime(payload.get("neural_runtime"))
     measurement = payload.get("measurement")
-    if not isinstance(measurement, Mapping) or set(measurement) != {"clock", "batch_size", "warmup_passes", "cuda_synchronized"}:
+    measurement_fields = {
+        "clock",
+        "batch_size",
+        "case_duration_attribution",
+        "warmup_passes",
+        "cuda_synchronized",
+    }
+    if not isinstance(measurement, Mapping) or set(measurement) != measurement_fields:
         msg = "Runtime comparison measurement has invalid fields."
         raise ValueError(msg)
-    if measurement.get("clock") != MEASUREMENT_CLOCK or measurement.get("batch_size") != 1:
-        msg = "Runtime comparison must use perf_counter_ns and direct batch size one."
+    measured_batch_size = measurement.get("batch_size")
+    if (
+        measurement.get("clock") != MEASUREMENT_CLOCK
+        or isinstance(measured_batch_size, bool)
+        or not isinstance(measured_batch_size, int)
+        or measured_batch_size <= 0
+        or measurement.get("case_duration_attribution") != CASE_DURATION_ATTRIBUTION
+    ):
+        msg = "Runtime comparison must describe amortized perf_counter_ns loader-batch timing."
         raise ValueError(msg)
     passes = measurement.get("warmup_passes")
     if isinstance(passes, bool) or not isinstance(passes, int) or passes <= 0:

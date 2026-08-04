@@ -51,7 +51,7 @@ class _StatCache(TypedDict):
     """
     Track incrementally loaded generator-statistic scalars for one dataset.
 
-    ``loaded`` is the consumed ordered prefix length; ``cols`` retains flattened
+    ``loaded`` is the consumed ordered prefix length. ``cols`` retains flattened
     numeric leaf histories keyed by metadata path.
     """
 
@@ -451,7 +451,7 @@ def plot_meta_statistics(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
     Notes
     -----
     Nested mapping/sequence paths are flattened and non-numeric leaves omitted.
-    Caches grow monotonically; reducing the case control after loading a larger
+    Caches grow monotonically. Reducing the case control after loading a larger
     prefix does not discard already accumulated observations.
 
     """
@@ -511,7 +511,7 @@ def plot_meta_statistics(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
             data_by_dataset=data,
             active_datasets=active,
             columns=keys,
-            title=f"Meta statistics distributions (first {max_cases} cases)",
+            title=f"Meta statistics distributions — {max_cases} cases",
         )
 
     ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
@@ -613,7 +613,7 @@ def plot_meta_parameters(*, datasets: dict[str, pd.DataFrame]) -> widgets.VBox:
             data_by_dataset=data,
             active_datasets=active,
             columns=keys,
-            title=f"Meta parameter distributions (first {max_cases} cases)",
+            title=f"Meta parameter distributions — {max_cases} cases",
         )
 
     ds = analysis.ui.components.ui_checkbox_datasets(dataset_names=names)
@@ -655,7 +655,7 @@ def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widg
 
     Notes
     -----
-    Values are clipped to the 1st--99th percentile for display only; source
+    Values are clipped to the 1st--99th percentile for display only. Source
     frames are not mutated. Previously cached observations remain when a user
     lowers the case-count control.
 
@@ -800,7 +800,7 @@ def plot_field_value_distributions(*, datasets: dict[str, pd.DataFrame]) -> widg
                 ax.grid(True, linestyle="--", alpha=0.25)
 
         ax_leg.legend(legend_handles, active, title="Dataset", loc="upper left")
-        fig.suptitle(f"Field value distributions per channel (first {max_cases} cases)")
+        fig.suptitle(f"Field value distributions per channel — {max_cases} cases")
         fig.subplots_adjust(top=0.96, bottom=0.06, left=0.06, right=0.97)
 
         return fig

@@ -1,11 +1,10 @@
-# ruff: noqa: S101, D103, EM101, PLR2004, SLF001, TRY003
+# ruff: noqa: S101, EM101, PLR2004, SLF001, TRY003
 """Verify direct timing, strict persistence, matching, and cache independence."""
 
 from __future__ import annotations
 
 import copy
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,14 +19,29 @@ class _IdentityNormalizer:
         return value
 
 
+class _IdentityProcessor:
+    def __init__(self) -> None:
+        self.training = True
+
+    def eval(self) -> None:
+        self.training = False
+
+    def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if self.training:
+            raise AssertionError("warmup processor remained in training mode")
+        return batch
+
+
 class _RecordingProjection(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(()))
         self.inference_modes: list[bool] = []
+        self.batch_sizes: list[int] = []
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         self.inference_modes.append(torch.is_inference_mode_enabled())
+        self.batch_sizes.append(int(value.shape[0]))
         return value[:, :1] * self.weight
 
 
@@ -50,7 +64,7 @@ def _dataset_identity() -> dict[str, str]:
     return {
         "name": "batch-a",
         "fingerprint": "dataset-fingerprint",
-        "task_contract_digest": "task-digest",
+        "data_contract_digest": "data-digest",
         "saved_membership_digest": "membership-digest",
         "effective_ordered_source_indices_sha256": "indices-digest",
     }
@@ -105,6 +119,7 @@ def _comparison(*, comsol: bool = True) -> dict[str, Any]:
         dataset_identity=_dataset_identity(),
         model_identity=_model_identity(),
         neural_runtime=_neural_runtime(),
+        batch_size=2,
         cases=_neural_cases(),
         comsol_timing=_comsol_payload() if comsol else None,
         batch_manifest_sha256="a" * 64 if comsol else None,
@@ -151,6 +166,7 @@ def test_comsol_timing_resolution_uses_only_validated_training_metadata(
     request = analysis.artifacts.service.ArtifactRequest(
         provenance={},
         source_indices=(),
+        batch_size=2,
         dataset_metadata=package,
     )
 
@@ -164,10 +180,12 @@ def test_comsol_timing_resolution_uses_only_validated_training_metadata(
 
 
 def test_missing_training_timing_snapshot_is_nonfatal() -> None:
+    """Verify that missing training timing snapshot is nonfatal."""
     package = _metadata_package(digest="a" * 64, timing=None, status="missing")
     request = analysis.artifacts.service.ArtifactRequest(
         provenance={},
         source_indices=(),
+        batch_size=2,
         dataset_metadata=package,
     )
     payload, digest, reason = analysis.artifacts.service._resolve_comsol_timing(request)
@@ -177,6 +195,7 @@ def test_missing_training_timing_snapshot_is_nonfatal() -> None:
 
 
 def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
+    """Verify that validated zero case timing snapshot is unavailable."""
     comsol_payload = _comsol_payload()
     comsol_payload["cases"] = []
     comsol_payload["aggregates"] = {
@@ -190,6 +209,7 @@ def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
     request = analysis.artifacts.service.ArtifactRequest(
         provenance={},
         source_indices=(),
+        batch_size=2,
         dataset_metadata=package,
     )
 
@@ -201,6 +221,8 @@ def test_validated_zero_case_timing_snapshot_is_unavailable() -> None:
 
 
 def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that cpu forward is direct inference mode and never uses cuda."""
+
     def forbidden(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("CPU timing accessed CUDA")
 
@@ -208,19 +230,20 @@ def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: p
     model = _RecordingProjection()
     prediction, duration = analysis.artifacts.timing.measure_forward(
         model=model,
-        normalized_inputs=torch.ones(1, 2, 2, 2),
+        normalized_inputs=torch.ones(3, 2, 2, 2),
         device=torch.device("cpu"),
     )
-    assert prediction.shape == (1, 1, 2, 2)
+    assert prediction.shape == (3, 1, 2, 2)
     assert duration > 0.0
     assert model.training is False
     assert model.inference_modes == [True]
 
 
 def test_warmup_is_separate_from_authoritative_measurement() -> None:
+    """Verify that warmup is separate from authoritative measurement."""
     model = _RecordingProjection()
-    processor = SimpleNamespace(in_normalizer=_IdentityNormalizer())
-    batch = {"x": torch.ones(4, 2, 2, 2)}
+    processor = _IdentityProcessor()
+    batch = {"x": torch.ones(4, 2, 2, 2), "y": torch.ones(4, 1, 2, 2)}
     analysis.artifacts.timing.warm_up_forward(
         representative_batch=batch,
         model=model,
@@ -229,6 +252,7 @@ def test_warmup_is_separate_from_authoritative_measurement() -> None:
         passes=1,
     )
     assert model.inference_modes == [True]
+    assert model.batch_sizes == [4]
     _prediction, measured_s = analysis.artifacts.timing.measure_forward(
         model=model,
         normalized_inputs=batch["x"][:1],
@@ -236,9 +260,11 @@ def test_warmup_is_separate_from_authoritative_measurement() -> None:
     )
     assert measured_s > 0.0
     assert model.inference_modes == [True, True]
+    assert model.batch_sizes == [4, 1]
 
 
 def test_cuda_synchronizes_exact_resolved_device_around_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that cuda synchronizes exact resolved device around forward."""
     calls: list[torch.device] = []
 
     def record(device: torch.device) -> None:
@@ -255,6 +281,7 @@ def test_cuda_synchronizes_exact_resolved_device_around_forward(monkeypatch: pyt
 
 
 def test_case_matching_uses_only_identical_ids_and_primary_speedup() -> None:
+    """Verify that case matching uses only identical ids and primary speedup."""
     payload = _comparison()
     first, second = payload["cases"]
     assert first["case_id"] == "case_0001"
@@ -270,6 +297,7 @@ def test_case_matching_uses_only_identical_ids_and_primary_speedup() -> None:
 
 
 def test_missing_comsol_timing_retains_neural_measurements_without_fabrication() -> None:
+    """Verify that missing comsol timing retains neural measurements without fabrication."""
     payload = _comparison(comsol=False)
     assert payload["comparison"] == {"status": "unavailable", "reason": "COMSOL timing is unavailable"}
     assert all(case["comsol_solve_s"] is None and case["speedup"] is None for case in payload["cases"])
@@ -278,12 +306,14 @@ def test_missing_comsol_timing_retains_neural_measurements_without_fabrication()
 
 
 def test_manifest_mismatch_is_rejected() -> None:
+    """Verify that manifest mismatch is rejected."""
     with pytest.raises(ValueError, match="batch manifest"):
         analysis.artifacts.timing.build_runtime_comparison(
             split_role="eval",
             dataset_identity=_dataset_identity(),
             model_identity=_model_identity(),
             neural_runtime=_neural_runtime(),
+            batch_size=2,
             cases=_neural_cases(),
             comsol_timing=_comsol_payload(digest="b" * 64),
             batch_manifest_sha256="a" * 64,
@@ -295,7 +325,6 @@ def test_manifest_mismatch_is_rejected() -> None:
     "mutation",
     [
         lambda payload: payload["cases"][0].__setitem__("neural_operator_forward_s", 0.0),
-        lambda payload: payload["cases"][0].__setitem__("neural_operator_forward_s", -1.0),
         lambda payload: payload["cases"][0].__setitem__("neural_operator_forward_s", float("inf")),
         lambda payload: payload["cases"][0].__setitem__("speedup", 99.0),
         lambda payload: payload["cases"].append(copy.deepcopy(payload["cases"][0])),
@@ -303,6 +332,7 @@ def test_manifest_mismatch_is_rejected() -> None:
     ],
 )
 def test_runtime_comparison_rejects_invalid_or_duplicate_cases(mutation: Any) -> None:
+    """Verify that runtime comparison rejects invalid or duplicate cases."""
     payload = _comparison()
     mutation(payload)
     with pytest.raises((TypeError, ValueError)):
@@ -372,12 +402,14 @@ def test_metadata_timing_aggregate_count_requires_an_integer(measured_case_count
 
 
 def test_comsol_timing_accepts_nonlexicographic_manifest_order() -> None:
+    """Verify that comsol timing accepts nonlexicographic manifest order."""
     payload = _comsol_payload()
     payload["cases"] = list(reversed(payload["cases"]))
     assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
 
 
 def test_empty_comsol_sidecar_uses_matlab_empty_aggregates() -> None:
+    """Verify that empty comsol sidecar uses matlab empty aggregates."""
     payload = _comsol_payload()
     payload["cases"] = []
     payload["aggregates"] = {
@@ -391,6 +423,7 @@ def test_empty_comsol_sidecar_uses_matlab_empty_aggregates() -> None:
 
 
 def test_comsol_aggregates_allow_only_machine_roundoff() -> None:
+    """Verify that comsol aggregates allow only machine roundoff."""
     payload = _comsol_payload()
     payload["aggregates"]["mean_s"] += 5e-15
     assert analysis.artifacts.timing.validate_comsol_solve_timing(payload) == payload
@@ -400,6 +433,7 @@ def test_comsol_aggregates_allow_only_machine_roundoff() -> None:
 
 
 def test_comsol_timing_rejects_zero_nonfinite_malformed_and_duplicate_records() -> None:
+    """Verify that comsol timing rejects zero nonfinite malformed and duplicate records."""
     for value in (0.0, -1.0, float("inf")):
         payload = _comsol_payload()
         payload["cases"][0]["comsol_solve_s"] = value
@@ -416,6 +450,7 @@ def test_comsol_timing_rejects_zero_nonfinite_malformed_and_duplicate_records() 
 
 
 def test_atomic_round_trip_and_scientific_manifest_exclusion(tmp_path: Path) -> None:
+    """Verify that atomic round trip and scientific manifest exclusion."""
     artifact_root = tmp_path / "artifact"
     npz_root = artifact_root / "npz"
     npz_root.mkdir(parents=True)

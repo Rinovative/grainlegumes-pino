@@ -40,7 +40,12 @@ import numpy as np
 import pandas as pd
 
 from src import common, domain
-from src.datasets.dataset_identity import TRAINING_DATASET_SCHEMA_VERSION, DatasetIdentity, build_generated_batch_identity
+from src.datasets.dataset_identity import (
+    TRAINING_DATASET_SCHEMA_VERSION,
+    DatasetIdentity,
+    build_generated_batch_identity,
+    validate_dataset_data_contract_digest,
+)
 
 METADATA_FILENAME = "dataset_metadata.json"
 SOURCE_MANIFEST_FILENAME = "source_manifest.json"
@@ -164,7 +169,7 @@ class DatasetMetadataSummary:
     metadata_directory: Path
     dataset_exists: bool
     task_id: str
-    task_contract_digest: str
+    data_contract_digest: str
     fingerprint: str
     sample_ids: tuple[str, ...]
     sample_count: int
@@ -189,7 +194,7 @@ def _require_exact_keys(value: dict[str, Any], expected: set[str] | frozenset[st
     missing = sorted(set(expected).difference(value))
     unexpected = sorted(set(value).difference(expected))
     if missing or unexpected:
-        msg = f"{label} keys do not match: missing={missing}; unexpected={unexpected}."
+        msg = f"{label} keys do not match: missing={missing}, unexpected={unexpected}."
         raise ValueError(msg)
 
 
@@ -902,7 +907,7 @@ def validate_dataset_metadata_directory(
     unexpected = sorted(names.difference(_ALLOWED_PACKAGE_FILES))
     missing = sorted((_REQUIRED_SNAPSHOT_FILES | {METADATA_FILENAME}).difference(names))
     if missing or unexpected:
-        msg = f"Dataset metadata package is incomplete or inconsistent: missing={missing}; unexpected={unexpected}."
+        msg = f"Dataset metadata package is incomplete or inconsistent: missing={missing}, unexpected={unexpected}."
         raise ValueError(msg)
 
     metadata = _load_json(root / METADATA_FILENAME, label="dataset metadata")
@@ -933,7 +938,7 @@ def validate_dataset_metadata_directory(
             "dataset_schema_version",
             "dataset_fingerprint",
             "task_id",
-            "task_contract_digest",
+            "data_contract_digest",
             "source_batch_id",
             "generated_batch_identity_sha256",
             "sample_count",
@@ -950,7 +955,7 @@ def validate_dataset_metadata_directory(
     sample_count = _require_positive_int(scientific["sample_count"], label="Dataset metadata sample_count")
     spatial_shape = _require_spatial_shape(scientific["spatial_shape"], label="Dataset metadata spatial_shape")
     _require_sha256(scientific["dataset_fingerprint"], label="Dataset metadata dataset_fingerprint")
-    _require_sha256(scientific["task_contract_digest"], label="Dataset metadata task_contract_digest")
+    _require_sha256(scientific["data_contract_digest"], label="Dataset metadata data_contract_digest")
     _validate_generated_batch_digest(
         scientific["generated_batch_identity_sha256"],
         dataset_identity=dataset_identity,
@@ -958,7 +963,7 @@ def validate_dataset_metadata_directory(
     if (
         scientific["dataset_fingerprint"] != dataset_identity.fingerprint
         or scientific["task_id"] != dataset_identity.task
-        or scientific["task_contract_digest"] != dataset_identity.task_contract_digest
+        or scientific["data_contract_digest"] != dataset_identity.data_contract_digest
         or scientific["source_batch_id"] != dataset_identity.dataset_id
         or sample_count != dataset_identity.sample_count
         or spatial_shape != list(dataset_identity.spatial_shape)
@@ -1100,13 +1105,11 @@ def load_dataset_metadata_summary(
     if task_id != task.id:
         msg = f"Dataset metadata for {logical_id!r} does not match TaskSpec {task.id!r}."
         raise ValueError(msg)
-    task_contract_digest = _require_sha256(
-        scientific.get("task_contract_digest"),
-        label="Dataset metadata task_contract_digest",
+    data_contract_digest = validate_dataset_data_contract_digest(
+        scientific.get("data_contract_digest"),
+        task=task,
+        label="Dataset metadata data_contract_digest",
     )
-    if task_contract_digest != task.contract_digest:
-        msg = f"Dataset metadata for {logical_id!r} does not match TaskSpec {task.id!r}."
-        raise ValueError(msg)
 
     fingerprint = _require_sha256(
         scientific.get("dataset_fingerprint"),
@@ -1129,7 +1132,7 @@ def load_dataset_metadata_summary(
     identity = DatasetIdentity(
         dataset_id=logical_id,
         task=task.id,
-        task_contract_digest=task.contract_digest,
+        data_contract_digest=data_contract_digest,
         fingerprint=fingerprint,
         sample_ids=tuple(raw_sample_ids),
         sample_count=sample_count,
@@ -1153,7 +1156,7 @@ def load_dataset_metadata_summary(
         metadata_directory=directory,
         dataset_exists=dataset_exists,
         task_id=identity.task,
-        task_contract_digest=identity.task_contract_digest,
+        data_contract_digest=identity.data_contract_digest,
         fingerprint=identity.fingerprint,
         sample_ids=identity.sample_ids,
         sample_count=identity.sample_count,

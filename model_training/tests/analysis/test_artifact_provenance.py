@@ -5,7 +5,7 @@ Verify task-generic and steady-flow artifact generation against current provenan
 The suite checks field/unit propagation, normalized SSE/count equivalence across
 batch partitions, dual continuity, boundary naming, physical permeability, and
 reserved metadata rejection. Cache locking and rebuild races belong to
-``test_artifact_identity``; visualization behavior is outside this module.
+``test_artifact_identity``. Visualization behavior is outside this module.
 """
 
 from __future__ import annotations
@@ -13,9 +13,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -25,6 +23,9 @@ from src import analysis, datasets, domain, learning
 from support.synthetic_task import build_synthetic_generated_batch_identity
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _SYNTHETIC_INPUT_VALUE = 4.0
 _SYNTHETIC_METADATA_VALUE = 3.25
@@ -52,12 +53,11 @@ class _MappingDataset(Dataset[dict[str, Any]]):
 
 
 class _IdentityNormalizer:
-    """
-    Leave synthetic tensors unchanged at the processor boundary.
+    """Leave tensors unchanged while exposing unit fitted scales."""
 
-    Identity normalization makes runtime and stored SSE/count evidence directly
-    comparable without introducing fitted-state or serialization concerns.
-    """
+    def __init__(self, channels: int) -> None:
+        """Store unit channel scales in the saved-normalizer layout."""
+        self.std = torch.ones(1, channels, 1, 1)
 
     def transform(self, value: torch.Tensor) -> torch.Tensor:
         """Return normalized-space input unchanged."""
@@ -68,6 +68,31 @@ class _IdentityNormalizer:
         return value
 
 
+class _IdentityProcessor:
+    """Model the fitted processor lifecycle used by online evaluation."""
+
+    def __init__(self, task: domain.tasks.spec.TaskSpec) -> None:
+        """Create task-shaped identity normalizers and call traces."""
+        self.in_normalizer = _IdentityNormalizer(task.in_channels)
+        self.out_normalizer = _IdentityNormalizer(task.out_channels)
+        self.training = True
+        self.preprocessed_batch_sizes: list[int] = []
+
+    def eval(self) -> None:
+        """Switch preprocessing to evaluation semantics."""
+        self.training = False
+
+    def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Normalize complete-batch inputs while preserving physical targets."""
+        if self.training:
+            raise AssertionError("artifact preprocessing did not enter evaluation mode")
+        inputs = batch["x"]
+        if not isinstance(inputs, torch.Tensor):
+            raise TypeError("fixture inputs must be tensors")
+        self.preprocessed_batch_sizes.append(int(inputs.shape[0]))
+        return {**batch, "x": self.in_normalizer.transform(inputs)}
+
+
 class _Projection(nn.Module):
     """
     Project synthetic-task inputs into two deterministic output fields.
@@ -76,23 +101,35 @@ class _Projection(nn.Module):
     the ordinary ``nn.Module`` inference boundary used by artifact generation.
     """
 
+    def __init__(self) -> None:
+        """Initialize the observed complete-batch forward sizes."""
+        super().__init__()
+        self.forward_batch_sizes: list[int] = []
+
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         """Map the leading two input channels to doubled predictions."""
+        self.forward_batch_sizes.append(int(value.shape[0]))
         return 2.0 * value[:, :2]
 
 
 class _SteadyProjection(nn.Module):
-    """
-    Return deterministic ``p=x``, ``u=x``, ``v=0`` steady-flow fields.
+    """Return a deterministic task-ordered manufactured steady-flow state."""
 
-    This manufactured state yields distinct continuity definitions and stable
-    pressure-boundary values without loading a trained checkpoint.
-    """
+    def __init__(self, task: domain.tasks.spec.TaskSpec) -> None:
+        super().__init__()
+        self.task = task
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Construct the manufactured pressure and velocity channels."""
-        zeros = torch.zeros_like(value[:, 0])
-        return torch.stack((value[:, 0], value[:, 0], zeros), dim=1)
+        """Construct pressure and velocity values by TaskSpec field names."""
+        coordinate = next(field.name for field in self.task.inputs if field.role == "coordinate")
+        coordinate_values = value[:, self.task.input_names.index(coordinate)]
+        zeros = torch.zeros_like(coordinate_values)
+        pressure = next(group for group in self.task.output_groups if group.id == "pressure")
+        velocity = next(group for group in self.task.output_groups if group.id == "velocity")
+        output_by_field = dict.fromkeys(self.task.output_names, zeros)
+        output_by_field[pressure.fields[0]] = coordinate_values
+        output_by_field[velocity.fields[0]] = coordinate_values
+        return torch.stack([output_by_field[field] for field in self.task.output_names], dim=1)
 
 
 def _save_dataset(root: Path, payload: dict[str, Any]) -> Path:
@@ -108,6 +145,40 @@ def _save_dataset(root: Path, payload: dict[str, Any]) -> Path:
     path = directory / f"{dataset_id}.pt"
     torch.save(payload, path)
     return path
+
+
+def _attach_objective_contract(
+    provenance: dict[str, Any],
+    *,
+    task: domain.tasks.spec.TaskSpec,
+) -> None:
+    """Attach task-owned groups and unit saved-normalizer evidence in place."""
+    selection = provenance.get("selection")
+    if not isinstance(selection, dict):
+        raise TypeError("fixture selection must be a dictionary")
+    count = selection.get("effective_case_count")
+    digest = selection.get("effective_ordered_source_indices_sha256")
+    selection.update(
+        {
+            "full_selected_case_count": count,
+            "generation_limit": None,
+            "full_ordered_source_indices_sha256": digest,
+        }
+    )
+    evaluator = provenance.setdefault("evaluator", {})
+    if not isinstance(evaluator, dict):
+        raise TypeError("fixture evaluator must be a dictionary")
+    evaluator.update(
+        {
+            "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],
+            "objective": next(metric for metric in task.default_metrics if metric.kind == "group_macro_rmse").as_dict(all_fields=task.output_names),
+            "output_groups": analysis.artifacts.contracts.output_group_payload(task.output_groups),
+        }
+    )
+    provenance["normalizer"] = {
+        "denominator_floor": 0.0,
+        "output_standard_deviations": dict.fromkeys(task.output_names, 1.0),
+    }
 
 
 def test_generic_artifacts_preserve_task_fields_units_and_provenance(
@@ -136,6 +207,7 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
             "output_units": {field.name: field.unit for field in task.outputs},
         },
     }
+    _attach_objective_contract(provenance, task=task)
     inputs = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
     targets = torch.ones(1, 2, 2, 2)
     loader = [
@@ -147,10 +219,7 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
             "meta": {"label": ["synthetic-case"], "quality": torch.tensor([7])},
         }
     ]
-    processor = SimpleNamespace(
-        in_normalizer=_IdentityNormalizer(),
-        out_normalizer=_IdentityNormalizer(),
-    )
+    processor = _IdentityProcessor(task)
     save_root = tmp_path / "analysis" / "id"
 
     frame, parquet_path = analysis.artifacts.generation.generate_artifacts(
@@ -169,8 +238,8 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
     assert {
         "rel_l2",
         "rel_h1",
-        "rmse_response_a",
-        "rmse_response_b",
+        "physical_rmse_response_a",
+        "physical_rmse_response_b",
         "normalized_sse_response_a",
         "normalized_count_response_a",
         "normalized_rmse_response_a",
@@ -199,23 +268,26 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
     stored_aggregate = stored_provenance.pop("aggregate")
     assert stored_provenance == provenance
     assert stored_outputs == analysis.artifacts.contracts.artifact_output_manifest(save_root)
-    assert stored_aggregate == analysis.artifacts.contracts.aggregate_normalized_macro_rmse(
+    assert stored_aggregate == analysis.artifacts.contracts.aggregate_normalized_group_macro_rmse(
         frame,
-        output_fields=task.output_names,
+        output_groups=task.output_groups,
+        train_standard_deviations=dict.fromkeys(task.output_names, 1.0),
+        normalization_denominator_floor=0.0,
     )
 
 
-def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking(
+def test_group_objective_matches_online_and_artifacts_across_partitions(
     tmp_path: Path,
     synthetic_task: domain.tasks.spec.TaskSpec,
 ) -> None:
     """
-    Match macro-RMSE evidence across runtime and artifact chunking.
+    Match group-objective evidence across runtime and artifact chunking.
 
     Equivalent three-case inputs use two partition schemes and two loader batch
-    sizes; SSE/count aggregation, row order, and stored provenance must agree.
+    sizes. SSE/count aggregation, row order, and stored provenance must agree.
     """
-    fields = synthetic_task.output_names
+    task = synthetic_task
+    fields = task.output_names
     prediction = (
         torch.tensor(
             [
@@ -229,21 +301,25 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
         .expand(-1, -1, 2, 2)
     )
     target = torch.zeros_like(prediction)
+    objective_spec = next(metric for metric in task.default_metrics if metric.id == "normalized_group_macro_rmse")
+    train_standard_deviations = dict.fromkeys(fields, 1.0)
     definition = learning.metrics.metrics.ResolvedMetric(
-        id="normalized_macro_rmse",
-        kind="macro_rmse",
-        space="normalized",
+        id=objective_spec.id,
+        kind=objective_spec.kind,
+        space=objective_spec.space,
         fields=fields,
-        field_indices=(0, 1),
-        reduction="field_macro_element_mean",
-        direction="minimize",
+        field_indices=tuple(range(len(fields))),
+        reduction=objective_spec.reduction,
+        direction=objective_spec.direction,
         unit="1",
         operator_dimensionality=2,
+        groups=task.output_groups,
+        field_standard_deviations=tuple(train_standard_deviations[field] for field in fields),
     )
 
     runtime_values: list[float] = []
     for chunks in ((2, 1), (1, 1, 1)):
-        metric = learning.metrics.metrics.MacroRMSEMetric(
+        metric = learning.metrics.metrics.GroupMacroRMSEMetric(
             definition,
             device=torch.device("cpu"),
         )
@@ -253,25 +329,33 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
             metric.update(
                 prediction[start:stop],
                 target[start:stop],
-                space="normalized",
+                space="physical",
                 batch_index=batch_index,
             )
             start = stop
         runtime_values.append(metric.compute())
 
-    rows = analysis.artifacts.generation.normalized_case_statistics(
+    physical_rows = analysis.artifacts.generation.physical_case_statistics(
         prediction,
         target,
         output_fields=fields,
     )
-    aggregate = analysis.artifacts.contracts.aggregate_normalized_macro_rmse(
-        pd.DataFrame(rows),
+    normalized_rows = analysis.artifacts.generation.normalized_case_statistics(
+        prediction,
+        target,
         output_fields=fields,
+    )
+    rows = [{**physical_row, **normalized_row} for physical_row, normalized_row in zip(physical_rows, normalized_rows, strict=True)]
+    aggregate = analysis.artifacts.contracts.aggregate_normalized_group_macro_rmse(
+        pd.DataFrame(rows),
+        output_groups=task.output_groups,
+        train_standard_deviations=train_standard_deviations,
+        normalization_denominator_floor=0.0,
     )
     per_case_macro_mean = float(pd.DataFrame(rows)[[f"normalized_rmse_{field}" for field in fields]].mean(axis=1).mean())
 
     source_indices = [5, 1, 8]
-    inputs = torch.zeros(3, len(synthetic_task.input_names), 2, 2)
+    inputs = torch.zeros(3, len(task.input_names), 2, 2)
     inputs[:, :2] = prediction / 2.0
     samples = [
         {
@@ -283,31 +367,32 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
         }
         for index, source_index in enumerate(source_indices)
     ]
-    processor = SimpleNamespace(
-        in_normalizer=_IdentityNormalizer(),
-        out_normalizer=_IdentityNormalizer(),
-    )
     artifact_frames: list[pd.DataFrame] = []
     artifact_values: list[float] = []
+    forward_batch_sizes: list[list[int]] = []
+    preprocessed_batch_sizes: list[list[int]] = []
     for batch_size in (2, 1):
         root = tmp_path / f"batch-{batch_size}"
         provenance = {
             "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
             "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
-            "run": {"name": "synthetic", "task": synthetic_task.id},
+            "run": {"name": "synthetic", "task": task.id},
             "selection": {
                 "effective_case_count": len(source_indices),
                 "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256(source_indices),
             },
             "evaluator": {
-                "input_fields": list(synthetic_task.input_names),
+                "input_fields": list(task.input_names),
                 "output_fields": list(fields),
-                "output_units": {field.name: field.unit for field in synthetic_task.outputs},
+                "output_units": {field.name: field.unit for field in task.outputs},
             },
         }
+        _attach_objective_contract(provenance, task=task)
+        processor = _IdentityProcessor(task)
+        model = _Projection()
         frame, _ = analysis.artifacts.generation.generate_artifacts(
-            task=synthetic_task,
-            model=_Projection(),
+            task=task,
+            model=model,
             loader=DataLoader(_MappingDataset(samples), batch_size=batch_size, shuffle=False),
             processor=processor,
             device=torch.device("cpu"),
@@ -318,7 +403,11 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
         stored = json.loads((root / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
         artifact_frames.append(frame)
         artifact_values.append(float(stored["aggregate"]["value"]))
+        forward_batch_sizes.append(model.forward_batch_sizes)
+        preprocessed_batch_sizes.append(processor.preprocessed_batch_sizes)
 
+    assert forward_batch_sizes == [[2, 1], [1, 1, 1]]
+    assert preprocessed_batch_sizes == forward_batch_sizes
     assert runtime_values[0] == pytest.approx(runtime_values[1], rel=0.0, abs=1e-15)
     assert aggregate["value"] == pytest.approx(runtime_values[0], rel=0.0, abs=1e-15)
     assert artifact_values == pytest.approx(runtime_values, rel=0.0, abs=1e-15)
@@ -327,14 +416,18 @@ def test_normalized_macro_evidence_matches_runtime_and_artifacts_across_chunking
     for field in fields:
         assert aggregate["field_statistics"][field]["normalized_element_count"] == expected_element_count
     pd.testing.assert_frame_equal(
-        artifact_frames[0].drop(columns="npz_path"),
-        artifact_frames[1].drop(columns="npz_path"),
+        artifact_frames[0].drop(columns=["npz_path", "inference_time_ms"]),
+        artifact_frames[1].drop(columns=["npz_path", "inference_time_ms"]),
     )
     for field in fields:
-        sse_column, count_column, rmse_column = analysis.artifacts.contracts.normalized_statistic_columns(field)
-        assert artifact_frames[0][sse_column].tolist() == pytest.approx([row[sse_column] for row in rows])
-        assert artifact_frames[0][count_column].tolist() == [row[count_column] for row in rows]
-        assert artifact_frames[0][rmse_column].tolist() == pytest.approx([row[rmse_column] for row in rows])
+        for columns in (
+            analysis.artifacts.contracts.physical_statistic_columns(field),
+            analysis.artifacts.contracts.normalized_statistic_columns(field),
+        ):
+            sse_column, count_column, rmse_column = columns
+            assert artifact_frames[0][sse_column].tolist() == pytest.approx([row[sse_column] for row in rows])
+            assert artifact_frames[0][count_column].tolist() == [row[count_column] for row in rows]
+            assert artifact_frames[0][rmse_column].tolist() == pytest.approx([row[rmse_column] for row in rows])
     assert artifact_frames[0]["source_index"].tolist() == source_indices
 
 
@@ -346,24 +439,37 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
     contract, while undeclared NPZ arrays fail the generic exact-schema check.
     """
     task = domain.tasks.steady_flow.STEADY_FLOW
+    groups_by_id = {group.id: group for group in task.output_groups}
+    (pressure_field,) = groups_by_id["pressure"].fields
+    velocity_fields = groups_by_id["velocity"].fields
+    pressure_index = task.output_names.index(pressure_field)
+    velocity_indices = [task.output_names.index(field) for field in velocity_fields]
+    velocity_units = {task.field(field).unit for field in velocity_fields}
+    assert len(velocity_units) == 1
+    velocity_unit = next(iter(velocity_units))
     height, width = 9, 11
     y_values = torch.linspace(0.0, 1.0, height)
     x_values = torch.linspace(0.0, 2.0, width)
     y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
     zeros = torch.zeros_like(x_grid)
-    inputs = torch.stack(
-        (
-            x_grid,
-            y_grid,
-            torch.full_like(x_grid, -4.0),
-            zeros,
-            torch.full_like(x_grid, -4.0),
-            0.25 + 0.25 * x_grid,
-            zeros,
-        ),
-        dim=0,
-    ).unsqueeze(0)
-    targets = torch.zeros(1, 3, height, width)
+    coordinate_values = iter((x_grid, y_grid))
+    input_by_field: dict[str, torch.Tensor] = {}
+    for field in task.inputs:
+        if field.role == "coordinate":
+            input_by_field[field.name] = next(coordinate_values)
+        elif field.role == "permeability" and "cross_component" in field.representation:
+            input_by_field[field.name] = zeros
+        elif field.role == "permeability":
+            input_by_field[field.name] = torch.full_like(x_grid, -4.0)
+        elif field.role == "porosity":
+            input_by_field[field.name] = 0.25 + 0.25 * x_grid
+        elif field.role == "boundary":
+            input_by_field[field.name] = zeros
+        else:
+            msg = f"unsupported steady-flow fixture role: {field.role}"
+            raise AssertionError(msg)
+    inputs = torch.stack([input_by_field[field] for field in task.input_names], dim=0).unsqueeze(0)
+    targets = torch.zeros((1, task.out_channels, height, width))
     loader = [
         {
             "x": inputs,
@@ -373,10 +479,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
             "meta": {"sample_id": ["manufactured"]},
         }
     ]
-    processor = SimpleNamespace(
-        in_normalizer=_IdentityNormalizer(),
-        out_normalizer=_IdentityNormalizer(),
-    )
+    processor = _IdentityProcessor(task)
     frames: list[pd.DataFrame] = []
 
     for continuity in ("div_velocity", "div_eps_velocity"):
@@ -397,9 +500,10 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
             },
             "physics": {"selected_training_continuity": continuity},
         }
+        _attach_objective_contract(provenance, task=task)
         frame, _parquet_path = analysis.artifacts.generation.generate_artifacts(
             task=task,
-            model=_SteadyProjection(),
+            model=_SteadyProjection(task),
             loader=loader,
             processor=processor,
             device=torch.device("cpu"),
@@ -418,7 +522,12 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
             "pressure_outlet_mean_square",
         }
         assert required_scalars.issubset(frame.columns)
-        with np.load(Path(row["npz_path"]), allow_pickle=False) as payload:
+        payload_path = analysis.artifacts.contracts.resolve_case_payload_path(
+            root,
+            row["npz_path"],
+            expected_filename=f"case_{int(row['case_index']):04d}.npz",
+        )
+        with np.load(payload_path, allow_pickle=False) as payload:
             assert {"Rx", "Ry", "div_u", "div_eps_u", "coordinates"}.issubset(payload.files)
             for name in ("Rx", "Ry", "div_u", "div_eps_u"):
                 assert payload[name].shape == (height, width)
@@ -431,7 +540,10 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
             assert row["div_velocity_mse"] == pytest.approx(float(np.mean(payload["div_u"][interior] ** 2)))
             assert row["div_eps_velocity_mse"] == pytest.approx(float(np.mean(payload["div_eps_u"][interior] ** 2)))
             assert row["div_velocity_mse"] != pytest.approx(row["div_eps_velocity_mse"])
-            pressure = payload["pred"][0]
+            expected_speed = np.sqrt(np.square(payload["pred"][velocity_indices]).sum(axis=0))
+            np.testing.assert_allclose(payload["pred"][-1], expected_speed)
+            assert payload["artifact_units"][-1] == velocity_unit
+            pressure = payload["pred"][pressure_index]
             pressure_boundary = payload["p_bc"][0]
             expected_inlet = float(np.mean((pressure[0] - pressure_boundary[0]) ** 2))
             expected_outlet_mean_square = float(np.mean(pressure[-1]) ** 2)
@@ -441,7 +553,12 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         assert row["pressure_outlet_mean_square"] != pytest.approx(outlet_pointwise_mse)
         assert row["pressure_boundary_mse"] == pytest.approx(row["pressure_inlet_mse"] + row["pressure_outlet_mean_square"])
 
-    invalid_npz_path = Path(frames[0].iloc[0]["npz_path"])
+    invalid_row = frames[0].iloc[0]
+    invalid_npz_path = analysis.artifacts.contracts.resolve_case_payload_path(
+        tmp_path / "div_velocity",
+        invalid_row["npz_path"],
+        expected_filename=f"case_{int(invalid_row['case_index']):04d}.npz",
+    )
     with np.load(invalid_npz_path, allow_pickle=False) as stored:
         unexpected_array = np.asarray(stored["div_eps_u"])
     with io.BytesIO() as stream:
@@ -454,6 +571,10 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         input_fields=task.input_names,
         output_fields=task.output_names,
         output_units=tuple(field.unit for field in task.outputs),
+        output_groups=tuple((group.id, group.fields) for group in task.output_groups),
+        train_standard_deviations=dict.fromkeys(task.output_names, 1.0),
+        normalization_denominator_floor=0.0,
+        group_metric_columns=("normalized_velocity_vector_rmse", "physical_velocity_vector_rmse"),
         physics_kind=task.physics.kind,
     )
     with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match=r"unexpected=\['unexpected_array'\]"):
@@ -509,6 +630,7 @@ def test_generic_artifacts_reject_reserved_source_metadata(
             "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
         }
     }
+    _attach_objective_contract(provenance, task=task)
     loader = [
         {
             "x": torch.zeros(1, 3, 2, 2),
@@ -518,10 +640,7 @@ def test_generic_artifacts_reject_reserved_source_metadata(
             "meta": {"case_index": 99},
         }
     ]
-    processor = SimpleNamespace(
-        in_normalizer=_IdentityNormalizer(),
-        out_normalizer=_IdentityNormalizer(),
-    )
+    processor = _IdentityProcessor(task)
 
     try:
         analysis.artifacts.generation.generate_artifacts(
@@ -590,7 +709,4 @@ def test_synthetic_task_flows_through_final_dataset_contract(
     assert loaded[0]["x"].shape == (3, 2, 3)
     assert torch.all(loaded[0]["x"][0] == _SYNTHETIC_INPUT_VALUE)
     assert synthetic_task.physics.kind == "none"
-    assert [metric.fields for metric in synthetic_task.default_metrics[1:]] == [
-        ("response_a",),
-        ("response_b",),
-    ]
+    assert tuple(field for group in synthetic_task.output_groups for field in group.fields) == synthetic_task.output_names

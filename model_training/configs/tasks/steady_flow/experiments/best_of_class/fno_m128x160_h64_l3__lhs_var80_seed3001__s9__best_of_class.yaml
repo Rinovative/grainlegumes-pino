@@ -1,11 +1,8 @@
-# Recreated from named run: UNO_m64x64_h32_l7_s1-05-05-1-1-2-2_mr0p495_20260116_022222
-# Source config: model_training/data/processed/safe/UNO_m64x64_h32_l7_s1-05-05-1-1-2-2_mr0p495_20260116_022222/config.json
-
 task: steady_flow
 
 run:
   seed: 9
-  deterministic: false
+  deterministic: true
   device: auto
   suffix: best_of_class
 
@@ -16,22 +13,16 @@ data:
   batch_size: 32
 
 model:
-  kind: uno
+  kind: fno
   params:
-    modes_x: 64
-    modes_y: 64
-    hidden_channels: 32
-    n_layers: 7
-    mode_ratio: 0.4951318201313778
-    uno_scalings:
-      - [1.0, 1.0]
-      - [0.5, 0.5]
-      - [0.5, 0.5]
-      - [1.0, 1.0]
-      - [1.0, 1.0]
-      - [2.0, 2.0]
-      - [2.0, 2.0]
-    channel_mlp_skip: linear
+    n_modes: [128, 160]
+    hidden_channels: 64
+    n_layers: 3
+    lifting_channel_ratio: 2
+    projection_channel_ratio: 2
+    fno_skip: linear
+    channel_mlp_skip: soft-gating
+    implementation: factorized
 
 loss:
   data:
@@ -43,11 +34,11 @@ loss:
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw
-  lr: 5.319714363424885e-4
+  lr: 3.883614530748613e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

@@ -5,7 +5,7 @@ Protect current artifact reader identity, cache admission, and contained rebuild
 The tests cover current table parsing, metadata collision rejection, ordered
 membership, symlink/path containment, concurrent publication, and provenance
 completion races. Numerical artifact generation is covered in
-``test_artifact_provenance``; plot usability is covered separately.
+``test_artifact_provenance``. Plot usability is covered separately.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any
 
 import pandas as pd
 import pytest
+import torch
 from src import analysis, common, experiments, learning
 
 
@@ -45,7 +46,9 @@ def _current_generic_frame(*, metadata: object, index: int = 0, source_index: in
                 "inference_time_ms": None,
                 "rel_l2": 0.0,
                 "rel_h1": 0.0,
-                "rmse_target": 0.0,
+                "physical_sse_target": 0.0,
+                "physical_count_target": 1,
+                "physical_rmse_target": 0.0,
                 "normalized_sse_target": 0.0,
                 "normalized_count_target": 1,
                 "normalized_rmse_target": 0.0,
@@ -55,18 +58,20 @@ def _current_generic_frame(*, metadata: object, index: int = 0, source_index: in
     )
 
 
-def test_dataframe_reader_exposes_authoritative_normalized_aggregate() -> None:
+def test_dataframe_reader_admits_current_sufficient_statistics() -> None:
     """
-    Reconstruct the authoritative aggregate from normalized SSE and count.
+    Admit exact physical and normalized evidence without inventing provenance.
 
-    A current one-row table must expose schema metadata and a zero macro RMSE;
-    this protects analysis consumers from treating per-case means as primary.
+    A current one-row table exposes its schema and field contract while remaining
+    explicitly table-only until authoritative group and scale provenance is bound.
     """
     enriched = analysis.evaluation.dataframe.build_eval_df(_current_generic_frame(metadata='{"label": "valid"}'))
 
     assert enriched.attrs["artifact_schema_version"] == analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION
     assert enriched.attrs["output_fields"] == ("target",)
-    assert enriched.attrs["normalized_macro_rmse"]["value"] == 0.0
+    assert enriched.attrs["provenance_complete"] is False
+    assert analysis.evaluation.dataframe.PRIMARY_OBJECTIVE_ID not in enriched.attrs
+    assert enriched.loc[0, "physical_rmse_target"] == 0.0
 
 
 def test_dataframe_reader_rejects_every_unexpected_column() -> None:
@@ -99,7 +104,7 @@ def test_dataframe_reader_rejects_missing_and_duplicate_columns() -> None:
         analysis.evaluation.dataframe.build_eval_df(missing)
 
     base = _current_generic_frame(metadata="{}")
-    duplicate = pd.concat([base, base[["rmse_target"]]], axis=1)
+    duplicate = pd.concat([base, base[["physical_rmse_target"]]], axis=1)
     with pytest.raises(ValueError, match="duplicate columns"):
         analysis.evaluation.dataframe.build_eval_df(duplicate)
 
@@ -135,7 +140,7 @@ def test_metadata_expansion_preserves_noncontiguous_row_indices() -> None:
     Preserve metadata alignment for a noncontiguous DataFrame index.
 
     A row indexed at seven must retain its case identity and label after
-    expansion; positional concatenation would attach metadata to the wrong row.
+    expansion. Positional concatenation would attach metadata to the wrong row.
     """
     row_index = 7
     case_index = 8
@@ -180,8 +185,8 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
     """
     Separate scientific cache identity from operational runtime facts.
 
-    Mutating every required scientific component must change the projected
-    provenance, while device, batch size, outputs, and aggregates must not.
+    Mutating every required scientific component, including saved inference
+    batching, changes the projection. Runtime device facts and results do not.
     """
     provenance = {
         "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
@@ -191,12 +196,26 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
             "best_checkpoint_sha256": "checkpoint-a",
             "normalizer_sha256": "normalizer-a",
         },
-        "dataset": {"fingerprint": "dataset-a"},
+        "dataset": {
+            "fingerprint": "dataset-a",
+            "data_contract_digest": "data-a",
+        },
         "selection": {"effective_ordered_source_indices_sha256": "membership-a"},
-        "normalizer": {"sha256": "normalizer-a"},
+        "normalizer": {
+            "sha256": "normalizer-a",
+            "output_standard_deviations": {"first": 1.0, "second": 2.0},
+            "denominator_floor": 1.0e-6,
+        },
         "evaluator": {
-            "objective": {"id": "normalized_macro_rmse", "reduction": "field_macro_element_mean"},
+            "objective": {
+                **analysis.evaluation.dataframe.PRIMARY_OBJECTIVE_DEFINITION,
+                "fields": "all",
+            },
             "output_fields": ["first", "second"],
+            "output_groups": [
+                {"id": "first_group", "fields": ["first"]},
+                {"id": "second_group", "fields": ["second"]},
+            ],
         },
         "physics": {
             "residual_schema_version": 1,
@@ -206,7 +225,7 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
             "constants": {"dynamic_viscosity_pa_s": 1.8139e-5},
             "scalar_definitions": {"div_velocity_mse": "mean(div(u)**2)"},
         },
-        "generation": {"effective_case_limit": None},
+        "generation": {"effective_case_limit": None, "inference_batch_size": 1},
         "runtime": {"requested_policy": "cpu", "resolved_device": "cpu", "batch_size": 1},
     }
     baseline = analysis.artifacts.service._scientific_provenance(provenance)
@@ -216,9 +235,12 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
         (("run", "best_checkpoint_sha256"), "checkpoint-b"),
         (("normalizer", "sha256"), "normalizer-b"),
         (("dataset", "fingerprint"), "dataset-b"),
+        (("dataset", "data_contract_digest"), "data-b"),
         (("selection", "effective_ordered_source_indices_sha256"), "membership-b"),
         (("evaluator", "objective", "reduction"), "wrong-reduction"),
         (("evaluator", "output_fields"), ["second", "first"]),
+        (("evaluator", "output_groups", 0, "fields"), ["second"]),
+        (("normalizer", "output_standard_deviations", "second"), 3.0),
         (("physics", "residual_schema_version"), 2),
         (("physics", "selected_training_continuity"), "div_velocity"),
         (("physics", "derivatives", "kind"), "unsupported"),
@@ -227,14 +249,15 @@ def test_scientific_cache_identity_tracks_science_but_not_runtime_device() -> No
         (("physics", "constants", "dynamic_viscosity_pa_s"), 2.0e-5),
         (("physics", "scalar_definitions", "div_velocity_mse"), "different"),
         (("generation", "effective_case_limit"), 4),
+        (("generation", "inference_batch_size"), 2),
     ]
     for keys, replacement in mutations:
         changed = copy.deepcopy(provenance)
         target: object = changed
         for key in keys[:-1]:
-            assert isinstance(target, dict)
+            assert isinstance(target, (dict, list))
             target = target[key]
-        assert isinstance(target, dict)
+        assert isinstance(target, (dict, list))
         target[keys[-1]] = replacement
         assert analysis.artifacts.service._scientific_provenance(changed) != baseline
 
@@ -302,7 +325,7 @@ def test_upload_gate_requires_an_explicit_complete_current_artifact(
     """
     Admit only an explicit, complete, current artifact for upload.
 
-    The valid fixture must pass without changing its bytes; after the manifest
+    The valid fixture must pass without changing its bytes. After the manifest
     is made stale, validation must fail before any tracking-side effect.
     """
     run_dir = tmp_path / "run"
@@ -387,8 +410,8 @@ def test_unrelated_artifact_targets_use_independent_locks(tmp_path: Path) -> Non
     """
     Allow unrelated artifact targets to acquire independent locks.
 
-    Holding the ID lock must not prevent a worker from taking a named OOD lock;
-    target-scoped locking preserves concurrency without weakening serialization.
+    Holding the ID lock must not prevent a worker from taking a named OOD lock.
+    Target-scoped locking preserves concurrency without weakening serialization.
     """
     run_dir = tmp_path / "run"
     id_target = common.paths.resolve_id_analysis_dir(run_dir)
@@ -539,7 +562,7 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
     """
     Preserve the complete cache when rebuild generation fails.
 
-    The injected generator error occurs after request setup; only staging may be
+    The injected generator error occurs after request setup. Only staging may be
     cleaned, while the prior marker remains the externally visible artifact.
     """
     run_dir = tmp_path / "run"
@@ -555,6 +578,7 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
         lambda **_kwargs: analysis.artifacts.service.ArtifactRequest(
             provenance={"request": "replacement"},
             source_indices=(0,),
+            batch_size=2,
         ),
     )
     monkeypatch.setattr(analysis.artifacts.service, "_load_run_config", lambda _run_dir: {})
@@ -582,8 +606,6 @@ def test_failed_rebuild_generation_preserves_previous_complete_target(
             run_dir=run_dir,
             dataset_name="dataset",
             split="eval",
-            max_cases=1,
-            batch_size=2,
             device_resolution=learning.device.resolve_device("cpu"),
             dataset_root=tmp_path / "datasets",
             metadata_root=tmp_path / "meta",
@@ -622,7 +644,7 @@ def _run_artifact_worker(arguments: dict[str, Any], outcomes: Any) -> None:
     """
     Execute one artifact request and publish a process-safe outcome.
 
-    Success sends the normalized generation marker; failures are reduced to a
+    Success sends the normalized generation marker. Failures are reduced to a
     stable type-and-message tuple that the parent process can assert on.
     """
     try:
@@ -640,14 +662,14 @@ def test_discovery_rejects_every_malformed_child_run_marker(
     """
     Reject a child containing any lone required run marker.
 
-    The parameter covers every current lifecycle marker; discovery must surface
+    The parameter covers every current lifecycle marker. Discovery must surface
     each partial run as corruption instead of silently omitting it.
     """
     malformed = tmp_path / "malformed"
     malformed.mkdir()
     (malformed / marker_name).touch()
 
-    with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=r"evaluation evidence|best checkpoint"):
         list(analysis.artifacts.service.iter_run_dirs(tmp_path))
 
 
@@ -690,6 +712,7 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
         return analysis.artifacts.service.ArtifactRequest(
             provenance={"request": "shared"},
             source_indices=(0,),
+            batch_size=2,
         )
 
     def cache_has_outputs(**_kwargs: Any) -> bool:
@@ -734,8 +757,6 @@ def test_concurrent_rebuilds_coalesce_to_one_generation_and_one_reuse(
         "run_dir": run_dir,
         "dataset_name": "dataset",
         "split": "eval",
-        "max_cases": 1,
-        "batch_size": 1,
         "device_resolution": learning.device.resolve_device("cpu"),
         "dataset_root": tmp_path / "datasets",
         "metadata_root": tmp_path / "meta",
@@ -791,8 +812,6 @@ def test_rebuild_waiter_recovers_after_prior_generator_removed_completion(
         run_dir=tmp_path / "run",
         dataset_name="dataset",
         split="eval",
-        max_cases=1,
-        batch_size=1,
         device_resolution=learning.device.resolve_device("cpu"),
         dataset_root=tmp_path / "datasets",
         metadata_root=tmp_path / "meta",
@@ -802,15 +821,14 @@ def test_rebuild_waiter_recovers_after_prior_generator_removed_completion(
     assert captured == {"rebuild": True}
 
 
-def test_artifact_operation_waits_for_the_active_run_writer(
+def test_artifact_operation_rejects_the_active_run_writer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Serialize artifact work behind the active run-writer lease.
+    Reject artifact work while an active run-writer lease owns the bundle.
 
-    A worker may observe request identity before blocking, but its locked body
-    must execute only after the resume/training writer releases ownership.
+    Evaluation must fail rather than waiting for a mutating training process.
     """
     monkeypatch.setenv("MODEL_TRAINING_DATA_ROOT", str(tmp_path / "training"))
     run_dir = tmp_path / "run"
@@ -837,8 +855,6 @@ def test_artifact_operation_waits_for_the_active_run_writer(
                 run_dir=run_dir,
                 dataset_name="dataset",
                 split="eval",
-                max_cases=1,
-                batch_size=1,
                 device_resolution=learning.device.resolve_device("cpu"),
                 dataset_root=tmp_path / "datasets",
                 metadata_root=tmp_path / "meta",
@@ -851,10 +867,78 @@ def test_artifact_operation_waits_for_the_active_run_writer(
         worker = threading.Thread(target=build)
         worker.start()
         assert observed.wait(timeout=5)
-        assert not executed.wait(timeout=0.1)
-        assert worker.is_alive()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert not executed.is_set()
 
-    worker.join(timeout=5)
-    assert not worker.is_alive()
-    assert not errors
-    assert executed.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], experiments.run.RunLifecycleError)
+    assert "active writer lease" in str(errors[0])
+
+
+def test_portable_artifact_service_reuses_supplied_cuda_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generate a missing role with the caller's exact concrete device decision."""
+    device = torch.device("cuda", 0)
+    metadata = learning.device.DeviceRuntimeMetadata(
+        requested_policy="cuda",
+        resolved_device=str(device),
+        device_type="cuda",
+        pytorch_version=str(torch.__version__),
+        cuda_index=0,
+        cuda_device_name="restricted fixture GPU",
+    )
+    resolution = learning.device.DeviceResolution(
+        requested_policy="cuda",
+        device=device,
+        device_type="cuda",
+        cuda_index=0,
+        metadata=metadata,
+    )
+    loaded = SimpleNamespace(run_dir=tmp_path / "renamed run")
+    load_count = 0
+    forwarded: dict[str, object] = {}
+
+    def load_artifacts(path: Path, **_kwargs: object) -> object:
+        nonlocal load_count
+        load_count += 1
+        if load_count == 1:
+            message = "missing ID artifacts"
+            raise analysis.evaluation.artifact_loader.MissingEvaluationArtifactsError(
+                message,
+                role="eval",
+                run_dir=path,
+            )
+        return loaded
+
+    def capture_generation(**kwargs: object) -> pd.DataFrame:
+        forwarded.update(kwargs)
+        return pd.DataFrame()
+
+    def reject_resolution(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("supplied device resolution was independently resolved again")
+
+    monkeypatch.setattr(analysis.evaluation.artifact_loader, "load_run_artifacts", load_artifacts)
+    monkeypatch.setattr(
+        analysis.artifacts.service,
+        "load_run_artifact_plan",
+        lambda _path: SimpleNamespace(id_dataset_name="id_dataset", ood_dataset_name="ood_dataset"),
+    )
+    monkeypatch.setattr(analysis.artifacts.service, "run_or_load_artifacts", capture_generation)
+    monkeypatch.setattr(learning.device, "resolve_device", reject_resolution)
+
+    prepared = analysis.artifacts.service.load_or_build_run_artifacts(
+        tmp_path / "renamed run",
+        artifact_roles=("id",),
+        dataset_root=tmp_path / "datasets",
+        metadata_root=tmp_path / "metadata",
+        device_resolution=resolution,
+    )
+
+    assert prepared.loaded_run is loaded
+    assert prepared.role_actions == {"id": "generated"}
+    assert prepared.artifact_device == "cuda:0"
+    assert forwarded["run_dir"] == (tmp_path / "renamed run").resolve()
+    assert forwarded["device_resolution"] is resolution

@@ -18,9 +18,9 @@ Design principles:
   - Controller behavior stays independent of model architecture
 
 This module does NOT:
-  - Load or resolve configs; ``experiments.config.loader`` owns semantic admission
-  - Construct models or losses; caller-selected learning factories own construction
-  - Parse CLI arguments; ``experiments.cli`` owns command boundaries
+  - Load or resolve configs. ``experiments.config.loader`` owns semantic admission
+  - Construct models or losses. Caller-selected learning factories own construction
+  - Parse CLI arguments. ``experiments.cli`` owns command boundaries
 ===============================================================================
 """
 
@@ -172,8 +172,8 @@ def train_one_epoch(
     reduction. Training duration covers dataloader waiting through final batch
     bookkeeping and optimizer work, while complete epoch duration remains a
     separate outer lifecycle metric. Throughput is actual processed samples
-    divided by this training-phase duration; batch size remains relevant context.
-    Supervised runs publish only total/data loss; physics-informed runs additionally
+    divided by this training-phase duration. Batch size remains relevant context.
+    Supervised runs publish only total/data loss. Physics-informed runs additionally
     publish momentum, boundary, one formulation-qualified continuity contribution,
     applied weights, and warmup fractions.
 
@@ -213,7 +213,7 @@ def train_one_epoch(
 
     """
     if use_amp and device.type != "cuda":
-        msg = "Mixed-precision training requires a concrete CUDA device; CPU autocast is unsupported."
+        msg = "Mixed-precision training requires a concrete CUDA device. CPU autocast is unsupported."
         raise ValueError(msg)
     if use_amp and scaler is None:
         msg = "Mixed-precision training requires a CUDA GradScaler."
@@ -360,8 +360,8 @@ def evaluate_physics_monitor(
     ValueError
         If ``max_cases`` is not a positive exact integer.
     PhysicsMonitorEvaluationError
-        If model prediction, physics diagnostics, or finite-value validation fails;
-        the originating exception is retained as the direct cause.
+        If model prediction, physics diagnostics, or finite-value validation fails.
+        The originating exception is retained as the direct cause.
     RuntimeError
         If the selected membership produces no samples.
 
@@ -474,8 +474,8 @@ def eval_one_epoch(
 
     Notes
     -----
-    Dataset accumulators are reset at entry and finalized once after all batches;
-    no batch-level metric means are averaged.
+    Dataset accumulators are reset at entry and finalized once after all batches.
+    No batch-level metric means are averaged.
 
     """
     model.eval()
@@ -661,7 +661,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     checkpoint_identity : Mapping[str, Any] | None, optional
         Immutable task/config/dataset/split/objective identity.
     scaler : Any | None, optional
-        Injected scaler for focused tests; normally constructed internally.
+        Injected scaler for focused tests. Normally constructed internally.
 
     Returns
     -------
@@ -728,7 +728,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         msg = f"use_amp must be boolean, got {use_amp!r}."
         raise TypeError(msg)
     if use_amp and device.type != "cuda":
-        msg = "training.mixed_precision=true requires a resolved CUDA device; CPU autocast is unsupported."
+        msg = "training.mixed_precision=true requires a resolved CUDA device. CPU autocast is unsupported."
         raise ValueError(msg)
     amp_enabled = use_amp
     if amp_enabled and scaler is None:

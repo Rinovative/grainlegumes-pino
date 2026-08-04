@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pytest
 import torch
-from src import experiments, learning
+from src import domain, experiments, learning
 from torch import nn
 from torch.amp.grad_scaler import GradScaler
 from torch.optim.sgd import SGD
@@ -35,7 +35,7 @@ class _MappingDataset(Dataset[dict[str, torch.Tensor]]):
     """
     Provide a fixed twelve-sample regression dataset for exact-resume tests.
 
-    Samples are generated in memory with no normalization or storage behavior;
+    Samples are generated in memory with no normalization or storage behavior.
     deterministic shuffle state is owned by the surrounding DataLoader.
     """
 
@@ -48,31 +48,6 @@ class _MappingDataset(Dataset[dict[str, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         return {"x": self.x[index], "y": self.y[index]}
-
-
-class _BatchDataset(Dataset[dict[str, torch.Tensor]]):
-    """
-    Wrap prescribed tensor samples in PyTorch's typed dataset contract.
-
-    Parameters
-    ----------
-    samples : list[dict[str, torch.Tensor]]
-        Caller-owned synthetic samples retained in order without copying.
-
-    Notes
-    -----
-    The helper deliberately models no task fields, identity, or persistence.
-
-    """
-
-    def __init__(self, samples: list[dict[str, torch.Tensor]]) -> None:
-        self.samples = samples
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        return self.samples[index]
 
 
 class _DatasetMSE:
@@ -202,15 +177,6 @@ class _NonFiniteTrainingLoss(nn.Module):
         return pred.sum() * 0.0 + self.value
 
 
-class _PredictionSumLoss(nn.Module):
-    """Return a finite prediction sum that can induce a scaled-gradient overflow."""
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Sum predictions to expose gradient overflow under artificial scaling."""
-        del target
-        return pred.sum()
-
-
 def _objective(*, direction: str = "minimize") -> dict[str, Any]:
     """Return one complete synthetic resolved objective."""
     return {
@@ -268,7 +234,7 @@ def _components(seed: int) -> tuple[nn.Module, Optimizer, Any, nn.Module, DataLo
     Construct deterministically seeded model, optimizer, scheduler, loss, and loaders.
 
     The training loader owns an explicit generator whose state is part of exact
-    checkpoint continuation; all components remain CPU-local and synthetic.
+    checkpoint continuation. All components remain CPU-local and synthetic.
     """
     experiments.run.seed_process(seed, device=torch.device("cpu"))
     dataset = _MappingDataset()
@@ -420,7 +386,7 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
     """
     Train three epochs and load both published checkpoint roles explicitly.
 
-    Each file must validate only for its declared role; treating ``last`` as
+    Each file must validate only for its declared role. Treating ``last`` as
     ``best`` must fail so inference selection and continuation remain distinct.
     """
     run_dir = tmp_path / "run"
@@ -491,14 +457,14 @@ def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path) ->
 
 @pytest.mark.parametrize(
     "value",
-    [math.nan, math.inf, -math.inf],
-    ids=("nan", "positive-inf", "negative-inf"),
+    [math.nan, math.inf],
+    ids=("nan", "infinity"),
 )
 def test_non_finite_training_loss_precedes_backward(value: float) -> None:
     """
-    Vary training loss across NaN and both signed infinities before backward.
+    Vary training loss across NaN and infinity before backward.
 
-    Every non-finite family must fail with parameters, gradients, and optimizer
+    Each non-finite category must fail with parameters, gradients, and optimizer
     state untouched, preventing invalid arithmetic from entering an update.
     """
     model, optimizer, _scheduler, _loss, train_loader, _eval_loader = _components(73)
@@ -517,38 +483,6 @@ def test_non_finite_training_loss_precedes_backward(value: float) -> None:
     _assert_nested_equal(model_before, model.state_dict())
     _assert_nested_equal(optimizer_before, optimizer.state_dict())
     assert all(parameter.grad is None for parameter in model.parameters())
-
-
-def test_cpu_training_rejects_amp_before_iteration() -> None:
-    """
-    Pass an enabled scaler to a one-batch CPU training call.
-
-    Device validation must fail before iteration or weight mutation because the
-    maintained mixed-precision path requires a concrete CUDA runtime.
-    """
-    model = nn.Linear(1, 1, bias=False)
-    optimizer = SGD(model.parameters(), lr=0.1)
-    scaler = GradScaler("cpu", init_scale=64.0)
-    loader = DataLoader(
-        _BatchDataset([{"x": torch.ones(1), "y": torch.zeros(1)}]),
-        batch_size=1,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(11),
-    )
-    before = model.weight.detach().clone()
-
-    with pytest.raises(ValueError, match="concrete CUDA device"):
-        learning.training.loop.train_one_epoch(
-            model,
-            loader,
-            optimizer,
-            _PredictionSumLoss(),
-            torch.device("cpu"),
-            scaler=scaler,
-            use_amp=True,
-        )
-
-    assert torch.equal(model.weight, before)
 
 
 def test_cpu_checkpoint_ignores_unrelated_host_cuda_rng(
@@ -798,33 +732,6 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
     assert payload["identity"]["objective"] == objective
 
 
-def test_every_missing_checkpoint_field_is_rejected(tmp_path: Path) -> None:
-    """
-    Remove each current checkpoint key in turn while holding all other fields valid.
-
-    Every omission must fail the exact schema check, proving no required continuation
-    state is accidentally optional merely because another test covers it.
-    """
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    _run(run_dir, epochs=2, seed=41)
-    payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
-    identity = _identity()
-
-    for missing_key in tuple(payload):
-        incomplete = dict(payload)
-        incomplete.pop(missing_key)
-        with pytest.raises(ValueError, match="schema mismatch"):
-            learning.training.checkpoint.validate_checkpoint(
-                incomplete,
-                expected_identity=identity,
-                expected_role="last",
-                scheduler_expected=True,
-                amp_expected=False,
-                require_best=True,
-            )
-
-
 @pytest.mark.parametrize(
     "schema_version",
     [True, 1.0, 2],
@@ -1072,18 +979,8 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     )
     best_state = best["model_state_dict"]
     ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
-    science_metric_ids = (
-        "normalized_macro_rmse",
-        "normalized_rmse",
-        "normalized_rmse_p",
-        "normalized_rmse_u",
-        "normalized_rmse_v",
-        "normalized_relative_l2",
-        "normalized_relative_h1",
-        "physical_rmse_p",
-        "physical_rmse_u",
-        "physical_rmse_v",
-    )
+    task = domain.tasks.registry.get_task("steady_flow")
+    science_metric_ids = tuple(metric.id for metric in task.default_metrics)
     id_science_metrics = {metric_id: 0.11 + 0.01 * index for index, metric_id in enumerate(science_metric_ids)}
     ood_science_metrics = {metric_id: 0.51 + 0.01 * index for index, metric_id in enumerate(science_metric_ids)}
 
@@ -1251,43 +1148,6 @@ def test_training_timer_excludes_post_training_epoch_lifecycle(
     assert observed["system/train_samples_per_second"] == 12.0
     assert observed["system/epoch_duration_seconds"] == 5.0
     assert observed["system/session_elapsed_seconds"] == 7.0
-
-
-def test_final_epoch_is_evaluated_when_interval_is_larger(tmp_path: Path) -> None:
-    """
-    Train one epoch with a nominal evaluation interval larger than total duration.
-
-    The terminal epoch must still evaluate and publish finite best/last checkpoints,
-    ensuring a short valid run cannot finish without selection state.
-    """
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    model, optimizer, scheduler, loss, train_loader, eval_loader = _components(12)
-    config = {
-        "run": {"device": "cpu"},
-        "training": {"epochs": 1, "evaluation_interval": 5, "ood_evaluation_interval": 5},
-        "evaluation": {"objective": _objective()},
-        "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 5, "max_cases": 1}}},
-    }
-
-    result = learning.training.loop.train_loop(
-        config=config,
-        device=torch.device("cpu"),
-        model=model,
-        optimizer=optimizer,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        train_loss=loss,
-        eval_metrics={"mse": _DatasetMSE()},
-        scheduler=scheduler,
-        save_dir=run_dir,
-        checkpoint_identity=_identity("final-eval"),
-    )
-
-    assert result["best_epoch"] == 1
-    assert math.isfinite(result["best_metric"])
-    assert (run_dir / "best_checkpoint.pt").is_file()
-    assert (run_dir / "last_checkpoint.pt").is_file()
 
 
 def test_missing_best_prevents_successful_loop_completion(

@@ -1,13 +1,10 @@
-# Recreated from named run: S-FNO_m12x12_h24_l4_20260109_201346
-# Source config: model_training/data/processed/safe/S-FNO_m12x12_h24_l4_20260109_201346/config.json
-
 task: steady_flow
 
 run:
   seed: 9
   deterministic: true
   device: auto
-  suffix: low_capacity
+  suffix: null
 
 data:
   train_dataset: lhs_var80_seed3001
@@ -18,9 +15,9 @@ data:
 model:
   kind: fno
   params:
-    n_modes: [12, 12]
-    hidden_channels: 24
-    n_layers: 4
+    n_modes: [48, 48]
+    hidden_channels: 64
+    n_layers: 3
     lifting_channel_ratio: 2
     projection_channel_ratio: 2
     fno_skip: linear
@@ -33,15 +30,30 @@ loss:
     space: normalized
     weight: 1.0
   physics:
-    enabled: false
+    enabled: true
+    continuity: div_eps_velocity
+    derivatives:
+      kind: physical
+      extension: none
+    interior_crop: 0
+    residual_weight:
+      target: 1.3392592245679144e-4
+      warmup:
+        kind: linear
+        epochs: 300
+    boundary_weight:
+      target: 6.696296122839572e-4
+      warmup:
+        kind: linear
+        epochs: 300
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw
-  lr: 1.0e-2
+  lr: 4.3682304700764195e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

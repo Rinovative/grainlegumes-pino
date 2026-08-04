@@ -7,7 +7,7 @@ Compare bounded dataset spectra without loading model activations or artifacts.
 Responsibilities:
   - Compute Hann-windowed isotropic and x/y directional power spectra
   - Show cumulative bandwidth with casewise uncertainty over ordered prefixes
-  - Resolve cross-stream spectral composition along the flow direction
+  - Resolve both complementary position-dependent spectral orientations
   - Enforce shared task contracts, stored representations, and Cartesian grids
 
 Design principles:
@@ -24,26 +24,39 @@ This module does NOT:
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, Literal
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 
+from src.analysis.presentation.analysis_field_labels import field_label
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import pandas as pd
+    from matplotlib.artist import Artist
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
 _DEFAULT_CASE_LIMIT = 100
 _LEGEND_FONT_SIZE = 10
 _MIN_GRID_SIZE = 2
+_ROW_LABEL_X = -0.34
+SpectralEvolutionOrientation = Literal["cross_stream_along_flow", "flow_across_cross_stream"]
+_POWER_FRACTION_FLOOR = 1e-12
+_CROSS_STREAM_ALONG_FLOW: Final[SpectralEvolutionOrientation] = "cross_stream_along_flow"
+_FLOW_ACROSS_CROSS_STREAM: Final[SpectralEvolutionOrientation] = "flow_across_cross_stream"
 _CASE_ID_PATTERN = re.compile(r"case_([0-9]{4,})")
 _DIMENSIONLESS_REPRESENTATION_LABELS = {
     "dimensionless_log10_ratio_to_1_m2": "log10(k / 1 m²)",
     "dimensionless_cross_component_ratio_to_geometric_mean": "kij / sqrt(kii kjj)",
+}
+_PHYSICAL_REPRESENTATION_LABELS = {
+    "identity": "physical values",
+    "identity_before_train_normalization": "physical values",
+    "derived_speed_magnitude": "derived magnitude |u|",
 }
 _PHYSICAL_VALUE_REPRESENTATIONS = frozenset(
     {
@@ -140,13 +153,13 @@ def _select_datasets(
     return {name: datasets[name] for name in available if name in requested_set}
 
 
-def _ordered_case_text(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> str:
-    """Describe exact included ordered-prefix counts without changing limits."""
+def _case_count_text(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> str:
+    """Report only actual displayed case counts; selection mechanics stay internal."""
     counts = {label: min(max_cases, len(frame)) for label, frame in datasets.items()}
     unique_counts = set(counts.values())
     if len(unique_counts) == 1:
-        return f"first {next(iter(unique_counts))} ordered cases"
-    return ", ".join(f"{label} n={count}" for label, count in counts.items()) + " ordered cases"
+        return f"{next(iter(unique_counts))} cases"
+    return ", ".join(f"{label}: {count} cases" for label, count in counts.items())
 
 
 def _validate_datasets(datasets: dict[str, pd.DataFrame], *, max_cases: int) -> tuple[str, ...]:
@@ -217,7 +230,72 @@ def _stored_representation_label(frame: pd.DataFrame, field: str) -> str:
         msg = f"EDA field {field!r} has no stored-representation metadata."
         raise TypeError(msg)
     representation = raw_representation
-    return _DIMENSIONLESS_REPRESENTATION_LABELS.get(representation, representation)
+    labels = {**_DIMENSIONLESS_REPRESENTATION_LABELS, **_PHYSICAL_REPRESENTATION_LABELS}
+    try:
+        return labels[representation]
+    except KeyError as error:
+        msg = f"EDA field {field!r} has unsupported stored representation {representation!r}."
+        raise ValueError(msg) from error
+
+
+def _field_display_label(field: str) -> str:
+    """Return the canonical Matplotlib field label without changing internal keys."""
+    scientific_labels = {
+        "kxx": r"$\kappa_{xx}$",
+        "kxy": r"$\kappa_{xy}$",
+        "kyy": r"$\kappa_{yy}$",
+        "eps": r"$\varepsilon$",
+        "p_bc": r"$p_{\mathrm{bc}}$",
+    }
+    return scientific_labels.get(field, field_label(field, mathtext=True))
+
+
+def _field_row_label(frame: pd.DataFrame, field: str, *, include_representation: bool = False) -> str:
+    """Return one concise field-row label, optionally disclosing stored representation."""
+    label = _field_display_label(field)
+    if not include_representation:
+        return label
+    representation = _stored_representation_label(frame, field)
+    if representation in {"physical values", "derived magnitude |u|"}:
+        return label
+    return f"{label}\n{representation}"
+
+
+def _label_matrix_row(axis: Axes, label: str, *, field: str) -> None:
+    """Place one field label clear of unit-bearing axes, emphasizing only magnitude."""
+    annotation = axis.annotate(
+        label,
+        xy=(_ROW_LABEL_X, 0.5),
+        xycoords="axes fraction",
+        ha="right",
+        va="center",
+        multialignment="center",
+        fontsize=11,
+        fontweight="bold" if field == "U" else "normal",
+        annotation_clip=False,
+    )
+    annotation.set_gid("matrix-row-label")
+
+
+def _matrix_with_legend_sidebar(nrows: int) -> tuple[Figure, np.ndarray, Axes]:
+    """Build the same two-column matrix plus right legend rail used by plots 1-x."""
+    figure = plt.figure(figsize=(13, 4 * nrows), constrained_layout=True)
+    grid = figure.add_gridspec(nrows, 3, width_ratios=(1.0, 1.0, 0.35))
+    axes = np.asarray([[figure.add_subplot(grid[row, column]) for column in range(2)] for row in range(nrows)], dtype=object)
+    legend_axis = figure.add_subplot(grid[:, -1])
+    legend_axis.axis("off")
+    return figure, axes, legend_axis
+
+
+def _add_sidebar_legend(axis: Axes, handles: Sequence[Artist], labels: Sequence[str]) -> None:
+    """Add one shared legend at the top of a dedicated axis-free right rail."""
+    axis.legend(
+        handles,
+        labels,
+        loc="upper left",
+        title="Dataset",
+        fontsize=_LEGEND_FONT_SIZE,
+    )
 
 
 def _spectral_power_ylabel(frame: pd.DataFrame, field: str) -> str:
@@ -262,7 +340,7 @@ def _power_grid(field: np.ndarray, *, dx: float, dy: float) -> tuple[np.ndarray,
     Compute mean-centered Hann-windowed FFT power on physical frequency grids.
 
     The input must be one finite 2D field with both axes at least length two.
-    Power is ``abs(fft2((field-mean)*window))**2 / field.size``; frequency grids
+    Power is ``abs(fft2((field-mean)*window))**2 / field.size``. Frequency grids
     use the caller's positive physical ``dx`` and ``dy``.
     """
     values = np.asarray(field, dtype=float)
@@ -327,7 +405,7 @@ def _case_spectra(
     Stack aligned isotropic and directional spectra for one declared field.
 
     The first bounded saved prefix is used without reranking. Frequency grids
-    must remain identical within the frame; the result carries exact selected
+    must remain identical within the frame. The result carries exact selected
     count and coordinate unit for disclosure.
     """
     selected = frame.iloc[: min(max_cases, len(frame))]
@@ -360,38 +438,97 @@ def _case_spectra(
     )
 
 
-def _vertical_case_map(
+def _spectral_evolution_case_map(
     row: pd.Series,
     field: str,
+    *,
+    orientation: SpectralEvolutionOrientation,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    """Return one case's cross-stream spectral fractions by flow position."""
+    """Return one correctly oriented position-resolved spectral-fraction map."""
     values = np.asarray(row[field], dtype=float)
     x_grid = np.asarray(row["x"], dtype=float)
     y_grid = np.asarray(row["y"], dtype=float)
     if values.ndim != _MIN_GRID_SIZE or x_grid.shape != values.shape or y_grid.shape != values.shape:
-        msg = "Vertical spectral evolution requires field, x, and y arrays on the same 2D grid."
+        msg = "Spectral evolution requires field, x, and y arrays on the same 2D grid."
         raise ValueError(msg)
     if not np.isfinite(values).all() or not np.isfinite(x_grid).all() or not np.isfinite(y_grid).all():
-        msg = "Vertical spectral evolution requires finite field and coordinate arrays."
+        msg = "Spectral evolution requires finite field and coordinate arrays."
         raise ValueError(msg)
     x_values = np.median(x_grid, axis=0)
     y_values = np.median(y_grid, axis=1)
     if x_values.size < _MIN_GRID_SIZE or y_values.size < _MIN_GRID_SIZE:
-        msg = "Vertical spectral evolution requires at least two grid points per axis."
+        msg = "Spectral evolution requires at least two grid points per axis."
         raise ValueError(msg)
     dx_values = np.diff(x_values)
     dy_values = np.diff(y_values)
     if np.any(dx_values <= 0.0) or np.any(dy_values <= 0.0):
-        msg = "Vertical spectral evolution requires increasing rectilinear coordinates."
+        msg = "Spectral evolution requires increasing rectilinear coordinates."
         raise ValueError(msg)
-    dx = float(np.median(dx_values))
-    frequency = np.fft.rfftfreq(values.shape[1], d=dx)[1:]
-    centered = values - np.mean(values, axis=1, keepdims=True)
-    transformed = np.fft.rfft(centered * np.hanning(values.shape[1]), axis=1)[:, 1:]
-    power = np.abs(transformed) ** 2 / values.shape[1]
+
+    if orientation == _CROSS_STREAM_ALONG_FLOW:
+        transform_axis = 1
+        spacing = float(np.median(dx_values))
+        position = y_values
+        window = np.hanning(values.shape[1])[np.newaxis, :]
+        centered = values - np.mean(values, axis=1, keepdims=True)
+        transformed = np.fft.rfft(centered * window, axis=transform_axis)[:, 1:]
+        power = np.abs(transformed) ** 2 / values.shape[1]
+    elif orientation == _FLOW_ACROSS_CROSS_STREAM:
+        transform_axis = 0
+        spacing = float(np.median(dy_values))
+        position = x_values
+        window = np.hanning(values.shape[0])[:, np.newaxis]
+        centered = values - np.mean(values, axis=0, keepdims=True)
+        transformed = np.fft.rfft(centered * window, axis=transform_axis)[1:, :]
+        power = (np.abs(transformed) ** 2 / values.shape[0]).T
+    else:
+        msg = f"Unsupported spectral-evolution orientation: {orientation!r}."
+        raise ValueError(msg)
+
+    frequency = np.fft.rfftfreq(values.shape[transform_axis], d=spacing)[1:]
     totals = np.sum(power, axis=1, keepdims=True)
     fractions = np.divide(power, totals, out=np.zeros_like(power), where=totals > 0.0)
-    return frequency, y_values, fractions, "m"
+    return frequency, position, fractions, "m"
+
+
+def _vertical_case_map(
+    row: pd.Series,
+    field: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Retain the original cross-stream-along-flow reducer for internal callers."""
+    return _spectral_evolution_case_map(row, field, orientation=_CROSS_STREAM_ALONG_FLOW)
+
+
+def _spectral_evolution_map(
+    frame: pd.DataFrame,
+    field: str,
+    *,
+    max_cases: int,
+    orientation: SpectralEvolutionOrientation,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
+    """Return median spectral fractions on one frequency/retained-position grid."""
+    selected = frame.iloc[: min(max_cases, len(frame))]
+    spectra: list[np.ndarray] = []
+    reference_frequency: np.ndarray | None = None
+    reference_position: np.ndarray | None = None
+    coordinate_unit = "m"
+    for _index, row in selected.iterrows():
+        frequency, position, fractions, coordinate_unit = _spectral_evolution_case_map(
+            row,
+            field,
+            orientation=orientation,
+        )
+        if reference_frequency is None:
+            reference_frequency = frequency
+            reference_position = position
+        elif not np.allclose(reference_frequency, frequency) or reference_position is None or not np.allclose(reference_position, position):
+            msg = "Spectral-evolution aggregation requires identical grids within each dataset."
+            raise ValueError(msg)
+        spectra.append(fractions)
+    if reference_frequency is None or reference_position is None or not spectra:
+        msg = "Spectral-evolution aggregation did not establish a frequency-position grid."
+        raise RuntimeError(msg)
+    return reference_frequency, reference_position, np.median(np.stack(spectra), axis=0), len(selected), coordinate_unit
 
 
 def _vertical_spectral_map(
@@ -400,25 +537,36 @@ def _vertical_spectral_map(
     *,
     max_cases: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
-    """Return median cross-stream spectral fractions resolved by flow position."""
-    selected = frame.iloc[: min(max_cases, len(frame))]
-    spectra: list[np.ndarray] = []
-    reference_frequency: np.ndarray | None = None
-    reference_height: np.ndarray | None = None
-    coordinate_unit = "m"
-    for _index, row in selected.iterrows():
-        frequency, height, fractions, coordinate_unit = _vertical_case_map(row, field)
-        if reference_frequency is None:
-            reference_frequency = frequency
-            reference_height = height
-        elif not np.allclose(reference_frequency, frequency) or reference_height is None or not np.allclose(reference_height, height):
-            msg = "Vertical spectral aggregation requires identical grids within each dataset."
-            raise ValueError(msg)
-        spectra.append(fractions)
-    if reference_frequency is None or reference_height is None or not spectra:
-        msg = "Vertical spectral aggregation did not establish a frequency-height grid."
-        raise RuntimeError(msg)
-    return reference_frequency, reference_height, np.median(np.stack(spectra), axis=0), len(selected), coordinate_unit
+    """Retain the original aggregate reducer for internal callers."""
+    return _spectral_evolution_map(
+        frame,
+        field,
+        max_cases=max_cases,
+        orientation=_CROSS_STREAM_ALONG_FLOW,
+    )
+
+
+def _orientation_labels(orientation: SpectralEvolutionOrientation, coordinate_unit: str) -> tuple[str, str, str]:
+    """Return figure title and explicit frequency/position axis labels."""
+    if orientation == _CROSS_STREAM_ALONG_FLOW:
+        return (
+            "Cross-stream spectral evolution along flow direction y",
+            f"Cross-stream spatial frequency k_x [1/{coordinate_unit}]",
+            f"Flow-direction position y [{coordinate_unit}]",
+        )
+    if orientation == _FLOW_ACROSS_CROSS_STREAM:
+        return (
+            "Flow-direction spectral evolution across cross-stream direction x",
+            f"Flow-direction spatial frequency k_y [1/{coordinate_unit}]",
+            f"Cross-stream position x [{coordinate_unit}]",
+        )
+    msg = f"Unsupported spectral-evolution orientation: {orientation!r}."
+    raise ValueError(msg)
+
+
+def _log_power_fraction(fractions: np.ndarray) -> np.ndarray:
+    """Apply the documented fixed floor used by both evolution orientations."""
+    return np.log10(np.maximum(fractions, _POWER_FRACTION_FLOOR))
 
 
 def _band(axis: Axes, k_values: np.ndarray, energy: np.ndarray, *, label: str, color: object) -> None:
@@ -478,14 +626,14 @@ def plot_isotropic_spectral_summary(
 
     Notes
     -----
-    Power retains squared stored-value units; transformed dimensionless
+    Power retains squared stored-value units. Transformed dimensionless
     representations remain dimensionless. Cumulative energy is dimensionless,
     and no interpolation is used when within-frame frequency grids differ.
 
     """
     selected_datasets = _select_datasets(datasets, dataset_names)
     fields = _validate_datasets(selected_datasets, max_cases=max_cases)
-    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    figure, axes, legend_axis = _matrix_with_legend_sidebar(len(fields))
     colors = plt.get_cmap("tab10")
     reference_frame = next(iter(selected_datasets.values()))
     for field_index, field in enumerate(fields):
@@ -499,19 +647,22 @@ def plot_isotropic_spectral_summary(
             axes[field_index, 1].fill_between(radial_k[1:], q10, q90, color=color, alpha=0.18)
         _set_log_frequency_axis(axes[field_index, 0])
         axes[field_index, 0].set_yscale("log")
-        axes[field_index, 0].set_title(f"{field}: isotropic power")
+        if field_index == 0:
+            axes[field_index, 0].set_title("Isotropic power")
+            axes[field_index, 1].set_title("Cumulative energy")
+        _label_matrix_row(axes[field_index, 0], _field_row_label(reference_frame, field), field=field)
         axes[field_index, 0].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
         axes[field_index, 0].set_ylabel(_spectral_power_ylabel(reference_frame, field))
         _set_log_frequency_axis(axes[field_index, 1])
         axes[field_index, 1].set_ylim(0.0, 1.02)
-        axes[field_index, 1].set_title(f"{field}: cumulative energy")
         axes[field_index, 1].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
         axes[field_index, 1].set_ylabel("Cumulative energy [-]")
         for axis in axes[field_index]:
             axis.grid(alpha=0.25, which="both")
-            axis.legend(fontsize=_LEGEND_FONT_SIZE)
-    case_text = _ordered_case_text(selected_datasets, max_cases=max_cases)
-    figure.suptitle(f"Isotropic spectra and cumulative energy — {case_text}")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_sidebar_legend(legend_axis, handles, labels)
+    case_text = _case_count_text(selected_datasets, max_cases=max_cases)
+    figure.suptitle(f"Isotropic spectra — {case_text}")
     return figure
 
 
@@ -524,7 +675,7 @@ def plot_isotropic_spectral_case(
     """Compare one exact dataset-local case's isotropic spectra."""
     selected_datasets = _select_datasets(datasets, dataset_names)
     fields = _validate_datasets(selected_datasets, max_cases=1)
-    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    figure, axes, legend_axis = _matrix_with_legend_sidebar(len(fields))
     colors = plt.get_cmap("tab10")
     reference_frame = next(iter(selected_datasets.values()))
     for field_index, field in enumerate(fields):
@@ -539,18 +690,21 @@ def plot_isotropic_spectral_case(
             axes[field_index, 1].plot(radial_k[1:], cumulative, color=color, label=label)
         _set_log_frequency_axis(axes[field_index, 0])
         axes[field_index, 0].set_yscale("log")
-        axes[field_index, 0].set_title(f"{field}: isotropic power")
+        if field_index == 0:
+            axes[field_index, 0].set_title("Isotropic power")
+            axes[field_index, 1].set_title("Cumulative energy")
+        _label_matrix_row(axes[field_index, 0], _field_row_label(reference_frame, field), field=field)
         axes[field_index, 0].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
         axes[field_index, 0].set_ylabel(_spectral_power_ylabel(reference_frame, field))
         _set_log_frequency_axis(axes[field_index, 1])
         axes[field_index, 1].set_ylim(0.0, 1.02)
-        axes[field_index, 1].set_title(f"{field}: cumulative energy")
         axes[field_index, 1].set_xlabel(f"Spatial frequency k [1/{coordinate_unit}]")
         axes[field_index, 1].set_ylabel("Cumulative energy [-]")
         for axis in axes[field_index]:
             axis.grid(alpha=0.25, which="both")
-            axis.legend(fontsize=_LEGEND_FONT_SIZE)
-    figure.suptitle(f"Isotropic spectra and cumulative energy — case {case_number}")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    _add_sidebar_legend(legend_axis, handles, labels)
+    figure.suptitle(f"Isotropic spectra — Case {case_number}")
     return figure
 
 
@@ -562,14 +716,15 @@ def _directional_axis(
     direction: str,
     max_cases: int | None = None,
     case_number: int | None = None,
-) -> None:
-    """Plot one physical directional spectrum in aggregate or single-case scope."""
+) -> tuple[list[Artist], list[str]]:
+    """Plot one physical directional spectrum and return its shared legend entries."""
     if (max_cases is None) == (case_number is None):
         msg = "Directional spectra require exactly one aggregate bound or case number."
         raise ValueError(msg)
     colors = plt.get_cmap("tab10")
     cumulative_axis = axis.twinx()
     coordinate_unit = "m"
+    has_positive_power = False
     for dataset_index, (label, frame) in enumerate(datasets.items()):
         if case_number is None:
             if max_cases is None:
@@ -594,25 +749,32 @@ def _directional_axis(
             raise ValueError(message)
         color = colors(dataset_index % colors.N)
         if case_number is None:
+            median_power = np.quantile(energy, 0.5, axis=0)
+            has_positive_power = has_positive_power or bool(np.any((k_values > 0.0) & (median_power > 0.0)))
             _band(axis, k_values, energy, label=f"{label} power", color=color)
         else:
             power = energy[0]
             valid = (k_values > 0.0) & (power > 0.0)
+            has_positive_power = has_positive_power or bool(np.any(valid))
             axis.plot(k_values[valid], power[valid], color=color, label=f"{label} power")
         cumulative = _cumulative(energy)
         curve = np.quantile(cumulative, 0.5, axis=0) if case_number is None else cumulative[0]
         cumulative_axis.plot(k_values[1:], curve, color=color, linestyle="--", label=f"{label} cumulative")
     _set_log_frequency_axis(axis)
     axis.set_yscale("log")
-    frequency_name = "ky" if direction == "y" else "kx"
-    axis.set_xlabel(f"Spatial frequency {frequency_name} [1/{coordinate_unit}]")
+    if direction == "y":
+        axis.set_xlabel(f"Flow-direction spatial frequency k_y [1/{coordinate_unit}]")
+    else:
+        axis.set_xlabel(f"Cross-stream spatial frequency k_x [1/{coordinate_unit}]")
     axis.set_ylabel(_spectral_power_ylabel(next(iter(datasets.values())), field))
     cumulative_axis.set_ylim(0.0, 1.02)
     cumulative_axis.set_ylabel("Cumulative energy [-]")
+    if not has_positive_power:
+        axis.text(0.5, 0.5, "No positive non-DC spectral power", transform=axis.transAxes, ha="center", va="center")
     axis.grid(alpha=0.25, which="both")
     handles, labels = axis.get_legend_handles_labels()
     cumulative_handles, cumulative_labels = cumulative_axis.get_legend_handles_labels()
-    axis.legend((*handles, *cumulative_handles), (*labels, *cumulative_labels), fontsize=_LEGEND_FONT_SIZE)
+    return [*handles, *cumulative_handles], [*labels, *cumulative_labels]
 
 
 def plot_directional_spectral_summary(
@@ -646,26 +808,33 @@ def plot_directional_spectral_summary(
 
     Notes
     -----
-    Directional spectra remain separate so anisotropic bandwidth is visible; no
+    Directional spectra remain separate so anisotropic bandwidth is visible. No
     scalar cross-direction score is calculated.
 
     """
     selected_datasets = _select_datasets(datasets, dataset_names)
     fields = _validate_datasets(selected_datasets, max_cases=max_cases)
-    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    figure, axes, legend_axis = _matrix_with_legend_sidebar(len(fields))
+    legend_handles: list[Artist] = []
+    legend_labels: list[str] = []
     for field_index, field in enumerate(fields):
         for axis_index, direction in enumerate(("y", "x")):
-            _directional_axis(
+            handles, labels = _directional_axis(
                 axes[field_index, axis_index],
                 datasets=selected_datasets,
                 field=field,
                 direction=direction,
                 max_cases=max_cases,
             )
-            title = "flow-direction spectrum (y)" if direction == "y" else "cross-stream spectrum (x)"
-            axes[field_index, axis_index].set_title(f"{field}: {title}")
-    case_text = _ordered_case_text(selected_datasets, max_cases=max_cases)
-    figure.suptitle(f"Directional spectra in flow and cross-stream directions — {case_text}")
+            if not legend_handles:
+                legend_handles, legend_labels = handles, labels
+        if field_index == 0:
+            axes[field_index, 0].set_title("Flow direction y (k_y)")
+            axes[field_index, 1].set_title("Cross-stream direction x (k_x)")
+        _label_matrix_row(axes[field_index, 0], _field_row_label(next(iter(selected_datasets.values())), field), field=field)
+    _add_sidebar_legend(legend_axis, legend_handles, legend_labels)
+    case_text = _case_count_text(selected_datasets, max_cases=max_cases)
+    figure.suptitle(f"Directional spectra — {case_text}")
     return figure
 
 
@@ -680,19 +849,26 @@ def plot_directional_spectral_case(
     fields = _validate_datasets(selected_datasets, max_cases=1)
     for frame in selected_datasets.values():
         _case_row(frame, case_number)
-    figure, axes = plt.subplots(len(fields), 2, figsize=(13, 4 * len(fields)), squeeze=False, constrained_layout=True)
+    figure, axes, legend_axis = _matrix_with_legend_sidebar(len(fields))
+    legend_handles: list[Artist] = []
+    legend_labels: list[str] = []
     for field_index, field in enumerate(fields):
         for axis_index, direction in enumerate(("y", "x")):
-            _directional_axis(
+            handles, labels = _directional_axis(
                 axes[field_index, axis_index],
                 datasets=selected_datasets,
                 field=field,
                 direction=direction,
                 case_number=case_number,
             )
-            title = "flow-direction spectrum (y)" if direction == "y" else "cross-stream spectrum (x)"
-            axes[field_index, axis_index].set_title(f"{field}: {title}")
-    figure.suptitle(f"Directional spectra in flow and cross-stream directions — case {case_number}")
+            if not legend_handles:
+                legend_handles, legend_labels = handles, labels
+        if field_index == 0:
+            axes[field_index, 0].set_title("Flow direction y (k_y)")
+            axes[field_index, 1].set_title("Cross-stream direction x (k_x)")
+        _label_matrix_row(axes[field_index, 0], _field_row_label(next(iter(selected_datasets.values())), field), field=field)
+    _add_sidebar_legend(legend_axis, legend_handles, legend_labels)
+    figure.suptitle(f"Directional spectra — Case {case_number}")
     return figure
 
 
@@ -701,9 +877,10 @@ def plot_vertical_spectral_evolution(
     datasets: dict[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
     dataset_names: Sequence[str] | None = None,
+    orientation: SpectralEvolutionOrientation = _CROSS_STREAM_ALONG_FLOW,
 ) -> Figure:
     """
-    Plot cross-stream spectral composition along the physical flow direction.
+    Plot either position-resolved physical spectral orientation.
 
     Parameters
     ----------
@@ -714,11 +891,14 @@ def plot_vertical_spectral_evolution(
         Positive bound on the stored ordered prefix aggregated per dataset.
     dataset_names : collections.abc.Sequence[str] | None, optional
         Explicit dataset labels to compare. Omission preserves all input labels.
+    orientation : {"cross_stream_along_flow", "flow_across_cross_stream"}, optional
+        Spatial transform and retained-position orientation. The default preserves
+        cross-stream k_x spectra resolved along flow-direction position y.
 
     Returns
     -------
     matplotlib.figure.Figure
-        One cross-stream-frequency/flow-position map per dataset and field. Values are
+        One frequency/orthogonal-position map per dataset and field. Values are
         casewise median log10 row-normalized power fractions.
 
     Raises
@@ -729,14 +909,15 @@ def plot_vertical_spectral_evolution(
 
     Notes
     -----
-    Each horizontal row is mean-centered and Hann-windowed before the real FFT.
-    Omitting the DC bin and normalizing within a row makes the map dimensionless;
-    it describes scale composition rather than absolute field power.
+    The selected transform axis is mean-centered and Hann-windowed before the
+    real FFT. Omitting the DC bin and normalizing at each retained position makes
+    the map dimensionless. Both orientations use a fixed 1e-12 numerical floor
+    and log10 color range from -12 to 0, including honest zero-energy annotation.
 
     """
     selected_datasets = _select_datasets(datasets, dataset_names)
     fields = _validate_datasets(selected_datasets, max_cases=max_cases)
-    case_text = _ordered_case_text(selected_datasets, max_cases=max_cases)
+    case_text = _case_count_text(selected_datasets, max_cases=max_cases)
     figure, axes = plt.subplots(
         len(fields),
         len(selected_datasets),
@@ -746,22 +927,28 @@ def plot_vertical_spectral_evolution(
     )
     for field_index, field in enumerate(fields):
         for dataset_index, (label, frame) in enumerate(selected_datasets.items()):
-            frequency, height, fractions, count, coordinate_unit = _vertical_spectral_map(
+            frequency, position, fractions, _count, coordinate_unit = _spectral_evolution_map(
                 frame,
                 field,
                 max_cases=max_cases,
+                orientation=orientation,
             )
-            log_fraction = np.log10(np.maximum(fractions, np.finfo(float).tiny))
+            log_fraction = _log_power_fraction(fractions)
             axis = axes[field_index, dataset_index]
-            image = axis.pcolormesh(frequency, height, log_fraction, shading="auto", cmap="magma")
+            image = axis.pcolormesh(frequency, position, log_fraction, shading="auto", cmap="magma", vmin=np.log10(_POWER_FRACTION_FLOOR), vmax=0.0)
             _set_log_frequency_axis(axis)
-            representation = _stored_representation_label(frame, field)
-            axis.set_title(f"{label}: {field} ({representation}), n={count}")
-            axis.set_xlabel(f"Cross-stream spatial frequency kx [1/{coordinate_unit}]")
-            axis.set_ylabel(f"Flow-direction position y [{coordinate_unit}]")
+            if field_index == 0:
+                axis.set_title(label)
+            if dataset_index == 0:
+                _label_matrix_row(axis, _field_row_label(frame, field, include_representation=True), field=field)
+            title, xlabel, ylabel = _orientation_labels(orientation, coordinate_unit)
+            axis.set_xlabel(xlabel)
+            axis.set_ylabel(ylabel)
+            if not np.any(fractions > 0.0):
+                axis.text(0.5, 0.5, "No positive non-DC spectral power", transform=axis.transAxes, ha="center", va="center", color="white")
             colorbar = figure.colorbar(image, ax=axis)
             colorbar.set_label("log10 row-normalized power fraction [-]")
-    figure.suptitle(f"Cross-stream spectral evolution along the flow direction — {case_text}")
+    figure.suptitle(f"{title} — {case_text}")
     return figure
 
 
@@ -770,8 +957,9 @@ def plot_vertical_spectral_case(
     datasets: dict[str, pd.DataFrame],
     case_number: int,
     dataset_names: Sequence[str] | None = None,
+    orientation: SpectralEvolutionOrientation = _CROSS_STREAM_ALONG_FLOW,
 ) -> Figure:
-    """Compare one case's cross-stream spectral evolution across datasets."""
+    """Compare either position-resolved spectral orientation for one case."""
     selected_datasets = _select_datasets(datasets, dataset_names)
     fields = _validate_datasets(selected_datasets, max_cases=1)
     figure, axes = plt.subplots(
@@ -784,16 +972,21 @@ def plot_vertical_spectral_case(
     for field_index, field in enumerate(fields):
         for dataset_index, (label, frame) in enumerate(selected_datasets.items()):
             row = _case_row(frame, case_number)
-            frequency, height, fractions, coordinate_unit = _vertical_case_map(row, field)
-            log_fraction = np.log10(np.maximum(fractions, np.finfo(float).tiny))
+            frequency, position, fractions, coordinate_unit = _spectral_evolution_case_map(row, field, orientation=orientation)
+            log_fraction = _log_power_fraction(fractions)
             axis = axes[field_index, dataset_index]
-            image = axis.pcolormesh(frequency, height, log_fraction, shading="auto", cmap="magma")
+            image = axis.pcolormesh(frequency, position, log_fraction, shading="auto", cmap="magma", vmin=np.log10(_POWER_FRACTION_FLOOR), vmax=0.0)
             _set_log_frequency_axis(axis)
-            representation = _stored_representation_label(frame, field)
-            axis.set_title(f"{label}: {field} ({representation})")
-            axis.set_xlabel(f"Cross-stream spatial frequency kx [1/{coordinate_unit}]")
-            axis.set_ylabel(f"Flow-direction position y [{coordinate_unit}]")
+            if field_index == 0:
+                axis.set_title(label)
+            if dataset_index == 0:
+                _label_matrix_row(axis, _field_row_label(frame, field, include_representation=True), field=field)
+            title, xlabel, ylabel = _orientation_labels(orientation, coordinate_unit)
+            axis.set_xlabel(xlabel)
+            axis.set_ylabel(ylabel)
+            if not np.any(fractions > 0.0):
+                axis.text(0.5, 0.5, "No positive non-DC spectral power", transform=axis.transAxes, ha="center", va="center", color="white")
             colorbar = figure.colorbar(image, ax=axis)
             colorbar.set_label("log10 row-normalized power fraction [-]")
-    figure.suptitle(f"Cross-stream spectral evolution along the flow direction — case {case_number}")
+    figure.suptitle(f"{title} — Case {case_number}")
     return figure

@@ -15,9 +15,9 @@ Design principles:
   - One composition interface serves supervised and physics-informed training
 
 This module does NOT:
-  - Define task contracts or allowed physics choices; ``domain.tasks`` owns them
-  - Implement derivatives, equations, residuals, or diagnostics; ``domain.physics`` does
-  - Define evaluation metrics or dataset aggregation; ``learning.metrics`` does
+  - Define task contracts or allowed physics choices. ``domain.tasks`` owns them
+  - Implement derivatives, equations, residuals, or diagnostics. ``domain.physics`` does
+  - Define evaluation metrics or dataset aggregation. ``learning.metrics`` does
 ===============================================================================
 """
 
@@ -81,7 +81,7 @@ def validate_data_loss_semantics(kind: str, *, space: str) -> DataLossKindSpec:
     """Validate the selected data-loss tensor space."""
     spec = resolve_data_loss_kind(kind)
     if space not in spec.spaces:
-        msg = f"Loss {kind!r} does not support space {space!r}; expected one of {sorted(spec.spaces)}."
+        msg = f"Loss {kind!r} does not support space {space!r}. Expected one of {sorted(spec.spaces)}."
         raise ValueError(msg)
     return spec
 
@@ -150,7 +150,7 @@ def _resolved_weight(config: dict[str, Any], name: str) -> pino.LinearWarmup:
         msg = f"loss.physics.{name}.warmup must be a mapping."
         raise TypeError(msg)
     if warmup.get("kind") != "linear":
-        msg = f"Unknown warmup identifier {warmup.get('kind')!r}; expected 'linear'."
+        msg = f"Unknown warmup identifier {warmup.get('kind')!r}. Expected 'linear'."
         raise ValueError(msg)
     return pino.LinearWarmup(
         target=float(weight["target"]),
@@ -167,7 +167,7 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> pino
     continuity formulations, default continuity, and boundary formulation. The
     effective experiment config selects continuity, numerical derivatives,
     explicit weights, and warmup. The caller supplies the already resolved
-    concrete runtime device; this factory never performs availability fallback.
+    concrete runtime device. This factory never performs availability fallback.
 
     Parameters
     ----------

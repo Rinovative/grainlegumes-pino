@@ -15,9 +15,9 @@ Design principles:
   - Ordered membership remains distinct from dataset-level content identity
 
 This module does NOT:
-  - Load final datasets into model-ready samples; ``dataset_simulation`` owns that
-  - Choose training/evaluation ratios or random seeds; experiment services own them
-  - Publish dataset files; the generation-domain builder owns publication
+  - Load final datasets into model-ready samples. ``dataset_simulation`` owns that
+  - Choose training/evaluation ratios or random seeds. Experiment services own them
+  - Publish dataset files. The generation-domain builder owns publication
 ===============================================================================
 """
 
@@ -47,7 +47,6 @@ SPLIT_SCHEMA_VERSION = 1
 _SHA256_HEX_LENGTH = 64
 _TENSOR_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
-
 _GENERATED_BATCH_IDENTITY_KEYS = frozenset(
     {
         "schema_version",
@@ -84,7 +83,7 @@ _REQUIRED_KEYS = frozenset(
         "schema_kind",
         "dataset_id",
         "task",
-        "task_contract_digest",
+        "data_contract_digest",
         "fields",
         "tensor_layout",
         "sample_count",
@@ -105,11 +104,16 @@ _REQUIRED_KEYS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class DatasetIdentity:
-    """Portable ordered identity returned after strict dataset validation."""
+    """
+    Portable ordered identity returned after strict dataset validation.
+
+    ``data_contract_digest`` identifies learned-data compatibility, distinct
+    from the complete run TaskSpec contract digest.
+    """
 
     dataset_id: str
     task: str
-    task_contract_digest: str
+    data_contract_digest: str
     fingerprint: str
     sample_ids: tuple[str, ...]
     sample_count: int
@@ -124,7 +128,7 @@ class DatasetIdentity:
         return {
             "dataset_id": self.dataset_id,
             "task": self.task,
-            "task_contract_digest": self.task_contract_digest,
+            "data_contract_digest": self.data_contract_digest,
             "fingerprint": self.fingerprint,
             "sample_ids": list(self.sample_ids),
             "sample_count": self.sample_count,
@@ -242,7 +246,7 @@ def _require_exact_mapping(
     missing = sorted(set(expected).difference(normalized))
     unexpected = sorted(set(normalized).difference(expected))
     if missing or unexpected:
-        msg = f"{label} keys do not match. Missing: {missing}; unexpected: {unexpected}."
+        msg = f"{label} keys do not match. Missing: {missing}. Unexpected: {unexpected}."
         raise ValueError(msg)
     return normalized
 
@@ -533,8 +537,52 @@ def _require_exact_keys(payload: Mapping[str, Any], *, label: str) -> None:
     missing = sorted(_REQUIRED_KEYS.difference(payload))
     unexpected = sorted(set(payload).difference(_REQUIRED_KEYS))
     if missing or unexpected:
-        msg = f"{label} schema keys do not match. Missing: {missing}; unexpected: {unexpected}."
+        msg = f"{label} schema keys do not match. Missing: {missing}. Unexpected: {unexpected}."
         raise ValueError(msg)
+
+
+def validate_dataset_data_contract_digest(
+    value: Any,
+    *,
+    task: TaskSpec,
+    label: str = "Dataset data_contract_digest",
+) -> str:
+    """
+    Admit one persisted digest against the task's learned-data contract.
+
+    Parameters
+    ----------
+    value : Any
+        Persisted digest from a dataset payload, identity, or metadata package.
+    task : TaskSpec
+        Authoritative current task whose learned-data contract must match.
+    label : str, optional
+        Evidence label used in validation errors.
+
+    Returns
+    -------
+    str
+        The exact admitted persisted digest.
+
+    Raises
+    ------
+    TypeError
+        If ``value`` is not a non-empty string.
+    ValueError
+        If ``value`` is not a SHA-256 digest or is not bound to the current
+        learned-data contract.
+
+    Notes
+    -----
+    Datasets persist only ``TaskSpec.data_contract_digest``. Complete-task
+    digests and prior data-contract digests are rejected without conversion.
+
+    """
+    digest = _require_sha256(value, label=label)
+    if digest != task.data_contract_digest:
+        msg = f"{label} is not compatible with the learned-data contract for task {task.id!r}."
+        raise ValueError(msg)
+    return digest
 
 
 def _validate_task_header(payload: Mapping[str, Any], task: TaskSpec, *, label: str) -> None:
@@ -548,9 +596,11 @@ def _validate_task_header(payload: Mapping[str, Any], task: TaskSpec, *, label: 
     if payload.get("task") != task.id:
         msg = f"{label} task must be {task.id!r}, got {payload.get('task')!r}."
         raise ValueError(msg)
-    if payload.get("task_contract_digest") != task.contract_digest:
-        msg = f"{label} task-contract digest does not match registered task {task.id!r}."
-        raise ValueError(msg)
+    validate_dataset_data_contract_digest(
+        payload.get("data_contract_digest"),
+        task=task,
+        label=f"{label}.data_contract_digest",
+    )
     fields = _require_mapping(payload.get("fields"), label=f"{label}.fields")
     if set(fields) != {"inputs", "outputs"}:
         msg = f"{label}.fields must contain exactly 'inputs' and 'outputs'."
@@ -609,7 +659,7 @@ def compute_case_fingerprint(
     metadata = {
         "case_fingerprint_version": CASE_FINGERPRINT_VERSION,
         "task": task.id,
-        "task_contract_digest": task.contract_digest,
+        "data_contract_digest": task.data_contract_digest,
         "fields": {"inputs": list(task.input_names), "outputs": list(task.output_names)},
         "tensor_layout": list(task.tensor_layout[1:]),
         "case_id": normalized_case_id,
@@ -675,7 +725,7 @@ def build_training_dataset_payload(
         "schema_kind": TRAINING_DATASET_SCHEMA_KIND,
         "dataset_id": normalized_dataset_id,
         "task": task.id,
-        "task_contract_digest": task.contract_digest,
+        "data_contract_digest": task.data_contract_digest,
         "fields": {"inputs": list(task.input_names), "outputs": list(task.output_names)},
         "tensor_layout": list(task.tensor_layout),
         "sample_count": sample_count,
@@ -795,7 +845,7 @@ def validate_training_dataset_payload(
     return DatasetIdentity(
         dataset_id=dataset_id,
         task=task.id,
-        task_contract_digest=task.contract_digest,
+        data_contract_digest=str(mapping["data_contract_digest"]),
         fingerprint=fingerprint,
         sample_ids=sample_ids,
         sample_count=sample_count,

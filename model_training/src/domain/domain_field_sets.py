@@ -67,10 +67,10 @@ def validate_ordered_fields(
     missing = [name for name in expected_fields if name not in actual_fields]
     unexpected = [name for name in actual_fields if name not in expected_fields]
     if missing or unexpected:
-        msg = f"{label} does not match the task contract. Missing: {missing}; unexpected: {unexpected}; expected order: {list(expected_fields)}."
+        msg = f"{label} does not match the task contract. Missing: {missing}. Unexpected: {unexpected}. Expected order: {list(expected_fields)}."
         raise ValueError(msg)
 
     if actual_fields != expected_fields:
-        msg = f"{label} has the wrong channel order. Expected: {list(expected_fields)}; got: {list(actual_fields)}."
+        msg = f"{label} has the wrong channel order. Expected: {list(expected_fields)}. Received: {list(actual_fields)}."
         raise ValueError(msg)
     return actual_fields

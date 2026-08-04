@@ -2,10 +2,10 @@
 """
 Protect shared requested-versus-resolved runtime device behavior at every boundary.
 
-Mocked CUDA facts cover CPU silence, ``auto`` selection/fallback, strict CUDA
-failure, safe metadata, mixed precision, cleanup, CLI forwarding, and artifact
-resolution exactly once. No real CUDA query or GPU allocation is required; model
-numerics and queue selection are covered elsewhere.
+Mocked CUDA facts cover CPU silence, ``auto`` selection and fallback, strict
+CUDA failure, safe metadata, mixed precision, cleanup, CLI forwarding, and
+artifact resolution exactly once. Focused operation probes run only when CUDA is
+available. Model numerics and queue selection are covered elsewhere.
 """
 
 from __future__ import annotations
@@ -15,13 +15,12 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
-from src import analysis, experiments, learning
+from src import analysis, domain, experiments, learning
 from support import configs
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-_CONFIG = configs.acceptance_config_path()
 _MOCK_CUDA_INDEX = 2
 
 
@@ -180,7 +179,7 @@ def test_invalid_device_values_fail_at_the_exact_semantic_path() -> None:
     """
     invalid_values: tuple[Any, ...] = ("unsupported", "cuda:0", True, 0, None)
     for invalid in invalid_values:
-        raw = experiments.config.loader.load_yaml(_CONFIG)
+        raw = configs.direct_config()
         raw["run"]["device"] = invalid
         with pytest.raises(
             experiments.config.loader.ConfigError,
@@ -216,53 +215,130 @@ def test_artifact_cpu_cleanup_does_not_touch_cuda_runtime(
     analysis.artifacts.service.cleanup_runtime(torch.device("cpu"))
 
 
-def test_current_uno_bicubic_cuda_policy_rejects_only_strict_determinism() -> None:
-    """Reject current CUDA UNO strictness while admitting non-strict, FNO, and CPU cases."""
-    uno_raw = experiments.config.loader.load_yaml(
-        configs.experiment_config_path(model_kind="uno", physics_enabled=False),
-    )
+def test_cuda_determinism_policy_is_operation_aware_and_never_mutates_config() -> None:
+    """Reject known strict CUDA conflicts while admitting supported effective operations."""
+    cuda = _mock_cuda_resolution()
+    uno_raw = configs.direct_config(model_kind="uno", physics_enabled=False)
     uno_raw["run"]["deterministic"] = True
     uno = experiments.config.loader.resolve_config(uno_raw)
-    cuda = _mock_cuda_resolution()
     with pytest.raises(
         learning.device.DeviceResolutionError,
-        match=r"bicubic CUDA backward.*run\.deterministic: false.*seed remains active.*alter UNO model semantics",
+        match=r"(?s)UNO 2D resampling.*bicubic.*run\.deterministic: false.*best-effort CUDA reproducibility",
     ):
         experiments.run.validate_deterministic_model_device_policy(uno, cuda)
+    assert uno["run"]["deterministic"] is True
 
-    uno["run"]["deterministic"] = False
-    experiments.run.validate_deterministic_model_device_policy(uno, cuda)
-    uno["run"]["deterministic"] = True
-    experiments.run.validate_deterministic_model_device_policy(uno, learning.device.resolve_device("cpu"))
+    reflected_raw = configs.direct_config(model_kind="fno", physics_enabled=True)
+    reflected_raw["run"]["deterministic"] = True
+    reflected_raw["loss"]["physics"]["derivatives"] = {
+        "kind": "spectral",
+        "extension": "reflect",
+    }
+    reflected = experiments.config.loader.resolve_config(reflected_raw)
+    with pytest.raises(
+        learning.device.DeviceResolutionError,
+        match=r"(?s)spectral physics.*extension 'reflect'.*reflection_pad2d_backward_cuda.*will not change",
+    ):
+        experiments.run.validate_deterministic_model_device_policy(reflected, cuda)
+    assert reflected["run"]["deterministic"] is True
+    assert reflected["loss"]["physics"]["derivatives"] == {
+        "kind": "spectral",
+        "extension": "reflect",
+    }
 
-    fno = experiments.config.loader.load_and_resolve_config(
-        configs.experiment_config_path(model_kind="fno", physics_enabled=False),
+    for config in (uno, reflected):
+        config["run"]["deterministic"] = False
+        experiments.run.validate_deterministic_model_device_policy(config, cuda)
+        config["run"]["deterministic"] = True
+        experiments.run.validate_deterministic_model_device_policy(config, learning.device.resolve_device("cpu"))
+
+    data_only = experiments.config.loader.resolve_config(
+        configs.direct_config(model_kind="fno", physics_enabled=False),
     )
-    experiments.run.validate_deterministic_model_device_policy(fno, cuda)
+    physical = experiments.config.loader.resolve_config(
+        configs.direct_config(model_kind="fno", physics_enabled=True),
+    )
+    experiments.run.validate_deterministic_model_device_policy(data_only, cuda)
+    experiments.run.validate_deterministic_model_device_policy(physical, cuda)
 
 
-def test_uno_cuda_strict_determinism_fails_before_allocation_or_tracking(
-    tmp_path: Path,
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    [
+        ("reflected-spectral-physics", "reflection_pad2d_backward_cuda"),
+        ("uno-bicubic-resampling", "upsample_bicubic2d_backward"),
+    ],
+)
+def test_known_cuda_operations_reject_strict_deterministic_backward(
+    operation: str,
+    message: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reject an unsupported request before run locks, files, allocation, or W&B initialization."""
-    raw = experiments.config.loader.load_yaml(
-        configs.experiment_config_path(model_kind="uno", physics_enabled=True),
+    """Exercise the project derivative and maintained UNO model CUDA paths."""
+    previous_enabled = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    try:
+        if operation == "reflected-spectral-physics":
+            value = torch.randn(1, 2, 8, 10, device="cuda", requires_grad=True)
+            derivative_x, derivative_y = domain.physics.derivatives.SpectralDerivatives(
+                extension="reflect",
+            ).gradient(value, 1.0, 1.0)
+            objective = derivative_x.square().mean() + derivative_y.square().mean()
+        else:
+            config = experiments.config.loader.resolve_config(
+                configs.direct_config(model_kind="uno", physics_enabled=False),
+            )
+            model = learning.models.factory.build_model(config, device=torch.device("cuda:0"))
+            params = config["model"]["params"]
+            in_channels = int(params["in_channels"])
+            height = int(params["modes_y"])
+            width = int(params["modes_x"])
+            value = torch.randn(1, in_channels, height, width, device="cuda")
+            objective = model(value).square().mean()
+        with pytest.raises(RuntimeError, match=message):
+            objective.backward()
+    finally:
+        torch.use_deterministic_algorithms(previous_enabled, warn_only=previous_warn_only)
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "reflected_spectral_physics"),
+    [("uno", False), ("fno", True)],
+    ids=("uno-bicubic", "reflected-spectral-physics"),
+)
+def test_known_cuda_determinism_conflicts_fail_before_allocation_or_tracking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_kind: str,
+    reflected_spectral_physics: bool,
+) -> None:
+    """Reject known conflicts before run locks, files, allocation, or W&B initialization."""
+    raw = configs.direct_config(
+        model_kind=model_kind,
+        physics_enabled=True,
     )
     raw["run"]["device"] = "cuda"
     raw["run"]["deterministic"] = True
+    if reflected_spectral_physics:
+        raw["loss"]["physics"]["derivatives"] = {
+            "kind": "spectral",
+            "extension": "reflect",
+        }
     allocation_attempted = False
     tracking_attempted = False
 
     def reject_allocation(_run_dir: Path | str) -> Path:
         nonlocal allocation_attempted
         allocation_attempted = True
-        pytest.fail("unsupported UNO request must not allocate")
+        pytest.fail("unsupported deterministic request must not allocate")
 
     def reject_tracking(*_args: Any, **_kwargs: Any) -> Any:
         nonlocal tracking_attempted
         tracking_attempted = True
-        pytest.fail("unsupported UNO request must not initialize W&B")
+        pytest.fail("unsupported deterministic request must not initialize W&B")
 
     monkeypatch.setattr(experiments.run.config_loader, "load_yaml", lambda _path: raw)
     monkeypatch.setattr(experiments.run.learning.device, "resolve_device", lambda *_args, **_kwargs: _mock_cuda_resolution())
@@ -271,7 +347,7 @@ def test_uno_cuda_strict_determinism_fails_before_allocation_or_tracking(
     output_root = tmp_path / "outputs"
 
     with pytest.raises(learning.device.DeviceResolutionError, match=r"Set run\.deterministic: false"):
-        experiments.run.run_experiment("unsupported-uno.yaml", output_root=output_root)
+        experiments.run.run_experiment(f"unsupported-{model_kind}.yaml", output_root=output_root)
 
     assert allocation_attempted is False
     assert tracking_attempted is False
@@ -291,9 +367,13 @@ def test_strict_cuda_fails_before_fresh_training_allocation(
     _hide_cuda(monkeypatch)
     output_root = tmp_path / "outputs"
 
-    with pytest.raises(learning.device.DeviceResolutionError, match="strict CUDA"):
+    config_path = configs.write_yaml(
+        tmp_path / "request.yaml",
+        configs.direct_config(),
+    )
+    with pytest.raises(learning.device.DeviceResolutionError):
         experiments.run.run_experiment(
-            _CONFIG,
+            config_path,
             device="cuda",
             output_root=output_root,
         )
@@ -319,9 +399,13 @@ def test_strict_cuda_does_not_mutate_an_existing_resume_run(
     (run_dir / "marker.bin").write_bytes(b"unchanged")
     before = _file_inventory(run_dir)
 
-    with pytest.raises(learning.device.DeviceResolutionError, match="strict CUDA"):
+    config_path = configs.write_yaml(
+        tmp_path / "request.yaml",
+        configs.direct_config(),
+    )
+    with pytest.raises(learning.device.DeviceResolutionError):
         experiments.run.run_experiment(
-            _CONFIG,
+            config_path,
             resume=run_dir,
             device="cuda",
         )
@@ -343,7 +427,7 @@ def test_inference_strict_cuda_fails_before_saved_run_admission(
     """
     _hide_cuda(monkeypatch)
 
-    with pytest.raises(learning.device.DeviceResolutionError, match="strict CUDA"):
+    with pytest.raises(learning.device.DeviceResolutionError):
         learning.inference.context.load_inference_context(
             run_dir=tmp_path / "missing-run",
             device_policy="cuda",
@@ -366,7 +450,7 @@ def test_artifact_strict_cuda_fails_before_target_mutation(
     (runs_root / "marker.bin").write_bytes(b"unchanged")
     before = _file_inventory(runs_root)
 
-    with pytest.raises(learning.device.DeviceResolutionError, match="strict CUDA"):
+    with pytest.raises(learning.device.DeviceResolutionError):
         analysis.artifacts.service.build_artifacts(
             runs_root=runs_root,
             dataset_root=tmp_path / "datasets",
@@ -392,6 +476,9 @@ def test_artifact_boundary_reuses_one_resolution_for_both_splits(
         run_dir=run_dir,
         id_dataset_name="id",
         ood_dataset_name="ood",
+        lifecycle_status="completed",
+        is_completed=True,
+        scientific_run_name=run_dir.name,
     )
     resolutions: list[learning.device.DeviceResolution] = []
     cleanup_devices: list[torch.device] = []

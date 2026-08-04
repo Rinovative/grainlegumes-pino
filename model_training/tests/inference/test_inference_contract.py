@@ -5,7 +5,7 @@ Protect completed-run admission and strict inference versus resume checkpoint ro
 Temporary saved-run fixtures show that status, required files, digests, normalizer
 identity, and ``best``/``last`` roles fail before model forward or redundant loads.
 Detailed checkpoint-state restoration and artifact payload generation are covered
-elsewhere; this module performs no production inference.
+elsewhere. This module performs no production inference.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
     Model the minimal field-aware dataset needed for context reconstruction.
 
     The single zero sample deliberately omits production storage and scientific
-    meaning; it only exercises validated normalizer and split wiring.
+    meaning. It only exercises validated normalizer and split wiring.
     """
 
     input_fields: ClassVar[list[str]] = ["source"]
@@ -57,7 +57,7 @@ def _status_run(tmp_path: Path, status: str, *, touch_payloads: bool) -> Path:
     Create one synthetic run leaf at a requested lifecycle status.
 
     Optional empty payload files test that filename presence cannot override the
-    authoritative status marker; no payload is intended to be deserialized.
+    authoritative status marker. No payload is intended to be deserialized.
     """
     run_dir = experiments.run.allocate_run_directory(tmp_path / status)
     experiments.run.transition_run_status(run_dir, "initializing")
@@ -80,9 +80,9 @@ def test_inference_and_artifacts_reject_running_status(tmp_path: Path) -> None:
     """
     run_dir = _status_run(tmp_path, "running", touch_payloads=True)
 
-    with pytest.raises(experiments.run.RunLifecycleError, match="status must be 'completed'"):
+    with pytest.raises(experiments.run.RunLifecycleError, match="terminal and inactive"):
         learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
-    with pytest.raises(experiments.run.RunLifecycleError, match="status must be 'completed'"):
+    with pytest.raises(experiments.run.RunLifecycleError, match="terminal and inactive"):
         analysis.artifacts.service.load_run_artifact_plan(run_dir)
 
 
@@ -95,9 +95,9 @@ def test_incomplete_run_is_rejected_before_reconstruction(tmp_path: Path) -> Non
     """
     run_dir = _status_run(tmp_path, "initializing", touch_payloads=False)
 
-    with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
+    with pytest.raises(experiments.run.RunLifecycleError, match="evaluation evidence|best checkpoint"):
         learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
-    with pytest.raises(experiments.run.RunLifecycleError, match="incomplete and not loadable"):
+    with pytest.raises(experiments.run.RunLifecycleError, match="evaluation evidence|best checkpoint"):
         analysis.artifacts.service.load_run_artifact_plan(run_dir)
 
 
@@ -158,7 +158,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
     )
     dataset = _SyntheticDataset()
 
-    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _run_dir: completed_run)
+    monkeypatch.setattr(experiments.run, "validate_evaluable_run", lambda _run_dir: completed_run)
     monkeypatch.setattr(context, "_field_contract", lambda _config: (["source"], ["target"]))
 
     def configure_reproducibility(_config: dict[str, Any], *, device: torch.device) -> dict[str, int]:

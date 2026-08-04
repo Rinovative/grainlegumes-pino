@@ -1,13 +1,10 @@
-# Recreated from named run: PI-FNO-divepsu-SP_m64x64_h64_l4_lamPhys1e-04_lamP5e-04_20260115_084137
-# Source config: model_training/data/processed/safe/PI-FNO-divepsu-SP_m64x64_h64_l4_lamPhys1e-04_lamP5e-04_20260115_084137/config.json
-
 task: steady_flow
 
 run:
   seed: 9
-  deterministic: true
+  deterministic: false
   device: auto
-  suffix: lr_0p01
+  suffix: lr_0p000625
 
 data:
   train_dataset: lhs_var80_seed3001
@@ -52,11 +49,11 @@ loss:
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw
-  lr: 1.0e-2
+  lr: 6.25e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

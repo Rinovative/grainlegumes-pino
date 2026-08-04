@@ -109,7 +109,7 @@ def resolve_internal_to_present_sources(
     dict[str, list[str]]
         Present internal components in canonical 2D or 3D order, each mapped to
         present source names in declared preference order. Any z-component
-        selects the 3D candidate order; absent components are omitted rather
+        selects the 3D candidate order. Absent components are omitted rather
         than synthesized or averaged.
 
     """

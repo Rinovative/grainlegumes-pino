@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# < 3 )); then
-  echo "Usage: $0 <gpu-id> <train|optuna|artifacts> <log-basename> [semantic CLI arguments...]" >&2
+if (( $# < 4 )); then
+  echo "Usage: $0 <gpu-id> <train|optuna|artifacts> <log-scope> <log-basename> [semantic CLI arguments...]" >&2
   exit 2
 fi
 
 GPU_ID="$1"
 JOB_TYPE="$2"
-LOG_BASENAME="$3"
-shift 3
+LOG_SCOPE="$3"
+LOG_BASENAME="$4"
+shift 4
 SEMANTIC_ARGS=("$@")
 
 if [[ ! "${GPU_ID}" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "GPU ID must be a non-negative integer, got: ${GPU_ID@Q}" >&2
+  exit 2
+fi
+TRIMMED_LOG_SCOPE="${LOG_SCOPE#"${LOG_SCOPE%%[![:space:]]*}"}"
+TRIMMED_LOG_SCOPE="${TRIMMED_LOG_SCOPE%"${TRIMMED_LOG_SCOPE##*[![:space:]]}"}"
+if [[ -z "${LOG_SCOPE}" || "${TRIMMED_LOG_SCOPE}" != "${LOG_SCOPE}" || "${LOG_SCOPE}" == */* || "${LOG_SCOPE}" == *\\* || "${LOG_SCOPE}" == "." || "${LOG_SCOPE}" == ".." ]]; then
+  echo "Log scope must be one safe non-empty path component, got: ${LOG_SCOPE@Q}" >&2
   exit 2
 fi
 if [[ -z "${LOG_BASENAME}" || "${LOG_BASENAME}" == */* || "${LOG_BASENAME}" == "." || "${LOG_BASENAME}" == ".." ]]; then
@@ -77,7 +84,7 @@ while (( INDEX < ${#SEMANTIC_ARGS[@]} )); do
     exit 2
   fi
   if [[ "${DEVICE_VALUE}" != "cuda" ]]; then
-    echo "Queued jobs require strict --device cuda; received --device ${DEVICE_VALUE@Q}." >&2
+    echo "Queued jobs require explicit --device cuda. Received --device ${DEVICE_VALUE@Q}." >&2
     exit 2
   fi
 done
@@ -91,7 +98,7 @@ STORAGE_DIR="$(cd "${HOST_STORAGE_ROOT}" && pwd -P)"
 HOST_GENERATED_DATA_ROOT="${STORAGE_DIR}/data_generation"
 HOST_MODEL_TRAINING_DATA_ROOT="${STORAGE_DIR}/data_training"
 DOCKER_HOME="${STORAGE_DIR}/.docker_home"
-QUEUE_LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/steady_flow/logs/queue"
+QUEUE_LOG_DIR="${HOST_MODEL_TRAINING_DATA_ROOT}/processed/${LOG_SCOPE}/logs/queue"
 LOG_FILE="${QUEUE_LOG_DIR}/${LOG_BASENAME}"
 mkdir -p \
   "${PROJECT_DIR}/data_generation/data" \

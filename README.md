@@ -46,31 +46,33 @@ An interactive EDA framework including:
 <details>
 <summary><strong>⚙️ Neural Operator training (FNO / U-NO / PINOs)  </strong></summary>
 
-A modular, reproducible training framework for neural operator models, including:
+A modular, seeded training framework for neural operator models, including:
 - **Architectures**: FNO, U-NO, and physics-informed variants (PI-FNO, PI-U-NO)
 - **Multi-field I/O**: spatial coordinates, tensor-valued permeability, porosity, inlet pressure → velocity components and pressure
 - **Physics-informed learning**: COMSOL-consistent Brinkman PINO loss combining data fidelity and PDE residuals
 - **Spectral diagnostics**: optional non-intrusive forward hooks on spectral convolution layers
-- **Experiment tracking**: structured logging with full model, optimizer, scheduler, and loss configurations (wandb + checkpoints)
-- **Hyperparameter optimization**: systematic Optuna-based search across architectural, training and physics-informed loss parameters with staged training
+- **Experiment tracking**: structured local and W&B logging with resolved model, optimizer, scheduler, loss, seed, device, and deterministic-algorithm settings
+- **Reproducibility**: stable labelled seeds for Python, NumPy, PyTorch, data loading, workers, splitting, and tuning, with explicit per-configuration deterministic-algorithm policy
+- **Hyperparameter optimization**: Optuna studies resolved through the same task, configuration, data, run, and tracking contracts as direct training
+- **Selection objective**: task-owned `normalized_group_macro_rmse`, a dimensionless lower-is-better macro mean over physical output groups
 </details>
 
 
 <details>
 <summary><strong>🧪 Evaluation</strong></summary>
 
-A evaluation suite for systematic model comparison and assessment, supporting both cross-model comparison on fixed datasets and cross-dataset generalisation analysis (ID and OOD), including:
-- **Global error analysis**: L2 and relative L2 metrics, distributions, CDFs, mean and standard-deviation error maps, and frequency-domain error spectra
-- **Error decomposition**: error vs output magnitude and error vs distance to domain boundaries
-- **Physical consistency checks**: velocity divergence, mass conservation error maps, pressure boundary-condition consistency, and full Darcy–Brinkman operator residual evaluation
-- **Error sensitivity analysis**: parameter–error correlation heatmaps and parameter-wise error trend analysis
-- **Interactive sample inspection**: multi-field prediction, ground truth, and error viewer with permeability field visualisation
-- **Outlier and extreme-case analysis**: worst-case per output channel and extreme input parameter multi-field case viewer
+An evaluation suite for systematic single-run assessment, cross-run comparison on shared memberships, and ID/OOD analysis, including:
+- **Run-owned artifacts**: versioned provenance, payload digests, saved membership, normalized diagnostics, physical squared-error/count sufficient statistics, per-case arrays, physics residuals, and optional runtime comparison
+- **Portable evaluation notebooks**: explicit current run-directory selection, strict completed or provisional terminal-run admission, reuse of valid artifacts, and local CPU generation of missing roles without silent incompatible-cache rebuilds
+- **Performance and field fidelity**: authoritative grouped-objective summaries, predictive-error distributions, mean fields, spatial error statistics, bias, and output spectra
+- **Error drivers and physical consistency**: target-magnitude, boundary-distance, metadata, Darcy–Brinkman residual, continuity, and pressure-boundary diagnostics
+- **Cases and extremes**: shared-case inspection, permeability overlays, outlier tables, worst-case fields, and extreme-input views
+- **Model trade-offs**: comparison-only accuracy–physics and exact parameter-count analyses
 </details>
 
 
 🧬 **Interactive research environment**  
-All evaluation components are provided as interactive Jupyter widgets with dataset selection, case sliders and dynamic plots for systematic exploration of model behaviour.
+Evaluation panels expose distinct single-model and comparison compositions. Every visible tab offers multiple scientific views, renders only the selected figure, and exports only that figure. An explicit bounded session reuses validated immutable case data and numerical reductions until it is closed, while presentation-only changes do not reopen unchanged NPZ payloads.
 
 ## 📄 Project Report
 
@@ -111,32 +113,41 @@ Evaluation of the best-performing model (PI-U-NO with physics-informed loss) on 
 ```mermaid
 flowchart TD
 
-M[MATLAB<br/>Synthetic Data Generator<br/>batch_run.m]
-D1[(Parameter Metadata<br/>data_generation/data/meta/<br/>batch_name.json<br/>batch_name.csv)]
-D2[(Generator Outputs<br/>data_generation/data/raw/batch_name/<br/>case_XXXX.json<br/>case_XXXX.csv)]
-C[COMSOL Multiphysics<br/>Brinkman Flow Solver]
-D3[(Simulation Outputs<br/>data_generation/data/processed/batch_name/<br/>case_XXXX_sol.csv)]
-P[Python Pipeline<br/>Dataset Construction<br/>Model Training & Evaluation]
-D4[(Case Dataset<br/>data/raw/batch_name/<br/>meta.pt<br/>cases/case_XXXX.pt<br/>)]
-D5[(Training Dataset<br/>model_training/data/raw/batch_name/<br/>meta.pt<br/>batch_name.pt)]
-D6[(Model Artifacts<br/>model_training/data/processed/model_name/...)]
-E[Model Comparison and Single Model Analysis]
-D7[(Final Model<br/>data/processed/model_name/...)]
+M[MATLAB<br/>Synthetic field generation<br/>batch_run.m]
+G1[(Generation metadata<br/>data_generation/data/meta/batch_name)]
+G2[(Raw generated cases<br/>data_generation/data/raw/batch_name)]
+C[COMSOL Multiphysics<br/>Darcy–Brinkman solver]
+G3[(Processed reference solutions<br/>data_generation/data/processed/batch_name)]
+B[Python dataset builder<br/>Strict generated-batch admission<br/>Atomic publication]
+D1[(Validated metadata snapshots<br/>model_training/data/meta/dataset_name)]
+D2[(Final tensor dataset<br/>model_training/data/raw/dataset_name)]
+X[Task-owned YAML configuration<br/>Experiment or Optuna request]
+T[Configuration preflight<br/>Training or Optuna]
+R[(Terminal saved runs<br/>model_training/data/processed/task_name/runs/run_name)]
+A[Public artifact CLI<br/>Explicit run path + best checkpoint + saved data state]
+D3[(Run-owned ID and OOD artifacts<br/>Provenance + Parquet + NPZ)]
+L[Path-based artifact admission<br/>Bounded evaluation session]
+E1[Single-model analysis]
+E2[Model comparison]
 
-M --> D1
-M --> D2
-D2 --> C
-C --> D3
-
-D1 --> P
-D2 --> P
-D3 --> P
-
-P --> D4
-D4 --> D5
-D5 --> D6
-D6 --> E
-E --> D7
+M --> G1
+M --> G2
+G2 --> C --> G3
+G1 --> B
+G2 --> B
+G3 --> B
+B --> D1
+B --> D2
+X --> T
+D1 --> T
+D2 --> T
+T --> R
+R --> A
+D1 --> A
+D2 --> A
+A --> D3 --> L
+L --> E1
+L --> E2
 
 ```
 </details>
@@ -151,178 +162,191 @@ flowchart TD
 %% DATA GENERATION
 %% =========================================================
 subgraph DG[DATA GENERATION]
+    subgraph M[MATLAB batch_run.m]
+        M1[sample_parameters.m<br/>Uniform, LHS, or Sobol sampling]
+        M2[gen_structure_field.m<br/>Multi-scale stochastic geometry]
+        M3[gen_permeability_field.m<br/>Tensor permeability]
+        M4[gen_porosity_field.m<br/>Kozeny–Carman anchored porosity]
+        M5[gen_pressure_bc.m<br/>Inlet boundary condition]
+        M6[gen_export.m<br/>Unit-bearing case export]
+        M7[run_comsol_case.m<br/>LiveLink orchestration]
 
-    subgraph M[MATLAB *batch_run.m*]
-        M1[*sample_parameters.m*<br/>Parameter sampling<br/>Uniform/ LHS/ Sobol]
-
-        D1[(Parameter Metadata<br/>data_generation/data/meta/<br/>batch_name.json<br/>batch_name.csv)]
-
-        subgraph GMF[gen_simulation_inputs.m]
-            M2[*gen_structure_field.m*<br/>Structure synthesis<br/>Multi scale stochastic geometry]
-            M3[*gen_permeability_field.m*<br/>κ<br/>Permeability construction<br/>Scalar and tensor fields kappa]
-            M4[*gen_porosity_field.m*<br/>ε<br/>Porosity modelling<br/>Field epsilon with Kozeny Carman anchoring]
-            M5[*gen_pressure_bc.m*<br/>p_bc<br/>Boundary condition generation]
-            M6[*gen_export_fields.m*<br/>Export generator outputs]
-
-            M2 --> M3 --> M6
-            M2 --> M4
-            M3 --> M4
-            M4 --> M6
-            M5 --> M6
-        end
-        D2[(Generator Outputs<br/>data_generation/data/raw/batch_name/<br/>case_XXXX.json<br/>case_XXXX.csv)]
-        M7[*run_comsol_case.m*<br/>Connect MATLAB via Live-Link to COMSOL]
-
-        M1 --> D1
-        D1 --> M2
-        D1 --> M3
-        D1 --> M4
-        D1 --> M5
+        M1 --> M2 --> M3
+        M2 --> M4
+        M3 --> M4
+        M1 --> M5
+        M3 --> M6
+        M4 --> M6
+        M5 --> M6
+        M6 --> M7
     end
 
-   subgraph C[COMSOL]
-      C1[COMSOL Multiphysics<br/>Import generator outputs]
-      C2[Brinkman flow solver<br/>Compute p/ u/ v fields]
-      C3[Export simulation outputs<br/>Fields CSV]
+    GM[(Parameter samples<br/>data_generation/data/meta/batch_name)]
+    GR[(Raw cases and terminal manifest<br/>data_generation/data/raw/batch_name)]
 
-      C1 --> C2 --> C3
-   end
+    subgraph C[COMSOL]
+        C1[Import generated inputs]
+        C2[Darcy–Brinkman solve]
+        C3[Export reference fields and timing]
+        C1 --> C2 --> C3
+    end
 
-   D3[(Simulation Outputs<br/>data_generation/data/processed/batch_name/<br/>case_XXXX_sol.csv)]
+    GP[(Reference solutions<br/>data_generation/data/processed/batch_name)]
 end
 
-M6 --> D2 --> M7 --> C1
-C3 --> D3
+M1 --> GM
+M6 --> GR
+M7 --> C1
+C3 --> GP
 
-subgraph P[PYTHON]
-P0[*src/schema_*.py*<br/>Define Data]
+%% =========================================================
+%% DATASET CONSTRUCTION AND EDA
+%% =========================================================
+subgraph PY[PYTHON DATA ADMISSION]
+    P1[generated_batch.py<br/>Validate manifest, hashes, units,<br/>grids, fields, and membership]
+    P2[build_training_dataset.py<br/>Build tensors and publish dataset<br/>with metadata atomically]
+    D1[(Validated metadata package<br/>model_training/data/meta/dataset_name)]
+    D2[(Immutable final dataset<br/>model_training/data/raw/dataset_name/dataset_name.pt)]
+    E1{{eda.ipynb<br/>Bounded read-only generated-batch analysis}}
 
-P1[Load batch_name.json, /batch_name/case_XXXX_sol.csv<br/>/batch_name/case_XXXX.json]
-
-P2[*build_batch_dataset.py*<br/>Assemble fields, prune metadata,<br/>detect unused channels]
-
-D4[(Case Dataset<br/>data/raw/batch_name/<br/>meta.pt<br/>cases/case_XXXX.pt<br/>)]
-
-P3[*merge_batch_cases.py*<br/>Select channels, stack tensors,<br/>build training dataset]
-
-E1{{EDA *eda.ipynb*<br/>Case-level statistics + spectral sanity checks}}
-
-    %% =========================================================
-    %% MODEL TRAINING
-    %% =========================================================
-    subgraph MT[MODEL TRAINING]
-
-        D5[(Training Dataset<br/>model_training/data/raw/batch_name/<br/>meta.pt<br/>batch_name.pt)]
-
-        %% -------------------------
-        %% Dataset stack (split)
-        %% -------------------------
-        P4[*dataset_base.py*<br/>Data splitting:<br/>train / eval / OOD<br/>Global normalisation on full train set]
-        P5[*dataset_simulation.py*<br/>PhysicsDataset<br/>Load datasets<br/>Expose samples: x, y]
-        P6[*dataset_module_flow.py*<br/>FlowModule<br/>Channel ordering and selection]
-
-        %% -------------------------
-        %% Training entrypoints
-        %% -------------------------
-        subgraph TE[Training entrypoints]
-            TE1[*train_fno.py*]
-            TE2[*train_pi_fno.py*]
-            TE3[*train_uno.py*]
-            TE4[*train_pi_uno.py*]
-        end
-
-        TO1[*spectral_hook.py*<br/>optional diagnostic SpectralConv hooks]
-        TO2[*PINOLoss*<br/>Brinkman residual and data loss]
-        T0[*training/train_config.py*<br/>Define storage locations]
-        T1[*train_base.py*<br/>Unified pipeline]
-        T2[NeuralOP *Trainer*<br/>]
-        D6[(Model Artifacts<br/>model_training/data/processed/model_name/...)]
-
-        %% -------------------------
-        %% Data flow: training
-        %% -------------------------
-        D5 --> P4 --> P5 --> P6
-        T0 --> T1
-        P4 --> T1 --> T2
-
-        TO1 --> TE --> T1
-
-        %% PINO loss is created inside PI entrypoints and passed to train_base
-        TO2 --> TE2
-        TO2 --> TE4
-
-        %% -------------------------
-        %% Evaluation split
-        %% -------------------------
-        subgraph EVA[Evaluation]
-            E2{{*eval_single_model.ipynb*<br/>Single Model Analysis<br/>ID and OOD datasets}}
-            E3{{*eval_comparison_models.ipynb*<br/>Model Comparison<br/>multiple models<br/>same ID/OOD dataset}}
-        end
-
-        %% -------------------------
-        %% Data flow: evaluation
-        %% -------------------------
-        T2 --> D6
-        D4 --> D6 
-        D6 --> E2
-        D6 --> E3
-
-    end  
-
-    D7[(Final Model<br/>data/processed/model_name/...)]
-
+    P1 --> P2
+    P2 --> D1
+    P2 --> D2
+    P1 --> E1
 end
 
+GM --> P1
+GR --> P1
+GP --> P1
 
-%% -------------------------
-%% Data flow: dataset build
-%% -------------------------
-P0 --> P1 --> P2 --> D4 --> P3 --> D5
-D4 --> E1
+%% =========================================================
+%% MODEL TRAINING
+%% =========================================================
+subgraph MT[MODEL TRAINING]
+    X[Task-owned YAML path<br/>Experiment or Optuna configuration]
+    P3[experiments_config_loader.py<br/>Resolve and validate effective config]
+    P4[experiments_config_preflight.py<br/>Compatibility and path preflight]
+    P5[dataset_simulation.py + dataset_base.py<br/>Validate tensors, saved split,<br/>train-only normalizer, loaders]
+    P6[learning_models_factory.py<br/>learning_losses_factory.py]
+    P7[cli_train.py or cli_optuna.py<br/>Seeded training lifecycle]
+    W[W&B observer<br/>Configured tracking and bounded uploads]
+    R[(Completed run<br/>config.yaml + summary.json<br/>split_indices.pt + normalizer.pt<br/>best_checkpoint.pt + last_checkpoint.pt)]
 
-E2 --> D7
-E3 --> D7
+    X --> P3 --> P4 --> P7
+    D1 --> P5
+    D2 --> P5
+    P5 --> P7
+    P6 --> P7
+    P7 --> R
+    P7 --> W
+end
 
-D1 --> P1
-D2 --> P1
-D3 --> P1
+%% =========================================================
+%% ARTIFACT GENERATION AND PORTABLE EVALUATION
+%% =========================================================
+subgraph EVA[EVALUATION]
+    A1[cli_build_artifacts.py<br/>Explicit generation or rebuild]
+    A2[analysis_artifact_service.py<br/>Validate evaluable run and provenance<br/>Saved-membership inference]
+    A3[(analysis/id and analysis/ood/dataset_name<br/>artifact_provenance.json<br/>Parquet + per-case NPZ)]
+    A4[evaluation_artifact_loader.py<br/>Strict path-based run and artifact admission]
+    A5[evaluation_session.py<br/>Bounded case and numerical reuse<br/>Explicit close boundary]
+    E2{{eval_single_model.ipynb<br/>Single-model ID and OOD analysis}}
+    E3{{eval_comparison_models.ipynb<br/>Shared-membership run comparison}}
+
+    A1 --> A2 --> A3 --> A4 --> A5
+    A5 --> E2
+    A5 --> E3
+end
+
+R --> A1
+D1 --> A2
+D2 --> A2
+A3 --> W
+
 ```
 </details>
 
 ## ⚙️ Local Execution
 
 <details>
-<summary><strong>Option A – Run in Visual Studio Code with Docker Dev Container (recommended)</strong></summary>
+<summary><strong>Run via Docker</strong></summary>
 
-**Requirements**
-- [Docker Desktop](https://www.docker.com/products/docker-desktop)
-- [Visual Studio Code](https://code.visualstudio.com/)
-- VS Code extension **“Dev Containers”**
+### Requirements
 
-**Steps**
-```bash
-git clone https://github.com/Rinovative/grainlegumes-pino.git
-cd grainlegumes-pino
-```
-1. Open the folder in VS Code  
-2. Reopen in Container (via prompt or `F1 → Dev Containers: Reopen in Container`)  
-3. Launch one of the notebooks or trainingsskripts  
+Install Git, Docker with Docker Compose, and Visual Studio Code with the
+**Dev Containers** extension. NVIDIA Container Toolkit is also required for GPU
+jobs.
 
-</details>
+### Recommended: Dev Container
 
-<details>
-<summary><strong>Option B – Run via Docker CLI (without VS Code)</strong></summary>
+Clone the repository, build the maintained image, and start the development
+container:
 
-```bash
-git clone https://github.com/Rinovative/grainlegumes-pino.git
-cd grainlegumes-pino
+~~~bash
+git clone https://github.com/Rinovative/grainlegumes-pino-airflow.git
+cd grainlegumes-pino-airflow
+./scripts/docker_build.sh
+./scripts/docker_dev.sh
+~~~
 
-docker build -t pino-dev .
-docker run -it --rm -p 8888:8888 -v $(pwd):/app pino-dev
-jupyter notebook --ip=0.0.0.0 --no-browser --allow-root
-```
+In Visual Studio Code, open **Remote Explorer -> Dev Containers**, attach to
+**grainlegumes-pino-airflow-dev**, and open **/workspace/repo**.
 
-Then open the URL shown in the terminal.
+To enter the running container from a terminal instead:
+
+~~~bash
+docker exec -it grainlegumes-pino-airflow-dev bash
+~~~
+
+### Storage
+
+**STORAGE_ROOT** selects the host storage directory and defaults to the sibling
+**../storage** directory. Set it before starting the container when using another
+location:
+
+~~~bash
+export STORAGE_ROOT=/absolute/path/to/storage
+~~~
+
+The maintained mounts are:
+
+~~~text
+$STORAGE_ROOT/data_generation -> /workspace/repo/data_generation/data
+$STORAGE_ROOT/data_training   -> /workspace/repo/model_training/data
+~~~
+
+**data_generation** is mounted read-only. **data_training** is mounted read-write.
+
+### Train, tune, and publish artifacts
+
+Run the host job wrapper from the repository root:
+
+~~~bash
+./scripts/docker_job.sh train experiment.yaml
+./scripts/docker_job.sh train experiment.yaml --no-build-artifacts
+./scripts/docker_job.sh optuna <optuna_config> [Optuna options...]
+./scripts/docker_job.sh artifacts (--task TASK | --runs-root PATH | --run-dir RUN_DIR) [artifact options...]
+~~~
+
+Normal direct training publishes the completed run and then generates missing or
+reuses valid ID and configured OOD artifacts inside that run bundle. This stage
+runs in the same queued container on the same selected physical GPU. The
+**--no-build-artifacts** flag skips only this post-training stage. Optuna trials do not build full artifacts automatically.
+
+Non-interactive submissions must include **--queue-gpu auto** or
+**--queue-gpu INDEX**. Interactive submissions may select a reported GPU at the
+prompt.
+
+### Portable evaluation notebooks
+
+Use:
+
+- model_training/notebooks/eval_single_model.ipynb
+- model_training/notebooks/eval_comparison_models.ipynb
+
+Both notebooks default to the conventional processed-data `<task>/runs` parent and compose each current run directory from an editable runs root plus `RUN_NAME`. `RUN_NAME` is the directory leaf or storage alias; the immutable scientific run name is read from `config.yaml` and `summary.json`. Change the root independently for moved collections, or set it to an Optuna study's `trials/` parent. The composed directory is passed to the portable path-based workflow.
+
+Valid artifacts are loaded without reconstructing a model or running inference. Missing selected roles are generated atomically and locally on CPU by default. Partial, corrupt, stale, or incompatible targets fail without replacement unless the visible rebuild option is explicitly enabled. Notebook-triggered generation does not contact W&B. Complete run bundles and their relative-path artifacts remain usable after a rename or move; valid non-completed terminal runs remain visibly provisional.
 
 </details>
 
@@ -332,150 +356,277 @@ Then open the URL shown in the terminal.
 
 ```bash
 .
-│
-├── data                                                              # Central storage for datasets used in training and evaluation
-│   ├── meta                                                          # Global metadata
+├── .github
+│   └── workflows
+│       └── quality.yml                                             # Maintained quality checks
+│ 
+├── data_generation                                                 # Generated-data domain and dataset publication
+│   ├── comsol
+│   │   └── template_brinkman.mph                                   # Darcy–Brinkman COMSOL model template
 │   │
-│   ├── processed                                                     # Final Model
-│   │
-│   └── raw                                                           # Raw simulation outputs
-│       ├── lhs_var80_seed3001                                        # Example dataset batch (Latin Hypercube Sampling)
-│       │   ├── cases                                                 # Individual simulation cases
-│       │   │   ├── case_0001.pt                                      # PyTorch case containing fields (kappa, p, u, v)
-│       │   │   └── case_0002.pt                                      # Additional simulation case
-│       │   └── meta.pt                                               # Batch-level generation metadata
-│       └── ...                                                       # Additional raw datasets
-│
-├── data_generation                                                   # Full data generation pipeline (MATLAB → COMSOL → Python)
-│   ├── comsol                                                        # COMSOL-related assets
-│   │   └── template_brinkman.mph                                     # COMSOL Darcy-Brinkman model template
-│   │
-│   ├── data                                                          # Intermediate and final generation outputs
-│   │   ├── meta                                                      # Dataset generation metadata
-│   │   │   ├── lhs_var80_seed3001.csv                                # Case-level generator parameters
-│   │   │   ├── lhs_var80_seed3001.json                               # Batch-level configuration metadata
-│   │   │   └── ...                                                   
+│   ├── data                                                        # GENERATED_DATA_ROOT mount target
+│   │   ├── meta
+│   │   │   ├── <batch_name>.csv                                    # Sampled batch parameters
+│   │   │   └── <batch_name>.json                                   # Batch sampling configuration
 │   │   │
-│   │   ├── processed                                                 # Processed COMSOL solution fields
-│   │   │   ├── lhs_var80_seed3001                                    # Processed batch outputs
-│   │   │   │   ├── case_0001_sol.csv                                 # Processed solution for case 0001
-│   │   │   │   └── case_0002_sol.csv                                 # Processed solution for case 0002
-│   │   │   └── ...                                                   
+│   │   ├── processed
+│   │   │   └── <batch_name>
+│   │   │       └── case_0001_sol.csv                               # Unit-bearing COMSOL reference fields
 │   │   │
-│   │   └── raw                                                       # Raw MATLAB-generated fields
-│   │       ├── lhs_var80_seed3001                                    # Raw permeability batch
-│   │       │   ├── case_0001.csv                                     # Raw field data (e.g. kappa(x,y))
-│   │       │   └── case_0001.json                                    # Case-specific metadata
-│   │       └── ...                                                   
+│   │   └── raw
+│   │       └── <batch_name>
+│   │           ├── batch_manifest.json                             # Terminal generated-batch identity and membership
+│   │           ├── case_0001.csv                                   # Generated permeability, porosity, and boundary fields
+│   │           └── case_0001.json                                  # Case generation metadata
 │   │
-│   └── matlab                                                        # MATLAB code for field generation and COMSOL coupling
-│       ├── functions                                                 # Modular MATLAB function library
-│       │   ├── core                                                  # Core generation and simulation logic
-│       │   │   ├── gen                                               # Low-level physical field generators
-│       │   │   │   ├── gen_export.m                                  # Export routines for CSV and COMSOL
-│       │   │   │   ├── gen_permeability_field.m                      # Synthetic permeability field generator
-│       │   │   │   ├── gen_porosity_field.m                          # Porosity field generator
-│       │   │   │   ├── gen_pressure_bc.m                             # Pressure boundary condition generator
-│       │   │   │   └── gen_structure_field.m                         # Structure and obstacle field generator
-│       │   │   │
-│       │   │   ├── gen_simulation_inputs.m                           # Assembly of COMSOL simulation inputs
-│       │   │   ├── run_comsol_case.m                                 # Execution of a single COMSOL simulation
-│       │   │   ├── sample_parameters.m                               # Design of experiments and parameter sampling
-│       │   │   └── visualize_case.m                                  # MATLAB visualization utilities
-│       │   │
-│       │   └── test                                                  # MATLAB tests
-│       │       └── ...
-│       │
-│       ├── batch_run.m                                               # Full batch execution script
-│       ├── build_batch_dataset.py                                    # Python converter from raw outputs to PyTorch datasets
-│       ├── merge_batch_cases.py                                      # Merge individual cases into unified datasets
-│       ├── permeability_field_viewer.mlx                             # MATLAB live script for field inspection
-│       └── single_run.m                                              # Single-case debug execution
-│
-├── model_training                                                    # Training, evaluation, and analysis
-│   ├── data                                                          # Training-related data storage
-│   │   ├── meta                                                      # Training-related metadata
-│   │   │
-│   │   ├── processed                                                 # Model runs and evaluation artefacts
-│   │   │   ├── FNO_lhs_var10_plog100_seed1_20251208_230304            # Example trained model run
-│   │   │   │   ├── analysis                                          # Evaluation outputs
-│   │   │   │   │   ├── id                                            # In-distribution evaluation results
-│   │   │   │   │   │   ├── npz                                       # Per-case cached prediction fields
-│   │   │   │   │   │   └── lhs_var80_seed3001.parquet                # Aggregated metadata table
-│   │   │   │   │   └── ood                                           # Out-of-distribution evaluation
-│   │   │   │   │       └── ...
-│   │   │   │   │ 
-│   │   │   │   └── model artifacts                                   # Checkpoints, training states, and configs
-│   │   │   └── ...                                                   # Additional model runs
-│   │   │
-│   │   └── raw                                                       # Raw datasets used for training
-│   │       ├── lhs_var80_seed3001                                    # Example training dataset
-│   │       │   ├── lhs_var80_seed3001.pt                             # Combined dataset tensor
-│   │       │   └── meta.pt                                           # Dataset metadata
-│   │       └── ...                                                   # Additional training datasets
-│   │
-│   ├── notebooks                                                     
-│   │   ├── eda.ipynb                                                 # Exploratory data analysis
-│   │   ├── eval_comparison_models.ipynb                              # Model comparison evaluation
-│   │   ├── eval_single_model.ipynb                                   # Single-model evaluation
-│   │   └── training_pipeline.ipynb                                   # Training pipeline overview
-│   │
-│   ├── src                                                           
-│   │   ├── analysis                                                  # Analysis and evaluation logic
-│   │   │   ├── evaluation                                            # Evaluation submodule
-│   │   │   │   ├── evaluation_plot                                   # Evaluation plot functions
-│   │   │   │   │   └── ...                                   
-│   │   │   │   ├── evaluation_dataframe.py                           # Central evaluation DataFrame construction
-│   │   │   │   └── evaluation_panel.py                               # Interactive evaluation panel
+│   ├── matlab                                                      # MATLAB field generation and COMSOL coupling
+│   │   ├── functions
+│   │   │   ├── core
+│   │   │   │   ├── gen
+│   │   │   │   │   ├── gen_export.m                                # Case export
+│   │   │   │   │   ├── gen_permeability_field.m                    # Tensor permeability generation
+│   │   │   │   │   ├── gen_porosity_field.m                        # Porosity generation
+│   │   │   │   │   ├── gen_pressure_bc.m                           # Inlet-pressure generation
+│   │   │   │   │   └── gen_structure_field.m                       # Stochastic structure generation
+│   │   │   │   │
+│   │   │   │   ├── gen_simulation_inputs.m                         # Simulation-input assembly
+│   │   │   │   ├── run_comsol_case.m                               # One COMSOL solve
+│   │   │   │   └── sample_parameters.m                             # Design-of-experiments sampling
 │   │   │   │
-│   │   │   ├── analysis_artifacts.py                                 # Analysis artefact handling utilities
-│   │   │   └── analysis_interference.py                              # Model interference and interaction analysis
+│   │   │   └── test                                                # MATLAB contract tests
 │   │   │
-│   │   ├── dataset                                                   # Dataset abstractions and loaders
-│   │   │   ├── dataset_module                                        # Dataset feature modules
-│   │   │   │   └── dataset_module_flow.py                            # Flow-specific dataset fields (p, u, v, kappa)
-│   │   │   ├── dataset_base.py                                       # Abstract dataset base class
-│   │   │   └── dataset_simulation.py                                 # Simulation-based dataset implementation
-│   │   │
-│   │   ├── eda                                                       # Exploratory data analysis
-│   │   │   ├── eda_plot                                              # EDA plot functions
-│   │   │   │   └── ...
-│   │   │   └── eda_dataframe.py                                      # EDA-specific DataFrame preparation
-│   │   │
-│   │   ├── schema                                                    # Single source of truth for conventions
-│   │   │   ├── schema_fields.py                                      # Field definitions and ordering
-│   │   │   ├── schema_kappa.py                                       # Permeability and tensor schema
-│   │   │   └── schema_training.py                                    # Training configuration schema
-│   │   │
-│   │   └── util                                                      # Shared utility functions
-│   │       ├── util_metrics.py                                       # Error and performance metrics
-│   │       ├── util_nb.py                                            # Notebook and widget helpers
-│   │       ├── util_plot.py                                          # General plotting helpers
-│   │       └── util_plot_components.py                               # Reusable plot components
+│   │   └── batch_run.m                                             # Resume-safe batch orchestration
 │   │
-│   └── training                                                      # Training infrastructure and entry points
-│       ├── optuna                                                    # Hyperparameter optimization
-│       │   ├── optuna_setup.py                                       # Shared Optuna setup and utilities
-│       │   └── optuna_*.py                                           # Optuna study for *
-│       │
-│       ├── tools                                                     # Training-specific helper modules
-│       │   ├── pino_loss.py                                          # Physics-informed loss functions
-│       │   └── spectral_hook.py                                      # Spectral energy diagnostics hooks
-│       │
-│       ├── train_base.py                                             # Shared base training loop
-│       ├── train_config.py                                           # Default training configurations
-│       └── train_*.py                                                # * training entry point
+│   ├── build_training_dataset.py                                   # Atomic final-dataset and metadata publication
+│   └── generated_batch.py                                          # Strict read-only generated-batch admission
 │
-├── environment-dev.yml                                               # Development environment specification
-├── environment.yml                                                   # Production environment specification
-└── pyproject.toml                                                    # Python project and dependency configuration
-└── README.md                                                         # Project overview and usage documentation
+├── docs
+│   ├── figures                                                     # README figures
+│   └── Albertin_2026_PINO_Airflow_PorousMedia.pdf                  # Project report
+│
+├── model_training                                                  # Task, training, artifact, and analysis package
+│   ├── configs
+│   │   └── tasks
+│   │       └── <task>
+│   │           ├── experiments
+│   │           │   └── <category>
+│   │           │       └── <experiment_config>.yaml                # Direct-training request
+│   │           │ 
+│   │           └── optuna
+│   │               └── <optuna_config>.yaml                        # Optuna study request
+│   │
+│   ├── data                                                        # MODEL_TRAINING_DATA_ROOT mount target
+│   │   ├── meta
+│   │   │   └── <dataset_name>
+│   │   │       ├── dataset_metadata.json                           # Validated dataset identity and payload digest
+│   │   │       ├── source_manifest.json                            # Admitted generation-manifest snapshot
+│   │   │       ├── source_sample.csv                               # Admitted sampled-parameter table
+│   │   │       └── source_sample.json                              # Admitted sampling snapshot
+│   │   │
+│   │   ├── processed
+│   │   │   └── <task>
+│   │   │       ├── logs
+│   │   │       │   └── queue                                       # Host-visible detached worker logs
+│   │   │       ├── runs
+│   │   │       │   └── <run_name>
+│   │   │       │       ├── analysis
+│   │   │       │       │   ├── id
+│   │   │       │       │   │   ├── npz
+│   │   │       │       │   │   │   └── case_0001.npz               # Prediction, reference, input, and residual arrays
+│   │   │       │       │   │   ├── artifact_provenance.json        # Versioned identity and payload manifest
+│   │   │       │       │   │   └── <dataset_name>.parquet          # Per-case metrics and aggregate evidence
+│   │   │       │       │   │
+│   │   │       │       │   └── ood
+│   │   │       │       │       └── <dataset_name>                  # OOD role with the same artifact contract
+│   │   │       │       │
+│   │   │       │       ├── best_checkpoint.pt                      # Selected inference and artifact checkpoint
+│   │   │       │       ├── config.yaml                             # Resolved immutable run configuration
+│   │   │       │       ├── last_checkpoint.pt                      # Exact resume checkpoint
+│   │   │       │       ├── normalizer.pt                           # Train-membership-fitted normalizer
+│   │   │       │       ├── split_indices.pt                        # Saved train, ID evaluation, and OOD membership
+│   │   │       │       └── summary.json                            # Lifecycle, identity, and selected metrics
+│   │   │       │
+│   │   │       └── studies
+│   │   │           └── <study_name>                                # Persistent Optuna study and trial runs
+│   │   │
+│   │   └── raw
+│   │       └── <dataset_name>
+│   │           └── <dataset_name>.pt                               # Immutable final tensor dataset
+│   │
+│   ├── notebooks
+│   │   ├── eda.ipynb                                               # Bounded generated-batch exploration
+│   │   ├── eval_comparison_models.ipynb                            # Path-based shared-membership run comparison
+│   │   ├── eval_single_model.ipynb                                 # Path-based single-run ID/OOD evaluation
+│   │   └── training_pipeline.ipynb                                 # Read-only configuration and workflow control plane
+│   │
+│   ├── src
+│   │   ├── analysis
+│   │   │   ├── artifacts
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── analysis_artifact_contracts.py                  # Versioned artifact schemas, digests, and aggregates
+│   │   │   │   ├── analysis_artifact_generation.py                 # Per-case inference artifact generation
+│   │   │   │   ├── analysis_artifact_service.py                    # Evaluable-run artifact orchestration and publication
+│   │   │   │   └── analysis_artifact_timing.py                     # COMSOL and neural runtime sidecars
+│   │   │   │
+│   │   │   ├── eda
+│   │   │   │   ├── plots
+│   │   │   │   │   ├── __init__.py
+│   │   │   │   │   ├── eda_plot_case_statistics.py                 # Case metadata and field-statistic plots
+│   │   │   │   │   └── eda_plot_spectral_analysis.py               # Isotropic, directional, and evolving spectra
+│   │   │   │   │
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── eda_dataframe.py                                # Strict generated-batch EDA frames
+│   │   │   │   └── eda_panel.py                                    # Lazy interactive EDA panel
+│   │   │   │
+│   │   │   ├── evaluation
+│   │   │   │   ├── evaluation_plot
+│   │   │   │   │   ├── __init__.py
+│   │   │   │   │   ├── evaluation_plot_error_behavior.py           # Predictive-error and field-fidelity plots
+│   │   │   │   │   ├── evaluation_plot_physical_consistency.py     # Residual and pressure-boundary diagnostics
+│   │   │   │   │   ├── evaluation_plot_run_summary.py              # Run summaries and accuracy-physics trade-offs
+│   │   │   │   │   ├── evaluation_plot_samples_outliers.py         # Case, outlier, and extreme-input views
+│   │   │   │   │   ├── evaluation_plot_sensitivity_capacity.py     # Metadata sensitivity and model capacity plots
+│   │   │   │   │   └── evaluation_plot_spectral_fidelity.py        # Output-spectrum and transfer diagnostics
+│   │   │   │   │
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── evaluation_artifact_loader.py                   # Strict path-based evaluable-run artifact admission
+│   │   │   │   ├── evaluation_case.py                              # Validated per-case NPZ access
+│   │   │   │   ├── evaluation_dataframe.py                         # Artifact tables and comparison contracts
+│   │   │   │   ├── evaluation_panel.py                             # Lazy single-model and comparison panels
+│   │   │   │   └── evaluation_session.py                           # Bounded case and numerical reuse session
+│   │   │   │
+│   │   │   ├── presentation
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── analysis_presentation_curated.py                # Curated non-interactive analysis bundle
+│   │   │   │   └── analysis_presentation_registry.py               # Ordered section and plot presentation metadata
+│   │   │   │
+│   │   │   ├── ui
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── analysis_ui_components.py                       # Shared notebook widget components
+│   │   │   │   ├── analysis_ui_notebook.py                         # Notebook panel and selected-export composition
+│   │   │   │   └── analysis_ui_viewers.py                          # Lazy controlled figure viewers
+│   │   │   └── __init__.py
+│   │   │
+│   │   ├── common
+│   │   │   ├── __init__.py
+│   │   │   ├── common_locking.py                                   # Advisory file-lock helpers
+│   │   │   ├── common_paths.py                                     # Data-domain, run, study, and artifact paths
+│   │   │   └── common_serialization.py                             # Atomic JSON and binary serialization
+│   │   │
+│   │   ├── datasets
+│   │   │   ├── dataset_modules
+│   │   │   │   ├── __init__.py
+│   │   │   │   └── dataset_module_flow.py                          # Task-ordered flow tensor validation
+│   │   │   │
+│   │   │   ├── __init__.py
+│   │   │   ├── dataset_base.py                                     # Splits, normalizers, and dataloaders
+│   │   │   ├── dataset_identity.py                                 # Immutable final-dataset identity
+│   │   │   ├── dataset_metadata.py                                 # Validated dataset metadata packages
+│   │   │   └── dataset_simulation.py                               # Final simulation-dataset loader
+│   │   │
+│   │   ├── domain
+│   │   │   ├── physics
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── domain_physics_boundary.py                      # Pressure-boundary diagnostics
+│   │   │   │   ├── domain_physics_brinkman.py                      # Darcy–Brinkman residual operators
+│   │   │   │   ├── domain_physics_contracts.py                     # Physics and continuity contracts
+│   │   │   │   └── domain_physics_derivatives.py                   # Finite-difference and spectral derivatives
+│   │   │   │
+│   │   │   ├── tasks
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── domain_task_registry.py                         # Registered task lookup
+│   │   │   │   ├── domain_task_spec.py                             # Immutable task scientific contract
+│   │   │   │   └── domain_task_steady_flow.py                      # Steady-flow task definition
+│   │   │   │
+│   │   │   ├── __init__.py
+│   │   │   ├── domain_field_sets.py                                # Task field-set composition
+│   │   │   ├── domain_fields.py                                    # Physical field specifications
+│   │   │   └── domain_permeability.py                              # Permeability representation transforms
+│   │   │
+│   │   ├── experiments
+│   │   │   ├── cli
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── cli_build_artifacts.py                          # Artifact-generation command line
+│   │   │   │   ├── cli_config_preflight.py                         # Configuration-preflight command line
+│   │   │   │   ├── cli_device.py                                   # Shared device-policy arguments
+│   │   │   │   ├── cli_optuna.py                                   # Optuna-study command line
+│   │   │   │   └── cli_train.py                                    # Direct-training command line
+│   │   │   │
+│   │   │   ├── config
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── experiments_config_defaults.py                  # Default effective configuration values
+│   │   │   │   ├── experiments_config_loader.py                    # YAML resolution and semantic validation
+│   │   │   │   └── experiments_config_preflight.py                 # Workflow-family configuration preflight
+│   │   │   │
+│   │   │   ├── tuning
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── experiments_tuning_optuna.py                    # Optuna study and trial lifecycle
+│   │   │   │   └── experiments_tuning_search_space.py              # Validated hyperparameter sampling
+│   │   │   │
+│   │   │   ├── validation
+│   │   │   │   ├── __init__.py
+│   │   │   │   └── experiments_validation_data_pipeline.py         # Full mounted-data pipeline validation
+│   │   │   │
+│   │   │   ├── __init__.py
+│   │   │   ├── experiments_console.py                              # Structured lifecycle console reporting
+│   │   │   ├── experiments_notebook_support.py                     # Read-only training-notebook presentation
+│   │   │   ├── experiments_run.py                                  # Seeded saved-run lifecycle and resume
+│   │   │   └── experiments_tracking.py                             # W&B observer and upload policy
+│   │   │
+│   │   ├── learning
+│   │   │   ├── inference
+│   │   │   │   ├── __init__.py
+│   │   │   │   └── learning_inference.py                           # Saved-run inference reconstruction
+│   │   │   │
+│   │   │   ├── losses
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── learning_losses_factory.py                      # Task-aware loss construction
+│   │   │   │   └── learning_losses_pino.py                         # Physics-informed loss composition
+│   │   │   │
+│   │   │   ├── metrics
+│   │   │   │   ├── __init__.py
+│   │   │   │   └── learning_metrics.py                             # Predictive and physical evaluation metrics
+│   │   │   │
+│   │   │   ├── models
+│   │   │   │   ├── __init__.py
+│   │   │   │   └── learning_models_factory.py                      # FNO and UNO model construction
+│   │   │   │
+│   │   │   ├── training
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── learning_training_checkpoint.py                 # Checkpoint state and resume validation
+│   │   │   │   ├── learning_training_events.py                     # Evaluation and checkpoint event schedules
+│   │   │   │   ├── learning_training_loop.py                       # Training, evaluation, and selection loop
+│   │   │   │   └── learning_training_optim.py                      # Optimizer and scheduler construction
+│   │   │   │
+│   │   │   ├── __init__.py
+│   │   │   ├── learning_device.py                                  # Concrete CPU and CUDA resolution
+│   │   │   └── learning_device_policy.py                           # Static device-policy validation
+│   │   └── __init__.py
+│   │
+│   └── tests                                                       # Unit, contract, integration, and real-data acceptance tests
+│ 
+├── scripts
+│   ├── check_notebooks.py                                          # Notebook JSON and code-cell validation
+│   ├── config_preflight_runtime.py                                 # Isolated host-wrapper preflight
+│   ├── docker_build.sh                                             # Maintained image build
+│   ├── docker_dev.sh                                               # Development-container mounts and startup
+│   └── docker_job.sh                                               # Generic train, Optuna, and artifact queue wrapper
+│ 
+├── .dockerignore                                                   # Excluded files from the Docker build context
+├── .gitignore                                                      # Files excluded from version control
+├── Dockerfile                                                      # CUDA/micromamba project image
+├── LICENSE.md                                                      # Apache License 2.0
+├── README.md                                                       # Project overview and workflow documentation
+├── environment-dev.yml                                             # Development additions
+├── environment.yml                                                 # Runtime dependencies
+├── pyproject.toml                                                  # Package and quality-tool configuration
+└── setup.py                                                        # Multi-root package discovery
 ```
 </details>
 
 ## 📄 License
 
-This project is released under the [Apache License 2.0](LICENSE).
+This project is released under the [Apache License 2.0](LICENSE.md).
 
 ## 📚 Reference
 

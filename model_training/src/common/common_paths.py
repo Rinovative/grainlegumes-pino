@@ -8,7 +8,7 @@ Responsibilities:
   - Resolve generation and model-training roots from their two public variables
   - Derive each domain's ``meta``, ``raw``, and ``processed`` lifecycle stages
   - Resolve final datasets, metadata snapshots, runs, studies, and artifacts
-  - Identify current saved-run directories by their required artifact files
+  - Identify completed and evaluable saved-run directories by required local files
 
 Design principles:
   - Application paths never derive scientific data locations from host storage
@@ -20,7 +20,7 @@ Design principles:
 This module does NOT:
   - Create datasets, runs, checkpoints, summaries, or analysis artifacts
   - Decide dataset membership, experiment semantics, or resume eligibility
-  - Validate artifact contents beyond the shallow completed-run predicate
+  - Validate run or artifact contents beyond shallow discovery predicates
 ===============================================================================
 """
 
@@ -41,6 +41,13 @@ CURRENT_RUN_REQUIRED_FILES = (
     RUN_NORMALIZER_FILENAME,
     RUN_BEST_CHECKPOINT_FILENAME,
     RUN_LAST_CHECKPOINT_FILENAME,
+    RUN_SUMMARY_FILENAME,
+)
+EVALUABLE_RUN_REQUIRED_FILES = (
+    RUN_CONFIG_FILENAME,
+    RUN_SPLIT_INDICES_FILENAME,
+    RUN_NORMALIZER_FILENAME,
+    RUN_BEST_CHECKPOINT_FILENAME,
     RUN_SUMMARY_FILENAME,
 )
 RESUME_RUN_REQUIRED_FILES = (
@@ -579,6 +586,40 @@ def missing_current_run_files(run_dir: Path | str) -> tuple[Path, ...]:
 
     """
     return tuple(path for path in resolve_current_run_required_paths(run_dir) if not path.is_file())
+
+
+def missing_evaluable_run_files(run_dir: Path | str) -> tuple[Path, ...]:
+    """Return bundle-local files required by evidence-based evaluation."""
+    path = Path(run_dir)
+    return tuple(path / filename for filename in EVALUABLE_RUN_REQUIRED_FILES if not (path / filename).is_file())
+
+
+def is_evaluable_run_dir(run_dir: Path | str) -> bool:
+    """
+    Return whether a directory has the shallow terminal evaluation contract.
+
+    Full lifecycle, configuration, saved-data, checkpoint, digest, and writer
+    checks remain owned by ``experiments.run.validate_evaluable_run``.
+    """
+    path = Path(run_dir)
+    if not path.is_dir() or missing_evaluable_run_files(path):
+        return False
+    try:
+        with resolve_run_summary_path(path).open(encoding="utf-8") as stream:
+            summary = json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(summary, dict):
+        return False
+    schema_version = summary.get("schema_version")
+    status = summary.get("status")
+    return (
+        isinstance(schema_version, int)
+        and not isinstance(schema_version, bool)
+        and schema_version == 1
+        and isinstance(status, str)
+        and status not in {"initializing", "running"}
+    )
 
 
 def is_current_run_dir(run_dir: Path | str) -> bool:

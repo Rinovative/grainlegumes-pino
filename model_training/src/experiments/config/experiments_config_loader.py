@@ -17,8 +17,8 @@ Design principles:
   - Saved configuration identifiers never depend on Python class names
 
 This module does NOT:
-  - Define dataset storage or fingerprints; dataset objects enforce those contracts
-  - Implement physics equations or metric mathematics; domain and learning modules do
+  - Define dataset storage or fingerprints. Dataset objects enforce those contracts
+  - Implement physics equations or metric mathematics. Domain and learning modules do
   - Own checkpoint, resume, run-directory, or artifact lifecycle
 ===============================================================================
 """
@@ -26,6 +26,7 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import math
 import re
 from collections.abc import Mapping, Sequence
 from io import StringIO
@@ -365,7 +366,7 @@ def save_yaml(config: dict[str, Any], path: Path | str) -> None:
     Notes
     -----
     Serialization is assembled in memory and published through atomic text
-    replacement; callers never observe a partially written config.
+    replacement. Callers never observe a partially written config.
 
     """
     destination = Path(path)
@@ -475,7 +476,7 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
         weight_config["target"] = target
         warmup = _as_mapping(weight_config["warmup"], path=f"loss.physics.{weight_name}.warmup")
         if warmup["kind"] != "linear":
-            msg = f"Unknown warmup identifier {warmup['kind']!r} at loss.physics.{weight_name}.warmup.kind; expected 'linear'."
+            msg = f"Unknown warmup identifier {warmup['kind']!r} at loss.physics.{weight_name}.warmup.kind. Expected 'linear'."
             raise ConfigError(msg)
         epochs = int(warmup["epochs"])
         if epochs < 0:
@@ -529,7 +530,7 @@ def _validate_resolved_metric_keys(config: Mapping[str, Any]) -> None:
     """
     Require every resolved metric to use the exact six-field canonical schema.
 
-    This fail-closed pass prevents raw-only aliases or omitted direction from
+    This fail-closed pass prevents unresolved shorthand or omitted direction from
     entering saved configs before metric/objective revalidation.
     """
     evaluation = _as_mapping(config.get("evaluation"), path="evaluation")
@@ -551,7 +552,7 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
 
     Each metric is bound to an exact tensor space, ordered field set, reduction,
     direction, and unit-compatible task contract. The selected objective becomes
-    a full copy of exactly one declared metric; partial or contradictory resolved
+    a full copy of exactly one declared metric. Partial or contradictory resolved
     objective mappings fail closed.
     """
     evaluation = _as_mapping(config["evaluation"], path="evaluation")
@@ -585,16 +586,29 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
             msg = f"{path}: {error}"
             raise ConfigError(msg) from error
         fields = _metric_fields(metric, task=task, path=path)
-        if kind == "macro_rmse" and fields != task.output_names:
-            msg = f"{path} macro_rmse must select every TaskSpec output field in declared order: {list(task.output_names)}."
-            raise ConfigError(msg)
-        if space == "physical" and len(fields) != 1:
+        group_kinds = {"group_macro_rmse", "group_rmse", "vector_rmse"}
+        if kind == "group_macro_rmse":
+            if not task.output_groups or fields != task.output_names:
+                msg = f"{path} group_macro_rmse must select every grouped TaskSpec output in declared order: {list(task.output_names)}."
+                raise ConfigError(msg)
+        elif kind in {"group_rmse", "vector_rmse"}:
+            matches = [group for group in task.output_groups if group.fields == fields]
+            if len(matches) != 1:
+                available = {group.id: list(group.fields) for group in task.output_groups}
+                msg = f"{path} fields must match one complete TaskSpec output group. Available groups: {available}."
+                raise ConfigError(msg)
+        if space == "physical" and len(fields) != 1 and kind not in group_kinds:
             units = {task.field(field).unit for field in fields}
             if len(units) > 1:
                 msg = f"{path} cannot aggregate physical fields with incompatible units: {sorted(units)}."
                 raise ConfigError(msg)
             msg = f"{path} physical metrics must select exactly one output field."
             raise ConfigError(msg)
+        if kind == "vector_rmse":
+            units = {task.field(field).unit for field in fields}
+            if len(units) != 1:
+                msg = f"{path} vector_rmse fields must share one physical unit, got {sorted(units)}."
+                raise ConfigError(msg)
         requested_direction = metric.get("direction", metric_kind.direction)
         if requested_direction != metric_kind.direction:
             msg = f"{path}.direction {requested_direction!r} contradicts metric {kind!r} direction {metric_kind.direction!r}."
@@ -623,7 +637,7 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
     }
     selection_keys = set(selection)
     if selection_keys != {"id"} and selection != objective:
-        msg = f"Resolved evaluation.objective must exactly equal its selected metric definition; expected {objective!r}, got {selection!r}."
+        msg = f"Resolved evaluation.objective must exactly equal its selected metric definition. Expected {objective!r}, received {selection!r}."
         raise ConfigError(msg)
 
     evaluation["metrics"] = metrics
@@ -710,8 +724,75 @@ def _model_variant(config: Mapping[str, Any]) -> str:
     return f"pi-{model_kind}" if bool(physics.get("enabled")) else model_kind
 
 
+_DERIVATIVE_STRATEGY_TOKENS = {
+    ("physical", "none"): "phys",
+    ("spectral", "reflect"): "spec",
+}
+_CONTINUITY_TOKENS = {
+    "div_velocity": "div_vel",
+    "div_eps_velocity": "div_eps_vel",
+}
+_RUN_SUFFIX_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*\Z")
+
+
+def _format_mode_ratio(value: object) -> str:
+    """Format one finite UNO mode ratio with three significant digits."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"model.params.mode_ratio must be numeric for run identity, got {value!r}."
+        raise ConfigError(msg)
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        msg = f"model.params.mode_ratio must be finite for run identity, got {value!r}."
+        raise ConfigError(msg)
+    return format(numeric, ".3g").replace(".", "p")
+
+
+def _format_scaling_value(value: float) -> str:
+    """Format one validated scaling injectively, retaining the historic compact form."""
+    if value.is_integer():
+        return str(int(value))
+    rendered = repr(value)
+    if rendered.startswith("0.") and "e" not in rendered:
+        return f"0{rendered[2:]}"
+    return rendered.replace(".", "p").replace("e+", "ep").replace("e-", "em")
+
+
+def _format_uno_scalings(params: Mapping[str, Any]) -> str:
+    """Return the collision-free isotropic or axis-retaining UNO scaling token."""
+    try:
+        scalings = model_factory.resolve_uno_scalings(
+            int(params["n_layers"]),
+            params.get("uno_scalings"),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        msg = f"Cannot derive canonical UNO scaling identity: {error}"
+        raise ConfigError(msg) from error
+
+    layers: list[str] = []
+    for x_scale, y_scale in scalings:
+        x_token = _format_scaling_value(x_scale)
+        y_token = _format_scaling_value(y_scale)
+        layers.append(x_token if x_scale == y_scale else f"{x_token}x{y_token}")
+    return f"s{'-'.join(layers)}"
+
+
+def _format_scientific_weight(value: object, *, path: str) -> str:
+    """Format one non-negative finite weight as normalized scientific notation."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"{path} must be numeric for run identity, got {value!r}."
+        raise ConfigError(msg)
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        msg = f"{path} must be finite and non-negative for run identity, got {value!r}."
+        raise ConfigError(msg)
+    if numeric == 0:
+        return "0"
+
+    return format(numeric, ".0e")
+
+
 def resolved_model_variant(config: Mapping[str, Any]) -> str:
-    """Return the loader-owned architecture and PI identity segment."""
+    """Return the loader-owned resolved architecture and PI identity segment."""
     task = str(config["task"])
     model = _as_mapping(config.get("model"), path="model")
     kind = str(model.get("kind"))
@@ -721,27 +802,18 @@ def resolved_model_variant(config: Mapping[str, Any]) -> str:
         modes = params["n_modes"]
         return f"{variant}_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
     if kind == "uno":
-        mode_ratio = format(float(params["mode_ratio"]), ".8g").replace(".", "p")
-        return f"{variant}_m{params['modes_x']}x{params['modes_y']}_h{params['hidden_channels']}_l{params['n_layers']}_r{mode_ratio}"
+        scalings = _format_uno_scalings(params)
+        mode_ratio = _format_mode_ratio(params["mode_ratio"])
+        return f"{variant}_m{params['modes_x']}x{params['modes_y']}_h{params['hidden_channels']}_l{params['n_layers']}_{scalings}_r{mode_ratio}"
     domain.tasks.registry.get_task(task)
     msg = f"Unknown model identifier {kind!r} while generating a run name."
     raise ConfigError(msg)
 
 
-_RUN_SUFFIX_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*\Z")
-
-
-def resolved_scientific_variant(config: Mapping[str, Any]) -> str | None:
-    """Return the PI derivative/continuity identity from resolved physics."""
+def _resolved_physics_identity(config: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    """Return validated derivative, continuity, residual, and boundary tokens."""
     loss = _as_mapping(config.get("loss"), path="loss")
     physics = _as_mapping(loss.get("physics"), path="loss.physics")
-    enabled = physics.get("enabled")
-    if type(enabled) is not bool:
-        msg = "Resolved loss.physics.enabled must be boolean while deriving scientific run identity."
-        raise ConfigError(msg)
-    if not enabled:
-        return None
-
     derivatives = _as_mapping(physics.get("derivatives"), path="loss.physics.derivatives")
     raw_kind = derivatives.get("kind")
     raw_extension = derivatives.get("extension")
@@ -762,15 +834,41 @@ def resolved_scientific_variant(config: Mapping[str, Any]) -> str | None:
         msg = f"Cannot derive canonical PI scientific variant: {error}"
         raise ConfigError(msg) from error
 
-    strategies = {
-        ("physical", "none"): "physical",
-        ("spectral", "reflect"): "spectral_reflect",
-    }
-    strategy = strategies.get((kind, extension))
+    strategy = _DERIVATIVE_STRATEGY_TOKENS.get((kind, extension))
     if strategy is None:
         msg = f"Unsupported resolved PI derivative strategy for run identity: kind={kind!r}, extension={extension!r}."
         raise ConfigError(msg)
-    return f"{strategy}_{resolved_continuity}"
+    continuity_token = _CONTINUITY_TOKENS.get(resolved_continuity)
+    if continuity_token is None:
+        msg = f"Unsupported resolved PI continuity for run identity: {resolved_continuity!r}."
+        raise ConfigError(msg)
+
+    residual = _as_mapping(physics.get("residual_weight"), path="loss.physics.residual_weight")
+    boundary = _as_mapping(physics.get("boundary_weight"), path="loss.physics.boundary_weight")
+    residual_token = _format_scientific_weight(
+        residual.get("target"),
+        path="loss.physics.residual_weight.target",
+    )
+    boundary_token = _format_scientific_weight(
+        boundary.get("target"),
+        path="loss.physics.boundary_weight.target",
+    )
+    return strategy, continuity_token, residual_token, boundary_token
+
+
+def resolved_scientific_variant(config: Mapping[str, Any]) -> str | None:
+    """Return the abbreviated PI strategy, continuity, and weight segment."""
+    loss = _as_mapping(config.get("loss"), path="loss")
+    physics = _as_mapping(loss.get("physics"), path="loss.physics")
+    enabled = physics.get("enabled")
+    if type(enabled) is not bool:
+        msg = "Resolved loss.physics.enabled must be boolean while deriving scientific run identity."
+        raise ConfigError(msg)
+    if not enabled:
+        return None
+
+    strategy, continuity, residual, boundary = _resolved_physics_identity(config)
+    return f"{strategy}_{continuity}_lamphys{residual}_lamp{boundary}"
 
 
 def _identity_tokens(value: object) -> tuple[str, ...]:
@@ -791,6 +889,12 @@ def _remove_identity_sequence(tokens: list[str], sequence: tuple[str, ...]) -> b
     return found
 
 
+def _identity_number(value: Any) -> str:
+    """Return a suffix-grammar-safe exact numeric identity token."""
+    numeric = float(value)
+    return repr(numeric).replace(".", "p").replace("+", "p").replace("-", "m")
+
+
 def _derived_suffix_components(
     config: Mapping[str, Any],
     *,
@@ -799,27 +903,50 @@ def _derived_suffix_components(
 ) -> list[tuple[str, str]]:
     """Return token-aware identities forbidden in manual experiment context."""
     model = _as_mapping(config.get("model"), path="model")
+    params = _as_mapping(model.get("params"), path="model.params")
     run = _as_mapping(config.get("run"), path="run")
+    data = _as_mapping(config.get("data"), path="data")
+    train_dataset = str(data.get("train_dataset"))
     components = [
         ("model architecture", model_key),
         ("task", str(config.get("task"))),
         ("model family", _model_variant(config)),
         ("model kind", str(model.get("kind"))),
+        ("training dataset", train_dataset),
         ("seed", f"s{run.get('seed')}"),
         ("seed", f"seed{run.get('seed')}"),
     ]
     components.extend(("architecture parameter", token) for token in model_key.split("_")[1:])
+
+    if model.get("kind") == "uno":
+        scaling_token = _format_uno_scalings(params)
+        visible_ratio = _format_mode_ratio(params.get("mode_ratio"))
+        exact_ratio = _identity_number(params.get("mode_ratio"))
+        components.extend(
+            [
+                ("scaling sequence", scaling_token),
+                ("scaling sequence", scaling_token.removeprefix("s")),
+                ("mode ratio", f"r{visible_ratio}"),
+                ("mode ratio", f"mr{visible_ratio}"),
+                ("mode ratio", f"mode_ratio_{exact_ratio}"),
+            ]
+        )
+
     if scientific_variant is not None:
         physics = _as_mapping(_as_mapping(config.get("loss"), path="loss").get("physics"), path="loss.physics")
         derivatives = _as_mapping(physics.get("derivatives"), path="loss.physics.derivatives")
-        continuity = str(physics.get("continuity"))
-        derivative_strategy = scientific_variant.removesuffix(f"_{continuity}")
+        strategy, continuity, residual, boundary = _resolved_physics_identity(config)
         components.extend(
             [
                 ("scientific variant", scientific_variant),
-                ("derivative strategy", derivative_strategy),
+                ("derivative strategy", strategy),
                 ("derivative kind", str(derivatives.get("kind"))),
                 ("continuity formulation", continuity),
+                ("continuity formulation", str(physics.get("continuity"))),
+                ("physics residual weight", f"lamphys{residual}"),
+                ("physics residual weight", f"residual_weight_{_identity_number(physics['residual_weight']['target'])}"),
+                ("pressure boundary weight", f"lamp{boundary}"),
+                ("pressure boundary weight", f"boundary_weight_{_identity_number(physics['boundary_weight']['target'])}"),
             ]
         )
         extension = str(derivatives.get("extension"))
@@ -1016,6 +1143,10 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         msg = "training.ood_evaluation_interval must be positive."
         raise ConfigError(msg)
     data = _as_mapping(config["data"], path="data")
+    batch_size = data.get("batch_size")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        msg = "data.batch_size must be a positive integer."
+        raise ConfigError(msg)
     try:
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
     except ValueError as error:
@@ -1065,6 +1196,7 @@ def generate_run_name(config: dict[str, Any]) -> str:
 
     """
     run = _as_mapping(config["run"], path="run")
+    data = _as_mapping(config["data"], path="data")
     model_key = resolved_model_variant(config)
     scientific_variant = resolved_scientific_variant(config)
     _validate_run_context(
@@ -1072,11 +1204,22 @@ def generate_run_name(config: dict[str, Any]) -> str:
         model_key=model_key,
         scientific_variant=scientific_variant,
     )
+    try:
+        train_dataset = common.paths.validate_logical_name(
+            data.get("train_dataset"),
+            label="data.train_dataset",
+        )
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    seed = run.get("seed")
+    if type(seed) is not int or seed < 0:
+        msg = f"run.seed must be a non-negative integer for run identity, got {seed!r}."
+        raise ConfigError(msg)
 
     parts = [model_key]
     if scientific_variant is not None:
         parts.append(scientific_variant)
-    parts.append(f"s{run['seed']}")
+    parts.extend((train_dataset, f"s{seed}"))
     if run.get("suffix"):
         parts.append(str(run["suffix"]))
     return "__".join(parts)
@@ -1260,7 +1403,7 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     missing = sorted(allowed.difference(effective))
     unknown = sorted(set(effective).difference(allowed))
     if missing or unknown:
-        msg = f"Resolved config keys do not match. Missing: {missing}; unknown: {unknown}."
+        msg = f"Resolved config keys do not match. Missing: {missing}. Unknown: {unknown}."
         raise ConfigError(msg)
 
     task = validate_resolved_task_contract(effective)
@@ -1299,11 +1442,11 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     missing_paths = sorted(_RESOLVED_PATH_KEYS.difference(paths))
     unknown_paths = sorted(set(paths).difference(_RESOLVED_PATH_KEYS))
     if missing_paths or unknown_paths:
-        msg = f"Resolved paths do not match the two-domain contract. Missing: {missing_paths}; unknown: {unknown_paths}."
+        msg = f"Resolved paths do not match the two-domain contract. Missing: {missing_paths}. Unknown: {unknown_paths}."
         raise ConfigError(msg)
     invalid_paths = sorted(key for key, value in paths.items() if not isinstance(value, str) or not value)
     if invalid_paths:
-        msg = f"Resolved paths must contain non-empty strings; invalid key(s): {invalid_paths}."
+        msg = f"Resolved paths must contain non-empty strings. Invalid key(s): {invalid_paths}."
         raise ConfigError(msg)
     effective["paths"] = paths
     return effective
@@ -1370,8 +1513,8 @@ def create_dataloaders_from_config(
     -----
     The shared task dataset factory validates schema and fingerprint before
     splitting. Loader construction may read dataset files, fit preprocessing
-    state for a fresh run, or reuse caller-supplied split and processor state;
-    persistence remains the run lifecycle's responsibility.
+    state for a fresh run, or reuse caller-supplied split and processor state.
+    Persistence remains the run lifecycle's responsibility.
 
     """
     task = validate_resolved_task_contract(config)

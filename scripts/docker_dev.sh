@@ -71,12 +71,12 @@ fi
 
 if docker ps --format '{{.Names}}' | grep -Fqx -- "${CONTAINER_NAME}"; then
   echo "Container '${CONTAINER_NAME}' already exists and may use a stale image or mount contract." >&2
-  echo "Stop it with: docker stop ${CONTAINER_NAME}; then rerun this script to recreate it." >&2
+  echo "Stop it with: docker stop ${CONTAINER_NAME}. Then rerun this script to recreate it." >&2
   exit 1
 fi
 if docker ps -a --format '{{.Names}}' | grep -Fqx -- "${CONTAINER_NAME}"; then
   echo "Stopped container '${CONTAINER_NAME}' may use a stale image or mount contract." >&2
-  echo "Remove it with: docker rm ${CONTAINER_NAME}; then rerun this script to recreate it." >&2
+  echo "Remove it with: docker rm ${CONTAINER_NAME}. Then rerun this script to recreate it." >&2
   exit 1
 fi
 
@@ -85,13 +85,13 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   DOCKER_RUNTIMES="$(docker info --format '{{json .Runtimes}}' 2>/dev/null || true)"
   if [[ "${DOCKER_RUNTIMES}" == *nvidia* ]]; then
     GPU_ARGS=(--gpus all)
-    echo "NVIDIA runtime detected; exposing all host GPUs to the development container."
+    echo "NVIDIA runtime detected. Exposing all host GPUs to the development container."
   else
     echo "NVIDIA GPUs are present but the Docker NVIDIA runtime is unavailable." >&2
-    echo "Starting CPU-only; install NVIDIA Container Toolkit to enable direct GPU work." >&2
+    echo "Starting CPU-only. Install NVIDIA Container Toolkit to enable direct GPU work." >&2
   fi
 else
-  echo "No usable host NVIDIA GPU was detected; starting the development container CPU-only."
+  echo "No usable host NVIDIA GPU was detected. Starting the development container CPU-only."
 fi
 
 docker run -d --rm \

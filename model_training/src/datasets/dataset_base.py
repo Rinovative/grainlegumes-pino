@@ -36,6 +36,8 @@ from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
+from src import domain
+
 from . import dataset_identity as identity
 
 if TYPE_CHECKING:
@@ -109,8 +111,8 @@ def _validated_index_tensor(split_info: Mapping[str, Any], key: str) -> Tensor:
     """
     Isolate one persisted membership tensor in canonical CPU ``long`` form.
 
-    Admission requires a non-empty, one-dimensional, unique integer tensor;
-    booleans, floating/complex values, and duplicate membership are rejected.
+    Admission requires a non-empty, one-dimensional, unique integer tensor.
+    Booleans, floating/complex values, and duplicate membership are rejected.
     The returned clone cannot mutate the loaded persistence payload.
     """
     value = split_info.get(key)
@@ -137,7 +139,7 @@ def _validate_index_bounds(indices: Tensor, *, key: str, full_count: int) -> Non
     min_index = int(indices.min().item())
     max_index = int(indices.max().item())
     if min_index < 0 or max_index >= full_count:
-        msg = f"split_indices.pt key {key!r} is out of bounds for full count {full_count}; index range is {min_index}..{max_index}."
+        msg = f"split_indices.pt key {key!r} is out of bounds for full count {full_count}. The observed index range is {min_index}..{max_index}."
         raise ValueError(msg)
 
 
@@ -150,13 +152,13 @@ def _validate_train_eval_partition(train_indices: Tensor, eval_indices: Tensor, 
     """
     overlap = train_indices[torch.isin(train_indices, eval_indices)]
     if overlap.numel():
-        msg = f"Saved train/eval indices must be disjoint; overlapping indices include {overlap[:10].tolist()}."
+        msg = f"Saved train/eval indices must be disjoint. Overlapping indices include {overlap[:10].tolist()}."
         raise ValueError(msg)
     combined = torch.cat((train_indices, eval_indices))
     expected = torch.arange(n_train_full, dtype=torch.long)
     if combined.numel() != n_train_full or not torch.equal(torch.sort(combined).values, expected):
         missing = expected[~torch.isin(expected, combined)]
-        msg = f"Saved train/eval indices must cover every source index exactly once; missing indices include {missing[:10].tolist()}."
+        msg = f"Saved train/eval indices must cover every source index exactly once. Missing indices include {missing[:10].tolist()}."
         raise ValueError(msg)
 
 
@@ -164,18 +166,18 @@ def _identity_from_mapping(value: Any, *, label: str) -> identity.DatasetIdentit
     """
     Reconstruct one exact persisted dataset identity without additional keys.
 
-    The mapping must contain only logical identity, task/digest, fingerprint,
-    ordered unique sample IDs, count, and positive spatial shape. String and
+    The mapping must contain only logical identity, task and learned-data digest,
+    fingerprint, ordered unique sample IDs, count, and positive spatial shape. String and
     count validation fails before the immutable ``DatasetIdentity`` is returned.
     """
     if not isinstance(value, Mapping):
         msg = f"{label} must be a mapping."
         raise TypeError(msg)
-    required = {"dataset_id", "task", "task_contract_digest", "fingerprint", "sample_ids", "sample_count", "spatial_shape"}
+    required = {"dataset_id", "task", "data_contract_digest", "fingerprint", "sample_ids", "sample_count", "spatial_shape"}
     missing = sorted(required.difference(value))
     unexpected = sorted(set(value).difference(required))
     if missing or unexpected:
-        msg = f"{label} keys do not match. Missing: {missing}; unexpected: {unexpected}."
+        msg = f"{label} keys do not match. Missing: {missing}. Unexpected: {unexpected}."
         raise ValueError(msg)
     sample_ids_raw = value["sample_ids"]
     if not isinstance(sample_ids_raw, list) or not all(isinstance(item, str) and item for item in sample_ids_raw):
@@ -195,7 +197,7 @@ def _identity_from_mapping(value: Any, *, label: str) -> identity.DatasetIdentit
         raise TypeError(msg)
     spatial_shape = tuple(_required_metadata_count({str(index): item}, str(index)) for index, item in enumerate(spatial_shape_raw))
     strings: dict[str, str] = {}
-    for key in ("dataset_id", "task", "task_contract_digest", "fingerprint"):
+    for key in ("dataset_id", "task", "data_contract_digest", "fingerprint"):
         item = value[key]
         if not isinstance(item, str) or not item:
             msg = f"{label}.{key} must be a non-empty string."
@@ -204,7 +206,7 @@ def _identity_from_mapping(value: Any, *, label: str) -> identity.DatasetIdentit
     return identity.DatasetIdentity(
         dataset_id=strings["dataset_id"],
         task=strings["task"],
-        task_contract_digest=strings["task_contract_digest"],
+        data_contract_digest=strings["data_contract_digest"],
         fingerprint=strings["fingerprint"],
         sample_ids=sample_ids,
         sample_count=sample_count,
@@ -222,11 +224,46 @@ def _validate_expected_identity(
     Bind a saved split to the complete currently loaded dataset identity.
 
     When an expected identity is supplied, dataclass equality compares the
-    logical ID, task digest, content fingerprint, ordered sample IDs, count, and
-    spatial shape; no partial or path-based match is accepted.
+    logical ID, persisted data-provenance digest, content fingerprint, ordered
+    sample IDs, count, and spatial shape. No partial or path-based match is
+    accepted.
     """
     if expected is not None and saved != expected:
-        msg = f"split_indices.pt {label} dataset identity does not match the loaded dataset. Saved: {saved.as_dict()}; loaded: {expected.as_dict()}."
+        msg = f"split_indices.pt {label} dataset identity does not match the loaded dataset. Saved: {saved.as_dict()}. Loaded: {expected.as_dict()}."
+        raise ValueError(msg)
+
+
+def _validate_split_task_identity(
+    *,
+    task_id: str,
+    task_contract_digest: str,
+    train_identity: identity.DatasetIdentity,
+    ood_identity: identity.DatasetIdentity,
+) -> None:
+    """Bind split-level task identity and nested learned-data identities."""
+    try:
+        registered_task = domain.tasks.registry.get_task(task_id)
+    except (KeyError, ValueError):
+        registered_task = None
+
+    if registered_task is not None and task_contract_digest != registered_task.contract_digest:
+        msg = f"split_indices.pt task_contract_digest does not match the current registered task {task_id!r}."
+        raise ValueError(msg)
+
+    saved_identities = (("train", train_identity), ("ood", ood_identity))
+    for label, saved_identity in saved_identities:
+        if saved_identity.task != task_id:
+            msg = f"split_indices.pt {label} identity does not match its task header."
+            raise ValueError(msg)
+        if registered_task is not None:
+            identity.validate_dataset_data_contract_digest(
+                saved_identity.data_contract_digest,
+                task=registered_task,
+                label=f"split_indices.pt {label} dataset data_contract_digest",
+            )
+
+    if registered_task is None and train_identity.data_contract_digest != ood_identity.data_contract_digest:
+        msg = "split_indices.pt train and OOD identities do not share one learned-data contract."
         raise ValueError(msg)
 
 
@@ -277,7 +314,9 @@ def validate_split_info(
     Train and eval must partition the full training dataset exactly once. OOD is
     a non-empty subset of its source dataset. Optional expected settings and
     identities bind an existing split to the effective run configuration without
-    mutating the supplied mapping.
+    mutating the supplied mapping. A current split header identifies the complete
+    TaskSpec, while nested dataset identities retain their independently validated
+    learned-data provenance.
 
     """
     if not isinstance(split_info, Mapping):
@@ -286,7 +325,7 @@ def validate_split_info(
     missing = sorted(_SPLIT_REQUIRED_KEYS.difference(split_info))
     unexpected = sorted(set(split_info).difference(_SPLIT_REQUIRED_KEYS))
     if missing or unexpected:
-        msg = f"split_indices.pt schema keys do not match. Missing: {missing}; unexpected: {unexpected}."
+        msg = f"split_indices.pt schema keys do not match. Missing: {missing}. Unexpected: {unexpected}."
         raise ValueError(msg)
     schema_version = split_info.get("schema_version")
     if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != identity.SPLIT_SCHEMA_VERSION:
@@ -317,7 +356,7 @@ def validate_split_info(
     missing_metadata = sorted(required_metadata_keys.difference(metadata))
     unexpected_metadata = sorted(set(metadata).difference(required_metadata_keys))
     if missing_metadata or unexpected_metadata:
-        msg = f"split_indices.pt metadata keys do not match. Missing: {missing_metadata}; unexpected: {unexpected_metadata}."
+        msg = f"split_indices.pt metadata keys do not match. Missing: {missing_metadata}. Unexpected: {unexpected_metadata}."
         raise ValueError(msg)
     datasets_meta = metadata.get("datasets")
     if not isinstance(datasets_meta, Mapping) or set(datasets_meta) != {"train", "ood"}:
@@ -325,10 +364,12 @@ def validate_split_info(
         raise ValueError(msg)
     saved_train_identity = _identity_from_mapping(datasets_meta["train"], label="metadata.datasets.train")
     saved_ood_identity = _identity_from_mapping(datasets_meta["ood"], label="metadata.datasets.ood")
-    for label, saved_identity in (("train", saved_train_identity), ("ood", saved_ood_identity)):
-        if saved_identity.task != task or saved_identity.task_contract_digest != digest:
-            msg = f"split_indices.pt {label} identity does not match its task contract header."
-            raise ValueError(msg)
+    _validate_split_task_identity(
+        task_id=task,
+        task_contract_digest=digest,
+        train_identity=saved_train_identity,
+        ood_identity=saved_ood_identity,
+    )
     _validate_expected_identity(saved_train_identity, train_identity, label="train")
     _validate_expected_identity(saved_ood_identity, ood_identity, label="OOD")
 
@@ -413,7 +454,7 @@ def data_processor_from_state(
     ----------
     state : Mapping[str, Any]
         Exact four-key normalizer state. Means and standard deviations must be
-        finite real tensors shaped ``[1, channels, 1, 1]``; standard deviations
+        finite real tensors shaped ``[1, channels, 1, 1]``. Standard deviations
         may be zero because the processor applies its denominator floor.
     device : torch.device | str, optional
         Target processor device for isolated state tensors.
@@ -440,7 +481,7 @@ def data_processor_from_state(
     missing = sorted(set(_REQUIRED_NORMALIZER_STATE_KEYS).difference(state))
     unexpected = sorted(set(state).difference(_REQUIRED_NORMALIZER_STATE_KEYS))
     if missing or unexpected:
-        msg = f"Saved normalizer state keys do not match. Missing: {missing}; unexpected: {unexpected}."
+        msg = f"Saved normalizer state keys do not match. Missing: {missing}. Unexpected: {unexpected}."
         raise ValueError(msg)
 
     tensors: dict[str, Tensor] = {}
@@ -553,7 +594,7 @@ def create_dataloaders(
     batch_size : int, optional
         Batch size for all loaders.
     train_ratio : float, optional
-        Fraction in ``(0, 1)`` assigned to training; the remainder is evaluation.
+        Fraction in ``(0, 1)`` assigned to training. The remainder is evaluation.
         Counts use ``int(train_ratio * full_count)``.
     ood_fraction : float, optional
         Fraction in ``(0, 1]`` selected from the OOD dataset, also rounded down
@@ -571,7 +612,7 @@ def create_dataloaders(
         does not change membership.
     worker_seed : int | None, optional
         Base Python/NumPy/PyTorch worker seed. Worker ``i`` receives
-        ``worker_seed + i``; the default is ``loader_seed``.
+        ``worker_seed + i``. The default is ``loader_seed``.
     split_indices : Mapping[str, Any] | None, optional
         Saved exact membership to validate against datasets, settings, and
         membership digests. Omission creates deterministic new membership.
@@ -582,8 +623,8 @@ def create_dataloaders(
     Returns
     -------
     tuple[DataLoader, dict[str, DataLoader], DefaultDataProcessor, dict[str, Any]]
-        Shuffled train loader; non-shuffled ``eval`` and ``ood`` loaders; fitted
-        or supplied processor; and the complete current split contract. This
+        A shuffled train loader, non-shuffled ``eval`` and ``ood`` loaders, a fitted
+        or supplied processor, and the complete current split contract. This
         function does not persist the contract or processor.
 
     Raises
@@ -599,8 +640,8 @@ def create_dataloaders(
     -----
     ``num_workers=0`` forces ``persistent_workers=False``. Evaluation and OOD
     loaders always use the main process without pinned memory. Fitting a new
-    processor materializes the complete selected training tensors in memory;
-    caller-supplied processors are reused without refitting.
+    processor materializes the complete selected training tensors in memory.
+    Caller-supplied processors are reused without refitting.
 
     """
     train_ratio = _normalized_fraction(train_ratio, label="train_ratio", allow_one=False)
@@ -633,7 +674,7 @@ def create_dataloaders(
         n_eval = n_train_full - n_train
         n_ood = int(ood_fraction * n_ood_full)
         if min(n_train, n_eval, n_ood) <= 0:
-            msg = f"Split settings must select non-empty train/eval/OOD sets; got train={n_train}, eval={n_eval}, ood={n_ood}."
+            msg = f"Split settings must select non-empty train/eval/OOD sets. Received train={n_train}, eval={n_eval}, ood={n_ood}."
             raise ValueError(msg)
         train_random, eval_random = random_split(
             full_train,

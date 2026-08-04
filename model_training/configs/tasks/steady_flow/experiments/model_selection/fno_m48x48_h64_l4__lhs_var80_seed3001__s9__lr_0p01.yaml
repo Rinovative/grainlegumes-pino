@@ -1,13 +1,10 @@
-# Recreated from named run: PI-FNO-divepsu-PS_m48x48_h64_l3_lamPhys1e-04_lamP7e-04_20260114_070909
-# Source config: model_training/data/processed/safe/PI-FNO-divepsu-PS_m48x48_h64_l3_lamPhys1e-04_lamP7e-04_20260114_070909/config.json
-
 task: steady_flow
 
 run:
   seed: 9
   deterministic: true
   device: auto
-  suffix: null
+  suffix: lr_0p01
 
 data:
   train_dataset: lhs_var80_seed3001
@@ -20,7 +17,7 @@ model:
   params:
     n_modes: [48, 48]
     hidden_channels: 64
-    n_layers: 3
+    n_layers: 4
     lifting_channel_ratio: 2
     projection_channel_ratio: 2
     fno_skip: linear
@@ -33,30 +30,15 @@ loss:
     space: normalized
     weight: 1.0
   physics:
-    enabled: true
-    continuity: div_eps_velocity
-    derivatives:
-      kind: physical
-      extension: none
-    interior_crop: 0
-    residual_weight:
-      target: 1.3392592245679144e-4
-      warmup:
-        kind: linear
-        epochs: 300
-    boundary_weight:
-      target: 6.696296122839572e-4
-      warmup:
-        kind: linear
-        epochs: 300
+    enabled: false
 
 evaluation:
   objective:
-    id: normalized_macro_rmse
+    id: normalized_group_macro_rmse
 
 optimizer:
   kind: adamw
-  lr: 4.3682304700764195e-4
+  lr: 1.0e-2
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   second_moment_floor: 1.0e-6

@@ -17,7 +17,7 @@ Design principles:
 This module does NOT:
   - Build final training datasets or fit preprocessing state
   - Read model outputs, checkpoints, or experiment run directories
-  - Implement plots or notebook controls; EDA plot and UI modules own presentation
+  - Implement plots or notebook controls. EDA plot and UI modules own presentation
 ===============================================================================
 """
 

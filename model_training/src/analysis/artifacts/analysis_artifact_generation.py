@@ -5,13 +5,13 @@ analysis_artifact_generation.py
 Create persistent evaluation artifacts from trained neural-operator runs.
 
 Responsibilities:
-  - Run deterministic inference over explicit evaluation loaders
+  - Run inference over explicit evaluation loaders in saved membership order
   - Write Parquet scalar metrics and NPZ field artifacts
   - Compute field, physics, boundary and metadata diagnostics
   - Keep artifact columns stable for downstream analysis modules
 
 Design principles:
-  - Artifacts are reproducible, split-aware, and ordered by saved membership
+  - Artifacts preserve split identity and saved membership order
   - Physical units and the caller-provided TaskSpec field order are explicit
   - Provenance publishes last and binds every completed payload digest
   - Heavy inference work stays out of plotting modules
@@ -36,14 +36,13 @@ Artifact contract:
         - npz_path          : path to the corresponding NPZ artifact
 
         # Relative field errors (dimensionless, channel-balanced)
-        - rel_l2            : channel-balanced mean relative L2 on [p, u, v] over the full domain
-        - rel_h1            : channel-balanced mean relative H1 on [p, u, v] over the interior (cropped by EVAL_PAD)
+        - rel_l2            : channel-balanced mean relative L2 over TaskSpec outputs on the full domain
+        - rel_h1            : channel-balanced mean relative H1 over TaskSpec outputs on the cropped interior
 
-        # Book-friendly metrics (physical units, intuitive)
-        - rmse_p            : RMSE of pressure p over the full domain
-        - rmse_u            : RMSE of x-velocity u over the full domain
-        - rmse_v            : RMSE of y-velocity v over the full domain
-        - rmse_U            : RMSE of speed magnitude U=sqrt(u^2+v^2) over the full domain
+        # Physical diagnostics
+        - physical_rmse_<field> : per-field RMSE over the full domain
+        - physical_velocity_vector_rmse : vector RMSE over velocity components
+        - physical_rmse_speed_magnitude : RMSE of velocity-group speed magnitude |u|
 
         # Physics residual metrics (interior-cropped by EVAL_PAD)
         - momentum_residual_mse : mean(Rx**2 + Ry**2), unit (Pa/m)^2
@@ -55,10 +54,13 @@ Artifact contract:
         - pressure_outlet_mean_square   : mean_outlet(p)**2
         - pressure_boundary_mse         : sum of the preceding two terms
 
-        # Normalized primary-objective evidence (one triplet per TaskSpec output)
+        # Global-reduction evidence (one pair of triplets per TaskSpec output)
+        - physical_sse_<field>     : float64 per-case physical squared-error sum
+        - physical_count_<field>   : exact selected physical element count
+        - physical_rmse_<field>    : per-case physical diagnostic
         - normalized_sse_<field>   : float64 per-case normalized squared-error sum
         - normalized_count_<field> : exact selected normalized element count
-        - normalized_rmse_<field>  : sqrt(per-case SSE/count), never averaged for the objective
+        - normalized_rmse_<field>  : per-case normalized diagnostic
 
         # Diagnostics
         - kappa_names       : list of available permeability tensor components
@@ -96,8 +98,9 @@ Artifact contract:
         - meta         : JSON string with full metadata
 
     Provenance publishes last and contains the scientific identity, exact output
-    digests, and aggregate normalized_macro_rmse obtained by summing each field's
-    per-case SSE/count before finalizing field RMSEs and their arithmetic mean.
+    digests, saved train-fitted output scales, task-owned output groups, and the
+    aggregate normalized_group_macro_rmse finalized once from global physical
+    SSE/count evidence.
 ===============================================================================
 """
 
@@ -135,9 +138,10 @@ def normalized_case_statistics(
     """
     Return exact float64 normalized SSE/count/RMSE evidence per sample and field.
 
-    The subtraction and square are performed after conversion to float64, which
-    matches the authoritative runtime ``MacroRMSEMetric`` accumulation policy.
-    No per-case RMSE is used when the dataset-level macro objective is finalized.
+    The subtraction and square are performed after conversion to float64. These
+    component-normalized values remain diagnostics and never define the grouped
+    selection objective, which is finalized from physical evidence and raw fitted
+    training scales.
 
     Parameters
     ----------
@@ -190,23 +194,183 @@ def normalized_case_statistics(
     return rows
 
 
+def physical_case_statistics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    output_fields: Iterable[str],
+) -> list[dict[str, float | int]]:
+    """
+    Return exact float64 physical SSE/count/RMSE evidence per sample and field.
+
+    Parameters
+    ----------
+    prediction, target : torch.Tensor
+        Matching physical tensors in batch, channel, and spatial order.
+    output_fields : Iterable[str]
+        Unique TaskSpec output names aligned with the channel axis.
+
+    Returns
+    -------
+    list[dict[str, float | int]]
+        One row per case containing physical squared-error sums, element counts,
+        and diagnostic RMSE values.
+
+    Raises
+    ------
+    ValueError
+        If tensor shapes, ranks, or channel-to-field alignment disagree.
+    FloatingPointError
+        If any physical sufficient statistic is non-finite.
+
+    """
+    fields = tuple(output_fields)
+    if prediction.shape != target.shape or prediction.ndim < _MIN_NORMALIZED_TENSOR_RANK:
+        msg = (
+            "Physical prediction and target must have matching "
+            f"batch/channel/spatial shapes, got {tuple(prediction.shape)} and {tuple(target.shape)}."
+        )
+        raise ValueError(msg)
+    if prediction.shape[1] != len(fields) or len(fields) != len(set(fields)):
+        msg = "Physical artifact statistics require unique output fields matching the tensor channels."
+        raise ValueError(msg)
+    error_squared = (prediction.double() - target.double()).square()
+    rows: list[dict[str, float | int]] = []
+    for sample_index in range(prediction.shape[0]):
+        row: dict[str, float | int] = {}
+        for field_index, field_name in enumerate(fields):
+            sse_column, count_column, rmse_column = contracts.physical_statistic_columns(field_name)
+            field_error = error_squared[sample_index, field_index]
+            squared_error_sum = float(field_error.sum().detach().cpu().item())
+            element_count = int(field_error.numel())
+            field_rmse = math.sqrt(squared_error_sum / element_count)
+            if not math.isfinite(squared_error_sum) or not math.isfinite(field_rmse):
+                msg = f"Physical artifact statistics are non-finite for field {field_name!r}, sample {sample_index}."
+                raise FloatingPointError(msg)
+            row[sse_column] = squared_error_sum
+            row[count_column] = element_count
+            row[rmse_column] = field_rmse
+        rows.append(row)
+    return rows
+
+
+def _required_output_group(
+    task: domain.tasks.spec.TaskSpec,
+    *,
+    group_id: str,
+) -> domain.tasks.spec.OutputGroupSpec:
+    """Return one exact task-owned output group required by an artifact diagnostic."""
+    matches = tuple(group for group in task.output_groups if group.id == group_id)
+    if len(matches) != 1:
+        available = {group.id: list(group.fields) for group in task.output_groups}
+        msg = f"Artifact diagnostics require one TaskSpec output group {group_id!r}. Available groups: {available}."
+        raise ValueError(msg)
+    return matches[0]
+
+
+def _objective_context(
+    *,
+    task: domain.tasks.spec.TaskSpec,
+    processor: Any,
+    provenance: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, float], float]:
+    """Return task groups, raw saved training scales, and diagnostic floor."""
+    groups = contracts.output_group_payload(task.output_groups)
+    flattened_fields = tuple(field for group in groups for field in group["fields"])
+    if flattened_fields != task.output_names:
+        msg = "Artifact output groups do not partition TaskSpec outputs in declared order."
+        raise ValueError(msg)
+    normalizer = provenance.get("normalizer")
+    if not isinstance(normalizer, Mapping):
+        msg = "Artifact provenance must contain normalizer evidence."
+        raise TypeError(msg)
+    raw_scales = normalizer.get("output_standard_deviations")
+    denominator_floor = normalizer.get("denominator_floor")
+    if isinstance(denominator_floor, bool) or not isinstance(denominator_floor, (int, float)):
+        msg = "Artifact normalizer denominator_floor must be a real scalar."
+        raise TypeError(msg)
+    if not math.isfinite(float(denominator_floor)) or float(denominator_floor) < 0.0:
+        msg = "Artifact normalizer denominator_floor must be finite and non-negative."
+        raise ValueError(msg)
+    if not isinstance(raw_scales, Mapping):
+        msg = "Artifact normalizer provenance must contain output_standard_deviations."
+        raise TypeError(msg)
+    scales = {field: float(raw_scales[field]) for field in task.output_names if field in raw_scales}
+    if set(scales) != set(task.output_names):
+        msg = "Artifact normalizer provenance scales do not cover TaskSpec outputs exactly."
+        raise ValueError(msg)
+    out_normalizer = getattr(processor, "out_normalizer", None)
+    if out_normalizer is None:
+        msg = "Artifact generation requires processor.out_normalizer."
+        raise TypeError(msg)
+    processor_scales = contracts.output_standard_deviations_from_state(
+        {"out_normalizer.std": getattr(out_normalizer, "std", None)},
+        output_fields=task.output_names,
+    )
+    if processor_scales != scales:
+        msg = "Artifact processor output scales contradict saved normalizer provenance."
+        raise ValueError(msg)
+    evaluator = provenance.get("evaluator")
+    if not isinstance(evaluator, Mapping) or evaluator.get("output_groups") != groups:
+        msg = "Artifact evaluator output groups contradict TaskSpec."
+        raise ValueError(msg)
+    return groups, scales, float(denominator_floor)
+
+
+def _group_case_metrics(
+    *,
+    task: domain.tasks.spec.TaskSpec,
+    physical_statistics: Mapping[str, float | int],
+    output_groups: Iterable[Mapping[str, Any]],
+    train_standard_deviations: Mapping[str, float],
+) -> dict[str, float]:
+    """Return task-declared physical and normalized group diagnostics for one case."""
+    values: dict[str, float] = {}
+    metrics_by_signature = {
+        (metric.kind, metric.fields): metric.id for metric in task.default_metrics if metric.kind in {"group_rmse", "vector_rmse"}
+    }
+    for group in output_groups:
+        fields = tuple(group["fields"])
+        physical_mse_sum = sum(
+            float(physical_statistics[contracts.physical_statistic_columns(field)[0]])
+            / int(physical_statistics[contracts.physical_statistic_columns(field)[1]])
+            for field in fields
+        )
+        normalized_id = metrics_by_signature.get(("group_rmse", fields))
+        if normalized_id is not None:
+            variance_sum = sum(train_standard_deviations[field] ** 2 for field in fields)
+            values[normalized_id] = math.sqrt(physical_mse_sum / variance_sum)
+        physical_id = metrics_by_signature.get(("vector_rmse", fields))
+        if physical_id is not None:
+            values[physical_id] = math.sqrt(physical_mse_sum)
+    return values
+
+
 def _provenance_with_aggregate(
     provenance: Mapping[str, Any],
     *,
     frame: pd.DataFrame,
-    output_fields: Iterable[str],
+    output_groups: Iterable[Mapping[str, Any]],
+    train_standard_deviations: Mapping[str, float],
+    normalization_denominator_floor: float,
 ) -> dict[str, Any]:
     """
-    Add the authoritative aggregate to caller-owned generation provenance.
+    Add the authoritative group aggregate to generation provenance.
 
-    Caller-supplied aggregate results are rejected so only recomputed Parquet
-    SSE/count evidence can determine the published primary objective.
+    Caller-supplied aggregate results are rejected so only recomputed physical
+    Parquet SSE/count evidence and saved raw training scales can determine the
+    published selection objective.
     """
     payload = dict(provenance)
     if "aggregate" in payload:
         msg = "Caller-provided artifact provenance cannot define aggregate results."
         raise ValueError(msg)
-    payload["aggregate"] = contracts.aggregate_normalized_macro_rmse(frame, output_fields=output_fields)
+    payload["aggregate"] = contracts.aggregate_normalized_group_macro_rmse(
+        frame,
+        output_groups=output_groups,
+        train_standard_deviations=train_standard_deviations,
+        normalization_denominator_floor=normalization_denominator_floor,
+    )
     return payload
 
 
@@ -232,7 +396,7 @@ def meta_to_jsonable(obj: Any) -> Any:
 
     Notes
     -----
-    Unrecognized leaf objects pass through unchanged; callers that require JSON
+    Unrecognized leaf objects pass through unchanged. Callers that require JSON
     serialization must still supply JSON-compatible custom leaves.
 
     """
@@ -272,7 +436,7 @@ def _select_collated_case(value: Any, *, case_offset: int, batch_size: int) -> A
     Slice one case from nested collated metadata while preserving batch rank.
 
     Tensor/array values with the declared leading batch size retain a size-one
-    axis. Mappings and nested sequences recurse; non-batched values pass through
+    axis. Mappings and nested sequences recurse. Non-batched values pass through
     unchanged so dataset metadata structure is preserved beside ``x`` and ``y``.
     """
     if isinstance(value, torch.Tensor | np.ndarray):
@@ -292,60 +456,138 @@ def _select_collated_case(value: Any, *, case_offset: int, batch_size: int) -> A
     return value
 
 
-def _iter_artifact_cases(
+def _iter_inferred_artifact_cases(
     loader: Iterable[Mapping[str, Any]],
     *,
-    max_cases: int | None,
+    model: Any,
+    processor: Any,
+    device: torch.device,
 ) -> Iterable[tuple[int, dict[str, Any]]]:
     """
-    Yield deterministic size-one cases from arbitrary positive loader batches.
+    Infer each loader batch once and yield deterministic size-one case views.
 
-    Nested collated metadata is sliced with the same leading-axis semantics as
-    ``x`` and ``y``. The returned position is contiguous in loader order, while
-    saved ``source_index`` and ``split_local_index`` values remain payload data
-    for the caller to validate.
+    The fitted processor follows the online evaluation lifecycle exactly: it is
+    switched to evaluation mode and preprocesses a copied raw batch before the
+    model receives the complete loader batch. Predictions and prepared tensors
+    are then sliced for one-row/one-NPZ storage without repeating model forwards.
+    Batch forward duration is divided equally among its cases as an amortized
+    throughput measurement.
 
     Parameters
     ----------
     loader : Iterable[Mapping[str, Any]]
         Ordered batches containing compatible tensor ``x`` and ``y`` entries.
-    max_cases : int | None
-        Optional exclusive bound on yielded cases.
+    model : Any
+        Evaluation-mode model receiving each complete preprocessed loader batch.
+    processor : Any
+        Fitted processor exposing ``eval()``, ``preprocess()``, and an output
+        normalizer.
+    device : torch.device
+        Concrete inference device used by online and artifact evaluation.
 
     Yields
     ------
     tuple[int, dict[str, Any]]
-        Contiguous artifact position and one-sample batch mapping.
+        Contiguous artifact position and one-sample raw/preprocessed prediction
+        mapping in saved loader order.
 
     Raises
     ------
-    TypeError, ValueError, RuntimeError
-        If a batch is not a mapping, lacks compatible tensors, or is empty.
+    TypeError, ValueError, RuntimeError, FloatingPointError
+        If a raw or preprocessed batch is malformed, empty, non-finite, or has
+        incompatible prediction and target shapes.
 
     """
+    processor_eval = getattr(processor, "eval", None)
+    preprocess = getattr(processor, "preprocess", None)
+    out_normalizer = getattr(processor, "out_normalizer", None)
+    if not callable(processor_eval) or not callable(preprocess) or out_normalizer is None:
+        msg = "Artifact generation requires an evaluation-capable fitted data processor."
+        raise TypeError(msg)
+
     case_position = 0
-    for raw_batch in loader:
+    model.eval()
+    for batch_index, raw_batch in enumerate(loader):
         if not isinstance(raw_batch, Mapping):
             msg = f"Artifact loader batches must be mappings, got {type(raw_batch).__name__}."
             raise TypeError(msg)
-        inputs = raw_batch.get("x")
-        targets = raw_batch.get("y")
-        if not isinstance(inputs, torch.Tensor) or not isinstance(targets, torch.Tensor):
+        raw_inputs = raw_batch.get("x")
+        raw_targets = raw_batch.get("y")
+        if not isinstance(raw_inputs, torch.Tensor) or not isinstance(raw_targets, torch.Tensor):
             msg = "Artifact loader batches must contain tensor keys 'x' and 'y'."
             raise TypeError(msg)
-        if inputs.ndim < _MIN_BATCH_TENSOR_RANK or targets.ndim < _MIN_BATCH_TENSOR_RANK or inputs.shape[0] != targets.shape[0]:
-            msg = f"Artifact input/target batches must share a non-empty leading axis, got {tuple(inputs.shape)} and {tuple(targets.shape)}."
+        if raw_inputs.ndim < _MIN_BATCH_TENSOR_RANK or raw_targets.ndim < _MIN_BATCH_TENSOR_RANK or raw_inputs.shape[0] != raw_targets.shape[0]:
+            msg = f"Artifact input/target batches must share a non-empty leading axis, got {tuple(raw_inputs.shape)} and {tuple(raw_targets.shape)}."
             raise ValueError(msg)
-        batch_size = int(inputs.shape[0])
+        batch_size = int(raw_inputs.shape[0])
         if batch_size <= 0:
             msg = "Artifact loader produced an empty batch."
             raise RuntimeError(msg)
+        _require_finite_artifact_tensor(raw_inputs, label=f"Artifact batch {batch_index} raw inputs")
+        _require_finite_artifact_tensor(raw_targets, label=f"Artifact batch {batch_index} raw targets")
+
+        with torch.inference_mode():
+            processor_eval()
+            processed = preprocess(dict(raw_batch))
+            if not isinstance(processed, Mapping):
+                msg = f"Artifact processor must return a mapping, got {type(processed).__name__}."
+                raise TypeError(msg)
+            normalized_inputs = processed.get("x")
+            targets = processed.get("y")
+            if not isinstance(normalized_inputs, torch.Tensor) or not isinstance(targets, torch.Tensor):
+                msg = "Artifact processor output must contain tensor keys 'x' and 'y'."
+                raise TypeError(msg)
+            normalized_inputs = normalized_inputs.to(device)
+            targets = targets.to(device)
+            inputs = raw_inputs.to(device)
+            if (
+                normalized_inputs.ndim < _MIN_BATCH_TENSOR_RANK
+                or targets.ndim < _MIN_BATCH_TENSOR_RANK
+                or normalized_inputs.shape[0] != batch_size
+                or targets.shape[0] != batch_size
+            ):
+                msg = "Artifact preprocessing must preserve the complete loader batch axis."
+                raise ValueError(msg)
+            normalized_prediction, batch_forward_s = timing.measure_forward(
+                model=model,
+                normalized_inputs=normalized_inputs,
+                device=device,
+            )
+            if not isinstance(normalized_prediction, torch.Tensor):
+                msg = "Artifact model output must be a tensor."
+                raise TypeError(msg)
+            normalized_target = out_normalizer.transform(targets)
+            prediction = out_normalizer.inverse_transform(normalized_prediction)
+
+        tensors = {
+            "normalized inputs": normalized_inputs,
+            "physical targets": targets,
+            "normalized prediction": normalized_prediction,
+            "normalized target": normalized_target,
+            "physical prediction": prediction,
+        }
+        for label, value in tensors.items():
+            _require_finite_artifact_tensor(value, label=f"Artifact batch {batch_index} {label}")
+        if prediction.shape != targets.shape or normalized_prediction.shape != normalized_target.shape:
+            msg = (
+                "Artifact prediction/target shapes disagree after complete-batch inference: "
+                f"physical={tuple(prediction.shape)}/{tuple(targets.shape)}, "
+                f"normalized={tuple(normalized_prediction.shape)}/{tuple(normalized_target.shape)}."
+            )
+            raise RuntimeError(msg)
+        if prediction.shape[0] != batch_size:
+            msg = "Artifact model output must preserve the complete loader batch axis."
+            raise RuntimeError(msg)
+
+        amortized_forward_s = batch_forward_s / batch_size
         for case_offset in range(batch_size):
-            if max_cases is not None and case_position >= max_cases:
-                return
             case = {
                 "x": inputs[case_offset : case_offset + 1],
                 "y": targets[case_offset : case_offset + 1],
+                "y_normalized": normalized_target[case_offset : case_offset + 1],
+                "prediction_normalized": normalized_prediction[case_offset : case_offset + 1],
+                "prediction": prediction[case_offset : case_offset + 1],
+                "amortized_forward_s": amortized_forward_s,
                 "source_index": _select_collated_case(
                     raw_batch.get("source_index"),
                     case_offset=case_offset,
@@ -366,7 +608,7 @@ def _iter_artifact_cases(
             case_position += 1
 
 
-def write_artifact_provenance(save_root: str | Path, provenance: Mapping[str, Any]) -> Path:
+def write_artifact_provenance(save_root: str | Path, provenance: Mapping[str, Any]) -> tuple[Path, dict[str, Any]]:
     """
     Atomically publish provenance and payload digests as the completion marker.
 
@@ -379,13 +621,14 @@ def write_artifact_provenance(save_root: str | Path, provenance: Mapping[str, An
 
     Returns
     -------
-    pathlib.Path
-        Newly published ``artifact_provenance.json`` path.
+    tuple[pathlib.Path, dict[str, Any]]
+        Newly published path and the exact JSON-safe persisted payload including
+        its output manifest.
 
     Raises
     ------
     FileExistsError
-        If a completion marker already exists; provenance is never overwritten.
+        If a completion marker already exists. Provenance is never overwritten.
     RuntimeError
         If the artifact payload is incomplete.
 
@@ -408,15 +651,16 @@ def write_artifact_provenance(save_root: str | Path, provenance: Mapping[str, An
         raise ValueError(msg)
     payload["outputs"] = contracts.artifact_output_manifest(save_root)
 
-    return common.serialization.atomic_write_json(provenance_path, payload)
+    published_path = common.serialization.atomic_write_json(provenance_path, payload)
+    return published_path, payload
 
 
 def _require_batch_scalar_int(batch: Mapping[str, Any], key: str) -> int:
     """
     Extract one exact integer identity from a size-one artifact case mapping.
 
-    Torch, NumPy, singleton-sequence, and native integer encodings are accepted;
-    booleans, floating values, missing keys, and multi-value containers fail so
+    Torch, NumPy, singleton-sequence, and native integer encodings are accepted.
+    Booleans, floating values, missing keys, and multi-value containers fail so
     persisted membership identity is never coerced ambiguously.
     """
     if key not in batch:
@@ -426,24 +670,24 @@ def _require_batch_scalar_int(batch: Mapping[str, Any], key: str) -> int:
     value = batch[key]
     if isinstance(value, torch.Tensor):
         if value.numel() != 1 or value.dtype == torch.bool or value.is_floating_point() or value.is_complex():
-            msg = f"Artifact batch {key!r} must contain exactly one integer value; got {value!r}."
+            msg = f"Artifact batch {key!r} must contain exactly one integer value, not {value!r}."
             raise TypeError(msg)
         return int(value.detach().cpu().item())
 
     if isinstance(value, np.ndarray):
         if value.size != 1 or not np.issubdtype(value.dtype, np.integer):
-            msg = f"Artifact batch {key!r} must contain exactly one integer value; got {value!r}."
+            msg = f"Artifact batch {key!r} must contain exactly one integer value, not {value!r}."
             raise TypeError(msg)
         return int(value.reshape(-1)[0])
 
     if isinstance(value, (list, tuple)):
         if len(value) != 1:
-            msg = f"Artifact batch {key!r} must contain exactly one integer value; got {value!r}."
+            msg = f"Artifact batch {key!r} must contain exactly one integer value, not {value!r}."
             raise TypeError(msg)
         value = value[0]
 
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        msg = f"Artifact batch {key!r} must be an integer; got {type(value).__name__}."
+        msg = f"Artifact batch {key!r} must be an integer, not {type(value).__name__}."
         raise TypeError(msg)
     return int(value)
 
@@ -458,23 +702,40 @@ def _require_finite_artifact_tensor(value: torch.Tensor, *, label: str) -> None:
         raise FloatingPointError(msg)
 
 
-def _artifact_effective_case_count(provenance: Mapping[str, Any]) -> int:
+def _artifact_complete_case_count(provenance: Mapping[str, Any]) -> int:
     """
-    Read the positive generated-row contract from provenance selection evidence.
+    Require complete saved-membership selection evidence before generation.
 
-    Missing mappings, booleans, zero, and negative counts fail before any output
-    directory is populated.
+    Authoritative artifacts cannot represent bounded prefixes. Full and effective
+    counts and ordered-membership digests must therefore be identical, while the
+    explicit generation limit remains ``None``.
     """
     selection = provenance.get("selection")
     if not isinstance(selection, Mapping):
         msg = "Artifact provenance must contain a selection mapping."
         raise TypeError(msg)
 
-    count = selection.get("effective_case_count")
-    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-        msg = "Artifact provenance selection.effective_case_count must be a positive integer."
+    full_count = selection.get("full_selected_case_count")
+    effective_count = selection.get("effective_case_count")
+    if (
+        isinstance(full_count, bool)
+        or not isinstance(full_count, int)
+        or full_count <= 0
+        or isinstance(effective_count, bool)
+        or not isinstance(effective_count, int)
+        or effective_count != full_count
+    ):
+        msg = "Artifact selection must cover the complete positive saved membership."
         raise ValueError(msg)
-    return count
+    if "generation_limit" not in selection or selection["generation_limit"] is not None:
+        msg = "Authoritative artifact generation requires generation_limit=None."
+        raise ValueError(msg)
+    full_digest = selection.get("full_ordered_source_indices_sha256")
+    effective_digest = selection.get("effective_ordered_source_indices_sha256")
+    if not isinstance(full_digest, str) or not full_digest or effective_digest != full_digest:
+        msg = "Artifact full and effective ordered-membership digests must be identical."
+        raise ValueError(msg)
+    return effective_count
 
 
 def _validate_generated_source_indices(provenance: Mapping[str, Any], source_indices: list[int]) -> None:
@@ -504,7 +765,7 @@ def _ensure_artifact_targets_absent(save_root: Path, dataset_name: str) -> None:
     Enforce create-only semantics for one staged artifact target.
 
     Existing Parquet, provenance, NPZ, or interrupted temporary files are all
-    reported together and rejected; generation never overwrites partial output.
+    reported together and rejected. Generation never overwrites partial output.
     """
     npz_dir = save_root / "npz"
     candidates = [
@@ -566,7 +827,7 @@ def extract_kappa(
     Returns
     -------
     dict[str, torch.Tensor]
-        ``kappa_encoded`` retains stored task representations; ``kappa`` contains
+        ``kappa_encoded`` retains stored task representations, while ``kappa`` contains
         physical square-metre components in the same channel order.
 
     Raises
@@ -641,7 +902,7 @@ def infer_current_run_dir(save_root: Path) -> Path:
     """
     candidate = Path(save_root)
     while candidate.parent != candidate:
-        if common.paths.is_current_run_dir(candidate):
+        if common.paths.is_evaluable_run_dir(candidate):
             return candidate
         candidate = candidate.parent
     return Path(save_root)
@@ -687,7 +948,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     save_root: str | Path,
     dataset_name: str,
     provenance: Mapping[str, Any],
-    max_cases: int | None = None,
     publication_root: str | Path | None = None,
     timing_cases: list[dict[str, Any]] | None = None,
     timing_case_ids: Sequence[str] | None = None,
@@ -695,8 +955,8 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     """
     Generate steady-Brinkman evaluation artifacts from saved-membership batches.
 
-    Each case is inferred in normalized space, inverse-transformed to physical
-    fields, and evaluated for channel-balanced relative errors, normalized
+    Complete loader batches are preprocessed and inferred exactly once before
+    their case views are evaluated for channel-balanced relative errors, normalized
     sufficient statistics, dual continuity, momentum, and pressure-boundary
     diagnostics. One NPZ is written per case and one Parquet row per membership.
 
@@ -718,15 +978,13 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         Logical dataset name used for the Parquet filename.
     provenance : Mapping[str, Any]
         Versioned request evidence, including selected training continuity and
-        exact effective membership digest.
-    max_cases : int | None, optional
-        Positive case bound counted across arbitrary positive batch sizes.
+        exact complete membership digest.
     publication_root : str | pathlib.Path | None, optional
         Final target recorded in Parquet NPZ paths while writing a sibling stage.
     timing_cases : list[dict[str, Any]] | None, optional
-        Empty collector populated with direct per-case forward durations.
+        Empty collector populated with amortized shares of complete-batch forwards.
     timing_case_ids : Sequence[str] | None, optional
-        Authoritative case IDs aligned with effective saved membership.
+        Authoritative case IDs aligned with complete saved membership.
 
     Returns
     -------
@@ -737,7 +995,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     ------
     KeyError, TypeError, ValueError, RuntimeError, FloatingPointError
         If task/provenance semantics, batch identity, shapes, finite values,
-        physics fields, metrics, or effective membership violate the contract.
+        physics fields, metrics, or complete membership violate the contract.
     FileExistsError
         If any complete or interrupted target payload already exists.
 
@@ -745,12 +1003,24 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     -----
     Full-grid residual arrays coexist with scalar gradient diagnostics cropped by
     ``EVAL_PAD``. Provenance, including exact output digests and the aggregate
-    normalized macro RMSE, publishes only after every payload succeeds.
+    normalized physical-group macro RMSE, publishes only after every payload succeeds.
 
     """
     save_root = Path(save_root)
     published_root = save_root if publication_root is None else Path(publication_root)
-    expected_case_count = _artifact_effective_case_count(provenance)
+    expected_case_count = _artifact_complete_case_count(provenance)
+    output_groups, train_standard_deviations, normalization_denominator_floor = _objective_context(
+        task=task,
+        processor=processor,
+        provenance=provenance,
+    )
+    velocity_group = _required_output_group(task, group_id="velocity")
+    velocity_indices = tuple(task.output_names.index(field) for field in velocity_group.fields)
+    velocity_units = {task.field(field).unit for field in velocity_group.fields}
+    if len(velocity_units) != 1:
+        msg = f"Task velocity-group fields must share one physical unit, got {sorted(velocity_units)}."
+        raise ValueError(msg)
+    velocity_unit = next(iter(velocity_units))
     authoritative_timing_ids = _timing_case_ids(
         timing_cases=timing_cases,
         timing_case_ids=timing_case_ids,
@@ -804,7 +1074,12 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     # Detect available kappa channels from field contracts
     kappa_names = detect_kappa_channels_from_inputs(list(task.input_names))
 
-    for idx, batch in _iter_artifact_cases(loader, max_cases=max_cases):
+    for idx, batch in _iter_inferred_artifact_cases(
+        loader,
+        model=model,
+        processor=processor,
+        device=device,
+    ):
         split_local_index = _require_batch_scalar_int(batch, "split_local_index")
         source_index = _require_batch_scalar_int(batch, "source_index")
         if split_local_index != idx:
@@ -816,10 +1091,13 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         case_id = source_index + 1
         generated_source_indices.append(source_index)
 
-        x = batch["x"].to(device)
-        y = batch["y"].to(device)
-        _require_finite_artifact_tensor(x, label=f"Artifact case {case_id} inputs")
-        _require_finite_artifact_tensor(y, label=f"Artifact case {case_id} targets")
+        x = batch["x"]
+        y = batch["y"]
+        y_norm = batch["y_normalized"]
+        y_hat_norm = batch["prediction_normalized"]
+        y_hat = batch["prediction"]
+        forward_s = float(batch["amortized_forward_s"])
+        inference_time_ms = None
 
         # Preserve generator metadata in a JSON-safe form.
         source_meta = meta_to_jsonable(batch.get("meta", {}))
@@ -838,42 +1116,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             input_fields=list(task.input_names),
             kappa_names=kappa_names,
         )
-
-        # --------------------------------------------------
-        # Forward pass (model operates in normalized space)
-        # --------------------------------------------------
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
-        end_time = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
-
-        if device.type == "cuda" and start_time is not None:
-            start_time.record(torch.cuda.current_stream())
-
-        with torch.inference_mode():
-            x_norm = processor.in_normalizer.transform(x)
-            y_hat_norm, forward_s = timing.measure_forward(
-                model=model,
-                normalized_inputs=x_norm,
-                device=device,
-            )
-            y_norm = processor.out_normalizer.transform(y)
-            y_hat = processor.out_normalizer.inverse_transform(y_hat_norm)
-
-        if device.type == "cuda" and end_time is not None:
-            end_time.record(torch.cuda.current_stream())
-            torch.cuda.synchronize()
-            inference_time_ms = start_time.elapsed_time(end_time) if start_time is not None else None
-        else:
-            inference_time_ms = None
-
-        _require_finite_artifact_tensor(x_norm, label=f"Artifact case {case_id} normalized inputs")
-        _require_finite_artifact_tensor(y_hat_norm, label=f"Artifact case {case_id} normalized prediction")
-        _require_finite_artifact_tensor(y_norm, label=f"Artifact case {case_id} normalized target")
-        _require_finite_artifact_tensor(y_hat, label=f"Artifact case {case_id} physical prediction")
-        if y_hat.shape != y.shape:
-            msg = f"Artifact prediction/target shape mismatch: {tuple(y_hat.shape)} != {tuple(y.shape)}."
-            raise RuntimeError(msg)
 
         # --------------------------------------------------
         # Physics diagnostics (exact training-consistent implementation)
@@ -909,27 +1151,33 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         # --------------------------------------------------
         # Outputs (de-normalised, physical units)
         # --------------------------------------------------
-        p, u, v = y_hat[:, 0:1], y_hat[:, 1:2], y_hat[:, 2:3]
-        p_gt, u_gt, v_gt = y[:, 0:1], y[:, 1:2], y[:, 2:3]
+        y_hat_main = y_hat
+        y_main = y
+        err_main = y_hat_main - y_main
+        velocity_index_tensor = torch.tensor(velocity_indices, dtype=torch.long, device=y_hat.device)
+        velocity_prediction = y_hat_main.index_select(1, velocity_index_tensor)
+        velocity_target = y_main.index_select(1, velocity_index_tensor)
+        U = torch.linalg.vector_norm(velocity_prediction, dim=1, keepdim=True)
+        U_gt = torch.linalg.vector_norm(velocity_target, dim=1, keepdim=True)
 
-        U = torch.sqrt(u**2 + v**2)
-        U_gt = torch.sqrt(u_gt**2 + v_gt**2)
-
-        # Book-friendly metrics (physical units)
-        rmse_p = torch.sqrt(torch.mean((p - p_gt) ** 2)).item()
-        rmse_u = torch.sqrt(torch.mean((u - u_gt) ** 2)).item()
-        rmse_v = torch.sqrt(torch.mean((v - v_gt) ** 2)).item()
-        rmse_U = torch.sqrt(torch.mean((U - U_gt) ** 2)).item()
-
-        # Full tensors for NPZ export / plotting (includes U)
-        y_hat_ext = torch.cat([p, u, v, U], dim=1)
-        y_ext = torch.cat([p_gt, u_gt, v_gt, U_gt], dim=1)
+        # Full tensors for NPZ export and plotting include derived speed magnitude.
+        y_hat_ext = torch.cat([y_hat_main, U], dim=1)
+        y_ext = torch.cat([y_main, U_gt], dim=1)
         err_ext = y_hat_ext - y_ext
 
-        # Main metric tensors (ONLY p,u,v)
-        y_hat_main = torch.cat([p, u, v], dim=1)
-        y_main = torch.cat([p_gt, u_gt, v_gt], dim=1)
-        err_main = y_hat_main - y_main
+        # Physical diagnostics and global-reduction evidence
+        physical_statistics = physical_case_statistics(
+            y_hat_main,
+            y_main,
+            output_fields=task.output_names,
+        )[0]
+        group_metrics = _group_case_metrics(
+            task=task,
+            physical_statistics=physical_statistics,
+            output_groups=output_groups,
+            train_standard_deviations=train_standard_deviations,
+        )
+        physical_rmse_speed_magnitude = torch.sqrt(torch.mean((U - U_gt) ** 2)).item()
 
         # Grid spacing from coordinate fields (physical)
         idx_x = task.input_names.index("x")
@@ -945,7 +1193,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         rel_l2_per_channel: list[float] = []
         rel_h1_per_channel: list[float] = []
 
-        for c in range(y_main.shape[1]):  # c in {p,u,v}
+        for c in range(y_main.shape[1]):
             e_c = err_main[:, c : c + 1]
             r_c = y_main[:, c : c + 1]
 
@@ -985,10 +1233,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             output_fields=task.output_names,
         )[0]
         scalar_metrics = (
-            rmse_p,
-            rmse_u,
-            rmse_v,
-            rmse_U,
+            physical_rmse_speed_magnitude,
             rel_l2,
             rel_h1,
             momentum_residual_mse,
@@ -997,7 +1242,9 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             pressure_boundary_mse,
             pressure_inlet_mse,
             pressure_outlet_mean_square,
+            *physical_statistics.values(),
             *normalized_statistics.values(),
+            *group_metrics.values(),
         )
         if not np.isfinite(np.asarray(scalar_metrics, dtype=float)).all():
             msg = f"Artifact case {case_id} produced non-finite scalar metrics."
@@ -1014,7 +1261,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         y_raw = y.squeeze(0).detach().cpu().numpy()  # (C_out,H,W)
 
         artifact_fields = (*task.output_names, "U")
-        artifact_units = (*(field.unit for field in task.outputs), "m/s")
+        artifact_units = (*(field.unit for field in task.outputs), velocity_unit)
         npz_payload = {
             "case_index": np.int64(case_id),
             "source_index": np.int64(source_index),
@@ -1061,13 +1308,10 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
                 "case_index": case_id,
                 "source_index": source_index,
                 "split_local_index": split_local_index,
-                "npz_path": str(published_root / "npz" / npz_path.name),
+                "npz_path": (Path("npz") / npz_path.name).as_posix(),
                 "rel_l2": rel_l2,
                 "rel_h1": rel_h1,
-                "rmse_p": rmse_p,
-                "rmse_u": rmse_u,
-                "rmse_v": rmse_v,
-                "rmse_U": rmse_U,
+                "physical_rmse_speed_magnitude": physical_rmse_speed_magnitude,
                 "kappa_names": kappa_names,
                 "momentum_residual_mse": momentum_residual_mse,
                 "div_velocity_mse": div_velocity_mse,
@@ -1075,7 +1319,9 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
                 "pressure_boundary_mse": pressure_boundary_mse,
                 "pressure_inlet_mse": pressure_inlet_mse,
                 "pressure_outlet_mean_square": pressure_outlet_mean_square,
+                **physical_statistics,
                 **normalized_statistics,
+                **group_metrics,
                 "meta": json.dumps(meta_clean),
             }
         )
@@ -1105,9 +1351,13 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     complete_provenance = _provenance_with_aggregate(
         provenance,
         frame=df,
-        output_fields=task.output_names,
+        output_groups=output_groups,
+        train_standard_deviations=train_standard_deviations,
+        normalization_denominator_floor=normalization_denominator_floor,
     )
-    write_artifact_provenance(save_root, complete_provenance)
+    _provenance_path, published_provenance = write_artifact_provenance(save_root, complete_provenance)
+    df.attrs["artifact_provenance"] = published_provenance
+    df.attrs["artifact_root"] = str(published_root)
 
     return df, parquet_path
 
@@ -1122,7 +1372,6 @@ def _generate_generic_artifacts(
     save_root: str | Path,
     dataset_name: str,
     provenance: Mapping[str, Any],
-    max_cases: int | None = None,
     publication_root: str | Path | None = None,
     timing_cases: list[dict[str, Any]] | None = None,
     timing_case_ids: Sequence[str] | None = None,
@@ -1130,8 +1379,8 @@ def _generate_generic_artifacts(
     """
     Generate artifacts without assuming concrete output fields or physics.
 
-    Each saved-split case is inverse-transformed into physical units, checked for
-    finite task-shaped tensors, and written as one compressed NPZ plus one
+    Complete saved-split batches are preprocessed and inferred once, then each
+    physical case view is checked and written as one compressed NPZ plus one
     Parquet row. Normalized sufficient statistics preserve exact objective
     aggregation. Provenance publishes last as the cache completion marker.
 
@@ -1153,14 +1402,12 @@ def _generate_generic_artifacts(
         Logical name used for the single Parquet payload.
     provenance : Mapping[str, Any]
         Request identity and expected membership evidence.
-    max_cases : int | None, optional
-        Positive case bound counted across batch boundaries.
     publication_root : str | pathlib.Path | None, optional
         Final target persisted in NPZ path columns during staged generation.
     timing_cases : list[dict[str, Any]] | None, optional
-        Empty collector populated with direct per-case forward durations.
+        Empty collector populated with amortized shares of complete-batch forwards.
     timing_case_ids : Sequence[str] | None, optional
-        Authoritative case IDs aligned with effective saved membership.
+        Authoritative case IDs aligned with complete saved membership.
 
     Returns
     -------
@@ -1184,7 +1431,12 @@ def _generate_generic_artifacts(
     """
     root = Path(save_root)
     published_root = root if publication_root is None else Path(publication_root)
-    expected_case_count = _artifact_effective_case_count(provenance)
+    expected_case_count = _artifact_complete_case_count(provenance)
+    output_groups, train_standard_deviations, normalization_denominator_floor = _objective_context(
+        task=task,
+        processor=processor,
+        provenance=provenance,
+    )
     authoritative_timing_ids = _timing_case_ids(
         timing_cases=timing_cases,
         timing_case_ids=timing_case_ids,
@@ -1197,7 +1449,12 @@ def _generate_generic_artifacts(
     rows: list[dict[str, Any]] = []
     generated_source_indices: list[int] = []
 
-    for iteration, batch in _iter_artifact_cases(loader, max_cases=max_cases):
+    for iteration, batch in _iter_inferred_artifact_cases(
+        loader,
+        model=model,
+        processor=processor,
+        device=device,
+    ):
         split_local_index = _require_batch_scalar_int(batch, "split_local_index")
         source_index = _require_batch_scalar_int(batch, "source_index")
         if split_local_index != iteration:
@@ -1216,38 +1473,12 @@ def _generate_generic_artifacts(
             msg = f"Source metadata contains reserved artifact identity keys: {sorted(reserved)}."
             raise KeyError(msg)
 
-        inputs = batch["x"].to(device)
-        targets = batch["y"].to(device)
-        _require_finite_artifact_tensor(inputs, label=f"Artifact case {case_index} inputs")
-        _require_finite_artifact_tensor(targets, label=f"Artifact case {case_index} targets")
-        with torch.inference_mode():
-            normalized_inputs = processor.in_normalizer.transform(inputs)
-            normalized_prediction, forward_s = timing.measure_forward(
-                model=model,
-                normalized_inputs=normalized_inputs,
-                device=device,
-            )
-            normalized_target = processor.out_normalizer.transform(targets)
-            prediction = processor.out_normalizer.inverse_transform(normalized_prediction)
-        _require_finite_artifact_tensor(
-            normalized_inputs,
-            label=f"Artifact case {case_index} normalized inputs",
-        )
-        _require_finite_artifact_tensor(
-            normalized_prediction,
-            label=f"Artifact case {case_index} normalized prediction",
-        )
-        _require_finite_artifact_tensor(
-            normalized_target,
-            label=f"Artifact case {case_index} normalized target",
-        )
-        _require_finite_artifact_tensor(
-            prediction,
-            label=f"Artifact case {case_index} physical prediction",
-        )
-        if prediction.shape != targets.shape:
-            msg = f"Prediction/target shape mismatch: {tuple(prediction.shape)} != {tuple(targets.shape)}."
-            raise RuntimeError(msg)
+        inputs = batch["x"]
+        targets = batch["y"]
+        normalized_target = batch["y_normalized"]
+        normalized_prediction = batch["prediction_normalized"]
+        prediction = batch["prediction"]
+        forward_s = float(batch["amortized_forward_s"])
         if prediction.shape[1] != len(task.output_names):
             msg = f"Artifact output channel count {prediction.shape[1]} does not match task fields {list(task.output_names)}."
             raise RuntimeError(msg)
@@ -1284,6 +1515,17 @@ def _generate_generic_artifacts(
             normalized_target,
             output_fields=task.output_names,
         )[0]
+        physical_statistics = physical_case_statistics(
+            prediction,
+            targets,
+            output_fields=task.output_names,
+        )[0]
+        group_metrics = _group_case_metrics(
+            task=task,
+            physical_statistics=physical_statistics,
+            output_groups=output_groups,
+            train_standard_deviations=train_standard_deviations,
+        )
         relative_l2_values: list[float] = []
         relative_h1_values: list[float] = []
         denominator_floor = 1e-12
@@ -1305,14 +1547,14 @@ def _generate_generic_artifacts(
             "case_index": case_index,
             "source_index": source_index,
             "split_local_index": split_local_index,
-            "npz_path": str(published_root / "npz" / npz_path.name),
+            "npz_path": (Path("npz") / npz_path.name).as_posix(),
             "rel_l2": float(np.mean(relative_l2_values)),
             "rel_h1": float(np.mean(relative_h1_values)),
             "meta": json.dumps(metadata),
+            **physical_statistics,
             **normalized_statistics,
+            **group_metrics,
         }
-        for channel, field in enumerate(task.outputs):
-            row[f"rmse_{field.name}"] = float(torch.sqrt(torch.mean(error_cpu[channel].square())).item())
         rows.append(row)
         if authoritative_timing_ids is not None and timing_cases is not None:
             timing_cases.append(
@@ -1339,9 +1581,13 @@ def _generate_generic_artifacts(
     complete_provenance = _provenance_with_aggregate(
         provenance,
         frame=frame,
-        output_fields=task.output_names,
+        output_groups=output_groups,
+        train_standard_deviations=train_standard_deviations,
+        normalization_denominator_floor=normalization_denominator_floor,
     )
-    write_artifact_provenance(root, complete_provenance)
+    _provenance_path, published_provenance = write_artifact_provenance(root, complete_provenance)
+    frame.attrs["artifact_provenance"] = published_provenance
+    frame.attrs["artifact_root"] = str(published_root)
     return frame, parquet_path
 
 
@@ -1355,7 +1601,6 @@ def generate_artifacts(
     save_root: str | Path,
     dataset_name: str,
     provenance: Mapping[str, Any],
-    max_cases: int | None = None,
     publication_root: str | Path | None = None,
     timing_cases: list[dict[str, Any]] | None = None,
     timing_case_ids: Sequence[str] | None = None,
@@ -1380,16 +1625,14 @@ def generate_artifacts(
     dataset_name : str
         Logical dataset name used for the Parquet filename.
     provenance : Mapping[str, Any]
-        Exact cache request identity; generated aggregate and output digests are
+        Exact cache request identity. Generated aggregate and output digests are
         appended only after all case payloads succeed.
-    max_cases : int | None, optional
-        Positive effective saved-split case limit across batch boundaries.
     publication_root : str | pathlib.Path | None, optional
         Final target recorded in Parquet NPZ paths while payloads are staged.
     timing_cases : list[dict[str, Any]] | None, optional
-        Empty collector populated with direct per-case forward durations.
+        Empty collector populated with amortized shares of complete-batch forwards.
     timing_case_ids : Sequence[str] | None, optional
-        Authoritative case IDs aligned with effective saved membership.
+        Authoritative case IDs aligned with complete saved membership.
 
     Returns
     -------
@@ -1404,7 +1647,7 @@ def generate_artifacts(
 
     Notes
     -----
-    The maintained steady-flow task uses its dual-continuity diagnostic adapter;
+    The maintained steady-flow task uses its dual-continuity diagnostic adapter.
     TaskSpecs without that physics selector use generic named field/unit storage. This function
     creates payloads only: cache locking and target replacement belong to the
     artifact service. Provenance is always the final completion marker.
@@ -1421,7 +1664,6 @@ def generate_artifacts(
             save_root=save_root,
             dataset_name=dataset_name,
             provenance=provenance,
-            max_cases=max_cases,
             publication_root=publication_root,
             timing_cases=timing_cases,
             timing_case_ids=timing_case_ids,
@@ -1435,7 +1677,6 @@ def generate_artifacts(
         save_root=save_root,
         dataset_name=dataset_name,
         provenance=provenance,
-        max_cases=max_cases,
         publication_root=publication_root,
         timing_cases=timing_cases,
         timing_case_ids=timing_case_ids,
