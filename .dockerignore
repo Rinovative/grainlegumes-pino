@@ -58,13 +58,6 @@ OneDrive*/
 /results/
 wandb/
 
-# Local agent/release records (not image inputs)
-AGENTS.md
-FINAL_FUNCTIONAL_COMPLETION_PLAN.md
-FUNCTIONAL_REFACTOR_AUDIT.md
-MODEL_SELECTION_OBJECTIVE_AUDIT.md
-MANUAL_ACCEPTANCE_CHECKLIST.md
-
 # Temporary files
 *.zip
 *.log

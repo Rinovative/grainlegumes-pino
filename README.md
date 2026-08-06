@@ -1,14 +1,17 @@
-# GrainLegumes-PINOs: Physics-Informed Neural Operators for Porous Media Flow  
-### *Specialization Project (VP1) – MSE Data Science, Autumn 2025*
+# GrainLegumes-PINO-Airflow: Physics-Informed Neural Operators for Porous Media Flow
+### *Specialization Project 1 (VP1) – MSE Data Science, Autumn 2025*
 
 **Master of Science in Engineering – Major Data Science**  
 **Eastern Switzerland University of Applied Sciences (OST)**  
 **Author:** Rino M. Albertin  
 **Supervisor:** Prof. Dr. Christoph Würsch  
 
+> **Follow-up project:**  
+> [GrainLegumes-PINO-Drying](https://github.com/Rinovative/grainlegumes-pino-drying) extends this steady-airflow foundation to transient coupled heat and moisture transport.
+
 ## 📌 Project Overview
 
-This specialization project studies the learning of physically consistent surrogate models for incompressible air flow in **porous granular media** using **Physics-Informed Neural Operators (PINOs)**.
+This specialization project studies the learning of physically consistent surrogate models for steady, incompressible airflow air flow through **heterogeneous porous granular** media using **Physics-Informed Neural Operators (PINOs)**.
 
 High-fidelity permeability and porosity fields are synthetically generated in **MATLAB** and simulated with **COMSOL Multiphysics** using a Darcy–Brinkman formulation.  
 The central objective is to train two-dimensional neural operators that learn the operator mapping

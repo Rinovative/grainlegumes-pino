@@ -1,9 +1,6 @@
 # ================================
 # Project-specific local files
 # ================================
-/mlenv/
-/.claude/
-/_llm_workflow/
 /AGENTS.md
 /DEVELOPMENT_STYLE.md
 
