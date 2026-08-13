@@ -1,9 +1,44 @@
+%% comsol_solve_timing.m
+% ============================================================
+% Validate and optionally publish COMSOL solve-timing metadata.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Builds the exact version-1 operational timing sidecar, validates runtime
+%   provenance and ordered case membership, derives aggregate durations, and
+%   optionally publishes the JSON payload atomically.
+%
+% USAGE
+%   payload = comsol_solve_timing(batch_name, cases, runtime, ...
+%       batch_manifest_sha256, output_path, intended_case_ids)
+%
+% INPUTS
+%   batch_name
+%       Non-empty batch identity.
+%   cases
+%       Struct array with case_id and positive comsol_solve_s values.
+%   runtime
+%       Exact MATLAB, COMSOL, host, processor, OS, and execution-mode record.
+%   batch_manifest_sha256
+%       Empty text or lowercase SHA-256 binding to a terminal batch manifest.
+%   output_path
+%       Optional destination JSON path; empty text performs validation only.
+%   intended_case_ids
+%       Optional ordered case membership used to validate and sort timings.
+%
+% OUTPUTS
+%   payload
+%       Validated timing schema with runtime, cases, and derived aggregates.
+%
+% NOTES
+%   Solve timings are operational metadata and never alter scientific identity.
+% ============================================================
+
 function payload = comsol_solve_timing( ...
         batch_name, cases, runtime, batch_manifest_sha256, output_path, ...
         intended_case_ids)
-%COMSOL_SOLVE_TIMING Build, validate, and optionally publish solve timings.
-% Per-case timings are operational metadata and never change case identity.
-% batch_run publishes this sidecar beside the processed COMSOL results.
 
 if nargin < 5
     output_path = "";

@@ -1,19 +1,35 @@
+%% gen_export.m
 % ============================================================
-% Export 2D material and boundary-condition fields for COMSOL
-%
-% CSV columns (row-wise, flattened):
-%   x ; y ;
-%   Kxx ; Kxy ; Kyy ;
-%   eps ;
-%   [p_bc]
-%
-% JSON metadata:
-%   - export schema
-%   - present fields
-%   - generator metadata
+% Export generated fields and their metadata for COMSOL.
 %
 % Author: Rino M. Albertin
-% Date:   2026-01-04
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Flattens one Cartesian field realization into the canonical seven-column
+%   COMSOL input table and publishes matching JSON generator metadata.
+%
+% USAGE
+%   info_export = gen_export(fields, info, opts)
+%
+% INPUTS
+%   fields
+%       Struct containing grid coordinates, permeability tensor components,
+%       porosity, and the inlet-pressure boundary vector.
+%   info
+%       Geometry and generator metadata from the completed field pipeline.
+%   opts
+%       Export options. save_dir is required; file_tag and delimiter are
+%       optional and default to "fields_comsol" and semicolon.
+%
+% OUTPUTS
+%   info_export
+%       Export schema, field-presence flags, generator metadata, paths, and
+%       timestamp written to the case JSON file.
+%
+% NOTES
+%   The CSV columns are x, y, Kxx, Kxy, Kyy, eps, and p_bc in that order.
+%   The pressure value is nonzero only on the first grid row.
 % ============================================================
 
 function info_export = gen_export(fields, info, opts)

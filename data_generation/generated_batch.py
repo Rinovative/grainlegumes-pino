@@ -49,6 +49,9 @@ _RAW_SOLUTION_RTOL = 1e-12
 _RAW_SOLUTION_SCALE_ATOL = 1e-12
 _SYMMETRY_EPSILON_FACTOR = 16.0
 _MIN_AXIS_POINTS = 2
+_SUPPORT_ENDPOINT_COUNT = 2
+_PACKING_SCATTER_LOWER = -3.0
+_PACKING_SCATTER_UPPER = 3.0
 _GRID_UNIFORM_RTOL = 1e-8
 _BATCH_MANIFEST_SCHEMA_VERSION = 1
 _BATCH_MANIFEST_SCHEMA_KIND = "comsol_batch_manifest"
@@ -58,7 +61,37 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _CASE_ID_PATTERN = re.compile(r"case_[0-9]{4,}")
 _MANIFEST_KEYS = frozenset({"schema_kind", "schema_version", "batch_name", "status", "configuration", "field_schema", "intended_case_ids", "cases"})
 _MANIFEST_CONFIGURATION_KEYS = frozenset(
-    {"method", "variation", "N", "seed", "Lx", "Ly", "res", "save_model", "sample_sha256", "template_name", "template_sha256"}
+    {
+        "method",
+        "variation",
+        "N",
+        "seed",
+        "Lx",
+        "Ly",
+        "res",
+        "save_model",
+        "sample_sha256",
+        "template_name",
+        "template_sha256",
+        "generation_contract",
+    }
+)
+_GENERATION_CONTRACT_KEYS = frozenset(
+    {
+        "generation_contract_version",
+        "kappa_nominal",
+        "eps_nominal",
+        "A_KC_reference",
+        "reference_id_variation",
+        "natural_kappa_support",
+        "natural_eps_reference_support",
+        "batch_kappa_support",
+        "batch_eps_reference_support",
+        "packing_scatter_truncation_lower",
+        "packing_scatter_truncation_upper",
+        "eps_min_global",
+        "eps_max_global",
+    }
 )
 _MANIFEST_RECORD_KEYS = frozenset({"case_id", "status", "stage", "message", "files"})
 _MANIFEST_FILE_KEYS = frozenset({"raw_csv_sha256", "raw_json_sha256", "solution_csv_sha256", "solution_model_sha256"})
@@ -111,8 +144,24 @@ _GENERATOR_MAPPING_KEYS = {
     "generator.permeability.parameters.orientation": frozenset({"theta_jitter", "theta_smooth_rel"}),
     "generator.porosity": frozenset({"parameters", "statistics"}),
     "generator.porosity.statistics": frozenset({"eps"}),
-    "generator.porosity.statistics.eps": frozenset({"max", "mean", "min", "std"}),
-    "generator.porosity.parameters": frozenset({"A_mat", "A_rel", "eps_max_global", "eps_min_global", "eps_ref", "eps_smooth_rel", "texture_amp"}),
+    "generator.porosity.statistics.eps": frozenset({"local_clipping_fraction", "max", "mean", "min", "std"}),
+    "generator.porosity.parameters": frozenset(
+        {
+            *_GENERATION_CONTRACT_KEYS,
+            "k_mean",
+            "eps_kc_trend",
+            "packing_scatter_seed",
+            "packing_scatter_z",
+            "packing_scatter_margin",
+            "packing_scatter_sigma",
+            "packing_support_kind",
+            "packing_support_lower",
+            "packing_support_upper",
+            "eps_reference",
+            "eps_smooth_rel",
+            "texture_amp",
+        }
+    ),
     "generator.bc": frozenset({"parameters", "statistics"}),
     "generator.bc.statistics": frozenset({"p_inlet"}),
     "generator.bc.statistics.p_inlet": frozenset({"max", "mean", "min", "std"}),
@@ -286,6 +335,148 @@ def _require_manifest_real(
     return numeric
 
 
+def _require_finite_real(value: Any, *, label: str) -> float:
+    """Return one finite persisted real without accepting booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"{label} must be a real number."
+        raise TypeError(msg)
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        msg = f"{label} must be finite."
+        raise ValueError(msg)
+    return numeric
+
+
+def _require_support(value: Any, *, label: str, strict: bool) -> tuple[float, float]:
+    """Return one finite ordered two-value scientific support."""
+    if not isinstance(value, list) or len(value) != _SUPPORT_ENDPOINT_COUNT:
+        msg = f"{label} must contain exactly two values."
+        raise TypeError(msg)
+    lower = _require_finite_real(value[0], label=f"{label}[0]")
+    upper = _require_finite_real(value[1], label=f"{label}[1]")
+    if lower > upper or (strict and lower == upper):
+        relation = "strictly increasing" if strict else "ordered"
+        msg = f"{label} must be {relation}."
+        raise ValueError(msg)
+    return lower, upper
+
+
+def _require_close(
+    actual: float,
+    expected: float,
+    *,
+    label: str,
+    absolute_tolerance: float = 0.0,
+) -> None:
+    """Require persisted numerical provenance to satisfy one derived identity."""
+    if not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=absolute_tolerance):
+        msg = f"{label} is inconsistent: actual={actual:.17g}, expected={expected:.17g}."
+        raise ValueError(msg)
+
+
+def _kc_response(porosity: float) -> float:
+    """Return the dimensionless Kozeny--Carman response."""
+    if not 0.0 < porosity < 1.0:
+        msg = "Kozeny--Carman porosity must lie strictly inside (0, 1)."
+        raise ValueError(msg)
+    return porosity**3 / (1.0 - porosity) ** 2
+
+
+def _validate_generation_contract(value: Any, *, variation: float) -> dict[str, Any]:
+    """Validate fixed calibration and variation-resolved packing provenance."""
+    contract = require_exact_mapping_keys(value, _GENERATION_CONTRACT_KEYS, label="Generation contract")
+    version = contract["generation_contract_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        msg = "Generation contract version must be integer 1."
+        raise ValueError(msg)
+
+    kappa_nominal = _require_finite_real(contract["kappa_nominal"], label="Generation contract kappa_nominal")
+    eps_nominal = _require_finite_real(contract["eps_nominal"], label="Generation contract eps_nominal")
+    reference = _require_finite_real(contract["A_KC_reference"], label="Generation contract A_KC_reference")
+    reference_variation = _require_finite_real(
+        contract["reference_id_variation"],
+        label="Generation contract reference_id_variation",
+    )
+    eps_min = _require_finite_real(contract["eps_min_global"], label="Generation contract eps_min_global")
+    eps_max = _require_finite_real(contract["eps_max_global"], label="Generation contract eps_max_global")
+    if kappa_nominal <= 0.0 or reference <= 0.0:
+        msg = "Generation contract permeability calibration values must be positive."
+        raise ValueError(msg)
+    if reference_variation <= 0.0:
+        msg = "Generation contract reference_id_variation must be positive."
+        raise ValueError(msg)
+    if not 0.0 < eps_min < eps_max < 1.0 or not eps_min <= eps_nominal <= eps_max:
+        msg = "Generation contract nominal porosity and global guards are invalid."
+        raise ValueError(msg)
+    _require_close(
+        reference,
+        kappa_nominal / _kc_response(eps_nominal),
+        label="Generation contract KC calibration identity",
+    )
+
+    natural_kappa = _require_support(contract["natural_kappa_support"], label="Natural kappa support", strict=True)
+    natural_eps = _require_support(
+        contract["natural_eps_reference_support"],
+        label="Natural eps_reference support",
+        strict=True,
+    )
+    batch_kappa = _require_support(contract["batch_kappa_support"], label="Batch kappa support", strict=variation > 0.0)
+    batch_eps = _require_support(
+        contract["batch_eps_reference_support"],
+        label="Batch eps_reference support",
+        strict=variation > 0.0,
+    )
+    expected_natural_kappa = (
+        kappa_nominal / (1.0 + reference_variation),
+        kappa_nominal * (1.0 + reference_variation),
+    )
+    expected_batch_kappa = (
+        kappa_nominal / (1.0 + variation),
+        kappa_nominal * (1.0 + variation),
+    )
+    for index in range(2):
+        _require_close(
+            natural_kappa[index],
+            expected_natural_kappa[index],
+            label=f"Natural kappa support endpoint {index}",
+        )
+        _require_close(
+            batch_kappa[index],
+            expected_batch_kappa[index],
+            label=f"Batch kappa support endpoint {index}",
+        )
+        _require_close(
+            reference * _kc_response(natural_eps[index]),
+            natural_kappa[index],
+            label=f"Natural porosity support endpoint {index}",
+        )
+        _require_close(
+            reference * _kc_response(batch_eps[index]),
+            batch_kappa[index],
+            label=f"Batch porosity support endpoint {index}",
+        )
+    if batch_eps[0] < eps_min or batch_eps[1] > eps_max:
+        msg = (
+            "Generation contract batch porosity support lies outside global guards: "
+            f"variation={variation:.17g}, kappa_support={batch_kappa}, "
+            f"porosity_support={batch_eps}, global_guards=({eps_min}, {eps_max})."
+        )
+        raise ValueError(msg)
+
+    truncation_lower = _require_finite_real(
+        contract["packing_scatter_truncation_lower"],
+        label="Packing scatter truncation lower",
+    )
+    truncation_upper = _require_finite_real(
+        contract["packing_scatter_truncation_upper"],
+        label="Packing scatter truncation upper",
+    )
+    if truncation_lower != _PACKING_SCATTER_LOWER or truncation_upper != _PACKING_SCATTER_UPPER:
+        msg = "Packing scatter truncation must be fixed at [-3, 3]."
+        raise ValueError(msg)
+    return contract
+
+
 def _validate_manifest_configuration(value: Any) -> dict[str, Any]:
     """
     Validate and return the exact production batch-configuration mapping.
@@ -321,7 +512,8 @@ def _validate_manifest_configuration(value: Any) -> dict[str, Any]:
     if not 0 <= seed <= _MAX_RANDOM_SEED:
         msg = f"Batch manifest configuration.seed must be in [0, {_MAX_RANDOM_SEED}]."
         raise ValueError(msg)
-    _require_manifest_real(configuration, "variation", positive=False)
+    variation = _require_manifest_real(configuration, "variation", positive=False)
+    _validate_generation_contract(configuration["generation_contract"], variation=variation)
     length_x = _require_manifest_real(configuration, "Lx", positive=True)
     length_y = _require_manifest_real(configuration, "Ly", positive=True)
     resolution = _require_manifest_real(configuration, "res", positive=True)
@@ -970,6 +1162,147 @@ def _validate_generator_metadata(value: Any) -> dict[str, Any]:
     return generator
 
 
+def _validate_porosity_metadata(
+    generator: dict[str, Any],
+    *,
+    configuration: dict[str, Any],
+    sample_row: pd.Series,
+) -> None:
+    """Validate case-level KC trend, bounded scatter, and field diagnostics."""
+    parameters = generator["porosity"]["parameters"]
+    contract = configuration["generation_contract"]
+    for key in _GENERATION_CONTRACT_KEYS:
+        if parameters[key] != contract[key]:
+            msg = f"Raw porosity metadata {key} does not match the batch generation contract."
+            raise ValueError(msg)
+
+    k_mean = _require_finite_real(parameters["k_mean"], label="Raw porosity k_mean")
+    permeability_k_mean = _require_finite_real(
+        generator["permeability"]["parameters"]["permeability"]["k_mean"],
+        label="Raw permeability k_mean",
+    )
+    _require_close(k_mean, permeability_k_mean, label="Raw porosity/permeability k_mean identity")
+    if "k_mean" in sample_row:
+        _require_close(
+            k_mean,
+            _require_finite_real(_python_scalar(sample_row["k_mean"]), label="Sample-row k_mean"),
+            label="Raw porosity/sample-row k_mean identity",
+        )
+
+    reference = _require_finite_real(parameters["A_KC_reference"], label="Raw porosity A_KC_reference")
+    eps_kc_trend = _require_finite_real(parameters["eps_kc_trend"], label="Raw porosity eps_kc_trend")
+    _require_close(
+        reference * _kc_response(eps_kc_trend),
+        k_mean,
+        label="Raw porosity KC trend identity",
+    )
+
+    natural_kappa = _require_support(parameters["natural_kappa_support"], label="Raw natural kappa support", strict=True)
+    natural_eps = _require_support(
+        parameters["natural_eps_reference_support"],
+        label="Raw natural eps_reference support",
+        strict=True,
+    )
+    batch_kappa = _require_support(
+        parameters["batch_kappa_support"],
+        label="Raw batch kappa support",
+        strict=configuration["variation"] > 0.0,
+    )
+    batch_eps = _require_support(
+        parameters["batch_eps_reference_support"],
+        label="Raw batch eps_reference support",
+        strict=configuration["variation"] > 0.0,
+    )
+    kappa_tolerance = 1e-12 * max(abs(batch_kappa[0]), abs(batch_kappa[1]), abs(k_mean))
+    if k_mean < batch_kappa[0] - kappa_tolerance or k_mean > batch_kappa[1] + kappa_tolerance:
+        msg = "Raw porosity k_mean lies outside the requested batch support."
+        raise ValueError(msg)
+
+    support_kind = parameters["packing_support_kind"]
+    if not isinstance(support_kind, str):
+        msg = "Raw porosity packing_support_kind must be text."
+        raise TypeError(msg)
+    if k_mean < natural_kappa[0] - kappa_tolerance:
+        expected_kind = "lower_extended_tail"
+        expected_support = (batch_eps[0], natural_eps[0])
+    elif k_mean > natural_kappa[1] + kappa_tolerance:
+        expected_kind = "upper_extended_tail"
+        expected_support = (natural_eps[1], batch_eps[1])
+    else:
+        expected_kind = "natural_id"
+        expected_support = natural_eps
+    if support_kind != expected_kind:
+        msg = f"Raw porosity packing_support_kind must be {expected_kind!r} for its k_mean."
+        raise ValueError(msg)
+
+    support_lower = _require_finite_real(parameters["packing_support_lower"], label="Raw packing support lower")
+    support_upper = _require_finite_real(parameters["packing_support_upper"], label="Raw packing support upper")
+    _require_close(support_lower, expected_support[0], label="Raw packing support lower identity", absolute_tolerance=1e-14)
+    _require_close(support_upper, expected_support[1], label="Raw packing support upper identity", absolute_tolerance=1e-14)
+    if support_lower >= support_upper:
+        msg = "Raw porosity active packing support must be strictly ordered."
+        raise ValueError(msg)
+
+    porosity_tolerance = 1e-12
+    if eps_kc_trend < support_lower - porosity_tolerance or eps_kc_trend > support_upper + porosity_tolerance:
+        msg = "Raw porosity eps_kc_trend lies outside active packing support."
+        raise ValueError(msg)
+    expected_margin = min(eps_kc_trend - support_lower, support_upper - eps_kc_trend)
+    if expected_margin < -porosity_tolerance:
+        msg = "Raw porosity packing scatter has a genuinely negative margin."
+        raise ValueError(msg)
+    if abs(expected_margin) <= porosity_tolerance:
+        expected_margin = 0.0
+    margin = _require_finite_real(parameters["packing_scatter_margin"], label="Raw packing scatter margin")
+    sigma = _require_finite_real(parameters["packing_scatter_sigma"], label="Raw packing scatter sigma")
+    if margin < 0.0 or sigma < 0.0:
+        msg = "Raw porosity packing scatter margin and sigma must be non-negative."
+        raise ValueError(msg)
+    _require_close(margin, expected_margin, label="Raw packing scatter margin identity", absolute_tolerance=1e-14)
+    _require_close(sigma, margin / 3.0, label="Raw packing scatter sigma identity", absolute_tolerance=1e-14)
+
+    scatter_seed = parameters["packing_scatter_seed"]
+    if isinstance(scatter_seed, bool) or not isinstance(scatter_seed, int) or not 0 <= scatter_seed <= _MAX_RANDOM_SEED:
+        msg = f"Raw porosity packing_scatter_seed must be an integer in [0, {_MAX_RANDOM_SEED}]."
+        raise ValueError(msg)
+    scatter_z = _require_finite_real(parameters["packing_scatter_z"], label="Raw packing scatter z")
+    if not _PACKING_SCATTER_LOWER < scatter_z < _PACKING_SCATTER_UPPER:
+        msg = "Raw porosity packing_scatter_z must lie strictly inside (-3, 3)."
+        raise ValueError(msg)
+
+    eps_reference = _require_finite_real(parameters["eps_reference"], label="Raw porosity eps_reference")
+    _require_close(
+        eps_reference,
+        eps_kc_trend + sigma * scatter_z,
+        label="Raw porosity scattered reference identity",
+        absolute_tolerance=1e-14,
+    )
+    if eps_reference < support_lower - porosity_tolerance or eps_reference > support_upper + porosity_tolerance:
+        msg = "Raw porosity eps_reference lies outside active packing support."
+        raise ValueError(msg)
+
+    eps_min = _require_finite_real(parameters["eps_min_global"], label="Raw porosity eps_min_global")
+    eps_max = _require_finite_real(parameters["eps_max_global"], label="Raw porosity eps_max_global")
+    smoothing = _require_finite_real(parameters["eps_smooth_rel"], label="Raw porosity eps_smooth_rel")
+    texture_amplitude = _require_finite_real(parameters["texture_amp"], label="Raw porosity texture_amp")
+    if not 0.0 <= smoothing <= 1.0 or texture_amplitude < 0.0:
+        msg = "Raw porosity local texture configuration is invalid."
+        raise ValueError(msg)
+
+    statistics = generator["porosity"]["statistics"]["eps"]
+    minimum = _require_finite_real(statistics["min"], label="Raw realized porosity minimum")
+    maximum = _require_finite_real(statistics["max"], label="Raw realized porosity maximum")
+    mean = _require_finite_real(statistics["mean"], label="Raw realized porosity mean")
+    standard_deviation = _require_finite_real(statistics["std"], label="Raw realized porosity standard deviation")
+    clipping_fraction = _require_finite_real(
+        statistics["local_clipping_fraction"],
+        label="Raw local porosity clipping fraction",
+    )
+    if minimum < eps_min or maximum > eps_max or not minimum <= mean <= maximum or standard_deviation < 0.0 or not 0.0 <= clipping_fraction <= 1.0:
+        msg = "Raw realized porosity statistics violate field guards or diagnostic ranges."
+        raise ValueError(msg)
+
+
 def _normalize_case_metadata(
     metadata: dict[str, Any],
     *,
@@ -1042,6 +1375,11 @@ def _normalize_case_metadata(
         msg = f"Raw metadata timestamp must be non-empty text: {metadata_path}"
         raise ValueError(msg)
     generator = _validate_generator_metadata(metadata["generator"])
+    _validate_porosity_metadata(
+        generator,
+        configuration=configuration,
+        sample_row=sample_row,
+    )
     normalized = {
         "case_id": case_id,
         "geometry": geometry,

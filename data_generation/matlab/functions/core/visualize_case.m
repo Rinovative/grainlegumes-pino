@@ -1,65 +1,74 @@
 %% visualize_case.m
 % ============================================================
-% Load and visualize 2D Darcy–Brinkman COMSOL results
+% Load and visualize one Darcy-Brinkman COMSOL result.
+%
 % Author: Rino M. Albertin
-% Date: 2025-10-14
+% Date:   2026-08-13
 %
 % DESCRIPTION
-%   Reads a COMSOL-exported .csv file containing field data of a
-%   2D Darcy–Brinkman simulation and reconstructs the variables on
-%   a regular grid for analysis or visualization.
+%   Reads the exact semicolon-delimited export produced by run_comsol_case,
+%   validates that it represents one finite and complete Cartesian grid,
+%   reconstructs all fields with deterministic ascending axes, and renders a
+%   two-by-three diagnostic plot.
 %
-%   Supported fields (the exact run_comsol_case export contract):
-%       - kxx, kxy, kyy → permeability tensor components [m²]
-%       - eps, p_bc     → porosity and inlet pressure fields
-%       - p, u, v, |U|  → solved pressure and velocity fields
+% EXPORT COLUMN CONTRACT
+%   The file must contain exactly these 12 numeric columns after any leading
+%   lines whose first non-whitespace character is "%":
 %
-%   The function automatically:
-%       • Detects and skips header/comment lines (%)
-%       • Validates a complete 12-column Cartesian-grid export
-%       • Reconstructs deterministic ascending x/y orientation
-%       • Generates a 2×3 tiled plot layout:
-%             log₁₀(kxx), log₁₀(kyy), p, |U|, v, u
-%       • Computes simple field statistics for metadata
+%       1  x          5  kappaxy      9  p
+%       2  y          6  kappayy     10  u
+%       3  kappaxx    7  eps         11  v
+%       4  kappayx    8  p_bc        12  U
 %
-%   If a parent UI container (figure, uitab, or uipanel) is provided,
-%   the plots are rendered inside it (e.g. one case per tab).
-%   Otherwise, a new standalone figure window is created.
+%   Coordinates are sorted by x and then y, checked for duplicates and missing
+%   Cartesian points, and reshaped to [ny, nx]. The exported xy and yx tensor
+%   entries are averaged to produce the reconstructed kxy field.
+%
+% VISUALIZATION
+%   The six tiles show, in order:
+%
+%       log10(kxx), log10(kyy), pressure, speed, v velocity, u velocity.
+%
+%   Each tile uses physical x/y coordinates, equal axis scaling, a tight view,
+%   and its own colorbar. With no parent, the function creates a standalone
+%   figure. With a parent, it creates a borderless panel inside that graphics
+%   container and places the tiled layout there.
+%
+% USAGE
+%   [fields, X, Y, info] = visualize_case(file_path)
+%   [fields, X, Y, info] = visualize_case(file_path, parent)
 %
 % INPUTS
-%   file_path : string
-%       Absolute or relative path to the COMSOL result .csv file.
-%
-%   parent    : (optional) graphics container handle
-%       Handle to a figure, uitab, or uipanel where the plots
-%       should be rendered. If omitted, a new figure is created.
+%   file_path
+%       Absolute or relative path to one run_comsol_case solution CSV.
+%   parent
+%       Optional figure, tab, or panel that receives the plot layout.
 %
 % OUTPUTS
-%   fields : struct
-%       Contains 2D matrices of all reconstructed physical fields.
-%         fields.kxx, fields.kxy, fields.kyy, fields.eps, fields.p_bc,
-%         fields.p, fields.u, fields.v, fields.Umag
+%   fields
+%       Reconstructed [ny, nx] arrays kxx, kxy, kyy, eps, p_bc, p, u, v,
+%       and Umag.
+%   X, Y
+%       Cartesian mesh coordinates with ascending x columns and y rows.
+%   info
+%       Source file path, nx, ny, and x/y coordinate ranges.
 %
-%   X, Y : double [ny × nx]
-%       Regular mesh grid coordinates [m].
-%
-%   info : struct
-%       Metadata including grid parameters, file path, and basic statistics.
-%
-% EXAMPLE
-%   % Standalone visualization
+% EXAMPLES
 %   visualize_case('data/processed/test_case_001_sol.csv');
 %
-%   % Visualization inside a tab
-%   fig = figure; tg = uitabgroup(fig); t = uitab(tg, 'Title', 'Case 1');
-%   visualize_case('case001_sol.csv', t);
+%   fig = figure;
+%   tabs = uitabgroup(fig);
+%   tab = uitab(tabs, 'Title', 'Case 1');
+%   visualize_case('case001_sol.csv', tab);
 %
-% DEPENDENCIES
-%   - MATLAB R2021b or later (for tiledlayout and uitabgroup)
-%   - COMSOL-exported .csv file with standard column structure
+% NOTES
+%   The reader rejects non-finite values, wrong column counts, duplicate points,
+%   incomplete grids, and coordinates that cannot be reconstructed exactly.
+%   It consumes an existing export and does not require a live COMSOL model.
 % ============================================================
 
 function [fields, X, Y, info] = visualize_case(file_path, parent)
+
 %% --- Check file existence ----------------------------------------------
 if ~isfile(file_path)
     error('File not found: %s', file_path);

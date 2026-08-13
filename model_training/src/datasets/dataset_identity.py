@@ -45,6 +45,7 @@ GENERATED_BATCH_IDENTITY_SCHEMA_VERSION = 1
 CASE_FINGERPRINT_VERSION = 1
 SPLIT_SCHEMA_VERSION = 1
 _SHA256_HEX_LENGTH = 64
+_PACKING_SCATTER_TRUNCATION = (-3, 3)
 _TENSOR_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
 _GENERATED_BATCH_IDENTITY_KEYS = frozenset(
@@ -71,11 +72,29 @@ _GENERATED_CONFIGURATION_KEYS = frozenset(
         "save_model",
         "template_name",
         "template_sha256",
+        "generation_contract",
+    }
+)
+_GENERATED_GENERATION_CONTRACT_KEYS = frozenset(
+    {
+        "generation_contract_version",
+        "kappa_nominal",
+        "eps_nominal",
+        "A_KC_reference",
+        "reference_id_variation",
+        "natural_kappa_support",
+        "natural_eps_reference_support",
+        "batch_kappa_support",
+        "batch_eps_reference_support",
+        "packing_scatter_truncation_lower",
+        "packing_scatter_truncation_upper",
+        "eps_min_global",
+        "eps_max_global",
     }
 )
 _GENERATED_FIELD_SCHEMA_KEYS = frozenset({"input_columns", "solution_columns"})
 _GENERATED_CASE_SOURCE_KEYS = frozenset({"case_id", "raw_csv_sha256", "solution_csv_sha256", "solution_model_sha256"})
-_GENERATED_SAMPLING_KEYS = frozenset({"method", "variation", "N", "seed", "base", "param_names"})
+_GENERATED_SAMPLING_KEYS = frozenset({"method", "variation", "N", "seed", "base", "param_names", "generation_contract"})
 
 _REQUIRED_KEYS = frozenset(
     {
@@ -305,6 +324,22 @@ def _validate_generated_configuration(value: Any, *, label: str) -> dict[str, An
         msg = f"{label}.template_name must be an .mph basename."
         raise ValueError(msg)
     _require_sha256(configuration["template_sha256"], label=f"{label}.template_sha256")
+    generation_contract = _require_exact_mapping(
+        configuration["generation_contract"],
+        _GENERATED_GENERATION_CONTRACT_KEYS,
+        label=f"{label}.generation_contract",
+    )
+    generation_contract_version = generation_contract["generation_contract_version"]
+    if isinstance(generation_contract_version, bool) or not isinstance(generation_contract_version, int) or generation_contract_version != 1:
+        msg = f"{label}.generation_contract_version must be integer 1."
+        raise ValueError(msg)
+    if (
+        generation_contract["packing_scatter_truncation_lower"] != _PACKING_SCATTER_TRUNCATION[0]
+        or generation_contract["packing_scatter_truncation_upper"] != _PACKING_SCATTER_TRUNCATION[1]
+    ):
+        msg = f"{label} packing scatter truncation must be [-3, 3]."
+        raise ValueError(msg)
+    configuration["generation_contract"] = generation_contract
     return configuration
 
 
@@ -383,6 +418,19 @@ def _validate_generated_sampling(
             msg = f"{label}.{name} must match the generated configuration."
             raise ValueError(msg)
     sampling["base"] = _json_mapping_copy(sampling["base"], label=f"{label}.base")
+    sampling["generation_contract"] = _require_exact_mapping(
+        sampling["generation_contract"],
+        _GENERATED_GENERATION_CONTRACT_KEYS,
+        label=f"{label}.generation_contract",
+    )
+    if sampling["generation_contract"] != configuration["generation_contract"]:
+        msg = f"{label}.generation_contract must match the generated configuration."
+        raise ValueError(msg)
+    non_doe_parameters = {"packing_scatter_z"}
+    unexpected_base = sorted(non_doe_parameters.intersection(sampling["base"]))
+    if unexpected_base:
+        msg = f"{label}.base contains non-DOE fields: {unexpected_base}."
+        raise ValueError(msg)
     parameter_names = _require_string_sequence(
         sampling["param_names"],
         label=f"{label}.param_names",
@@ -390,6 +438,10 @@ def _validate_generated_sampling(
     )
     if not parameter_names:
         msg = f"{label}.param_names must not be empty."
+        raise ValueError(msg)
+    unexpected_names = sorted(non_doe_parameters.intersection(parameter_names))
+    if unexpected_names:
+        msg = f"{label}.param_names contains non-DOE fields: {unexpected_names}."
         raise ValueError(msg)
     return sampling
 

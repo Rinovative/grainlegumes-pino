@@ -1,28 +1,41 @@
 %% batch_run.m
-% Start COMSOL server manually via:
-%   "C:\Program Files\COMSOL64\bin\win64\comsolmphserver.exe"
-%
 % ============================================================
-% Full batch pipeline: parameter sampling → κ(x,y) generation → COMSOL simulation
+% Execute the complete generated-data and COMSOL batch workflow.
+%
 % Author: Rino M. Albertin
-% Date: 2025-10-16
+% Date:   2026-08-13
 %
 % DESCRIPTION
-%   Executes a complete batch of synthetic permeability-field simulations:
-%     1. Generate parameter samples (sample_parameters.m)
-%     2. Generate κ(x,y) fields (gen_simulation_inputs.m)
-%     3. Run Darcy–Brinkman COMSOL simulations (run_comsol_case.m)
+%   Samples the version-1 design space, generates reproducible structure,
+%   permeability, porosity, and inlet-pressure fields, runs the configured
+%   Darcy-Brinkman COMSOL cases, and publishes validated batch metadata.
 %
-%   Output structure:
-%       <GENERATED_DATA_ROOT>/raw/<batch_name>/       → fields and batch manifest
-%       <GENERATED_DATA_ROOT>/processed/<batch_name>/ → COMSOL results and solve timing
+%   Resume state, terminal scientific identity, and operational solve timing
+%   are persisted separately. Existing artifacts are admitted only when their
+%   schemas, configuration, membership, and hashes match the current contract.
+%
+% CONFIGURATION
+%   Edit the settings near the top of this script:
+%     method, variation, N, seed
+%       Sampling strategy, variation, case count, and batch seed.
+%     save_model
+%       Save each solved COMSOL model in addition to the solution CSV.
+%     Lx, Ly, res
+%       Physical domain dimensions and Cartesian-grid resolution [m].
+%
+% OUTPUTS
+%   <GENERATED_DATA_ROOT>/meta
+%       Sample CSV and JSON identity files.
+%   <GENERATED_DATA_ROOT>/raw/<batch_name>
+%       Generated case fields, case metadata, progress, and terminal manifest.
+%   <GENERATED_DATA_ROOT>/processed/<batch_name>
+%       COMSOL solution exports, optional models, and solve-timing metadata.
 %
 % REQUIREMENTS
-%   • COMSOL Multiphysics with LiveLink for MATLAB
-%   • Functions:
-%       - sample_parameters.m
-%       - gen_simulation_inputs.m
-%       - run_comsol_case.m
+%   COMSOL Multiphysics with LiveLink for MATLAB and a running COMSOL server.
+%   On Windows, the server can be started with:
+%       "C:\Program Files\COMSOL64\bin\win64\comsolmphserver.exe"
+%   The template is data_generation/comsol/template_brinkman.mph.
 % ============================================================
 
 clear; clc;
@@ -145,7 +158,8 @@ manifest_configuration = struct( ...
     'save_model', save_model, ...
     'sample_sha256', sha256_file(sample_csv), ...
     'template_name', string(get_file_name(template_path)), ...
-    'template_sha256', sha256_file(template_path));
+    'template_sha256', sha256_file(template_path), ...
+    'generation_contract', sample_generation_contract(sample_json, variation));
 manifest_field_schema = batch_field_schema();
 validate_manifest_configuration(manifest_configuration);
 [terminal_complete_case_ids, terminal_case_records, terminal_status] = ...
@@ -355,7 +369,6 @@ for i = 1:n_cases
         'theta_jitter',      T.theta_jitter(i), ...
         'theta_smooth_rel',  T.theta_smooth_rel(i), ...
         ...
-        'A_rel',             T.A_rel(i), ...
         'eps_smooth_rel',    T.eps_smooth_rel(i), ...
         'texture_amp',       T.texture_amp(i), ...
         ...
@@ -371,7 +384,10 @@ for i = 1:n_cases
         ...
         'save',              true, ...
         'save_dir',          raw_dir, ...
-        'file_tag',          case_tag ...
+        'file_tag',          case_tag, ...
+        'packing_batch_variation', variation, ...
+        'packing_batch_seed', seed, ...
+        'packing_case_id', case_id ...
     );
 
     seed_case    = seed + case_id;
@@ -401,8 +417,9 @@ for i = 1:n_cases
             opts.theta_jitter, opts.theta_smooth_rel);
 
         % --- porosity ---------------------------------------------------
-        fprintf('  porosity: A_rel=%.3f | eps_smooth_rel=%.3f | texture_amp=%.4f\n', ...
-            opts.A_rel, opts.eps_smooth_rel, opts.texture_amp);
+        fprintf('  porosity: eps_smooth_rel=%.3f | texture_amp=%.4f | KC A=%.2e\n', ...
+            opts.eps_smooth_rel, opts.texture_amp, ...
+            manifest_configuration.generation_contract.A_KC_reference);
 
         % --- pressure BC --------------------------------------------
         fprintf('  p_bc: mean=%.1f | a_sin=%.3f | f_sin=%.2f | phi_sin=%.2f\n', ...
@@ -420,6 +437,19 @@ for i = 1:n_cases
     try
         [fields, info] = gen_simulation_inputs(Lx, Ly, res, seed_case, opts);
         if debug
+            porosity_parameters = info.porosity.parameters;
+            fprintf(['  porosity reference: eps_kc_trend=%.6f | ' ...
+                'packing_scatter_z=%.6f | packing_scatter_margin=%.6f | ' ...
+                'packing_scatter_sigma=%.6f\n'], ...
+                porosity_parameters.eps_kc_trend, ...
+                porosity_parameters.packing_scatter_z, ...
+                porosity_parameters.packing_scatter_margin, ...
+                porosity_parameters.packing_scatter_sigma);
+            fprintf(['  porosity support: kind=%s | eps_reference=%.6f | ' ...
+                'A_KC_reference=%.3e\n'], ...
+                char(porosity_parameters.packing_support_kind), ...
+                porosity_parameters.eps_reference, ...
+                porosity_parameters.A_KC_reference);
             fprintf('  → Fields exported: %s\n', info.export.paths.csv);
         end
     catch ME
@@ -723,20 +753,68 @@ if ~isfile(sample_csv) || ~isfile(sample_json)
         'Parameter sampling did not publish both CSV and JSON identity files.');
 end
 payload = jsondecode(fileread(sample_json));
-if ~isstruct(payload) || ~isfield(payload, 'meta') || ...
-        ~isstruct(payload.meta) || ~isfield(payload, 'n_cases')
+required_payload_fields = {'meta', 'n_cases'};
+if ~isstruct(payload) || ~isscalar(payload) || ...
+        ~isequal(sort(fieldnames(payload)), sort(required_payload_fields(:))) || ...
+        ~isstruct(payload.meta) || ~isscalar(payload.meta)
     error('batch_run:SampleIdentity', ...
-        'Sample JSON does not contain the required meta and n_cases contract.');
+        'Sample JSON does not contain the exact current meta/n_cases contract.');
 end
+[base, param_names, expected_contract] = sample_parameters('contract', variation);
 meta = payload.meta;
-required = {'method', 'variation', 'N', 'seed'};
-if ~all(isfield(meta, required)) || ...
-        ~strcmpi(char(meta.method), method) || ...
-        meta.variation ~= variation || meta.N ~= N || ...
-        meta.seed ~= seed || payload.n_cases ~= N
+required = {'method', 'variation', 'N', 'seed', 'base', 'param_names', ...
+    'generation_contract', 'timestamp'};
+if strcmpi(method, 'sobol')
+    required = [required, {'sobol_n_sim', 'sobol_simulate_fraction'}];
+end
+if ~isequal(sort(fieldnames(meta)), sort(required(:))) || ...
+        ~strcmpi(char(meta.method), method) || meta.variation ~= variation || ...
+        meta.N ~= N || meta.seed ~= seed || payload.n_cases ~= N || ...
+        ~isequal(string(meta.param_names(:)), param_names(:)) || ...
+        ~isequal(sort(fieldnames(meta.base)), sort(fieldnames(base))) || ...
+        ~isequaln(meta.base, base) || ...
+        ~generation_contracts_equal(meta.generation_contract, expected_contract)
     error('batch_run:SampleIdentity', ...
-        ['Existing sample identity does not match method/variation/N/seed. ' ...
-        'Use a distinct batch identity or remove the mismatched sample pair.']);
+        ['Existing sample identity does not match the exact current schema ' ...
+        'and KC generation contract.']);
+end
+T = readtable(sample_csv, 'Delimiter', ';');
+expected_columns = ["case_id", param_names];
+if strcmpi(method, 'sobol')
+    expected_columns(end + 1) = "simulate";
+end
+if ~isequal(string(T.Properties.VariableNames), expected_columns) || ...
+        height(T) ~= N || ~isequal(T.case_id, (1:N)')
+    error('batch_run:SampleIdentity', ...
+        'Sample CSV does not match the exact current DOE column schema.');
+end
+end
+
+function contract = sample_generation_contract(sample_json, variation)
+payload = jsondecode(fileread(sample_json));
+contract = payload.meta.generation_contract;
+validate_generation_contract(contract, variation);
+end
+
+function validate_generation_contract(contract, variation)
+[~, ~, expected] = sample_parameters('contract', variation);
+if ~generation_contracts_equal(contract, expected)
+    error('batch_run:GenerationContract', ...
+        'generation_contract is not the exact current version-1 KC contract.');
+end
+end
+
+function tf = generation_contracts_equal(left, right)
+if ~isstruct(left) || ~isscalar(left) || ~isstruct(right) || ~isscalar(right) || ...
+        ~isequal(sort(fieldnames(left)), sort(fieldnames(right)))
+    tf = false;
+    return;
+end
+fields = fieldnames(right);
+tf = true;
+for field_index = 1:numel(fields)
+    field = fields{field_index};
+    tf = tf && isequaln(left.(field), right.(field));
 end
 end
 
@@ -832,8 +910,9 @@ function validate_manifest_configuration(configuration)
 require_exact_struct_fields(configuration, { ...
     'method', 'variation', 'N', 'seed', 'Lx', 'Ly', 'res', ...
     'save_model', 'sample_sha256', 'template_name', ...
-    'template_sha256'}, ...
+    'template_sha256', 'generation_contract'}, ...
     'batch_run:ManifestConfiguration', 'manifest configuration');
+validate_generation_contract(configuration.generation_contract, configuration.variation);
 method = require_text_scalar(configuration.method, ...
     'batch_run:ManifestConfiguration', 'method');
 if ~ismember(method, {'uniform', 'lhs', 'sobol'})
@@ -1079,6 +1158,7 @@ for field_index = 1:numel(numeric_fields)
     field = numeric_fields{field_index};
     tf = tf && left.(field) == right.(field);
 end
+tf = tf && generation_contracts_equal(left.generation_contract, right.generation_contract);
 end
 
 function require_exact_struct_fields(value, expected_fields, error_id, label)

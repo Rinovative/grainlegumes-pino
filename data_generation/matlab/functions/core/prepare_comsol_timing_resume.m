@@ -1,11 +1,44 @@
+%% prepare_comsol_timing_resume.m
+% ============================================================
+% Select solve timings that are safe to reuse during batch resume.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Retains timing records only for scientifically complete cases and enforces
+%   the single-runtime provenance contract before extending partial coverage.
+%
+% USAGE
+%   [reusable_timings, timing_runtime] = prepare_comsol_timing_resume( ...
+%       prior_timings, prior_runtime, current_runtime, ...
+%       prior_complete_case_ids, intended_case_ids)
+%
+% INPUTS
+%   prior_timings
+%       Existing timing-record struct array.
+%   prior_runtime, current_runtime
+%       Exact runtime provenance records for existing and current measurements.
+%   prior_complete_case_ids
+%       Case IDs whose scientific outputs remain complete and authoritative.
+%   intended_case_ids
+%       Ordered membership required by the current batch.
+%
+% OUTPUTS
+%   reusable_timings
+%       Prior timing records restricted to complete current cases.
+%   timing_runtime
+%       Provenance record that owns the returned timing collection.
+%
+% NOTES
+%   Complete prior timing coverage remains valid on its recorded runtime.
+%   Partial coverage can be extended only on an exactly matching runtime.
+% ============================================================
+
 function [reusable_timings, timing_runtime] = ...
         prepare_comsol_timing_resume( ...
         prior_timings, prior_runtime, current_runtime, ...
         prior_complete_case_ids, intended_case_ids)
-%PREPARE_COMSOL_TIMING_RESUME Retain only scientifically reusable timings.
-% A single timing sidecar describes one runtime. Existing measurements may be
-% extended only on that exact runtime; stale or empty measurements never lend
-% their provenance to newly measured cases.
 
 prior_complete_case_ids = string(prior_complete_case_ids(:));
 intended_case_ids = string(intended_case_ids(:));

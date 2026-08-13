@@ -1,52 +1,84 @@
 %% gen_permeability_field.m
 % ============================================================
-% Generate synthetic 2D permeability fields κ(x,y) for porous media
+% Map a structure realization to scalar and tensor permeability fields.
 %
 % Author: Rino M. Albertin
-% Date:   2026-01-04
+% Date:   2026-08-13
 %
 % DESCRIPTION
-%   Maps a previously generated dimensionless structure field z(x,y)
-%   to physically meaningful permeability fields.
+%   Performs the physical permeability interpretation of the shared,
+%   dimensionless structure realization. It maps the final structure field to
+%   scalar lognormal permeability, derives anisotropy from the background
+%   structure, estimates a smooth pi-periodic director from its gradients, and
+%   rotates the principal permeabilities into a symmetric 2-D tensor.
 %
-%   This function performs ONLY the physical interpretation step:
-%     - lognormal mapping to scalar permeability κ(x,y)
-%     - derivation of anisotropy magnitude a(x,y)
-%     - derivation of smooth orientation field θ(x,y)
-%     - construction of a symmetric permeability tensor K(x,y)
+% MODEL
+%   With z = fields.structure.z and relative standard deviation var_rel,
 %
-%   The underlying structure field is generated externally by
-%   gen_structure_field.m and passed explicitly via fields.structure.
+%       s_logn = sqrt(log(1 + var_rel^2))
+%       kappa  = k_mean * exp(s_logn*z - 0.5*s_logn^2).
 %
-% ------------------------------------------------------------------------
+%   The background magnitude controls the principal-value ratio:
+%
+%       z_abs = abs(z_bg) / max(abs(z_bg(:)))
+%       a     = 1 + tensor_strength*(a_max - 1)*z_abs^a_gamma
+%       k1    = kappa*a,             k2 = kappa/a.
+%
+%   A director angle theta is obtained from grad(z_bg), smoothed in doubled-
+%   angle form, optionally perturbed by smoothed Gaussian jitter, and converted
+%   back with theta = 0.5*atan2(dir_y, dir_x). The rotated tensor is
+%
+%       Kxx = k1*cos(theta)^2 + k2*sin(theta)^2
+%       Kyy = k1*sin(theta)^2 + k2*cos(theta)^2
+%       Kxy = (k1 - k2)*sin(theta)*cos(theta).
+%
+%   For positive kappa and a, the construction is symmetric positive-definite
+%   and det(K) = k1*k2 = kappa^2 pointwise.
+%
 % USAGE
-%   [fields, info] = gen_permeability_field(fields, k_mean, var_rel, opts)
+%   [fields, info] = gen_permeability_field(fields, opts)
 %
 % INPUTS
-%   fields        – Struct containing:
-%                   fields.grid.X, fields.grid.Y
-%                   fields.structure.z, fields.structure.z_bg
-%   k_mean        – Mean permeability [m²]
-%   var_rel       – Relative standard deviation (e.g. 0.5 = 50 %)
+%   fields
+%       Struct containing fields.grid.X, fields.grid.Y,
+%       fields.structure.z, and fields.structure.z_bg.
+%   opts.k_mean
+%       Required scalar permeability scale [m^2].
+%   opts.var_rel
+%       Required relative standard deviation for the lognormal mapping.
 %
-% OPTIONAL STRUCT opts
-%   Same option structure as gen_structure_field.m plus:
-%
-%   (TENSOR CONSTRUCTION)
-%   .a_max
-%   .a_gamma
-%   .tensor_strength
-%   .theta_jitter
-%   .theta_smooth_rel
+% OPTIONAL OPTS
+%   a_max = 2.0
+%       Reference upper anisotropy ratio before tensor_strength scaling.
+%   a_gamma = 2.0
+%       Exponent controlling localization of anisotropy in abs(z_bg).
+%   tensor_strength = 1.0
+%       Scales the departure of a from one.
+%   theta_jitter = 0.2
+%       Amplitude of the smoothed random director perturbation.
+%   theta_smooth_rel = 0.02
+%       Orientation smoothing length relative to Lx, with a one-cell minimum.
+%   enable_hooks = false, hooks = struct()
+%       Optional callbacks for kappa, anisotropy, principal values, tensor, and
+%       tensor-check stages.
 %
 % OUTPUTS
-%   fields.material.kappa
-%   fields.material.K.Kxx, Kyy, Kxy
-%   fields.grid.X, fields.grid.Y
-%   info – geometry, parameters, statistics
+%   fields
+%       Input struct extended with fields.material.kappa and
+%       fields.material.K.Kxx, Kxy, and Kyy.
+%   info
+%       Resolved permeability, tensor, and orientation settings; scalar-field
+%       statistics; and mean tensor trace and determinant.
+%
+% NOTES
+%   Random values are drawn only when theta_jitter is positive. Those draws
+%   intentionally continue the spatial RNG stream initialized by
+%   gen_structure_field. This module neither regenerates nor renormalizes the
+%   shared structure field and does not generate porosity.
 % ============================================================
 
 function [fields, info] = gen_permeability_field(fields, opts)
+
 %% === Default options & hooks ================================
 if nargin < 2 || isempty(opts)
     opts = struct();

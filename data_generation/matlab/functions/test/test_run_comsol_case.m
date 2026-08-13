@@ -1,4 +1,20 @@
-%% TEST_RUN_BATCH – Führt alle COMSOL-Cases im Test-Ordner aus
+%% test_run_comsol_case.m
+% ============================================================
+% Run the real COMSOL case runner over the configured test inputs.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Discovers generated raw test CSV files, executes each case through
+%   run_comsol_case, and reports solve and wall-clock durations. This is a
+%   manual integration diagnostic and writes processed COMSOL outputs.
+%
+% REQUIREMENTS
+%   COMSOL Multiphysics with LiveLink for MATLAB, a running COMSOL server,
+%   the project MPH template, and generated raw test cases.
+% ============================================================
+
 clear; clc;
 
 %% --- COMSOL LiveLink Pfad hinzufügen ---

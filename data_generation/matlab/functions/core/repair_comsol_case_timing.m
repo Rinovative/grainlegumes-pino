@@ -1,10 +1,42 @@
+%% repair_comsol_case_timing.m
+% ============================================================
+% Remeasure one COMSOL solve without changing canonical artifacts.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Runs an existing raw case through the complete COMSOL solve/export lifecycle
+%   in a private sibling directory, retains only the measured duration, and
+%   verifies that raw inputs and canonical solution artifacts remain byte-exact.
+%
+% USAGE
+%   results = repair_comsol_case_timing(field_path, template_path, ...
+%       processed_dir, save_model, runner)
+%
+% INPUTS
+%   field_path
+%       Existing canonical case_0000.csv raw input.
+%   template_path
+%       Existing COMSOL model template.
+%   processed_dir
+%       Directory containing the canonical solution artifacts.
+%   save_model
+%       Logical scalar indicating whether a canonical solved model is required.
+%   runner
+%       Optional scalar function handle; defaults to run_comsol_case.
+%
+% OUTPUTS
+%   results
+%       Private runner result containing a positive comsol_solve_s duration.
+%
+% NOTES
+%   Private outputs are removed after validation. Any mutation of raw or
+%   canonical artifacts is an integrity failure.
+% ============================================================
+
 function results = repair_comsol_case_timing( ...
         field_path, template_path, processed_dir, save_model, runner)
-%REPAIR_COMSOL_CASE_TIMING Remeasure one solve without touching canonical output.
-% The existing raw input CSV is solved through run_comsol_case in a private
-% sibling directory. The private result proves the full solve/export lifecycle
-% succeeded, but it is discarded so manifest-authoritative scientific outputs
-% remain byte-for-byte unchanged.
 
 if nargin < 5
     runner = @run_comsol_case;

@@ -1,8 +1,32 @@
+%% acquire_comsol_batch_lock.m
+% ============================================================
+% Acquire one kernel-owned lease for a MATLAB batch producer.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Opens the requested lock file and acquires a non-blocking Java FileLock.
+%   The lease prevents concurrent MATLAB producers from publishing the same
+%   batch while allowing an interrupted batch to resume after process exit.
+%
+% USAGE
+%   cleanup = acquire_comsol_batch_lock(lock_path)
+%
+% INPUTS
+%   lock_path
+%       Non-empty path to the persistent lock file. Its parent must exist.
+%
+% OUTPUTS
+%   cleanup
+%       onCleanup owner that releases the FileLock, channel, and file handle.
+%
+% NOTES
+%   File contents are not the ownership signal. The operating system releases
+%   the kernel lock when MATLAB exits, so no stale-sentinel deletion is needed.
+% ============================================================
+
 function cleanup = acquire_comsol_batch_lock(lock_path)
-%ACQUIRE_COMSOL_BATCH_LOCK Hold one kernel-owned MATLAB producer lease.
-% The persistent lock file is not the ownership signal: Java FileLock
-% ownership is released by the operating system when MATLAB exits, so an
-% interrupted batch can resume without deleting a stale sentinel.
 
 lock_path = require_text(lock_path);
 lock_parent = fileparts(lock_path);

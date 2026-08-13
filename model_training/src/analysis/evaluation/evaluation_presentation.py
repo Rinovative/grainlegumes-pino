@@ -101,8 +101,7 @@ _PARAMETER_PRESENTATION = (
     ParameterPresentation("parameters_theta_smooth_rel", "Orientation smoothing length", "Material and properties", 260),
     ParameterPresentation("parameters_theta_jitter", "Orientation jitter", "Material and properties", 270),
     ParameterPresentation("parameters_eps_smooth_rel", "Porosity smoothing length", "Material and properties", 280),
-    ParameterPresentation("parameters_A_rel", "Porosity material factor", "Material and properties", 290),
-    ParameterPresentation("parameters_texture_amp", "Porosity texture amplitude", "Material and properties", 300),
+    ParameterPresentation("parameters_texture_amp", "Porosity texture amplitude", "Material and properties", 290),
     # gen_pressure_bc builds shape terms in this order, then applies p_inlet_mean.
     ParameterPresentation("parameters_a_sin", "Inlet sinusoid amplitude", "Boundary conditions", 410),
     ParameterPresentation("parameters_f_sin", "Inlet sinusoid frequency", "Boundary conditions", 420),

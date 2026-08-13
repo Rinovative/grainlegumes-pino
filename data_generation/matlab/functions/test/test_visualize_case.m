@@ -1,4 +1,19 @@
-%% TEST_VISUALIZE_CASE – Lädt und visualisiert alle COMSOL-Ergebnisse
+%% test_visualize_case.m
+% ============================================================
+% Visualize a bounded set of processed COMSOL result files.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Discovers solved case CSV files, creates one tab per selected case, and
+%   delegates exact result validation and plotting to visualize_case. This is
+%   an interactive diagnostic and does not modify scientific artifacts.
+%
+% REQUIREMENTS
+%   MATLAB graphics support and existing processed COMSOL result CSV files.
+% ============================================================
+
 clear; clc; close all;
 NR_CASES_SHOW = 5;
 

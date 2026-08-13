@@ -1,93 +1,97 @@
 %% gen_structure_field.m
 % ============================================================
-% Generate synthetic 2D multiscale structure fields z(x,y)
-% for heterogeneous porous or granular media.
+% Generate a reproducible multiscale structural field for porous media.
 %
 % Author: Rino M. Albertin
-% Date:   2026-01-04
+% Date:   2026-08-13
 %
 % DESCRIPTION
-%   Generates stochastic two-dimensional, dimensionless structure fields
-%   z(x,y) representing the geometric and statistical backbone of a
-%   heterogeneous porous medium.
+%   Synthesizes a dimensionless two-dimensional latent description of porous
+%   material organization. The result captures correlated background regions,
+%   anisotropic fine structure, cross-scale dependence, and localized
+%   heterogeneities, but carries no permeability, porosity, tensor, or boundary-
+%   condition interpretation. Those mappings are owned by later stages.
 %
-%   The structure field encodes spatial organization, connectivity,
-%   dominant regions, and sub-scale variability, but carries NO physical
-%   meaning by itself. It serves as a shared latent material descriptor
-%   from which different physical fields (e.g. permeability, porosity)
-%   can later be derived in a physically consistent but decoupled manner.
+% SCALE ROLES
+%   z_base
+%       Isotropically correlated backbone controlling broad organization.
+%   z_smooth
+%       Anisotropically correlated modulation whose white-noise seed is coupled
+%       to the base seed.
+%   z_bg
+%       Direct weighted superposition of independently normalized base and
+%       smooth scales.
+%   z_noises
+%       Mean-zero, RMS-scaled sum of randomly placed elliptical Gaussian
+%       perturbations.
+%   z
+%       Final standardized structure after adding z_bg and z_noises.
 %
-%   The generator is based on correlated Gaussian random fields and models
-%   multiscale heterogeneity through a clear separation of roles:
-%     - a BASE-scale correlated field
-%         defines the large-scale backbone of the medium, controlling
-%         connectivity, dominant regions, and global organization
-%     - a SMOOTH-scale correlated field
-%         introduces finer-scale modulation and texture, smoothing
-%         transitions and representing sub-dominant heterogeneity
+% ALGORITHM
+%   1. Seed MATLAB's global twister stream for the case realization.
+%   2. Build a Cartesian grid with round(L/res) + 1 points per direction.
+%   3. Filter Gaussian white noise with isotropic base and anisotropic smooth
+%      kernels. The smooth seed is
 %
-%   Both fields are normalized independently and combined by weighted
-%   superposition to form a background structure field z_bg(x,y).
+%          coupling*z_seed_base + sqrt(1 - coupling^2)*z_uncorr.
 %
-%   Additional localized heterogeneities (e.g. clusters, lenses, or
-%   particle-scale variability) are introduced as stochastic Gaussian
-%   perturbations directly in structure space and added to z_bg.
+%   4. Standardize z_base and z_smooth independently, then apply ms_weight.
+%   5. Draw a Poisson number of localized ellipses in normalized coordinates;
+%      each has random center, scale, aspect ratio, orientation, and sign.
+%   6. Center and RMS-normalize their sum, then scale it by noise_level.
+%   7. Add the background and localized terms and standardize the final field.
 %
-%   The final structure field z(x,y) is normalized once globally to ensure
-%   statistical consistency across realizations.
-%
-%   No physical mapping (e.g. permeability, porosity, tensors) is applied
-%   in this function.
-%
-%   Algorithm overview:
-%       1. Generate Gaussian noise fields for base and smooth scales
-%       2. Introduce optional cross-scale coupling
-%       3. Apply Gaussian smoothing kernels
-%            - smooth scale: anisotropic
-%            - base scale: isotropic
-%       4. Normalize each scale independently
-%       5. Combine base and smooth scales by weighted superposition
-%       6. Optionally add localized Gaussian perturbations in structure space
-%       7. Normalize the final structure field
-%
-% ------------------------------------------------------------------------
 % USAGE
 %   [fields, info] = gen_structure_field(Lx, Ly, res, seed, opts)
 %
 % INPUTS
-%   Lx, Ly        – Domain size [m]
-%   res           – Grid spacing [m]
-%   seed          – Random seed for reproducibility
+%   Lx, Ly
+%       Positive physical domain dimensions [m].
+%   res
+%       Target Cartesian grid spacing [m].
+%   seed
+%       Reproducibility seed for the shared spatial RNG stream.
+%   opts
+%       Optional generator settings listed below.
 %
-% OPTIONAL STRUCT opts (BACKGROUND HETEROGENEITY)
-%   .base_len_rel     scalar
-%       Relative correlation length of the BASE-scale field
-%   .smooth_len_rel   scalar
-%       Relative correlation length of the SMOOTH-scale field
-%   .ms_weight        [w_base, w_smooth]
-%       Weights for combining base and smooth scales (sum = 1)
-%   .anisotropy       [ax, ay]
-%       Correlation stretch factors applied ONLY to the smooth-scale field
-%   .coupling         scalar
-%       Cross-scale coupling coefficient (0 = independent, 1 = identical)
+% BACKGROUND OPTS
+%   base_len_rel = 0.10
+%       Isotropic base correlation length relative to Lx.
+%   smooth_len_rel = 0.05
+%       Smooth correlation length relative to Lx before anisotropic stretching.
+%   ms_weight = [0.4, 0.6]
+%       Direct [base, smooth] combination weights.
+%   anisotropy = [3, 1]
+%       [x, y] stretch factors applied only to the smooth kernel.
+%   coupling = 0.5
+%       White-noise cross-scale coefficient: zero is independent and one uses
+%       the base seed directly.
 %
-% OPTIONAL STRUCT opts (LOCALIZED NOISES)
-%   .noise_level         scalar in [0,1]
-%       Relative strength of sub-scale structural perturbations
-%   .noise_granularity   scalar in [0,1]
-%       Morphology control for localized heterogeneities
-%   .noise_bias          scalar in [0,1]
-%       Probability of positive vs. negative perturbations
+% LOCALIZED-NOISE OPTS
+%   noise_level = 0.2
+%       RMS amplitude of z_noises and intensity factor for the Poisson count.
+%   noise_granularity = 0.5
+%       Morphology coordinate from coarse at zero to fine at one. It varies the
+%       characteristic ellipse scale from base_len_rel to base_len_rel/10.
+%   noise_bias = 0.5
+%       Probability that a localized perturbation has positive sign.
+%   enable_hooks = false, hooks = struct()
+%       Optional callbacks after filtering, background combination, localized-
+%       noise scaling, and final structure assembly.
 %
 % OUTPUTS
-%   fields.structure.z_base
-%   fields.structure.z_smooth
-%   fields.structure.z_bg
-%   fields.structure.z_noises
-%   fields.structure.z
-%
 %   fields.grid.X, fields.grid.Y
-%   info – struct containing geometry, parameters, and statistics
+%       Cartesian coordinates with x varying by column and y by row.
+%   fields.structure
+%       z_base, z_smooth, z_bg, z_noises, and final z arrays.
+%   info
+%       Resolved seed and generator settings plus structure and localized-noise
+%       statistics. The stored RNG state is captured immediately after seeding.
+%
+% NOTES
+%   This function deliberately initializes MATLAB's global RNG. Permeability
+%   orientation jitter and inlet Gaussian-width jitter later continue the same
+%   stream so a case remains reproducible from one seed and one call order.
 % ============================================================
 
 function [fields, info] = gen_structure_field(Lx, Ly, res, seed, opts)

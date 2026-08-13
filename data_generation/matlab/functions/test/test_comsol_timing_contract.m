@@ -1,5 +1,20 @@
+%% test_comsol_timing_contract.m
+% ============================================================
+% Verify solve-timing schema validation and atomic publication.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Exercises case ordering, membership, runtime validation, aggregate
+%   derivation, manifest binding, and atomic JSON persistence.
+%
+% REQUIREMENTS
+%   MATLAB Unit Test framework. COMSOL is not required.
+% ============================================================
+
 function tests = test_comsol_timing_contract
-% COMSOL-free tests for solve timing validation and atomic persistence.
+
 tests = functiontests(localfunctions);
 end
 

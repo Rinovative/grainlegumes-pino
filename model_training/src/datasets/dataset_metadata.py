@@ -59,6 +59,7 @@ PUBLICATION_METHOD = "atomic_directory_rename"
 SOURCE_MANIFEST_SCHEMA_KIND = "comsol_batch_manifest"
 SOURCE_MANIFEST_SCHEMA_VERSION = 1
 _SHA256_LENGTH = 64
+_PACKING_SCATTER_TRUNCATION = (-3, 3)
 _SPATIAL_DIMENSIONS = 2
 _MAX_EXACT_MANIFEST_INTEGER = 2**53
 _MAX_RANDOM_SEED = 2**32 - 1
@@ -88,6 +89,24 @@ _SOURCE_MANIFEST_CONFIGURATION_KEYS = frozenset(
         "sample_sha256",
         "template_name",
         "template_sha256",
+        "generation_contract",
+    }
+)
+_SOURCE_GENERATION_CONTRACT_KEYS = frozenset(
+    {
+        "generation_contract_version",
+        "kappa_nominal",
+        "eps_nominal",
+        "A_KC_reference",
+        "reference_id_variation",
+        "natural_kappa_support",
+        "natural_eps_reference_support",
+        "batch_kappa_support",
+        "batch_eps_reference_support",
+        "packing_scatter_truncation_lower",
+        "packing_scatter_truncation_upper",
+        "eps_min_global",
+        "eps_max_global",
     }
 )
 _SOURCE_MANIFEST_RECORD_KEYS = frozenset({"case_id", "status", "stage", "message", "files"})
@@ -118,7 +137,7 @@ _REQUIRED_SNAPSHOT_FILES = frozenset(
 )
 _ALLOWED_PACKAGE_FILES = _REQUIRED_SNAPSHOT_FILES | {COMSOL_TIMING_FILENAME, METADATA_FILENAME}
 _SOURCE_SAMPLE_JSON_KEYS = frozenset({"meta", "n_cases"})
-_SOURCE_SAMPLE_META_KEYS = frozenset({"method", "variation", "N", "seed", "base", "param_names", "timestamp"})
+_SOURCE_SAMPLE_META_KEYS = frozenset({"method", "variation", "N", "seed", "base", "param_names", "generation_contract", "timestamp"})
 _SNAPSHOT_ROLES = {
     SOURCE_MANIFEST_FILENAME: "validated_generation_manifest",
     SOURCE_SAMPLE_CSV_FILENAME: "validated_parameter_sample_csv",
@@ -279,6 +298,25 @@ def _validate_source_manifest_configuration(value: Any) -> dict[str, Any]:
         label="Source manifest snapshot configuration.variation",
         positive=False,
     )
+    generation_contract = configuration["generation_contract"]
+    if not isinstance(generation_contract, dict):
+        msg = "Source manifest snapshot generation_contract must be a mapping."
+        raise TypeError(msg)
+    _require_exact_keys(
+        generation_contract,
+        _SOURCE_GENERATION_CONTRACT_KEYS,
+        label="Source manifest snapshot generation_contract",
+    )
+    generation_contract_version = generation_contract["generation_contract_version"]
+    if isinstance(generation_contract_version, bool) or not isinstance(generation_contract_version, int) or generation_contract_version != 1:
+        msg = "Source manifest snapshot generation_contract_version must be integer 1."
+        raise ValueError(msg)
+    if (
+        generation_contract["packing_scatter_truncation_lower"] != _PACKING_SCATTER_TRUNCATION[0]
+        or generation_contract["packing_scatter_truncation_upper"] != _PACKING_SCATTER_TRUNCATION[1]
+    ):
+        msg = "Source manifest snapshot packing scatter truncation must be [-3, 3]."
+        raise ValueError(msg)
     lengths = {
         name: _require_manifest_real(
             configuration[name],
@@ -454,9 +492,22 @@ def _parse_source_sample_json(
     if n_cases != count:
         msg = "Parameter-sample JSON n_cases does not match meta.N."
         raise ValueError(msg)
-    if not isinstance(sample_meta["base"], dict):
+    generation_contract = sample_meta["generation_contract"]
+    if not isinstance(generation_contract, dict):
+        msg = "Parameter-sample JSON meta.generation_contract must be a mapping."
+        raise TypeError(msg)
+    if generation_contract != configuration["generation_contract"]:
+        msg = "Parameter-sample JSON meta.generation_contract does not match the source manifest."
+        raise ValueError(msg)
+    base = sample_meta["base"]
+    if not isinstance(base, dict):
         msg = "Parameter-sample JSON meta.base must be a mapping."
         raise TypeError(msg)
+    non_doe_parameters = {"packing_scatter_z"}
+    unexpected_base = sorted(non_doe_parameters.intersection(base))
+    if unexpected_base:
+        msg = f"Parameter-sample JSON meta.base contains non-DOE fields: {unexpected_base}."
+        raise ValueError(msg)
     parameter_names_value = sample_meta["param_names"]
     if (
         not isinstance(parameter_names_value, list)
@@ -468,6 +519,10 @@ def _parse_source_sample_json(
     parameter_names = tuple(parameter_names_value)
     if len(parameter_names) != len(set(parameter_names)) or "case_id" in parameter_names:
         msg = "Parameter-sample JSON meta.param_names must be unique and exclude case_id."
+        raise ValueError(msg)
+    unexpected_names = sorted(non_doe_parameters.intersection(parameter_names))
+    if unexpected_names:
+        msg = f"Parameter-sample JSON meta.param_names contains non-DOE fields: {unexpected_names}."
         raise ValueError(msg)
     timestamp = sample_meta["timestamp"]
     if not isinstance(timestamp, str) or not timestamp:

@@ -1,12 +1,21 @@
+%% test_gen_simulation_inputs.m
 % ============================================================
-% Visualize all intermediate fields of gen_structure_field,
-% gen_permeability_field and gen_porosity_field using hooks
+% Visualize every intermediate stage of the field-generation pipeline.
 %
 % Author: Rino M. Albertin
-% Date:   2026-01-04
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Runs one unsaved generator case with diagnostic hooks and displays the
+%   structure, permeability, tensor, porosity, and inlet-pressure intermediates.
+%   This module is an interactive scientific diagnostic, not an automated test.
+%
+% REQUIREMENTS
+%   MATLAB with the field-generation dependencies. COMSOL is not required.
 % ============================================================
 
 function test_gen_field()
+
 clear; clc; close all;
 
 %% --- Path setup ---------------------------------------------
@@ -51,7 +60,9 @@ opts.theta_jitter     = 0.05;
 opts.theta_smooth_rel = 0.05;
 
 % --- Porosity parameters ------------------------------------
-opts.A_rel = 2.0;
+opts.packing_batch_variation = 0.8;
+opts.packing_batch_seed = 1;
+opts.packing_case_id = 1;
 opts.eps_smooth_rel = 0.05;
 opts.texture_amp = 0.005;
 
@@ -94,21 +105,8 @@ opts.hooks.eps_final    = @(d) store_hook('eps_final', d);
 opts.hooks.p_inlet      = @(d) store_hook('p_inlet', d);
 
 %% === RUN PIPELINE ==========================================
-fields = struct();
-info   = struct();
-
-% --- 1) Structure field -------------------------------------
-[fields, info.structure] = gen_structure_field( ...
-    Lx, Ly, res, seed, opts);
-
-% --- 2) Permeability + tensor -------------------------------
-[fields, info.permeability] = gen_permeability_field(fields, opts);
-
-% --- 3) Porosity --------------------------------------------
-[fields, info.porosity] = gen_porosity_field(fields, opts);
-
-% --- 4) Pressure BC -----------------------------------------
-[fields, info.bc] = gen_pressure_bc(fields, opts);
+opts.save = false;
+[fields, info] = gen_simulation_inputs(Lx, Ly, res, seed, opts); %#ok<NASGU>
 
 %% === PIPELINE VISUALIZATION ================================
 
@@ -183,7 +181,7 @@ plot_field(H.eps_final.eps, '\varepsilon(x,y) final');
 % --- KC reference annotation (global, not a tile) ------------
 annotation('textbox', [0.30 0.01 0.40 0.07], ...
     'String', sprintf('KC reference:  \\varepsilon_{ref} = %.4f   |   k_{ref} = %.2e m^2', ...
-        H.eps_level.eps_ref, H.eps_level.k_ref), ...
+        H.eps_level.eps_reference, opts.k_mean), ...
     'EdgeColor','none', ...
     'HorizontalAlignment','center', ...
     'Interpreter','tex', ...

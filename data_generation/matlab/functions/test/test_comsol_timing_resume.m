@@ -1,5 +1,21 @@
+%% test_comsol_timing_resume.m
+% ============================================================
+% Verify batch locking, timing resume, progress, and repair contracts.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Exercises exclusive producer locking, runtime-compatible timing reuse,
+%   private progress publication, timing repair isolation, and the relevant
+%   batch-run lifecycle classifiers with synthetic local fixtures.
+%
+% REQUIREMENTS
+%   MATLAB Unit Test framework and Java file-lock support. COMSOL is not required.
+% ============================================================
+
 function tests = test_comsol_timing_resume
-% COMSOL-free tests for timing resume, private progress, and repair.
+
 tests = functiontests(localfunctions);
 end
 

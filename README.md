@@ -29,7 +29,7 @@ A fully automated MATLAB-driven pipeline for synthetic porous-media data generat
 - **Parameter sampling**: space-filling sampling strategies (uniform, LHS, Sobol)
 - **Structure synthesis**: stochastic multi-scale structure field generation as latent geometric backbone
 - **Permeability construction**: physically consistent mapping to scalar and tensor-valued permeability fields
-- **Porosity modelling**: independent porosity field generation with global Kozeny–Carman level anchoring
+- **Porosity modelling**: fixed Kozeny--Carman reference trend with bounded latent packing scatter and separate local texture
 - **Boundary conditions**: low-dimensional, spatially varying inlet pressure boundary conditions
 - **High-fidelity simulation**: batch-controlled Darcy–Brinkman simulations in COMSOL via LiveLink for MATLAB
 The pipeline supports resume-safe batch execution, reproducible seeding, and rich data export (CSV + JSON).
@@ -393,6 +393,7 @@ Valid artifacts are loaded without reconstructing a model or running inference. 
 │   │   │   │   │   └── gen_structure_field.m                       # Stochastic structure generation
 │   │   │   │   │
 │   │   │   │   ├── gen_simulation_inputs.m                         # Simulation-input assembly
+│   │   │   │   ├── kc_porosity_inverse.m                           # Shared KC porosity inversion
 │   │   │   │   ├── run_comsol_case.m                               # One COMSOL solve
 │   │   │   │   └── sample_parameters.m                             # Design-of-experiments sampling
 │   │   │   │

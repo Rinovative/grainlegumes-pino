@@ -15,6 +15,51 @@ from typing import Any
 from src import domain
 
 
+def _invert_kc_response(target: float) -> float:
+    """Invert the monotone dimensionless KC response for a test fixture."""
+    lower = 0.0
+    upper = 1.0
+    for _ in range(100):
+        midpoint = 0.5 * (lower + upper)
+        response = midpoint**3 / (1.0 - midpoint) ** 2
+        if response > target:
+            upper = midpoint
+        else:
+            lower = midpoint
+    return 0.5 * (lower + upper)
+
+
+def build_synthetic_generation_contract(variation: float) -> dict[str, Any]:
+    """Return one internally consistent version-1 packing contract fixture."""
+    kappa_nominal = 1e-10
+    eps_nominal = 0.5
+    reference = kappa_nominal / (eps_nominal**3 / (1.0 - eps_nominal) ** 2)
+    reference_variation = 0.8
+    natural_kappa = [
+        kappa_nominal / (1.0 + reference_variation),
+        kappa_nominal * (1.0 + reference_variation),
+    ]
+    batch_kappa = [
+        kappa_nominal / (1.0 + variation),
+        kappa_nominal * (1.0 + variation),
+    ]
+    return {
+        "generation_contract_version": 1,
+        "kappa_nominal": kappa_nominal,
+        "eps_nominal": eps_nominal,
+        "A_KC_reference": reference,
+        "reference_id_variation": reference_variation,
+        "natural_kappa_support": natural_kappa,
+        "natural_eps_reference_support": [_invert_kc_response(value / reference) for value in natural_kappa],
+        "batch_kappa_support": batch_kappa,
+        "batch_eps_reference_support": [_invert_kc_response(value / reference) for value in batch_kappa],
+        "packing_scatter_truncation_lower": -3,
+        "packing_scatter_truncation_upper": 3,
+        "eps_min_global": 0.3,
+        "eps_max_global": 0.8,
+    }
+
+
 def build_synthetic_generated_batch_identity(
     *,
     batch_name: str,
@@ -34,6 +79,7 @@ def build_synthetic_generated_batch_identity(
         "template_name": "synthetic_template.mph",
         "template_sha256": hashlib.sha256(b"synthetic-template").hexdigest(),
     }
+    configuration["generation_contract"] = build_synthetic_generation_contract(configuration["variation"])
     sources = [
         {
             "case_id": case_id,
@@ -73,6 +119,7 @@ def build_synthetic_generated_batch_identity(
             "seed": configuration["seed"],
             "base": {"synthetic_parameter": 1.0},
             "param_names": ["synthetic_parameter"],
+            "generation_contract": configuration["generation_contract"],
         },
     }
     encoded = json.dumps(

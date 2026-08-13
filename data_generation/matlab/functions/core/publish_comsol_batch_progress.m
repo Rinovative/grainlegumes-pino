@@ -1,11 +1,45 @@
+%% publish_comsol_batch_progress.m
+% ============================================================
+% Atomically checkpoint private COMSOL batch-resume state.
+%
+% Author: Rino M. Albertin
+% Date:   2026-08-13
+%
+% DESCRIPTION
+%   Validates ordered case lifecycle records and file-digest completeness,
+%   publishes the version-1 in-progress batch payload, and writes the matching
+%   operational timing sidecar without a terminal-manifest digest.
+%
+% USAGE
+%   [progress, timing_payload] = publish_comsol_batch_progress( ...
+%       progress_path, timing_path, batch_name, configuration, field_schema, ...
+%       intended_case_ids, case_records, solve_timings, runtime)
+%
+% INPUTS
+%   progress_path, timing_path
+%       Destinations for atomic progress and timing JSON publication.
+%   batch_name
+%       Non-empty batch identity.
+%   configuration, field_schema
+%       Current scientific configuration and exact exported-field schema.
+%   intended_case_ids, case_records
+%       Ordered batch membership and one lifecycle record per intended case.
+%   solve_timings, runtime
+%       Current operational measurements and their runtime provenance.
+%
+% OUTPUTS
+%   progress
+%       Validated in-progress schema.
+%   timing_payload
+%       Validated timing sidecar published beside processed outputs.
+%
+% NOTES
+%   Terminal batch manifests are never used as mutable progress files.
+% ============================================================
+
 function [progress, timing_payload] = publish_comsol_batch_progress( ...
         progress_path, timing_path, batch_name, configuration, ...
         field_schema, intended_case_ids, case_records, solve_timings, runtime)
-%PUBLISH_COMSOL_BATCH_PROGRESS Atomically checkpoint private resume state.
-% The terminal batch manifest is never used for in-progress state. This
-% version-1 progress file fences consumers from an active or interrupted batch.
-% Timing remains a separate version-1 sidecar with an empty terminal-manifest
-% digest until final manifest publication.
 
 progress_path = require_text(progress_path, 'progress_path', false);
 timing_path = require_text(timing_path, 'timing_path', false);

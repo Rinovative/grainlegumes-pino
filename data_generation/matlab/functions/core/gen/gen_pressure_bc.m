@@ -1,55 +1,76 @@
 %% gen_pressure_bc.m
 % ============================================================
-% Generate synthetic inlet pressure boundary condition p(y=0)
+% Generate the inlet-pressure boundary condition.
 %
 % Author: Rino M. Albertin
-% Date:   2026-01-05
+% Date:   2026-08-13
 %
 % DESCRIPTION
-%   Generates a deterministic pressure boundary condition applied
-%   exclusively at the inlet boundary y = 0.
+%   Constructs a low-dimensional pressure profile on the minimum-y boundary
+%   from a sampled mean plus sinusoidal, Gaussian-bump, and linear shape terms.
+%   The completed profile is clipped at zero and returned as one inlet vector.
 %
-%   The inlet pressure is constructed from a small set of global
-%   shape parameters, enabling a wide variety of boundary "figures"
-%   while keeping the DoE dimensionality low.
+% MODEL
+%   For x_hat normalized from zero to one along the inlet,
 %
-%   Uniform pressure is obtained automatically when all amplitudes
-%   are set to zero.
+%       shape(x_hat) = a_sin*sin(2*pi*f_sin*x_hat + phi_sin)
+%                    + sum_i (a_gauss/k_gauss)
+%                        * exp(-(x_hat - mu_i)^2/(2*sigma_i^2))
+%                    + a_lin*(2*x_hat - 1)
 %
-% ------------------------------------------------------------------------
-% FUNCTION FORM
+%       p_inlet(x_hat) = max(0, p_inlet_mean*(1 + shape(x_hat))).
 %
-%   p(x) = p_mean · ( 1
-%                    + a_sin · sin(2π·f_sin·x̂)
-%                    + Σ_i a_i · exp(-(x̂-μ_i)^2/(2σ_i^2))
-%                    + a_lin · (2x̂ - 1) )
+%   When k_gauss > 0, centers are mu_i = i/(k_gauss + 1). Their widths are
 %
-%   with:
-%     μ_i   equally spaced centers
-%     σ_i   = σ · (1 + jitter · ξ_i),  ξ_i ~ N(0,1)
+%       sigma_i = max(sigma_gauss*(1 + gauss_jitter*xi_i),
+%                     0.05*sigma_gauss),       xi_i ~ N(0,1).
 %
-% ------------------------------------------------------------------------
+%   Dividing a_gauss by k_gauss keeps the sum of the individual bump
+%   coefficients equal to a_gauss as the number of centers changes. Setting all
+%   three shape amplitudes to zero
+%   gives a uniform inlet pressure.
+%
 % USAGE
 %   [fields, info] = gen_pressure_bc(fields, opts)
 %
-% REQUIRED OPTS (SAMPLED UPSTREAM)
-%   .p_inlet_mean     scalar > 0
+% INPUTS
+%   fields
+%       Struct containing fields.grid.X and fields.grid.Y.
+%   opts.p_inlet_mean
+%       Required mean inlet pressure [Pa].
 %
-% OPTIONAL OPTS (LOW-DIMENSIONAL)
-%   .a_sin            scalar, default 0
-%   .f_sin            scalar >= 0, default 1
-%
-%   .k_gauss          integer >= 0, default 0
-%   .a_gauss          scalar, default 0
-%   .sigma_gauss      scalar > 0, default 0.12
-%   .gauss_jitter     scalar >= 0, default 0.25
-%
-%   .a_lin            scalar, default 0
+% OPTIONAL OPTS
+%   a_sin = 0.0
+%       Sinusoidal amplitude relative to p_inlet_mean.
+%   f_sin = 1.0
+%       Sinusoidal frequency across the normalized inlet.
+%   phi_sin
+%       Sinusoidal phase [rad]; required when a_sin is nonzero.
+%   k_gauss = 0
+%       Number of equally spaced interior Gaussian centers.
+%   a_gauss = 0.0
+%       Total Gaussian-bump amplitude relative to p_inlet_mean.
+%   sigma_gauss = 0.12
+%       Nominal Gaussian width in normalized inlet coordinates.
+%   gauss_jitter = 0.25
+%       Relative Gaussian width perturbation.
+%   a_lin = 0.0
+%       End-to-end linear trend amplitude relative to p_inlet_mean.
+%   enable_hooks = false, hooks = struct()
+%       Optional p_inlet completion callback.
 %
 % OUTPUTS
-%   fields.bc.p_inlet
-%   info.parameters
-%   info.statistics
+%   fields
+%       Input struct with fields.bc replaced by a struct containing the
+%       1-by-nx fields.bc.p_inlet vector.
+%   info
+%       Inlet-pressure statistics and the stored generator settings.
+%
+% NOTES
+%   The Gaussian branch consumes k_gauss normal draws whenever k_gauss is
+%   positive and a_gauss is nonzero, even when gauss_jitter is zero. These
+%   draws intentionally continue the spatial RNG stream initialized by
+%   gen_structure_field. No random values are drawn by the other shape terms.
 % ============================================================
 
 function [fields, info] = gen_pressure_bc(fields, opts)

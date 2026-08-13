@@ -1,21 +1,37 @@
 %% run_comsol_case.m
 % ============================================================
-% Run one COMSOL Darcy-Brinkman simulation from generated task fields.
+% Run one Darcy-Brinkman COMSOL case from generated task fields.
 %
-% The seven input CSV columns have one explicit contract:
-%   x [m], y [m], Kxx [m^2], Kxy [m^2], Kyy [m^2], eps [1], p_bc [Pa].
+% Author: Rino M. Albertin
+% Date:   2026-08-13
 %
-% The copied model contains one combined interpolation feature whose visible
-% label is "int" and whose internal COMSOL feature tag is "int1". For each
-% case, the generated CSV is imported into that feature, which exposes the
-% functions int1 through int5.
+% DESCRIPTION
+%   Validates the canonical seven-column input grid, copies the immutable COMSOL
+%   template, imports the current fields into the template-owned interpolation
+%   feature, solves the model, and atomically publishes the solution export.
 %
-% The MPH template owns the Brinkman permeability matrix, material porosity,
-% and inlet-pressure bindings. This runner validates the required model nodes
-% but does not rewrite those template settings.
+% USAGE
+%   results = run_comsol_case(field_path, template_path, output_dir, save_model)
 %
-% The final solution CSV is published only after a complete export. Working
-% models and temporary exports are removed on both success and failure.
+% INPUTS
+%   field_path
+%       Generated CSV with x, y, Kxx, Kxy, Kyy, eps, and p_bc columns.
+%   template_path
+%       COMSOL MPH template containing the required physics and material nodes.
+%   output_dir
+%       Destination for the solved CSV and optional solved model.
+%   save_model
+%       Optional logical flag; false by default.
+%
+% OUTPUTS
+%   results
+%       Case name, input and export paths, save flag, COMSOL solve duration,
+%       and complete wall-clock duration.
+%
+% NOTES
+%   The template owns the permeability, porosity, and inlet-pressure bindings.
+%   This runner replaces only the interpolation source file. Existing outputs
+%   are never overwritten, and temporary models and exports are cleaned up.
 % ============================================================
 
 function results = run_comsol_case(field_path, template_path, output_dir, save_model)

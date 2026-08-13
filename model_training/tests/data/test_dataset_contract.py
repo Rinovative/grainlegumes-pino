@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 import torch
 from src import common, datasets, domain
+from support.synthetic_task import build_synthetic_generation_contract
 
 from data_generation import build_training_dataset as builder_module
 from data_generation import generated_batch as generated_module
@@ -47,6 +48,15 @@ def _case_rows(case_number: int) -> list[list[Any]]:
 
 def _synthetic_generator_metadata() -> dict[str, Any]:
     statistics = {"min": 0.1, "max": 0.9, "mean": 0.5, "std": 0.1}
+    generation_contract = build_synthetic_generation_contract(0.2)
+    eps_kc_trend = generation_contract["eps_nominal"]
+    natural_eps_support = generation_contract["natural_eps_reference_support"]
+    scatter_margin = min(
+        eps_kc_trend - natural_eps_support[0],
+        natural_eps_support[1] - eps_kc_trend,
+    )
+    scatter_sigma = scatter_margin / 3.0
+    scatter_z = 0.25
     return {
         "structure": {
             "parameters": {
@@ -73,7 +83,11 @@ def _synthetic_generator_metadata() -> dict[str, Any]:
         "permeability": {
             "parameters": {
                 "orientation": {"theta_jitter": 0.1, "theta_smooth_rel": 0.1},
-                "permeability": {"k_mean": 1e-10, "s_logn": 0.1, "var_rel": 0.1},
+                "permeability": {
+                    "k_mean": generation_contract["kappa_nominal"],
+                    "s_logn": 0.1,
+                    "var_rel": 0.1,
+                },
                 "tensor": {"a_gamma": 1.0, "a_max": 1.0, "tensor_strength": 0.1},
             },
             "statistics": {
@@ -83,15 +97,29 @@ def _synthetic_generator_metadata() -> dict[str, Any]:
         },
         "porosity": {
             "parameters": {
-                "A_mat": 0.1,
-                "A_rel": 0.1,
-                "eps_max_global": 0.9,
-                "eps_min_global": 0.1,
-                "eps_ref": 0.5,
+                **generation_contract,
+                "k_mean": generation_contract["kappa_nominal"],
+                "eps_kc_trend": eps_kc_trend,
+                "packing_scatter_seed": 12345,
+                "packing_scatter_z": scatter_z,
+                "packing_scatter_margin": scatter_margin,
+                "packing_scatter_sigma": scatter_sigma,
+                "packing_support_kind": "natural_id",
+                "packing_support_lower": natural_eps_support[0],
+                "packing_support_upper": natural_eps_support[1],
+                "eps_reference": eps_kc_trend + scatter_sigma * scatter_z,
                 "eps_smooth_rel": 0.1,
                 "texture_amp": 0.1,
             },
-            "statistics": {"eps": dict(statistics)},
+            "statistics": {
+                "eps": {
+                    "min": 0.4,
+                    "max": 0.7,
+                    "mean": 0.55,
+                    "std": 0.1,
+                    "local_clipping_fraction": 0.0,
+                }
+            },
         },
         "bc": {
             "parameters": {
@@ -162,6 +190,7 @@ def _write_generated_batch(
             "seed": 17,
             "base": {"alpha": 0.1},
             "param_names": ["alpha"],
+            "generation_contract": build_synthetic_generation_contract(0.2),
             "timestamp": "2026-01-01 00:00:00",
         },
         "n_cases": len(case_ids),
@@ -200,6 +229,7 @@ def _write_generated_batch(
             "sample_sha256": _sha256(sample_csv),
             "template_name": "template_brinkman.mph",
             "template_sha256": "1" * 64,
+            "generation_contract": build_synthetic_generation_contract(0.2),
         },
         "field_schema": _MANIFEST_FIELD_SCHEMA,
         "intended_case_ids": case_ids,
@@ -568,6 +598,7 @@ def test_builder_rejects_extra_csv_columns(tmp_path: Path, source_kind: str) -> 
         ("fields_present", "every generated field"),
         ("spacing", "dx/dy must equal res"),
         ("nested_generator_key", "generator.structure.parameters keys"),
+        ("porosity_parameters", "generator.porosity.parameters keys"),
     ],
 )
 def test_builder_rejects_raw_metadata_schema_drift(tmp_path: Path, corruption: str, message: str) -> None:
@@ -588,8 +619,46 @@ def test_builder_rejects_raw_metadata_schema_drift(tmp_path: Path, corruption: s
         metadata["fields_present"]["tensor"] = False
     elif corruption == "spacing":
         metadata["geometry"]["dx"] = 0.5
+    elif corruption == "porosity_parameters":
+        metadata["generator"]["porosity"]["parameters"] = {"unexpected": 0.5}
     else:
         metadata["generator"]["structure"]["parameters"]["source_path"] = "C:/private"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    _rebind_case_sources(raw_dir, processed_dir)
+
+    with pytest.raises(ValueError, match=message):
+        build_batch_dataset(
+            "synthetic",
+            generated_data_root=generated_root,
+            model_training_data_root=tmp_path / "training",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("packing_scatter_z", 3.0, "strictly inside"),
+        ("packing_scatter_sigma", -0.1, "must be non-negative"),
+        ("eps_reference", 0.7, "scattered reference identity"),
+        ("packing_support_upper", 0.6, "support upper identity"),
+    ],
+)
+def test_builder_rejects_inconsistent_packing_provenance(
+    tmp_path: Path,
+    field: str,
+    value: float,
+    message: str,
+) -> None:
+    """Reject case provenance that violates the admitted KC/scatter contract."""
+    generated_root = tmp_path / "generated"
+    _meta, raw_dir, processed_dir = _write_generated_batch(
+        generated_root,
+        case_numbers=(1,),
+        timing_count=1,
+    )
+    metadata_path = raw_dir / "case_0001.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["generator"]["porosity"]["parameters"][field] = value
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     _rebind_case_sources(raw_dir, processed_dir)
 
@@ -652,6 +721,7 @@ def test_public_source_sample_boundary_accepts_semantic_agreement(tmp_path: Path
         "seed": 17,
         "base": {"alpha": 0.1},
         "param_names": ["alpha"],
+        "generation_contract": build_synthetic_generation_contract(0.2),
     }
 
 
@@ -747,6 +817,23 @@ def test_public_source_sample_boundary_rejects_variable_name_mismatch(tmp_path: 
     payload["meta"]["param_names"] = ["beta"]
 
     with pytest.raises(ValueError, match="columns"):
+        datasets.metadata.validate_source_sample_semantics(
+            sample_csv,
+            json.dumps(payload).encode(),
+            source_manifest=manifest,
+        )
+
+
+def test_public_source_sample_boundary_rejects_latent_provenance_as_doe(
+    tmp_path: Path,
+) -> None:
+    """Reject case-level latent provenance in the sampled DOE schema."""
+    sample_csv, sample_json, manifest = _source_sample_contract(tmp_path / "generated")
+    payload = json.loads(sample_json)
+    payload["meta"]["base"]["packing_scatter_z"] = 0.0
+    payload["meta"]["param_names"].append("packing_scatter_z")
+
+    with pytest.raises(ValueError, match="non-DOE fields"):
         datasets.metadata.validate_source_sample_semantics(
             sample_csv,
             json.dumps(payload).encode(),
