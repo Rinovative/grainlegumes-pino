@@ -7,7 +7,7 @@
 **Supervisor:** Prof. Dr. Christoph Würsch  
 
 > **Follow-up project:**  
-> [GrainLegumes-PINO-Drying](https://github.com/Rinovative/grainlegumes-pino-drying) extends this steady-airflow foundation to transient coupled heat and moisture transport.
+> [GrainLegumes-PINO-Drying](https://github.com/Rinovative/grainlegumes-pino-drying) extends to transient coupled heat and moisture transport.
 
 ## 📌 Project Overview
 
