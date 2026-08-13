@@ -81,6 +81,7 @@ Evaluation panels expose distinct single-model and comparison compositions. Ever
 
 Full project report, including methodology, model formulation, and detailed evaluation results:
 [Albertin_2026_PINO_Airflow_PorousMedia.pdf](docs/Albertin_2026_PINO_Airflow_PorousMedia.pdf)
+> The report documents the VP1 submission state corresponding to commit `811ba0b` (`VP1: submission snapshot`, 18 February 2026). The repository has continued to evolve since then, so the current `main` branch may differ from the implementation described in the report.
 
 ## 📊 Visualization
 
